@@ -187,6 +187,38 @@ pub fn request_rearm() {
 
 /// Consume the pending flag and, if set, run the re-arm on this port: RX_CTL 0000
 /// then START|AB|IPE and one 0x81|0x8c FIFO read, recorded for the peer capture.
+/// The reference `ax88179_link_reset` loop: toggle RX_CTL and poll the TX FIFO until the
+/// FIFO-full bit (0x4000_0000) clears, bounded like the reference's 100 ms wait. The proof
+/// schedule never needed it because its first frame came after a two-second settle with the
+/// toggle already cycling; the frame channel primes once before its first bulk OUT.
+pub fn prime_tx<P: Port>(port: &mut P) -> bool {
+    for _ in 0..20 {
+        let on = match Request::mac_write(
+            MacRegister::RxControl,
+            &(RX_CTL_START | RX_CTL_AB | RX_CTL_IPE).to_le_bytes(),
+        ) {
+            Ok(request) => request,
+            Err(_) => return false,
+        };
+        let Ok(off) = Request::mac_write(MacRegister::RxControl, &[0x00, 0x00]) else {
+            return false;
+        };
+        let mut back = [0u8; 6];
+        if port.exchange(&off, &mut back).is_err()
+            || port.exchange(&on, &mut back).is_err()
+            || port.exchange(&Request::fifo_status(), &mut back).is_err()
+        {
+            return false;
+        }
+        let fifo = u32::from_le_bytes([back[0], back[1], back[2], back[3]]);
+        port.record(format_args!("NET7b tx prime fifo={:#010x}\n", fifo));
+        if fifo & 0x4000_0000 == 0 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Callers gate on the link actually receiving; the fast path is the driver's
 /// every-wake pump, the link tick is the fallback. — TIMBERDOODLE
 pub fn rearm_take<P: Port>(port: &mut P) -> bool {

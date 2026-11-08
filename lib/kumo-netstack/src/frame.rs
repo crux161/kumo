@@ -384,9 +384,11 @@ pub struct Lane {
     rx_granted: u32,
     rx_outstanding: u32,
     tx_credit: u32,
-    /// Sequence numbers of TX_FRAMEs awaiting TX_DONE are the contiguous range
-    /// `oldest_tx .. oldest_tx + tx_in_flight`: TX_DONEs answer in order.
-    oldest_tx: u32,
+    /// Sequences of the TX_FRAMEs awaiting their TX_DONE, oldest at `tx_head`. CREDIT
+    /// messages share the outbound sequence space, so consecutive TX answer numbers can
+    /// have gaps; the queue remembers the real sequences.
+    tx_sent: [u32; TX_CREDIT],
+    tx_head: usize,
     tx_in_flight: u32,
 }
 
@@ -399,7 +401,8 @@ impl Lane {
             rx_granted: 0,
             rx_outstanding: 0,
             tx_credit: 0,
-            oldest_tx: 0,
+            tx_sent: [0; TX_CREDIT],
+            tx_head: 0,
             tx_in_flight: 0,
         }
     }
@@ -414,6 +417,18 @@ impl Lane {
 
     pub const fn rx_outstanding(&self) -> u32 {
         self.rx_outstanding
+    }
+
+    pub fn oldest_tx(&self) -> u32 {
+        if self.tx_in_flight == 0 {
+            0
+        } else {
+            self.tx_sent[self.tx_head]
+        }
+    }
+
+    pub const fn tx_in_flight(&self) -> u32 {
+        self.tx_in_flight
     }
 
     /// Check an inbound frame and apply its effect. On `Err` the channel must be closed.
@@ -436,7 +451,8 @@ impl Lane {
                 rx_granted: (hello.rx_credit_wanted as u32).min(RX_CREDIT as u32),
                 rx_outstanding: 0,
                 tx_credit: (hello.tx_credit_offered as u32).min(TX_CREDIT as u32),
-                oldest_tx: 1,
+                tx_sent: [0; TX_CREDIT],
+                tx_head: 0,
                 tx_in_flight: 0,
             };
             return Ok(());
@@ -458,10 +474,10 @@ impl Lane {
                 self.rx_outstanding += 1;
             }
             Body::TxDone { answers, .. } => {
-                if self.tx_in_flight == 0 || answers != self.oldest_tx {
+                if self.tx_in_flight == 0 || answers != self.tx_sent[self.tx_head] {
                     return Err(Violation::UnsolicitedTxDone);
                 }
-                self.oldest_tx = self.oldest_tx.wrapping_add(1);
+                self.tx_head = (self.tx_head + 1) % TX_CREDIT;
                 self.tx_in_flight -= 1;
                 self.tx_credit += 1;
             }
@@ -492,11 +508,19 @@ impl Lane {
         }
         let out = self.outbound(Body::TxFrame(frame))?;
         self.tx_credit -= 1;
-        if self.tx_in_flight == 0 {
-            self.oldest_tx = out.sequence;
-        }
+        let slot = (self.tx_head + self.tx_in_flight as usize) % TX_CREDIT;
+        self.tx_sent[slot] = out.sequence;
         self.tx_in_flight += 1;
         Some(out)
+    }
+
+    /// Undo the most recent `send_tx`: the frame was counted but never written to the
+    /// channel, so its sequence can never be answered and must leave the queue.
+    pub fn abandon_tx(&mut self) {
+        if self.tx_in_flight > 0 {
+            self.tx_in_flight -= 1;
+            self.tx_credit = (self.tx_credit + 1).min(TX_CREDIT as u32);
+        }
     }
 
     /// Return `count` consumed RX credits to the provider.
@@ -828,5 +852,48 @@ mod tests {
             lane.accept(&rx(3, RX_CREDIT as u32 + 2)),
             Err(Violation::CreditOverrun)
         );
+    }
+    #[test]
+    fn tx_dones_survive_interleaved_credit_returns() {
+        // CREDIT messages share the outbound sequence space, so TX answer numbers are not
+        // consecutive. The lane must match TX_DONEs against the sequences it actually sent
+        // (a J843 metal finding: a +1 advance rejected the driver's correct answer).
+        let mut lane = Lane::new();
+        let hello = Frame {
+            generation: 1,
+            sequence: 1,
+            body: Body::Hello(Hello {
+                mac: [1; 6],
+                mtu: 1500,
+                max_frame: 1514,
+                rx_credit_wanted: 32,
+                tx_credit_offered: 16,
+                flags: 0,
+            }),
+        };
+        lane.accept(&hello).unwrap();
+        let rx = Frame {
+            generation: 1,
+            sequence: 2,
+            body: Body::RxFrame(&[0u8; 60]),
+        };
+        lane.accept(&rx).unwrap();
+        let a = lane.send_tx(&[0x11; 60]).unwrap();
+        let credit = lane.return_rx(1).unwrap();
+        let b = lane.send_tx(&[0x22; 60]).unwrap();
+        assert_eq!((a.sequence, credit.sequence, b.sequence), (1, 2, 3));
+        for (sequence, answers) in [(3u32, 1u32), (4, 3)] {
+            let done = Frame {
+                generation: 1,
+                sequence,
+                body: Body::TxDone {
+                    answers,
+                    status: TxStatus::HandedToBus,
+                },
+            };
+            lane.accept(&done).unwrap();
+        }
+        assert_eq!(lane.tx_credit(), 16);
+        0;
     }
 }

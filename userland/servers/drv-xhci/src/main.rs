@@ -1,16 +1,17 @@
 #![no_std]
 #![no_main]
 
-//j830
 //j831
 //j832
 //j833
 //j840
+//j843
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 mod ax88_identity;
 mod ax88_link;
+mod frame_chan;
 mod resident_nic;
 
 use drv_blk::{
@@ -247,6 +248,8 @@ static STORAGE_TRACE: AtomicBool = AtomicBool::new(true);
 /// volume on it and receives one channel per block client from it.
 static STORAGE_CONTROL: AtomicU32 = AtomicU32::new(0);
 const STORAGE_BOOTSTRAP_TAG: u8 = b'b';
+/// NET7b: Sora's end of the frame-provider admin channel (0 when absent).
+static FRAME_ADMIN_CONTROL: AtomicU32 = AtomicU32::new(0);
 /// Block clients one stick serves at once: one per `fatfs` instance Sora starts for it.
 const MAX_BLOCK_CLIENTS: usize = 4;
 /// Keep other slots' transfer events for their own poll (J545). Only the resident loop serving
@@ -310,16 +313,28 @@ extern "C" fn main(
         if raw == 0 || raw == u64::MAX {
             continue;
         }
+
+        ax88_record(format_args!(
+            "NET7b bootstrap tag={:#x} len={} raw={:#x}\n",
+            tag[0], len, raw
+        ));
         let slot = match tag[0] {
             KEYBOARD_BOOTSTRAP_TAG => &KEYBOARD_CHANNEL,
             MOUSE_BOOTSTRAP_TAG => &MOUSE_CHANNEL,
             STORAGE_BOOTSTRAP_TAG => &STORAGE_CONTROL,
+            frame_chan::FRAME_BOOTSTRAP_TAG => &FRAME_ADMIN_CONTROL,
             _ => {
                 let _ = handle_close(Handle(raw as u32));
                 continue;
             }
         };
         slot.store(raw as u32, Ordering::Relaxed);
+        if tag[0] == frame_chan::FRAME_BOOTSTRAP_TAG {
+            ax88_record(format_args!(
+                "NET7b admin channel received raw={:#x}\n",
+                raw
+            ));
+        }
     }
 
     log(b"drv-xhci: usb0 mmio=");
@@ -3589,6 +3604,19 @@ fn run_hid_lanes(
             // the same port. Wakes are told apart by their source's koid.
             let interrupt_koid = handle_koid(interrupt);
             let storage_control_koid = irq_port.and_then(offer_storage);
+            if let Some(port) = irq_port {
+                ax88_record(format_args!(
+                    "NET7b bootstrap tags k={:#x} m={:#x} b={:#x} f={:#x}\n",
+                    KEYBOARD_CHANNEL.load(Ordering::Relaxed),
+                    MOUSE_CHANNEL.load(Ordering::Relaxed),
+                    STORAGE_CONTROL.load(Ordering::Relaxed),
+                    FRAME_ADMIN_CONTROL.load(Ordering::Relaxed),
+                ));
+                frame_chan::offer_admin(
+                    port,
+                    u64::from(FRAME_ADMIN_CONTROL.load(Ordering::Relaxed)),
+                );
+            }
             if lanes.iter().all(Option::is_none) && nic.is_none() {
                 log(b"drv-xhci: storage irq-driven; no hid lanes\n");
             }
@@ -3649,6 +3677,12 @@ fn run_hid_lanes(
                             }
                             if proof_timer.is_some_and(|(_, koid)| koid == source) {
                                 tick = true;
+                                break;
+                            }
+                            if frame_chan::serve_wake(port, source) {
+                                // A served frame message means work is queued: return to the
+                                // outer iteration so arm_idle submits it. Continuing the wait
+                                // starved arm_idle for the whole burst.
                                 break;
                             }
                             let served = serve_storage_wake(

@@ -2,6 +2,7 @@
 #![no_main]
 //j815
 //j820
+//j843
 
 //! The resident netstack: one Port, one loopback interface, sessions over granted channels
 //! (DESIGN/026). Sora transfers a control channel in `x1`; each control message is the tag `S`
@@ -21,7 +22,8 @@ use alloc::vec::Vec;
 use kumo_abi::sys::log_level;
 use kumo_abi::Handle;
 use kumo_ipc::MAX_INLINE_BYTES;
-use kumo_netstack::budget::SESSIONS;
+use kumo_netstack::budget::{FRAMES_PER_TURN, FRAME_MAX, SESSIONS};
+use kumo_netstack::frame::{decode, encode, Body, Lane, HEADER_LEN};
 use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid, port_bind,
     port_create, port_unbind, port_wait, timer_create,
@@ -32,6 +34,8 @@ kumo_rt::entry!(main);
 
 /// A control message: one tag byte, with the session channel attached.
 const CONTROL_SESSION: u8 = b'S';
+/// A frame-channel grant: tag, IPv4 address (4 bytes), prefix (1), channel attached.
+const CONTROL_FRAME: u8 = b'F';
 /// Timers shorter than this are rounded up, so a busy stack cannot spin the loop.
 const MIN_TIMER_NS: u64 = 1_000_000;
 
@@ -134,6 +138,206 @@ impl Channels {
     }
 }
 
+/// The one frame channel (DESIGN/026 §3): Sora grants it with the wire address, the provider
+/// opens each generation with HELLO. A new grant replaces the old channel.
+struct Frame {
+    channel: Handle,
+    koid: u64,
+    lane: Lane,
+    addr: [u8; 4],
+    prefix: u8,
+    /// `wire_delivered()` at the last CREDIT return.
+    returned: u64,
+    /// RX_FRAMEs the wire device refused because its ingress ring was full.
+    device_drops: u64,
+    /// Set once when the TX credit first runs out with egress still queued.
+    backpressure_logged: bool,
+}
+
+/// Replace the frame channel with a fresh Sora grant. The wire stack attaches when the
+/// provider's HELLO supplies its MAC.
+fn install_frame(
+    frame: &mut Option<Frame>,
+    server: &mut Server,
+    port: Handle,
+    channel: Handle,
+    addr: [u8; 4],
+    prefix: u8,
+) {
+    close_frame(frame, server, port);
+    let koid = handle_koid(channel);
+    if koid == u64::MAX || port_bind(port, channel) != 0 {
+        let _ = handle_close(channel);
+        log(log_level::WARNING, b"netstack: frame channel bind failed\n");
+        return;
+    }
+    *frame = Some(Frame {
+        channel,
+        koid,
+        lane: Lane::new(),
+        addr,
+        prefix,
+        returned: 0,
+        device_drops: 0,
+        backpressure_logged: false,
+    });
+    log(log_level::NOTICE, b"netstack: frame channel granted\n");
+}
+
+fn close_frame(frame: &mut Option<Frame>, server: &mut Server, port: Handle) {
+    if let Some(old) = frame.take() {
+        let _ = port_unbind(port, old.channel);
+        let _ = handle_close(old.channel);
+    }
+    server.detach_wire();
+}
+
+/// One message from the frame channel: decode, enforce the Lane, apply to the wire stack.
+fn serve_frame(frame: &mut Option<Frame>, server: &mut Server, port: Handle, now: u64) {
+    let Some(f) = frame.as_mut() else {
+        return;
+    };
+    let mut bytes = [0u8; FRAME_MAX + HEADER_LEN];
+    let (n, raw) = channel_read_with_handle(f.channel, bytes.as_mut_ptr(), bytes.len());
+    if n == 0 {
+        log(log_level::NOTICE, b"netstack: frame channel closed\n");
+        close_frame(frame, server, port);
+        return;
+    }
+    let handles = usize::from(valid(raw).is_some());
+    if let Some(extra) = valid(raw) {
+        let _ = handle_close(extra);
+    }
+    let Ok(message) = decode(&bytes[..n], handles) else {
+        log(
+            log_level::WARNING,
+            b"netstack: frame message dropped (decode)\n",
+        );
+        return;
+    };
+    if let Err(violation) = f.lane.accept(&message) {
+        // A violation closes the channel (DESIGN/026 §3); a fresh channel re-HELLOs.
+        let name: &[u8] = match violation {
+            kumo_netstack::frame::Violation::WrongDirection => b"WrongDirection",
+            kumo_netstack::frame::Violation::NoHello => b"NoHello",
+            kumo_netstack::frame::Violation::ReusedGeneration => b"ReusedGeneration",
+            kumo_netstack::frame::Violation::HelloSequence => b"HelloSequence",
+            kumo_netstack::frame::Violation::StaleGeneration => b"StaleGeneration",
+            kumo_netstack::frame::Violation::SequenceGap => b"SequenceGap",
+            kumo_netstack::frame::Violation::CreditOverrun => b"CreditOverrun",
+            kumo_netstack::frame::Violation::UnsolicitedTxDone => b"UnsolicitedTxDone",
+        };
+        let answers = match message.body {
+            Body::TxDone { answers, .. } => answers,
+            _ => 0,
+        };
+        let mut line = Vec::with_capacity(128);
+        line.extend_from_slice(b"netstack: frame violation ");
+        line.extend_from_slice(name);
+        line.extend_from_slice(b" answers=");
+        push_dec(&mut line, u64::from(answers));
+        line.extend_from_slice(b" oldest=");
+        push_dec(&mut line, u64::from(f.lane.oldest_tx()));
+        line.extend_from_slice(b" in_flight=");
+        push_dec(&mut line, u64::from(f.lane.tx_in_flight()));
+        line.extend_from_slice(b"; channel closed\n");
+        log(log_level::WARNING, &line);
+        close_frame(frame, server, port);
+        return;
+    }
+    match message.body {
+        Body::Hello(hello) => {
+            server.attach_wire(now, hello.mac, f.addr, f.prefix);
+            log(log_level::NOTICE, b"netstack: wire interface up\n");
+        }
+        Body::Link { up, mbps, .. } => {
+            let mut line = Vec::with_capacity(64);
+            line.extend_from_slice(b"netstack: wire link ");
+            line.extend_from_slice(if up { b"up" } else { b"down" });
+            line.push(b' ');
+            push_dec(&mut line, mbps as u64);
+            line.extend_from_slice(b" Mb/s\n");
+            log(log_level::NOTICE, &line);
+        }
+        Body::RxFrame(bytes) => {
+            if server.push_wire_frame(bytes).is_err() {
+                f.device_drops += 1;
+            }
+        }
+        Body::Counters(counters) => {
+            let mut line = Vec::with_capacity(128);
+            line.extend_from_slice(b"netstack: provider counters drop_no_credit=");
+            push_dec(&mut line, counters.rx_drop_no_credit);
+            line.extend_from_slice(b" bad=");
+            push_dec(&mut line, counters.rx_bad);
+            line.extend_from_slice(b" tx_drop=");
+            push_dec(&mut line, counters.tx_drop);
+            line.extend_from_slice(b" tx_err=");
+            push_dec(&mut line, counters.tx_err);
+            line.push(b'\n');
+            log(log_level::NOTICE, &line);
+        }
+        _ => {}
+    }
+}
+
+/// Hand wire egress over as TX_FRAMEs within the TX credit, and return consumed RX credits.
+fn pump_frame(frame: &mut Option<Frame>, server: &mut Server) {
+    let Some(f) = frame.as_mut() else {
+        return;
+    };
+    let mut bytes = [0u8; FRAME_MAX];
+    for _ in 0..FRAMES_PER_TURN {
+        if f.lane.tx_credit() == 0 {
+            if !f.backpressure_logged && server.wire_pending_outbound() > 0 {
+                f.backpressure_logged = true;
+                log(
+                    log_level::NOTICE,
+                    b"netstack: frame tx backpressure (credit exhausted)\n",
+                );
+            }
+            break;
+        }
+        let Some(len) = server.take_wire_frame(&mut bytes) else {
+            break;
+        };
+        let Some(out) = f.lane.send_tx(&bytes[..len]) else {
+            break;
+        };
+        let mut wire = [0u8; FRAME_MAX + HEADER_LEN];
+        let Some(n) = encode(&out, &mut wire) else {
+            f.lane.abandon_tx();
+            break;
+        };
+        // A refused write means the frame never reached the provider; the lane must not
+        // keep counting it or every later TX_DONE answer misfires. J843 metal finding.
+        if channel_write(f.channel, wire.as_ptr(), n) != 0 {
+            f.lane.abandon_tx();
+            log(
+                log_level::NOTICE,
+                b"netstack: frame tx write refused; lane rolled back\n",
+            );
+            break;
+        }
+        kumo_rt::log_write(
+            log_level::NOTICE,
+            b"netstack: frame tx handed to provider\n",
+        );
+    }
+    let delivered = server.wire_delivered();
+    let owed = delivered.saturating_sub(f.returned);
+    if owed > 0 {
+        if let Some(credit) = f.lane.return_rx(owed as u32) {
+            let mut wire = [0u8; FRAME_MAX + HEADER_LEN];
+            if let Some(n) = encode(&credit, &mut wire) {
+                if channel_write(f.channel, wire.as_ptr(), n) == 0 {
+                    f.returned = delivered;
+                }
+            }
+        }
+    }
+}
+
 #[no_mangle]
 extern "C" fn main(
     _arg0: u64,
@@ -172,6 +376,7 @@ extern "C" fn main(
         sessions: [None; SESSIONS],
         timer: None,
     };
+    let mut frame: Option<Frame> = None;
     let mut out: Vec<Output> = Vec::new();
     let mut message = alloc::vec![0u8; MAX_INLINE_BYTES];
     log(
@@ -183,14 +388,29 @@ extern "C" fn main(
         let source = port_wait(port);
         let now = clock_get();
         if source == control_koid {
-            let mut tag = [0u8; 1];
-            let (n, raw) = channel_read_with_handle(control, tag.as_mut_ptr(), tag.len());
+            let mut grant = [0u8; 6];
+            let (n, raw) = channel_read_with_handle(control, grant.as_mut_ptr(), grant.len());
             if n == 0 {
                 // Sora is gone; serve the sessions that remain.
                 let _ = port_unbind(port, control);
+            } else if n == 6 && grant[0] == CONTROL_FRAME {
+                match valid(raw) {
+                    Some(channel) => install_frame(
+                        &mut frame,
+                        &mut server,
+                        port,
+                        channel,
+                        [grant[1], grant[2], grant[3], grant[4]],
+                        grant[5],
+                    ),
+                    None => log(
+                        log_level::WARNING,
+                        b"netstack: frame grant without a channel\n",
+                    ),
+                }
             } else if let Some(channel) = valid(raw) {
                 let koid = handle_koid(channel);
-                let admitted = (tag[0] == CONTROL_SESSION && koid != u64::MAX)
+                let admitted = (grant[0] == CONTROL_SESSION && koid != u64::MAX)
                     .then(|| server.open_session())
                     .flatten();
                 match admitted {
@@ -217,6 +437,8 @@ extern "C" fn main(
                     }
                 }
             }
+        } else if frame.as_ref().is_some_and(|f| f.koid == source) {
+            serve_frame(&mut frame, &mut server, port, clock_get());
         } else if let Some(session) = channels.session_of(source) {
             let (channel, _) = channels.sessions[session].unwrap();
             let (n, raw) = channel_read_with_handle(channel, message.as_mut_ptr(), message.len());
@@ -242,5 +464,6 @@ extern "C" fn main(
         server.poll(clock_get(), &mut out);
         channels.write(&mut out);
         channels.arm(&mut server, clock_get());
+        pump_frame(&mut frame, &mut server);
     }
 }

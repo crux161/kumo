@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-//j815
+//j843
 //j816
 //j817
 //j820
@@ -236,8 +236,12 @@ impl Client {
     }
 
     fn sendto(&mut self, socket: u32, port: u16, data: &[u8]) -> Status {
+        self.sendto_addr(socket, Addr { ip: LOOPBACK, port }, data)
+    }
+
+    fn sendto_addr(&mut self, socket: u32, to: Addr, data: &[u8]) -> Status {
         let mut payload = [0u8; ADDR_LEN + UDP_PAYLOAD_MAX];
-        payload[..ADDR_LEN].copy_from_slice(&Addr { ip: LOOPBACK, port }.encode());
+        payload[..ADDR_LEN].copy_from_slice(&to.encode());
         payload[ADDR_LEN..ADDR_LEN + data.len()].copy_from_slice(data);
         self.call(Op::SendTo, socket, 0, &payload[..ADDR_LEN + data.len()])
             .status
@@ -287,6 +291,81 @@ fn pattern(buf: &mut [u8; UDP_PAYLOAD_MAX], seed: u8) {
     for (i, byte) in buf.iter_mut().enumerate() {
         *byte = (i as u8).wrapping_mul(31).wrapping_add(seed);
     }
+}
+
+/// NET7b: send datagrams to a LAN peer. The peer's capture is the proof; each payload is
+/// the prefix, the index, then `index % 16` fill bytes, so a checker can match every frame.
+fn wire(client: &mut Client, ip: [u8; 4], port: u16, count: u16) {
+    let count = count.clamp(1, 64);
+    let s = client.udp_socket();
+    let local = client.bind(s, 0);
+    client.out.line(&[
+        b"netprobe: wire ",
+        dec(local as u64).bytes(),
+        b" -> ",
+        dec(port as u64).bytes(),
+        b" x",
+        dec(count as u64).bytes(),
+    ]);
+    let mut sent = 0u32;
+    for i in 0..count {
+        let mut payload = [0u8; 96];
+        let mut at = 0;
+        let index = dec(i as u64);
+        for part in [&b"kumo-net7b-"[..], index.bytes(), b"-"] {
+            payload[at..at + part.len()].copy_from_slice(part);
+            at += part.len();
+        }
+        for _ in 0..(i % 16) {
+            payload[at] = b'x';
+            at += 1;
+        }
+        // The wire may not be up yet: autoexec runs before the NIC finishes enumerating,
+        // so NetUnreachable is retried up to 60 s. A bound, unconnected socket's CONNECTED
+        // wait can only time out, which makes the reply a 500 ms sleep through netstack.
+        let mut attempts = 0;
+        loop {
+            let status = client.sendto_addr(s, Addr { ip, port }, &payload[..at]);
+            if i == 0 && attempts == 0 && status != Status::Ok {
+                let name = status_name(status);
+                let mut line = [0u8; 48];
+                const PREFIX: &[u8] = b"netprobe: wire first status=";
+                line[..PREFIX.len()].copy_from_slice(PREFIX);
+                let n = name.len().min(18);
+                line[PREFIX.len()..PREFIX.len() + n].copy_from_slice(&name[..n]);
+                line[PREFIX.len() + n] = b'\n';
+                let _ = kumo_rt::log_write(
+                    kumo_abi::sys::log_level::NOTICE,
+                    &line[..PREFIX.len() + n + 1],
+                );
+            }
+            if status == Status::Ok {
+                sent += 1;
+                break;
+            }
+            let retry = status == Status::NetUnreachable || status == Status::WouldBlock;
+            if !retry || attempts >= 300 {
+                client.fail(&[b"wire send -> ", status_name(status)]);
+                break;
+            }
+            attempts += 1;
+            // A bound, unconnected socket's CONNECTED wait can only time out, which makes
+            // the reply a sleep through netstack: 500 ms for an unattached wire, 200 ms
+            // while the wire socket's queue drains.
+            let sleep_ms = if status == Status::WouldBlock {
+                200u64
+            } else {
+                500u64
+            };
+            let _ = client.call(Op::Wait, s, WAIT_CONNECTED as u64 | (sleep_ms << 32), &[]);
+        }
+    }
+    client.out.line(&[
+        b"netprobe: wire sent ",
+        dec(sent as u64).bytes(),
+        b"/",
+        dec(count as u64).bytes(),
+    ]);
 }
 
 fn udp(client: &mut Client) {
@@ -911,6 +990,37 @@ fn errors(client: &mut Client) {
     }
 }
 
+/// `a.b.c.d`, four decimal octets of one to three digits.
+fn parse_ipv4(text: &[u8]) -> Option<[u8; 4]> {
+    let mut ip = [0u8; 4];
+    let mut fields = 0;
+    let mut octet = 0u32;
+    let mut digits = 0;
+    for &byte in text {
+        match byte {
+            b'.' => {
+                if digits == 0 || fields >= 3 || octet > 255 {
+                    return None;
+                }
+                ip[fields] = octet as u8;
+                fields += 1;
+                octet = 0;
+                digits = 0;
+            }
+            b'0'..=b'9' if digits < 3 => {
+                octet = octet * 10 + u32::from(byte - b'0');
+                digits += 1;
+            }
+            _ => return None,
+        }
+    }
+    if digits == 0 || fields != 3 || octet > 255 {
+        return None;
+    }
+    ip[3] = octet as u8;
+    Some(ip)
+}
+
 #[no_mangle]
 extern "C" fn main(
     bootstrap: u64,
@@ -930,6 +1040,12 @@ extern "C" fn main(
         .is_some_and(|argv| vmo_read(argv, 0, argv_buf.as_mut_ptr(), argv_buf.len()) == 0);
     let mut args = unpack_argv(if read { &argv_buf[..] } else { &[] }).skip(1);
     let mode: &[u8] = args.next().unwrap_or(b"");
+    // `wire <ip> <port> [count]` takes the address where the other modes take a port.
+    let wire_ip = if mode == b"wire" {
+        args.next().and_then(parse_ipv4)
+    } else {
+        None
+    };
     let port = args.next().and_then(parse_u16);
     let count = args.next().and_then(parse_u16);
     let Some(channel) = startup.net else {
@@ -976,6 +1092,12 @@ extern "C" fn main(
                 send(&mut client, port, count)
             }
         }
+        b"wire" if wire_ip.is_some_and(|ip| ip != [0; 4]) && port.is_some_and(|p| p != 0) => wire(
+            &mut client,
+            wire_ip.unwrap_or([0; 4]),
+            port.unwrap_or(0),
+            count.unwrap_or(4),
+        ),
         b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
         b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
         b"tcperrors" => tcp_errors(&mut client),
@@ -983,7 +1105,7 @@ extern "C" fn main(
         b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch>",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count]",
             ]);
             process_exit(2);
         }

@@ -2,6 +2,7 @@
 //j815
 //j817
 //j820
+//j843
 
 //! netstack's server core (PLAN/020 NET2b/NET2c, DESIGN/026): sessions over the KNS1/KNR1
 //! socket contract, UDP and TCP sockets on smoltcp, one loopback interface. No syscalls live
@@ -22,8 +23,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use kumo_netstack::budget::{
-    SESSIONS, SOCKETS_PER_SESSION, SOCKETS_TOTAL, SOCKET_BUFFER, STREAM_PAYLOAD_MAX, UDP_METADATA,
-    UDP_PAYLOAD_MAX,
+    FRAME_MAX, SESSIONS, SOCKETS_PER_SESSION, SOCKETS_TOTAL, SOCKET_BUFFER, STREAM_PAYLOAD_MAX,
+    UDP_METADATA, UDP_PAYLOAD_MAX,
 };
 use kumo_netstack::smoltcp::iface::{
     Config, Interface, PollResult, SocketHandle, SocketSet, SocketStorage,
@@ -31,14 +32,14 @@ use kumo_netstack::smoltcp::iface::{
 use kumo_netstack::smoltcp::socket::{tcp, udp};
 use kumo_netstack::smoltcp::time::Instant;
 use kumo_netstack::smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
 };
 use kumo_netstack::socket::{
     decode_request, encode_reply, hello_limits, Addr, Body, Disposition, Op, Rejected, Reply,
     Request, Session, SocketKind, Status, ADDR_LEN, HEADER_LEN, RESULT_TRUNCATED, WAIT_CONNECTED,
     WAIT_READABLE, WAIT_WRITABLE,
 };
-use kumo_netstack::Loopback;
+use kumo_netstack::{FrameDevice, InjectError, Loopback};
 
 /// The loopback interface's only address.
 pub const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
@@ -88,6 +89,8 @@ enum Tcp {
 
 struct Slot {
     udp: SocketHandle,
+    /// The same slot's UDP socket on the wire stack; `None` until a frame interface attaches.
+    wire_udp: Option<SocketHandle>,
     tcp: SocketHandle,
     kind: SocketKind,
     /// `(session index, socket id)` while a client holds it.
@@ -133,11 +136,25 @@ pub struct Stats {
     pub rejected: u64,
 }
 
+/// The wire stack: its own smoltcp interface and socket table over the frame channel's
+/// device. A shared table would let whichever interface polls first dispatch a socket's
+/// egress with its own addresses and medium (smoltcp's `poll` contract), so the wire gets
+/// its own `SocketSet` and the Server routes each operation to the right stack.
+struct Wire {
+    device: Box<FrameDevice>,
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    mac: [u8; 6],
+    addr: [u8; 4],
+    prefix: u8,
+}
+
 pub struct Server {
     iface: Interface,
     /// Boxed: the 16-slot ring is ~24 KB, more than a native child's 16 KiB default stack.
     device: Box<Loopback>,
     sockets: SocketSet<'static>,
+    wire: Option<Wire>,
     slots: Vec<Slot>,
     sessions: Vec<Option<SessionSlot>>,
     next_generation: u32,
@@ -161,6 +178,14 @@ fn boxed_loopback() -> Box<Loopback> {
     // SAFETY: every field of `Loopback` is an integer or an array of integers, for which zero is
     // a valid value, and zero is the empty ring `Loopback::new()` builds.
     unsafe { Box::<Loopback>::new_zeroed().assume_init() }
+}
+
+/// The wire device, built directly on the heap: its rings are ~24 KiB, larger than a native
+/// child's 16 KiB default stack. All-zero is exactly `FrameDevice::new()` (empty rings).
+fn boxed_frame_device() -> Box<FrameDevice> {
+    // SAFETY: every field of `FrameDevice` is an integer or an array of integers, for which
+    // zero is a valid value, and zero is the empty rings `FrameDevice::new()` builds.
+    unsafe { Box::<FrameDevice>::new_zeroed().assume_init() }
 }
 
 fn is_loopback(ip: [u8; 4]) -> bool {
@@ -214,6 +239,7 @@ impl Server {
             );
             slots.push(Slot {
                 udp: sockets.add(udp),
+                wire_udp: None,
                 tcp: sockets.add(tcp),
                 kind: SocketKind::Udp,
                 owner: None,
@@ -231,6 +257,7 @@ impl Server {
             iface,
             device,
             sockets,
+            wire: None,
             slots,
             sessions: (0..SESSIONS).map(|_| None).collect(),
             next_generation: 1,
@@ -272,6 +299,117 @@ impl Server {
         server.next_generation = (u32::from(epoch) << 16) | 1;
         server.generation_end = (u32::from(epoch) << 16) | 0xffff;
         Some(server)
+    }
+
+    /// Attach (or replace) the wire stack from a frame-provider HELLO: the interface takes the
+    /// provider's MAC and the Sora-granted address (DESIGN/026 §3; DHCP is NET11). Every slot
+    /// gains a wire UDP twin bound to the same port, so a bound port is one namespace reachable
+    /// from both stacks.
+    pub fn attach_wire(&mut self, now_ns: u64, mac: [u8; 6], addr: [u8; 4], prefix: u8) {
+        let mut device = boxed_frame_device();
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress(mac))),
+            &mut *device,
+            instant(now_ns),
+        );
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::from(addr)),
+                prefix,
+            ));
+        });
+        let storage: &'static mut [SocketStorage<'static>] =
+            Box::leak((0..SOCKETS_TOTAL).map(|_| SocketStorage::EMPTY).collect());
+        let mut sockets = SocketSet::new(storage);
+        let mut handles = Vec::with_capacity(SOCKETS_TOTAL);
+        for _ in 0..SOCKETS_TOTAL {
+            let udp = udp::Socket::new(
+                udp::PacketBuffer::new(
+                    leak(udp::PacketMetadata::EMPTY, UDP_METADATA),
+                    leak(0u8, SOCKET_BUFFER),
+                ),
+                udp::PacketBuffer::new(
+                    leak(udp::PacketMetadata::EMPTY, UDP_METADATA),
+                    leak(0u8, SOCKET_BUFFER),
+                ),
+            );
+            handles.push(sockets.add(udp));
+        }
+        for (slot, handle) in self.slots.iter_mut().zip(handles) {
+            slot.wire_udp = Some(handle);
+            if slot.port != 0 && slot.kind == SocketKind::Udp && slot.owner.is_some() {
+                let endpoint = IpListenEndpoint {
+                    addr: None,
+                    port: slot.port,
+                };
+                let _ = sockets.get_mut::<udp::Socket>(handle).bind(endpoint);
+            }
+        }
+        self.wire = Some(Wire {
+            device,
+            iface,
+            sockets,
+            mac,
+            addr,
+            prefix,
+        });
+    }
+
+    /// A new provider generation: discard wire-bound state (DESIGN/026 §3) and rebuild the
+    /// stack over the same grant. Loopback sockets are untouched.
+    pub fn reset_wire(&mut self, now_ns: u64) {
+        let Some(wire) = self.wire.take() else {
+            return;
+        };
+        self.attach_wire(now_ns, wire.mac, wire.addr, wire.prefix);
+    }
+
+    /// The frame channel closed: the stack and every wire twin go with it.
+    pub fn detach_wire(&mut self) {
+        if self.wire.take().is_some() {
+            for slot in &mut self.slots {
+                slot.wire_udp = None;
+            }
+        }
+    }
+
+    pub fn wire_attached(&self) -> bool {
+        self.wire.is_some()
+    }
+
+    /// Frames smoltcp built on the wire stack, waiting to be handed over as TX_FRAMEs.
+    pub fn take_wire_frame(&mut self, out: &mut [u8; FRAME_MAX]) -> Option<usize> {
+        self.wire.as_mut()?.device.take_outbound(out)
+    }
+
+    /// Queue a frame the provider delivered as an RX_FRAME.
+    pub fn push_wire_frame(&mut self, frame: &[u8]) -> Result<(), InjectError> {
+        self.wire
+            .as_mut()
+            .ok_or(InjectError::Full)?
+            .device
+            .push_inbound(frame)
+    }
+
+    /// Frames the wire stack has consumed; the process returns credits from its delta.
+    pub fn wire_delivered(&self) -> u64 {
+        self.wire
+            .as_ref()
+            .map_or(0, |wire| wire.device.counters().delivered)
+    }
+
+    /// Frames smoltcp has built but the channel has not taken yet.
+    pub fn wire_pending_outbound(&self) -> usize {
+        self.wire
+            .as_ref()
+            .map_or(0, |wire| wire.device.pending_outbound())
+    }
+
+    /// Inbound frames the wire stack refused because its ingress ring was full.
+    pub fn wire_ingress_full(&self) -> u64 {
+        self.wire
+            .as_ref()
+            .map_or(0, |wire| wire.device.counters().ingress_full)
     }
 
     /// Admit a new session; `None` when all [`SESSIONS`] are in use (the caller closes the
@@ -356,6 +494,9 @@ impl Server {
         slot.peer_finished = false;
         slot.draining = None;
         self.sockets.get_mut::<udp::Socket>(slot.udp).close();
+        if let (Some(wire), Some(handle)) = (self.wire.as_mut(), slot.wire_udp) {
+            wire.sockets.get_mut::<udp::Socket>(handle).close();
+        }
     }
 
     /// Handle one message read from `session`'s channel, which carried `handles` handles.
@@ -530,6 +671,12 @@ impl Server {
                 .get_mut::<udp::Socket>(self.slots[index].udp)
                 .bind(endpoint)
                 .map_err(|_| Status::InvalidArgument)?;
+            if let (Some(wire), Some(handle)) = (self.wire.as_mut(), self.slots[index].wire_udp) {
+                wire.sockets
+                    .get_mut::<udp::Socket>(handle)
+                    .bind(endpoint)
+                    .map_err(|_| Status::InvalidArgument)?;
+            }
         }
         // A TCP port is only recorded here; smoltcp takes it at LISTEN or CONNECT.
         self.slots[index].port = port;
@@ -544,7 +691,8 @@ impl Server {
     }
 
     fn send_datagram(&mut self, index: usize, to: Addr, data: &[u8]) -> Result<u64, Status> {
-        if !is_loopback(to.ip) {
+        let to_wire = !is_loopback(to.ip);
+        if to_wire && self.wire.is_none() {
             return Err(Status::NetUnreachable);
         }
         if to.port == 0 {
@@ -556,11 +704,20 @@ impl Server {
             return Err(Status::MessageTooLarge);
         }
         self.ensure_bound(index)?;
-        match self
-            .sockets
-            .get_mut::<udp::Socket>(self.slots[index].udp)
-            .send_slice(data, endpoint_of(to))
-        {
+        let sent = if to_wire {
+            let Some(wire) = self.wire.as_mut() else {
+                return Err(Status::NetUnreachable);
+            };
+            let handle = self.slots[index].wire_udp.ok_or(Status::NetUnreachable)?;
+            wire.sockets
+                .get_mut::<udp::Socket>(handle)
+                .send_slice(data, endpoint_of(to))
+        } else {
+            self.sockets
+                .get_mut::<udp::Socket>(self.slots[index].udp)
+                .send_slice(data, endpoint_of(to))
+        };
+        match sent {
             Ok(()) => {
                 self.stats.datagrams_sent += 1;
                 Ok(data.len() as u64)
@@ -599,11 +756,19 @@ impl Server {
         let slot = &self.slots[index];
         if slot.kind == SocketKind::Udp {
             let socket = self.sockets.get::<udp::Socket>(slot.udp);
+            let wire_socket = slot.wire_udp.and_then(|handle| {
+                self.wire
+                    .as_ref()
+                    .map(|wire| wire.sockets.get::<udp::Socket>(handle))
+            });
             let mut mask = 0;
-            if socket.can_recv() {
+            if socket.can_recv() || wire_socket.is_some_and(|wire| wire.can_recv()) {
                 mask |= WAIT_READABLE;
             }
-            if slot.port == 0 || socket.can_send() {
+            if slot.port == 0
+                || socket.can_send()
+                || wire_socket.is_some_and(|wire| wire.can_send())
+            {
                 mask |= WAIT_WRITABLE;
             }
             if slot.peer.is_some() {
@@ -723,7 +888,8 @@ impl Server {
                 if self.slots[index].port != 0 {
                     return Err(Status::InvalidArgument);
                 }
-                if addr.ip != LOOPBACK && addr.ip != [0; 4] {
+                let wire_addr = self.wire.as_ref().map(|wire| wire.addr);
+                if addr.ip != LOOPBACK && addr.ip != [0; 4] && Some(addr.ip) != wire_addr {
                     return Err(Status::AddrNotAvailable);
                 }
                 self.bind_slot(index, addr.port)?;
@@ -749,8 +915,13 @@ impl Server {
             }
             Body::GetName => {
                 let slot = &self.slots[index];
+                let wire_addr = self.wire.as_ref().map_or(LOOPBACK, |wire| wire.addr);
+                let local_ip = match slot.peer {
+                    Some(peer) if !is_loopback(peer.ip) => wire_addr,
+                    _ => LOOPBACK,
+                };
                 let local = Addr {
-                    ip: LOOPBACK,
+                    ip: local_ip,
                     port: slot.port,
                 };
                 let peer = if slot.kind == SocketKind::Tcp {
@@ -819,7 +990,7 @@ impl Server {
         let socket = request.socket;
         match request.body {
             Body::Connect(addr) => {
-                if !is_loopback(addr.ip) {
+                if !is_loopback(addr.ip) && self.wire.is_none() {
                     return Err(Status::NetUnreachable);
                 }
                 if addr.port == 0 {
@@ -836,8 +1007,23 @@ impl Server {
             Body::SendTo(to, data) => Ok(Answer::ok(socket, self.send_datagram(index, to, data)?)),
             Body::Recv { max } | Body::RecvFrom { max } => {
                 let with_addr = matches!(request.body, Body::RecvFrom { .. });
-                let udp = self.sockets.get_mut::<udp::Socket>(self.slots[index].udp);
-                let (data, meta) = udp.recv().map_err(|_| Status::WouldBlock)?;
+                // A bound slot exists on both stacks; a wire reply must not wait behind an
+                // empty loopback queue, so the wire stack is drained first.
+                let from_wire = if let (Some(wire), Some(handle)) =
+                    (self.wire.as_mut(), self.slots[index].wire_udp)
+                {
+                    wire.sockets.get_mut::<udp::Socket>(handle).recv().ok()
+                } else {
+                    None
+                };
+                let (data, meta) = match from_wire {
+                    Some(pair) => pair,
+                    None => self
+                        .sockets
+                        .get_mut::<udp::Socket>(self.slots[index].udp)
+                        .recv()
+                        .map_err(|_| Status::WouldBlock)?,
+                };
                 let take = data.len().min(max as usize);
                 let mut payload = Vec::with_capacity(ADDR_LEN + take);
                 if with_addr {
@@ -1018,6 +1204,16 @@ impl Server {
                 break;
             }
         }
+        if let Some(wire) = self.wire.as_mut() {
+            for _ in 0..POLLS_PER_TURN {
+                let result = wire
+                    .iface
+                    .poll(instant(now_ns), &mut *wire.device, &mut wire.sockets);
+                if result == PollResult::None {
+                    break;
+                }
+            }
+        }
         for index in 0..self.slots.len() {
             let Some(deadline) = self.slots[index].draining else {
                 continue;
@@ -1076,6 +1272,15 @@ impl Server {
             .iface
             .poll_delay(instant(now_ns), &self.sockets)
             .map(|delay| delay.total_micros().saturating_mul(1000));
+        let wire_stack = self.wire.as_mut().and_then(|wire| {
+            wire.iface
+                .poll_delay(instant(now_ns), &wire.sockets)
+                .map(|delay| delay.total_micros().saturating_mul(1000))
+        });
+        let stack = match (stack, wire_stack) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         match (slots, stack) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),

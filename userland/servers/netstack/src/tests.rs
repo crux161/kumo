@@ -1,6 +1,7 @@
 //j815
 //j817
 //j820
+//j843
 
 extern crate std;
 
@@ -138,7 +139,11 @@ impl Client {
     }
 
     fn sendto(&mut self, server: &mut Server, socket: u32, port: u16, data: &[u8]) -> Answer {
-        let mut payload = Addr { ip: LOOPBACK, port }.encode().to_vec();
+        self.sendto_to(server, socket, Addr { ip: LOOPBACK, port }, data)
+    }
+
+    fn sendto_to(&mut self, server: &mut Server, socket: u32, to: Addr, data: &[u8]) -> Answer {
+        let mut payload = to.encode().to_vec();
         payload.extend_from_slice(data);
         self.call(server, Op::SendTo, socket, 0, &payload)
     }
@@ -788,4 +793,212 @@ fn replacement_instances_have_disjoint_generations_and_never_wrap() {
     let last = first.open_session().unwrap();
     first.close_session(last);
     assert!(first.open_session().is_none());
+}
+
+// --- the wire stack: frames as the peer capture sees them ---
+
+use kumo_netstack::budget::FRAME_MAX;
+use kumo_netstack::smoltcp::phy::ChecksumCapabilities;
+use kumo_netstack::smoltcp::wire::{
+    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address,
+    Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
+};
+
+const WIRE_IP: [u8; 4] = [192, 168, 0, 50];
+const WIRE_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x50];
+const PEER_IP: [u8; 4] = [192, 168, 0, 106];
+const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x66];
+const WIRE_PORT: u16 = 9000;
+const PEER_PORT: u16 = 7777;
+
+fn ethernet_wrap(
+    src: [u8; 6],
+    dst: [u8; 6],
+    ethertype: EthernetProtocol,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut bytes = std::vec![0u8; 14 + payload.len()];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
+    frame.set_src_addr(kumo_netstack::smoltcp::wire::EthernetAddress(src));
+    frame.set_dst_addr(kumo_netstack::smoltcp::wire::EthernetAddress(dst));
+    frame.set_ethertype(ethertype);
+    frame.payload_mut().copy_from_slice(payload);
+    bytes
+}
+
+/// The ARP reply the peer answers our request with.
+fn arp_reply() -> Vec<u8> {
+    let mut payload = std::vec![0u8; 28];
+    let mut packet = ArpPacket::new_unchecked(&mut payload[..]);
+    ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Reply,
+        source_hardware_addr: kumo_netstack::smoltcp::wire::EthernetAddress(PEER_MAC),
+        source_protocol_addr: Ipv4Address::from(PEER_IP),
+        target_hardware_addr: kumo_netstack::smoltcp::wire::EthernetAddress(WIRE_MAC),
+        target_protocol_addr: Ipv4Address::from(WIRE_IP),
+    }
+    .emit(&mut packet);
+    ethernet_wrap(PEER_MAC, WIRE_MAC, EthernetProtocol::Arp, &payload)
+}
+
+/// A UDP datagram from the peer to the wire address, exactly as it arrives from the LAN.
+fn udp_frame(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+    let checksums = ChecksumCapabilities::default();
+    let udp = UdpRepr { src_port, dst_port };
+    let ip = Ipv4Repr {
+        src_addr: Ipv4Address::from(PEER_IP),
+        dst_addr: Ipv4Address::from(WIRE_IP),
+        next_header: IpProtocol::Udp,
+        payload_len: udp.header_len() + payload.len(),
+        hop_limit: 64,
+    };
+    let mut bytes = std::vec![0u8; ip.buffer_len() + ip.payload_len];
+    let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+    ip.emit(&mut packet, &checksums);
+    let mut datagram = UdpPacket::new_unchecked(packet.payload_mut());
+    let src: IpAddress = Ipv4Address::from(PEER_IP).into();
+    let dst: IpAddress = Ipv4Address::from(WIRE_IP).into();
+    udp.emit(
+        &mut datagram,
+        &src,
+        &dst,
+        payload.len(),
+        |buf| buf.copy_from_slice(payload),
+        &checksums,
+    );
+    ethernet_wrap(PEER_MAC, WIRE_MAC, EthernetProtocol::Ipv4, &bytes)
+}
+
+#[test]
+fn a_wire_send_resolves_arp_and_the_datagram_leaves_byte_exact() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut c = Client::open(&mut server);
+    let s = c.udp(&mut server);
+    let port = c.bind(&mut server, s, 0);
+    let to = Addr {
+        ip: PEER_IP,
+        port: PEER_PORT,
+    };
+    let sent = c.sendto_to(&mut server, s, to, b"over the wire");
+    assert_eq!((sent.status, sent.result), (Status::Ok, 13));
+
+    // First the ARP request for the peer, broadcast from the wire address.
+    let mut frame = [0u8; FRAME_MAX];
+    let n = server.take_wire_frame(&mut frame).expect("an ARP request");
+    assert_eq!(&frame[0..6], &[0xFF; 6]);
+    assert_eq!(&frame[6..12], &WIRE_MAC);
+    assert_eq!(&frame[12..14], &[0x08, 0x06]);
+    let arp = ArpPacket::new_checked(&frame[14..n]).expect("an ARP packet");
+    match ArpRepr::parse(&arp).expect("an ARP repr") {
+        ArpRepr::EthernetIpv4 {
+            operation,
+            source_protocol_addr,
+            target_protocol_addr,
+            ..
+        } => {
+            assert_eq!(operation, ArpOperation::Request);
+            assert_eq!(source_protocol_addr, Ipv4Address::from(WIRE_IP));
+            assert_eq!(target_protocol_addr, Ipv4Address::from(PEER_IP));
+        }
+        // ArpRepr is non-exhaustive; Ethernet/IPv4 is the only repr this stack speaks.
+        _ => panic!("unexpected ARP repr"),
+    }
+    assert!(
+        server.take_wire_frame(&mut frame).is_none(),
+        "nothing else leaves before the neighbour answers"
+    );
+
+    // The peer answers; the queued datagram must now leave byte-exact.
+    server.push_wire_frame(&arp_reply()).unwrap();
+    let mut out = Vec::new();
+    server.poll(MS, &mut out);
+    let n = server
+        .take_wire_frame(&mut frame)
+        .expect("the datagram after ARP");
+    assert_eq!(&frame[0..6], &PEER_MAC);
+    assert_eq!(&frame[6..12], &WIRE_MAC);
+    assert_eq!(&frame[12..14], &[0x08, 0x00]);
+    let ip = Ipv4Packet::new_checked(&frame[14..n]).expect("an IPv4 packet");
+    assert_eq!(ip.src_addr(), Ipv4Address::from(WIRE_IP));
+    assert_eq!(ip.dst_addr(), Ipv4Address::from(PEER_IP));
+    let udp = UdpPacket::new_checked(ip.payload()).expect("a UDP packet");
+    assert_eq!(udp.src_port(), port);
+    assert_eq!(udp.dst_port(), PEER_PORT);
+    assert_eq!(udp.payload(), b"over the wire");
+}
+
+#[test]
+fn a_wire_datagram_is_received_and_counted_for_credits() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut c = Client::open(&mut server);
+    let s = c.udp(&mut server);
+    assert_eq!(c.bind(&mut server, s, WIRE_PORT), WIRE_PORT);
+    server
+        .push_wire_frame(&udp_frame(PEER_PORT, WIRE_PORT, b"from the wire"))
+        .unwrap();
+    let mut out = Vec::new();
+    server.poll(MS, &mut out);
+    assert_eq!(
+        server.wire_delivered(),
+        1,
+        "a consumed frame owes one credit"
+    );
+    let got = c.recvfrom(&mut server, s, 64);
+    assert_eq!(got.status, Status::Ok);
+    assert_eq!(
+        &got.payload[..ADDR_LEN],
+        Addr {
+            ip: PEER_IP,
+            port: PEER_PORT
+        }
+        .encode()
+    );
+    assert_eq!(&got.payload[ADDR_LEN..], b"from the wire");
+}
+
+#[test]
+fn connects_and_names_follow_the_wire_once_attached() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut c = Client::open(&mut server);
+    let s = c.udp(&mut server);
+    let port = c.bind(&mut server, s, 0);
+    let peer = Addr {
+        ip: PEER_IP,
+        port: PEER_PORT,
+    };
+    assert_eq!(
+        c.call(&mut server, Op::Connect, s, 0, &peer.encode())
+            .status,
+        Status::Ok
+    );
+    let name = c.call(&mut server, Op::GetName, s, 0, &[]);
+    assert_eq!(name.status, Status::Ok);
+    assert_eq!(
+        &name.payload[..ADDR_LEN],
+        Addr { ip: WIRE_IP, port }.encode()
+    );
+    assert_eq!(&name.payload[ADDR_LEN..], peer.encode());
+}
+
+#[test]
+fn detaching_the_wire_stack_drops_wire_routing() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut c = Client::open(&mut server);
+    let s = c.udp(&mut server);
+    c.bind(&mut server, s, 0);
+    server.detach_wire();
+    assert!(!server.wire_attached());
+    assert_eq!(server.wire_delivered(), 0);
+    let to = Addr {
+        ip: PEER_IP,
+        port: PEER_PORT,
+    };
+    assert_eq!(
+        c.sendto_to(&mut server, s, to, b"x").status,
+        Status::NetUnreachable
+    );
 }

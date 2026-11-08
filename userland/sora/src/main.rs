@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j822
 //j824
 //j825
 //j829
 //j837
+//j843
 
 extern crate alloc;
 
@@ -2460,6 +2460,18 @@ const XHCI_MOUSE_BOOTSTRAP_TAG: u8 = b'm';
 /// J545: ...and the storage control channel. A driver that finds a USB stick offers its volume
 /// on it, and Sora answers with one block channel per `fatfs` instance it starts for the volume.
 const XHCI_STORAGE_BOOTSTRAP_TAG: u8 = b'b';
+
+/// NET7b: bootstrap tag bearing Sora's end of the frame-provider admin channel.
+const XHCI_FRAME_BOOTSTRAP_TAG: u8 = b'f';
+/// The admin message tag (to the driver) and netstack control tag carrying a frame-channel end.
+const FRAME_CHANNEL_TAG: u8 = b'F';
+/// NET11 brings DHCP; until then the wire interface takes a fixed LAN address, granted to
+/// netstack with the frame channel (DESIGN/026 §3).
+const WIRE_ADDR: [u8; 4] = [192, 168, 0, 50];
+const WIRE_PREFIX: u8 = 24;
+
+/// Sora's end of the frame-provider admin channel (usb0's driver); 0 when absent.
+static FRAME_ADMIN: AtomicU32 = AtomicU32::new(0);
 /// Sora's ends of the drivers' storage control channels, one per storage slot
 /// (`sora::StorageTransport`: usb0, usb1, host2, then NVMe since J803); 0 = none.
 static STORAGE_CONTROLS: [AtomicU32; sora::STORAGE_DEVICES] =
@@ -2679,6 +2691,29 @@ fn launch_xhci_first_light(
         STORAGE_CONTROLS[index].store(sora_end as u32, Ordering::Relaxed);
         driver_end
     };
+    // NET7b: the usb0 driver may run the frame provider. Sora keeps the admin end and hands the
+    // driver its end at spawn; the ax88 lives on controller 0, so only it takes one.
+    let frame_admin_for = || -> u64 {
+        let (sora_end, driver_end) = channel_create_pair();
+        if sora_end == u64::MAX || driver_end == u64::MAX {
+            for end in [sora_end, driver_end] {
+                if end != u64::MAX {
+                    let _ = handle_close(Handle(end as u32));
+                }
+            }
+            kumo_rt::log_write(
+                kumo_abi::sys::log_level::NOTICE,
+                b"drv-xhci: frame admin unavailable\n",
+            );
+            return u64::MAX;
+        }
+        FRAME_ADMIN.store(sora_end as u32, Ordering::Relaxed);
+        kumo_rt::log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"drv-xhci: frame admin offered\n",
+        );
+        driver_end
+    };
 
     match xhci_usb0_probe_from_dtb(dtb_vmo, dtb_phys) {
         Some(config) => spawn_xhci(
@@ -2688,6 +2723,7 @@ fn launch_xhci_first_light(
             writer_for(have_channel),
             mouse_for(have_mouse),
             storage_for(0),
+            u64::MAX,
             0,
         ),
         None => log(b"drv-xhci: no supported usb0 xhci\n"),
@@ -2705,6 +2741,7 @@ fn launch_xhci_first_light(
         writer_for(have_channel),
         mouse_for(have_mouse),
         storage_for(1),
+        frame_admin_for(),
         1,
     );
     spawn_xhci(
@@ -2720,6 +2757,7 @@ fn launch_xhci_first_light(
         writer_for(have_channel),
         mouse_for(have_mouse),
         storage_for(2),
+        u64::MAX,
         2,
     );
     // The originals stay with Sora only as duplication sources; close them.
@@ -4016,6 +4054,7 @@ fn spawn_xhci(
     keyboard_writer: u64,
     mouse_writer: u64,
     storage_writer: u64,
+    frame_admin_writer: u64,
     controller_index: usize,
 ) {
     if !configure_usb_custody(controller_index, config.mmio_base) {
@@ -4083,6 +4122,9 @@ fn spawn_xhci(
         if storage_writer != u64::MAX {
             let _ = handle_close(Handle(storage_writer as u32));
         }
+        if frame_admin_writer != u64::MAX {
+            let _ = handle_close(Handle(frame_admin_writer as u32));
+        }
         return;
     }
     // Hand the keyboard-channel writer to the driver as a tagged second bootstrap message. The
@@ -4113,6 +4155,21 @@ fn spawn_xhci(
             1,
             Handle(storage_writer as u32),
         );
+    }
+    if frame_admin_writer != u64::MAX {
+        let tag = [XHCI_FRAME_BOOTSTRAP_TAG];
+        if channel_write_with_handle(
+            Handle(sender as u32),
+            tag.as_ptr(),
+            1,
+            Handle(frame_admin_writer as u32),
+        ) != Errno::Ok.status()
+        {
+            kumo_rt::log_write(
+                kumo_abi::sys::log_level::NOTICE,
+                b"drv-xhci: frame admin send fail\n",
+            );
+        }
     }
     if run_elf(
         initrd,
@@ -7679,6 +7736,59 @@ fn spawn_netstack(initrd: Handle, epoch: u16) -> Option<NetInstance> {
     })
 }
 
+/// Mint the frame-channel pair for this netstack instance (DESIGN/026 §3): the provider end
+/// rides the driver's admin channel; the stack end rides the control channel with the granted
+/// address. A failed grant leaves netstack loopback-only and never resets supervision.
+fn grant_frame_channel(control: Handle) {
+    let raw = FRAME_ADMIN.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let admin = Handle(raw);
+    let (provider_end, stack_end) = channel_create_pair();
+    if provider_end == u64::MAX || stack_end == u64::MAX {
+        for end in [provider_end, stack_end] {
+            if end != u64::MAX {
+                let _ = handle_close(Handle(end as u32));
+            }
+        }
+        kumo_rt::log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"netstack: frame pair unavailable; loopback only\n",
+        );
+        return;
+    }
+    let provider = Handle(provider_end as u32);
+    let stack = Handle(stack_end as u32);
+    let tag = [FRAME_CHANNEL_TAG];
+    if channel_write_with_handle(admin, tag.as_ptr(), 1, provider) != Errno::Ok.status() {
+        let _ = handle_close(provider);
+        let _ = handle_close(stack);
+        kumo_rt::log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"netstack: frame provider unavailable; loopback only\n",
+        );
+        return;
+    }
+    let mut grant = [0u8; 6];
+    grant[0] = FRAME_CHANNEL_TAG;
+    grant[1..5].copy_from_slice(&WIRE_ADDR);
+    grant[5] = WIRE_PREFIX;
+    if channel_write_with_handle(control, grant.as_ptr(), grant.len(), stack) != Errno::Ok.status()
+    {
+        let _ = handle_close(stack);
+        kumo_rt::log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"netstack: frame grant refused; loopback only\n",
+        );
+        return;
+    }
+    kumo_rt::log_write(
+        kumo_abi::sys::log_level::NOTICE,
+        b"netstack: frame channel granted to netstack and provider\n",
+    );
+}
+
 fn netstack_start() -> bool {
     let mut state = NET_SUPERVISOR.get();
     let Some(epoch) = state.epoch.checked_add(1) else {
@@ -7692,8 +7802,10 @@ fn netstack_start() -> bool {
         return false;
     };
     state = NET_SUPERVISOR.get();
+    let control = instance.control;
     state.instance = Some(instance);
     NET_SUPERVISOR.set(state);
+    grant_frame_channel(control);
     log(b"netstack: supervised instance ");
     log_dec(u64::from(epoch));
     log(b" ready\n");

@@ -1,4 +1,5 @@
 //j834
+//j843
 //j835
 //j838
 //j839
@@ -242,6 +243,8 @@ enum Ended {
 }
 
 pub(super) struct NicResident {
+    /// The reference TX priming loop has completed since HELLO.
+    frame_primed: bool,
     dev: NicHandoff,
     rx: Lane,
     status: Lane,
@@ -430,6 +433,7 @@ impl NicResident {
             last_start_ns: (0, 0),
             proof: Proof::default(),
             pipe,
+            frame_primed: false,
             link_proof: if ax88_link::RX_ENABLED {
                 Link::with_goal(Goal::Receive)
             } else {
@@ -481,7 +485,12 @@ impl NicResident {
             return Err("phase");
         }
         let stride = ContextSize::Bytes64;
-        let tx = ax88_link::TX_ENABLED;
+        // The bulk OUT endpoint context must exist whenever the resident loop may carry the
+        // frame channel, not only in TX-proof images: an unconfigured DCI swallows every
+        // arming, which stalled the entire frame-channel TX path with no completion and no
+        // error. The status and RX endpoints are configured unconditionally for the same
+        // reason. — TIMBERDOODLE
+        let tx = ENABLED;
         let (Some(slot_off), Some(status_off), Some(rx_off), Some(tx_off)) = (
             stride.input_offset(0),
             stride.input_offset(self.status.dci),
@@ -595,7 +604,67 @@ impl NicResident {
         image: &mut NoOpCommandImage,
         evt: &DmaTrbs,
     ) {
-        if ax88_link::TX_ENABLED {
+        if crate::frame_chan::needs_mac() && self.link_proof.receiving() {
+            // NET7b: the frame provider needs the chip's node address for HELLO; read it once,
+            // on the same EP0 pipe the re-arm pump uses.
+            let segment = self.ep0();
+            // SAFETY: the adapter's own page holds its EP0 data buffer for life.
+            let buffer = unsafe {
+                DmaBuf::new(
+                    (self.dev.page_va as usize + OFF_DATA) as *mut u8,
+                    self.dev.page_phys + OFF_DATA as u64,
+                    8,
+                )
+            };
+            let mut port = Ep0Port {
+                io: &mut *io,
+                layout,
+                image: &mut *image,
+                evt,
+                ring: &mut self.dev.ep0_ring,
+                segment,
+                slot: self.dev.slot_id,
+                pipe: &mut self.pipe,
+                buffer,
+            };
+            let mut bytes = [0u8; 6];
+            if port
+                .exchange(&Request::mac_read(MacRegister::NodeId), &mut bytes)
+                .is_ok()
+            {
+                if let Ok(mac) = decode_mac(&bytes) {
+                    crate::frame_chan::set_mac(mac);
+                }
+            }
+        }
+        if crate::frame_chan::active() {
+            if !self.frame_primed && self.link_proof.receiving() {
+                let segment = self.ep0();
+                // SAFETY: the adapter's own page holds its EP0 data buffer for life.
+                let buffer = unsafe {
+                    DmaBuf::new(
+                        (self.dev.page_va as usize + OFF_DATA) as *mut u8,
+                        self.dev.page_phys + OFF_DATA as u64,
+                        8,
+                    )
+                };
+                let mut port = Ep0Port {
+                    io: &mut *io,
+                    layout,
+                    image: &mut *image,
+                    evt,
+                    ring: &mut self.dev.ep0_ring,
+                    segment,
+                    slot: self.dev.slot_id,
+                    pipe: &mut self.pipe,
+                    buffer,
+                };
+                if kumo_ax88::link::prime_tx(&mut port) {
+                    self.frame_primed = true;
+                }
+            }
+            self.tx_frame_submit(io, layout);
+        } else if ax88_link::TX_ENABLED {
             self.tx_pump(io, layout);
             // The per-wake re-arm pump: the link tick runs at 10 Hz while frames flow at
             // ~270/s, so the kick belongs here. Guarded to the receiving link.
@@ -729,6 +798,7 @@ impl NicResident {
                     if self.link != Some(status.link_up()) {
                         self.link = Some(status.link_up());
                         self.status_changed_ns = clock_get();
+                        crate::frame_chan::link(status.link_up());
                         ax88_record(format_args!(
                             "NET4c3 nic status link={} words={:#010x}/{:#010x}\n",
                             status.link_up() as u8,
@@ -743,6 +813,10 @@ impl NicResident {
                 // SAFETY: single-threaded; no earlier snapshot slice is in use.
                 let snapshot = unsafe { &mut *RX_SNAPSHOT.0.get() };
                 self.rx.buffer.read_into(0, &mut snapshot[..actual]);
+                if crate::frame_chan::active() {
+                    crate::frame_chan::forward_rx(&snapshot[..actual]);
+                    return;
+                }
                 if ax88_link::RX_ENABLED {
                     return self.receive(&snapshot[..actual]);
                 }
@@ -756,6 +830,36 @@ impl NicResident {
                     actual, frames
                 ));
             }
+        }
+    }
+
+    /// NET7b: hand the frame provider's oldest TX_FRAME to the bulk OUT lane.
+    fn tx_frame_submit(&mut self, io: &mut Mmio, layout: RegisterLayout) {
+        if self.life.phase() != NicPhase::Running || self.life.is_pending(NicLane::Tx) {
+            return;
+        }
+        // SAFETY: single-threaded; no earlier scratch borrow is live.
+        let (frame, out) = unsafe { &mut *TX_SCRATCH.0.get() };
+        let Some(len) = crate::frame_chan::next_tx(frame) else {
+            return;
+        };
+        let mps = self.dev.profile.tx().max_packet_size;
+        let encoded = kumo_ax88::tx::encode(&frame[..len], mps, out);
+        let Ok(n) = encoded else {
+            crate::frame_chan::note_submitted(0);
+            crate::frame_chan::note_complete(usize::MAX);
+            return;
+        };
+        self.tx.buffer.write_from(0, &out[..n]);
+        self.tx.len = n as u32;
+        crate::ax88_record(format_args!("NET7b tx submit transfer={}\n", n));
+        crate::frame_chan::note_submitted(n);
+        if self.arm(NicLane::Tx, io, layout).is_err() {
+            crate::frame_chan::note_complete(usize::MAX);
+            self.life.fail();
+            ax88_record(format_args!(
+                "NET7b tx FAIL stage=arm; frame channel retained\n"
+            ));
         }
     }
 
@@ -829,6 +933,9 @@ impl NicResident {
 
     /// NET7a: one exact OUT completion; the buffer may now take the next frame.
     fn tx_done(&mut self, actual: usize) {
+        if crate::frame_chan::note_complete(actual) {
+            return;
+        }
         let len = self.tx.len as usize;
         let mps = usize::from(self.dev.profile.tx().max_packet_size);
         let p = &mut self.tx_proof;
@@ -1389,6 +1496,7 @@ impl NicResident {
             match read {
                 Some(mac) => {
                     self.tx_proof.node = Some(mac);
+                    crate::frame_chan::set_mac(mac);
                     self.tx_proof.receive_ns = clock_get();
                     ax88_record(format_args!(
                         "NET7 tx node={} exact_in_ms={} burst_in_ms={} mps={}\n",
