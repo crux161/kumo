@@ -1,6 +1,7 @@
 #![no_std]
 //j813
 //j814
+//j841
 
 //! The network domain's shared, allocation-free core (PLAN/020, DESIGN/026): the budgets every
 //! netstack instance is sized by, a bounded in-memory loopback `Device` for smoltcp, and the
@@ -11,6 +12,7 @@
 pub mod budget;
 pub mod frame;
 pub mod loopback;
+pub mod provider;
 pub mod socket;
 
 pub use loopback::{InjectError, Loopback};
