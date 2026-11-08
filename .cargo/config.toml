@@ -1,4 +1,5 @@
 #j485
+#j844
 [alias]
 xtask = "run -p xtask --"
 
@@ -7,3 +8,7 @@ replace-with = "vendored-sources"
 
 [source.vendored-sources]
 directory = "vendor/cargo"
+# NET8 (J844): DESIGN/026 §5 fixes the neighbour cache at 8 entries. smoltcp 0.14's build
+# script reads this (its in-crate default is 3); the vendored checksums stay untouched.
+[env]
+SMOLTCP_IFACE_NEIGHBOR_CACHE_COUNT = "8"

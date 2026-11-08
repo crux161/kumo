@@ -2,6 +2,7 @@
 //j817
 //j820
 //j843
+//j844
 
 extern crate std;
 
@@ -800,8 +801,8 @@ fn replacement_instances_have_disjoint_generations_and_never_wrap() {
 use kumo_netstack::budget::FRAME_MAX;
 use kumo_netstack::smoltcp::phy::ChecksumCapabilities;
 use kumo_netstack::smoltcp::wire::{
-    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address,
-    Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
+    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Icmpv4Packet, Icmpv4Repr,
+    IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
 };
 
 const WIRE_IP: [u8; 4] = [192, 168, 0, 50];
@@ -839,6 +840,97 @@ fn arp_reply() -> Vec<u8> {
     }
     .emit(&mut packet);
     ethernet_wrap(PEER_MAC, WIRE_MAC, EthernetProtocol::Arp, &payload)
+}
+
+/// The peer's ARP request for the wire address (what a host sends before its first ping).
+fn arp_request() -> Vec<u8> {
+    let mut payload = std::vec![0u8; 28];
+    let mut packet = ArpPacket::new_unchecked(&mut payload[..]);
+    ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Request,
+        source_hardware_addr: kumo_netstack::smoltcp::wire::EthernetAddress(PEER_MAC),
+        source_protocol_addr: Ipv4Address::from(PEER_IP),
+        target_hardware_addr: kumo_netstack::smoltcp::wire::EthernetAddress([0; 6]),
+        target_protocol_addr: Ipv4Address::from(WIRE_IP),
+    }
+    .emit(&mut packet);
+    ethernet_wrap(PEER_MAC, [0xFF; 6], EthernetProtocol::Arp, &payload)
+}
+
+/// An ICMP echo frame from the peer: `request` false builds the reply.
+fn echo_from_peer(request: bool, ident: u16, seq_no: u16, data: &[u8]) -> Vec<u8> {
+    let checksums = ChecksumCapabilities::default();
+    let repr = if request {
+        Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no,
+            data,
+        }
+    } else {
+        Icmpv4Repr::EchoReply {
+            ident,
+            seq_no,
+            data,
+        }
+    };
+    let mut icmp = std::vec![0u8; repr.buffer_len()];
+    {
+        let mut packet = Icmpv4Packet::new_unchecked(&mut icmp[..]);
+        repr.emit(&mut packet, &checksums);
+    }
+    let ip = Ipv4Repr {
+        src_addr: Ipv4Address::from(PEER_IP),
+        dst_addr: Ipv4Address::from(WIRE_IP),
+        next_header: IpProtocol::Icmp,
+        payload_len: icmp.len(),
+        hop_limit: 64,
+    };
+    let mut bytes = std::vec![0u8; ip.buffer_len() + ip.payload_len];
+    {
+        let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        ip.emit(&mut packet, &checksums);
+        packet.payload_mut().copy_from_slice(&icmp);
+    }
+    ethernet_wrap(PEER_MAC, WIRE_MAC, EthernetProtocol::Ipv4, &bytes)
+}
+
+/// Parse an ICMPv4 echo out of a captured Ethernet frame:
+/// `(src, dst, is_request, ident, seq_no, data)`.
+fn parse_echo(frame: &[u8]) -> (Ipv4Address, Ipv4Address, bool, u16, u16, Vec<u8>) {
+    let eth = EthernetFrame::new_checked(frame).expect("ethernet");
+    assert_eq!(eth.ethertype(), EthernetProtocol::Ipv4);
+    let ip = Ipv4Packet::new_checked(eth.payload()).expect("ipv4");
+    assert!(ip.verify_checksum());
+    assert_eq!(ip.next_header(), IpProtocol::Icmp);
+    let packet = Icmpv4Packet::new_checked(ip.payload()).expect("icmp");
+    let repr = Icmpv4Repr::parse(&packet, &ChecksumCapabilities::default()).expect("icmp repr");
+    match repr {
+        Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no,
+            data,
+        } => (
+            ip.src_addr(),
+            ip.dst_addr(),
+            true,
+            ident,
+            seq_no,
+            data.to_vec(),
+        ),
+        Icmpv4Repr::EchoReply {
+            ident,
+            seq_no,
+            data,
+        } => (
+            ip.src_addr(),
+            ip.dst_addr(),
+            false,
+            ident,
+            seq_no,
+            data.to_vec(),
+        ),
+        _ => panic!("not an echo"),
+    }
 }
 
 /// A UDP datagram from the peer to the wire address, exactly as it arrives from the LAN.
@@ -981,6 +1073,251 @@ fn connects_and_names_follow_the_wire_once_attached() {
         Addr { ip: WIRE_IP, port }.encode()
     );
     assert_eq!(&name.payload[ADDR_LEN..], peer.encode());
+}
+
+#[test]
+fn the_interface_answers_a_peer_ping_after_its_arp_request() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut out = Vec::new();
+    let mut frame = [0u8; FRAME_MAX];
+
+    // The peer resolves us first, as a host does; the interface answers and learns the peer.
+    server.push_wire_frame(&arp_request()).unwrap();
+    server.poll(MS, &mut out);
+    let n = server.take_wire_frame(&mut frame).expect("the ARP reply");
+    assert_eq!(&frame[0..6], &PEER_MAC);
+    assert_eq!(&frame[6..12], &WIRE_MAC);
+    assert_eq!(&frame[12..14], &[0x08, 0x06]);
+    match ArpRepr::parse(&ArpPacket::new_checked(&frame[14..n]).unwrap()).unwrap() {
+        ArpRepr::EthernetIpv4 {
+            operation,
+            source_protocol_addr,
+            target_protocol_addr,
+            ..
+        } => {
+            assert_eq!(operation, ArpOperation::Reply);
+            assert_eq!(source_protocol_addr, Ipv4Address::from(WIRE_IP));
+            assert_eq!(target_protocol_addr, Ipv4Address::from(PEER_IP));
+        }
+        _ => panic!("unexpected ARP repr"),
+    }
+
+    // The peer's ping is answered by the interface itself (auto-icmp-echo-reply).
+    server
+        .push_wire_frame(&echo_from_peer(true, 0x1234, 7, b"kumo net8 ping"))
+        .unwrap();
+    server.poll(MS, &mut out);
+    let n = server.take_wire_frame(&mut frame).expect("the echo reply");
+    let (src, dst, request, ident, seq_no, data) = parse_echo(&frame[..n]);
+    assert_eq!(
+        (src, dst),
+        (Ipv4Address::from(WIRE_IP), Ipv4Address::from(PEER_IP))
+    );
+    assert!(!request, "the answer is an echo reply");
+    assert_eq!((ident, seq_no), (0x1234, 7));
+    assert_eq!(data, b"kumo net8 ping");
+    assert!(server.take_wire_frame(&mut frame).is_none());
+}
+
+#[test]
+fn a_kumo_ping_crosses_to_the_peer_and_the_reply_comes_back() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut c = Client::open(&mut server);
+    let s = c.call(&mut server, Op::Socket, 0, 3, &[]).socket;
+    let bound = c.call(
+        &mut server,
+        Op::Bind,
+        s,
+        0,
+        &Addr {
+            ip: [0; 4],
+            port: 0,
+        }
+        .encode(),
+    );
+    assert_eq!(bound.status, Status::Ok);
+    let ident = bound.result as u16;
+    assert!(ident >= 49152, "an ephemeral identifier");
+
+    let payload = b"kumo-net8-0-";
+    let sent = c.sendto_to(
+        &mut server,
+        s,
+        Addr {
+            ip: PEER_IP,
+            port: 0,
+        },
+        payload,
+    );
+    assert_eq!(
+        (sent.status, sent.result),
+        (Status::Ok, payload.len() as u64)
+    );
+
+    // Cold neighbour cache: the echo request waits behind one ARP request for the peer.
+    let mut frame = [0u8; FRAME_MAX];
+    server.take_wire_frame(&mut frame).expect("an ARP request");
+    assert_eq!(&frame[0..6], &[0xFF; 6]);
+    assert!(server.take_wire_frame(&mut frame).is_none());
+    server.push_wire_frame(&arp_reply()).unwrap();
+    let mut out = Vec::new();
+    server.poll(MS, &mut out);
+    let n = server
+        .take_wire_frame(&mut frame)
+        .expect("the echo request");
+    let (src, dst, request, got_ident, seq_no, data) = parse_echo(&frame[..n]);
+    assert_eq!(
+        (src, dst),
+        (Ipv4Address::from(WIRE_IP), Ipv4Address::from(PEER_IP))
+    );
+    assert!(request, "an echo request");
+    assert_eq!((got_ident, seq_no), (ident, 0));
+    assert_eq!(data, payload);
+
+    // The peer answers; WAIT is ready and RECVFROM reports the data and the source.
+    server
+        .push_wire_frame(&echo_from_peer(false, ident, 0, payload))
+        .unwrap();
+    server.poll(MS, &mut out);
+    let wait = c.call(
+        &mut server,
+        Op::Wait,
+        s,
+        WAIT_READABLE as u64 | (1000u64 << 32),
+        &[],
+    );
+    assert_eq!(
+        (wait.status, wait.result),
+        (Status::Ok, WAIT_READABLE as u64)
+    );
+    let got = c.recvfrom(&mut server, s, 1472);
+    assert_eq!(got.status, Status::Ok);
+    assert_eq!(
+        &got.payload[..ADDR_LEN],
+        Addr {
+            ip: PEER_IP,
+            port: 0
+        }
+        .encode()
+    );
+    assert_eq!(&got.payload[ADDR_LEN..], payload);
+    assert_eq!(got.result, payload.len() as u64);
+    assert_eq!(server.stats().echo_requests_sent, 1);
+    assert_eq!(server.stats().echo_replies_received, 1);
+}
+
+#[test]
+fn malformed_frames_are_refused_with_bounded_work() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut out = Vec::new();
+    let mut frame = [0u8; FRAME_MAX];
+
+    let ipv6 = ethernet_wrap(PEER_MAC, WIRE_MAC, EthernetProtocol::Ipv6, &[0u8; 40]);
+    assert_eq!(
+        server.push_wire_frame(&ipv6),
+        Err(IngressError::UnknownEthertype(0x86DD))
+    );
+    let vlan = ethernet_wrap(
+        PEER_MAC,
+        WIRE_MAC,
+        EthernetProtocol::Unknown(0x8100),
+        &[0u8; 40],
+    );
+    assert_eq!(
+        server.push_wire_frame(&vlan),
+        Err(IngressError::UnknownEthertype(0x8100))
+    );
+
+    // A first fragment of a valid datagram never reaches the stack as a whole packet.
+    let mut first = udp_frame(PEER_PORT, WIRE_PORT, b"fragment");
+    {
+        let mut packet = Ipv4Packet::new_unchecked(&mut first[14..]);
+        packet.set_more_frags(true);
+        packet.fill_checksum();
+    }
+    assert_eq!(server.push_wire_frame(&first), Err(IngressError::Fragment));
+
+    let mut bad = udp_frame(PEER_PORT, WIRE_PORT, b"checksum");
+    bad[14 + 10] ^= 0xFF;
+    assert_eq!(
+        server.push_wire_frame(&bad),
+        Err(IngressError::BadIpv4Checksum)
+    );
+
+    let short = ethernet_wrap(PEER_MAC, WIRE_MAC, EthernetProtocol::Ipv4, &[0u8; 10]);
+    assert_eq!(server.push_wire_frame(&short), Err(IngressError::Truncated));
+
+    let refusals = server.wire_refusals().expect("a wire is attached");
+    assert_eq!((refusals.unknown_ethertype, refusals.fragments), (2, 1));
+    assert_eq!((refusals.bad_ipv4_checksum, refusals.truncated), (1, 1));
+    server.poll(MS, &mut out);
+    assert!(
+        server.take_wire_frame(&mut frame).is_none(),
+        "refusals build nothing"
+    );
+
+    // An echo with a bad ICMP checksum passes the IPv4 gate and is dropped by smoltcp's own
+    // parse: still no reply, still one fixed parse's worth of work.
+    let mut corrupt = echo_from_peer(true, 0x2222, 1, b"bad icmp checksum");
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xFF;
+    assert_eq!(server.push_wire_frame(&corrupt), Ok(()));
+    server.poll(MS, &mut out);
+    assert!(server.take_wire_frame(&mut frame).is_none());
+}
+
+#[test]
+fn icmp_sockets_follow_the_wire_generation() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut c = Client::open(&mut server);
+    let s = c.call(&mut server, Op::Socket, 0, 3, &[]).socket;
+    let bound = c.call(
+        &mut server,
+        Op::Bind,
+        s,
+        0,
+        &Addr {
+            ip: [0; 4],
+            port: 5000,
+        }
+        .encode(),
+    );
+    assert_eq!((bound.status, bound.result), (Status::Ok, 5000));
+    let to = Addr {
+        ip: PEER_IP,
+        port: 0,
+    };
+
+    // Detach: the client socket survives, its wire socket does not.
+    assert_eq!(c.sendto_to(&mut server, s, to, b"one").status, Status::Ok);
+    server.detach_wire();
+    assert_eq!(
+        c.sendto_to(&mut server, s, to, b"two").status,
+        Status::NetUnreachable
+    );
+
+    // A new generation re-creates the wire socket for the same identifier and it sends again.
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    assert_eq!(c.sendto_to(&mut server, s, to, b"three").status, Status::Ok);
+    // Closing frees the identifier for a fresh socket.
+    assert_eq!(c.call(&mut server, Op::Close, s, 0, &[]).status, Status::Ok);
+    let s2 = c.call(&mut server, Op::Socket, 0, 3, &[]).socket;
+    let again = c.call(
+        &mut server,
+        Op::Bind,
+        s2,
+        0,
+        &Addr {
+            ip: [0; 4],
+            port: 5000,
+        }
+        .encode(),
+    );
+    assert_eq!((again.status, again.result), (Status::Ok, 5000));
 }
 
 #[test]

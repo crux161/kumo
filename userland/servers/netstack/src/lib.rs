@@ -3,6 +3,7 @@
 //j817
 //j820
 //j843
+//j844
 
 //! netstack's server core (PLAN/020 NET2b/NET2c, DESIGN/026): sessions over the KNS1/KNR1
 //! socket contract, UDP and TCP sockets on smoltcp, one loopback interface. No syscalls live
@@ -23,16 +24,19 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use kumo_netstack::budget::{
-    FRAME_MAX, SESSIONS, SOCKETS_PER_SESSION, SOCKETS_TOTAL, SOCKET_BUFFER, STREAM_PAYLOAD_MAX,
-    UDP_METADATA, UDP_PAYLOAD_MAX,
+    FRAME_MAX, ICMP_BUFFER, ICMP_ECHO_MAX, ICMP_METADATA, SESSIONS, SOCKETS_PER_SESSION,
+    SOCKETS_TOTAL, SOCKET_BUFFER, STREAM_PAYLOAD_MAX, UDP_METADATA, UDP_PAYLOAD_MAX,
 };
+use kumo_netstack::ingress::{self, Refusals};
 use kumo_netstack::smoltcp::iface::{
     Config, Interface, PollResult, SocketHandle, SocketSet, SocketStorage,
 };
-use kumo_netstack::smoltcp::socket::{tcp, udp};
+use kumo_netstack::smoltcp::phy::ChecksumCapabilities;
+use kumo_netstack::smoltcp::socket::{icmp, tcp, udp};
 use kumo_netstack::smoltcp::time::Instant;
 use kumo_netstack::smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
+    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
+    IpListenEndpoint, Ipv4Address,
 };
 use kumo_netstack::socket::{
     decode_request, encode_reply, hello_limits, Addr, Body, Disposition, Op, Rejected, Reply,
@@ -91,6 +95,11 @@ struct Slot {
     udp: SocketHandle,
     /// The same slot's UDP socket on the wire stack; `None` until a frame interface attaches.
     wire_udp: Option<SocketHandle>,
+    /// The same slot's ICMP socket on the wire stack (kind ICMP only): created when the slot
+    /// binds while a wire is attached, dropped with the generation. `None` otherwise.
+    wire_icmp: Option<SocketHandle>,
+    /// The next echo-request sequence number this slot sends (NET8).
+    icmp_seq: u16,
     tcp: SocketHandle,
     kind: SocketKind,
     /// `(session index, socket id)` while a client holds it.
@@ -134,6 +143,25 @@ pub struct Stats {
     pub stream_bytes_sent: u64,
     pub stream_bytes_received: u64,
     pub rejected: u64,
+    pub echo_requests_sent: u64,
+    pub echo_replies_received: u64,
+}
+
+/// Why [`Server::push_wire_frame`] refused a frame (NET8's ingress policy, DESIGN/026 §5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressError {
+    /// No wire stack is attached; the frame channel is closed.
+    Detached,
+    /// The wire device's ingress ring is full.
+    Device(InjectError),
+    /// Shorter than the Ethernet or IPv4 header it claims.
+    Truncated,
+    /// Not ARP and not IPv4 (VLAN tags, IPv6, LLDP, anything else).
+    UnknownEthertype(u16),
+    /// An IPv4 fragment; no reassembly exists by policy.
+    Fragment,
+    /// The IPv4 header checksum fails.
+    BadIpv4Checksum,
 }
 
 /// The wire stack: its own smoltcp interface and socket table over the frame channel's
@@ -147,6 +175,8 @@ struct Wire {
     mac: [u8; 6],
     addr: [u8; 4],
     prefix: u8,
+    /// NET8's ingress refusals: frames the policy kept out of the stack, by kind.
+    refusals: Refusals,
 }
 
 pub struct Server {
@@ -186,6 +216,22 @@ fn boxed_frame_device() -> Box<FrameDevice> {
     // SAFETY: every field of `FrameDevice` is an integer or an array of integers, for which
     // zero is a valid value, and zero is the empty rings `FrameDevice::new()` builds.
     unsafe { Box::<FrameDevice>::new_zeroed().assume_init() }
+}
+
+/// One wire ICMP socket (NET8): the slot's echo identifier, buffers from the ICMP budget.
+fn wire_icmp_socket(ident: u16) -> icmp::Socket<'static> {
+    let mut socket = icmp::Socket::new(
+        icmp::PacketBuffer::new(
+            leak(icmp::PacketMetadata::EMPTY, ICMP_METADATA),
+            leak(0u8, ICMP_BUFFER),
+        ),
+        icmp::PacketBuffer::new(
+            leak(icmp::PacketMetadata::EMPTY, ICMP_METADATA),
+            leak(0u8, ICMP_BUFFER),
+        ),
+    );
+    let _ = socket.bind(icmp::Endpoint::Ident(ident));
+    socket
 }
 
 fn is_loopback(ip: [u8; 4]) -> bool {
@@ -240,6 +286,8 @@ impl Server {
             slots.push(Slot {
                 udp: sockets.add(udp),
                 wire_udp: None,
+                wire_icmp: None,
+                icmp_seq: 0,
                 tcp: sockets.add(tcp),
                 kind: SocketKind::Udp,
                 owner: None,
@@ -318,8 +366,13 @@ impl Server {
                 prefix,
             ));
         });
-        let storage: &'static mut [SocketStorage<'static>] =
-            Box::leak((0..SOCKETS_TOTAL).map(|_| SocketStorage::EMPTY).collect());
+        // Half the table is the per-slot UDP twins; the rest is reserved for the ICMP
+        // sockets created on demand (NET8), so one `SocketSet` serves both socket kinds.
+        let storage: &'static mut [SocketStorage<'static>] = Box::leak(
+            (0..2 * SOCKETS_TOTAL)
+                .map(|_| SocketStorage::EMPTY)
+                .collect(),
+        );
         let mut sockets = SocketSet::new(storage);
         let mut handles = Vec::with_capacity(SOCKETS_TOTAL);
         for _ in 0..SOCKETS_TOTAL {
@@ -337,12 +390,18 @@ impl Server {
         }
         for (slot, handle) in self.slots.iter_mut().zip(handles) {
             slot.wire_udp = Some(handle);
+            slot.wire_icmp = None;
             if slot.port != 0 && slot.kind == SocketKind::Udp && slot.owner.is_some() {
                 let endpoint = IpListenEndpoint {
                     addr: None,
                     port: slot.port,
                 };
                 let _ = sockets.get_mut::<udp::Socket>(handle).bind(endpoint);
+            }
+            // A bound ICMP client socket gets a fresh wire socket per generation, the same
+            // rule as the UDP twin above (NET8).
+            if slot.port != 0 && slot.kind == SocketKind::Icmp && slot.owner.is_some() {
+                slot.wire_icmp = Some(sockets.add(wire_icmp_socket(slot.port)));
             }
         }
         self.wire = Some(Wire {
@@ -352,6 +411,7 @@ impl Server {
             mac,
             addr,
             prefix,
+            refusals: Refusals::default(),
         });
     }
 
@@ -369,6 +429,7 @@ impl Server {
         if self.wire.take().is_some() {
             for slot in &mut self.slots {
                 slot.wire_udp = None;
+                slot.wire_icmp = None;
             }
         }
     }
@@ -382,13 +443,34 @@ impl Server {
         self.wire.as_mut()?.device.take_outbound(out)
     }
 
-    /// Queue a frame the provider delivered as an RX_FRAME.
-    pub fn push_wire_frame(&mut self, frame: &[u8]) -> Result<(), InjectError> {
-        self.wire
-            .as_mut()
-            .ok_or(InjectError::Full)?
-            .device
-            .push_inbound(frame)
+    /// Queue a frame the provider delivered as an RX_FRAME, after NET8's ingress policy:
+    /// unknown EtherTypes, IPv4 fragments and bad IPv4 header checksums are refused and
+    /// counted here, so smoltcp only ever sees bounded, well-formed input.
+    pub fn push_wire_frame(&mut self, frame: &[u8]) -> Result<(), IngressError> {
+        let Some(wire) = self.wire.as_mut() else {
+            return Err(IngressError::Detached);
+        };
+        match ingress::classify(frame) {
+            ingress::Verdict::Pass => wire
+                .device
+                .push_inbound(frame)
+                .map_err(IngressError::Device),
+            verdict => {
+                wire.refusals.count(verdict);
+                Err(match verdict {
+                    ingress::Verdict::Truncated => IngressError::Truncated,
+                    ingress::Verdict::UnknownEthertype(raw) => IngressError::UnknownEthertype(raw),
+                    ingress::Verdict::Fragment => IngressError::Fragment,
+                    ingress::Verdict::BadIpv4Checksum => IngressError::BadIpv4Checksum,
+                    ingress::Verdict::Pass => unreachable!(),
+                })
+            }
+        }
+    }
+
+    /// NET8 wire ingress refusals; `None` while no frame interface is attached.
+    pub fn wire_refusals(&self) -> Option<Refusals> {
+        self.wire.as_ref().map(|wire| wire.refusals)
     }
 
     /// Frames the wire stack has consumed; the process returns credits from its delta.
@@ -497,6 +579,10 @@ impl Server {
         if let (Some(wire), Some(handle)) = (self.wire.as_mut(), slot.wire_udp) {
             wire.sockets.get_mut::<udp::Socket>(handle).close();
         }
+        if let (Some(wire), Some(handle)) = (self.wire.as_mut(), slot.wire_icmp.take()) {
+            wire.sockets.remove(handle);
+        }
+        slot.icmp_seq = 0;
     }
 
     /// Handle one message read from `session`'s channel, which carried `handles` handles.
@@ -678,6 +764,13 @@ impl Server {
                     .map_err(|_| Status::InvalidArgument)?;
             }
         }
+        if kind == SocketKind::Icmp {
+            // No wire yet records the identifier only; attach_wire creates the socket.
+            if let Some(wire) = self.wire.as_mut() {
+                let handle = wire.sockets.add(wire_icmp_socket(port));
+                self.slots[index].wire_icmp = Some(handle);
+            }
+        }
         // A TCP port is only recorded here; smoltcp takes it at LISTEN or CONNECT.
         self.slots[index].port = port;
         Ok(())
@@ -769,6 +862,24 @@ impl Server {
                 || socket.can_send()
                 || wire_socket.is_some_and(|wire| wire.can_send())
             {
+                mask |= WAIT_WRITABLE;
+            }
+            if slot.peer.is_some() {
+                mask |= WAIT_CONNECTED;
+            }
+            return Ok(mask);
+        }
+        if slot.kind == SocketKind::Icmp {
+            let wire_socket = slot.wire_icmp.and_then(|handle| {
+                self.wire
+                    .as_ref()
+                    .map(|wire| wire.sockets.get::<icmp::Socket>(handle))
+            });
+            let mut mask = 0;
+            if wire_socket.is_some_and(|socket| socket.can_recv()) {
+                mask |= WAIT_READABLE;
+            }
+            if wire_socket.is_some_and(|socket| socket.can_send()) {
                 mask |= WAIT_WRITABLE;
             }
             if slot.peer.is_some() {
@@ -872,7 +983,124 @@ impl Server {
         match self.slots[index].kind {
             SocketKind::Udp => self.dispatch_udp(session, index, request, now_ns),
             SocketKind::Tcp => self.dispatch_tcp(session, index, request, now_ns),
+            SocketKind::Icmp => self.dispatch_icmp(session, index, request, now_ns),
         }
+    }
+
+    /// NET8: ICMP echo on the wire. BIND's port is the echo identifier, SEND/SENDTO emit one
+    /// echo request (the sequence is managed here), RECV/RECVFROM return a matching echo
+    /// reply's data. Loopback has no ICMP stack, so every destination must be on the wire.
+    fn dispatch_icmp(
+        &mut self,
+        session: usize,
+        index: usize,
+        request: &Request<'_>,
+        now_ns: u64,
+    ) -> Result<Answer, Status> {
+        let socket = request.socket;
+        match request.body {
+            Body::Connect(addr) => {
+                if is_loopback(addr.ip) {
+                    return Err(Status::NetUnreachable);
+                }
+                if addr.port != 0 {
+                    return Err(Status::InvalidArgument);
+                }
+                if self.wire.is_none() {
+                    return Err(Status::NetUnreachable);
+                }
+                self.ensure_bound(index)?;
+                self.slots[index].peer = Some(addr);
+                Ok(Answer::ok(socket, 0))
+            }
+            Body::Send(data) => {
+                let peer = self.slots[index].peer.ok_or(Status::NotConnected)?;
+                let sent = self.send_echo(index, peer.ip, data)?;
+                Ok(Answer::ok(socket, sent))
+            }
+            Body::SendTo(to, data) => {
+                if is_loopback(to.ip) {
+                    return Err(Status::NetUnreachable);
+                }
+                if to.port != 0 {
+                    return Err(Status::InvalidArgument);
+                }
+                let sent = self.send_echo(index, to.ip, data)?;
+                Ok(Answer::ok(socket, sent))
+            }
+            Body::Recv { max } | Body::RecvFrom { max } => {
+                let with_addr = matches!(request.body, Body::RecvFrom { .. });
+                let from_wire = if let (Some(wire), Some(handle)) =
+                    (self.wire.as_mut(), self.slots[index].wire_icmp)
+                {
+                    wire.sockets.get_mut::<icmp::Socket>(handle).recv().ok()
+                } else {
+                    None
+                };
+                let (bytes, from) = from_wire.ok_or(Status::WouldBlock)?;
+                let packet = Icmpv4Packet::new_checked(bytes).map_err(|_| Status::WouldBlock)?;
+                let repr = Icmpv4Repr::parse(&packet, &ChecksumCapabilities::default())
+                    .map_err(|_| Status::WouldBlock)?;
+                let Icmpv4Repr::EchoReply { data, .. } = repr else {
+                    return Err(Status::WouldBlock);
+                };
+                let take = data.len().min(max as usize);
+                let mut payload = Vec::with_capacity(ADDR_LEN + take);
+                if with_addr {
+                    let ip = match from {
+                        IpAddress::Ipv4(v4) => v4.octets(),
+                        #[allow(unreachable_patterns)]
+                        _ => [0; 4],
+                    };
+                    payload.extend_from_slice(&Addr { ip, port: 0 }.encode());
+                }
+                payload.extend_from_slice(&data[..take]);
+                let mut result = data.len() as u64;
+                if data.len() > take {
+                    result |= RESULT_TRUNCATED;
+                }
+                self.stats.echo_replies_received += 1;
+                Ok(Answer::payload(socket, result, payload))
+            }
+            Body::Listen { .. } | Body::Accept | Body::Shutdown { .. } => Err(Status::Unsupported),
+            _ => self.dispatch_common(session, index, request, now_ns),
+        }
+    }
+
+    /// Emit one echo request for `index`'s identifier; returns the data bytes accepted.
+    fn send_echo(&mut self, index: usize, to: [u8; 4], data: &[u8]) -> Result<u64, Status> {
+        if data.len() > UDP_PAYLOAD_MAX {
+            return Err(Status::MessageTooLarge);
+        }
+        if self.wire.is_none() {
+            return Err(Status::NetUnreachable);
+        }
+        self.ensure_bound(index)?;
+        let ident = self.slots[index].port;
+        let seq_no = self.slots[index].icmp_seq;
+        let repr = Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no,
+            data,
+        };
+        let len = repr.buffer_len();
+        let mut bytes = [0u8; ICMP_ECHO_MAX];
+        let mut packet = Icmpv4Packet::new_unchecked(&mut bytes[..len]);
+        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        {
+            let wire = self.wire.as_mut().ok_or(Status::NetUnreachable)?;
+            let handle = self.slots[index].wire_icmp.ok_or(Status::NetUnreachable)?;
+            wire.sockets
+                .get_mut::<icmp::Socket>(handle)
+                .send_slice(&bytes[..len], IpAddress::Ipv4(Ipv4Address::from(to)))
+                .map_err(|error| match error {
+                    icmp::SendError::BufferFull => Status::WouldBlock,
+                    icmp::SendError::Unaddressable => Status::NetUnreachable,
+                })?;
+        }
+        self.slots[index].icmp_seq = seq_no.wrapping_add(1);
+        self.stats.echo_requests_sent += 1;
+        Ok(data.len() as u64)
     }
 
     fn dispatch_common(
@@ -887,6 +1115,9 @@ impl Server {
             Body::Bind(addr) => {
                 if self.slots[index].port != 0 {
                     return Err(Status::InvalidArgument);
+                }
+                if self.slots[index].kind == SocketKind::Icmp && addr.ip == LOOPBACK {
+                    return Err(Status::AddrNotAvailable);
                 }
                 let wire_addr = self.wire.as_ref().map(|wire| wire.addr);
                 if addr.ip != LOOPBACK && addr.ip != [0; 4] && Some(addr.ip) != wire_addr {
@@ -916,9 +1147,12 @@ impl Server {
             Body::GetName => {
                 let slot = &self.slots[index];
                 let wire_addr = self.wire.as_ref().map_or(LOOPBACK, |wire| wire.addr);
-                let local_ip = match slot.peer {
-                    Some(peer) if !is_loopback(peer.ip) => wire_addr,
-                    _ => LOOPBACK,
+                let local_ip = match slot.kind {
+                    SocketKind::Icmp => self.wire.as_ref().map_or([0; 4], |wire| wire.addr),
+                    _ => match slot.peer {
+                        Some(peer) if !is_loopback(peer.ip) => wire_addr,
+                        _ => LOOPBACK,
+                    },
                 };
                 let local = Addr {
                     ip: local_ip,

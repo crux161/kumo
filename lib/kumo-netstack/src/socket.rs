@@ -1,4 +1,5 @@
 //j814
+//j844
 
 //! KNS1 requests and KNR1 replies, the session channel between a client and netstack
 //! (DESIGN/026 §4, §6).
@@ -136,6 +137,8 @@ impl Status {
 pub enum SocketKind {
     Udp = 1,
     Tcp = 2,
+    /// A wire-only ICMP echo socket (NET8); BIND's port is the echo identifier.
+    Icmp = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,6 +304,7 @@ pub fn decode_request(message: &[u8], handles: usize) -> Result<Request<'_>, Rej
             Body::Socket(match arg {
                 1 => SocketKind::Udp,
                 2 => SocketKind::Tcp,
+                3 => SocketKind::Icmp,
                 _ => return Err(reject(Status::Unsupported)),
             })
         }
@@ -655,9 +659,10 @@ mod tests {
         sendto.extend_from_slice(b"datagram");
         let wait = WAIT_READABLE as u64 | (250u64 << 32);
         type Case<'a> = (Op, u32, u32, u64, &'a [u8], Body<'a>);
-        let cases: [Case<'_>; 14] = [
+        let cases: [Case<'_>; 15] = [
             (Op::Hello, 0, 0, 0, &[], Body::Hello),
             (Op::Socket, 0, 9, 2, &[], Body::Socket(SocketKind::Tcp)),
+            (Op::Socket, 0, 9, 3, &[], Body::Socket(SocketKind::Icmp)),
             (Op::Bind, 1, 9, 0, &ADDR.encode(), Body::Bind(ADDR)),
             (Op::Connect, 1, 9, 0, &ADDR.encode(), Body::Connect(ADDR)),
             (Op::Listen, 1, 9, 4, &[], Body::Listen { backlog: 4 }),
@@ -773,7 +778,7 @@ mod tests {
             (flags, Status::InvalidArgument),
             (req(Op::Hello, 0, 0, 1, &[]), Status::InvalidArgument),
             (req(Op::Hello, 0, 0, 0, &[0]), Status::BadLength),
-            (req(Op::Socket, 0, 9, 3, &[]), Status::Unsupported),
+            (req(Op::Socket, 0, 9, 4, &[]), Status::Unsupported),
             (
                 req(Op::Bind, 1, 9, 0, &ADDR.encode()[..7]),
                 Status::BadLength,

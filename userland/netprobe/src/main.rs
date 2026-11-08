@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 //j843
+//j844
 //j816
 //j817
 //j820
-//j822
 
 //! `netprobe` — drive netstack's socket contract over a real granted channel (PLAN/020 NET2b).
 //!
@@ -235,6 +235,20 @@ impl Client {
         reply.result as u16
     }
 
+    /// NET8: an ICMP echo socket; its identifier is the port BIND receives.
+    fn icmp_socket(&mut self) -> u32 {
+        let reply = self.call(Op::Socket, 0, 3, &[]);
+        self.expect(b"socket icmp", reply.status, Status::Ok);
+        reply.socket
+    }
+
+    /// Bind any wire address; BIND's port is the identifier for ICMP, the port for UDP.
+    fn bind_any(&mut self, socket: u32, port: u16) -> u16 {
+        let reply = self.call(Op::Bind, socket, 0, &Addr { ip: [0; 4], port }.encode());
+        self.expect(b"bind any", reply.status, Status::Ok);
+        reply.result as u16
+    }
+
     fn sendto(&mut self, socket: u32, port: u16, data: &[u8]) -> Status {
         self.sendto_addr(socket, Addr { ip: LOOPBACK, port }, data)
     }
@@ -365,6 +379,121 @@ fn wire(client: &mut Client, ip: [u8; 4], port: u16, count: u16) {
         dec(sent as u64).bytes(),
         b"/",
         dec(count as u64).bytes(),
+    ]);
+}
+
+/// NET8: ping a LAN peer. The peer's capture is the proof; each data body is the prefix, the
+/// index, then `index % 16` fill bytes, so a checker can match every request and reply.
+fn ping(client: &mut Client, ip: [u8; 4], count: u16) {
+    let count = count.clamp(1, 64);
+    let s = client.icmp_socket();
+    let ident = client.bind_any(s, 0);
+    let mut ip_text = [0u8; 15];
+    let mut at = 0;
+    for (i, octet) in ip.iter().enumerate() {
+        if i > 0 {
+            ip_text[at] = b'.';
+            at += 1;
+        }
+        let digits = dec(*octet as u64);
+        ip_text[at..at + digits.bytes().len()].copy_from_slice(digits.bytes());
+        at += digits.bytes().len();
+    }
+    client.out.line(&[
+        b"netprobe: ping ident ",
+        dec(ident as u64).bytes(),
+        b" -> ",
+        &ip_text[..at],
+        b" x",
+        dec(count as u64).bytes(),
+    ]);
+    let mut exact = 0u32;
+    for i in 0..count {
+        let mut payload = [0u8; 96];
+        let mut len = 0;
+        let index = dec(i as u64);
+        for part in [&b"kumo-net8-"[..], index.bytes(), b"-"] {
+            payload[len..len + part.len()].copy_from_slice(part);
+            len += part.len();
+        }
+        for _ in 0..(i % 16) {
+            payload[len] = b'x';
+            len += 1;
+        }
+        // The wire may not be up yet: autoexec runs before the NIC finishes enumerating, so
+        // NetUnreachable and WouldBlock are retried (same bounds as `wire`).
+        let mut attempts = 0;
+        loop {
+            let status = client.sendto_addr(s, Addr { ip, port: 0 }, &payload[..len]);
+            if i == 0 && attempts == 0 && status != Status::Ok {
+                let name = status_name(status);
+                let mut line = [0u8; 48];
+                const PREFIX: &[u8] = b"netprobe: ping first status=";
+                line[..PREFIX.len()].copy_from_slice(PREFIX);
+                let n = name.len().min(18);
+                line[PREFIX.len()..PREFIX.len() + n].copy_from_slice(&name[..n]);
+                line[PREFIX.len() + n] = b'\n';
+                let _ = kumo_rt::log_write(
+                    kumo_abi::sys::log_level::NOTICE,
+                    &line[..PREFIX.len() + n + 1],
+                );
+            }
+            if status == Status::Ok {
+                break;
+            }
+            let retry = status == Status::NetUnreachable || status == Status::WouldBlock;
+            if !retry || attempts >= 300 {
+                client.fail(&[b"ping send -> ", status_name(status)]);
+                break;
+            }
+            attempts += 1;
+            let sleep_ms = if status == Status::WouldBlock {
+                200u64
+            } else {
+                500u64
+            };
+            let _ = client.call(Op::Wait, s, WAIT_CONNECTED as u64 | (sleep_ms << 32), &[]);
+        }
+        if attempts >= 300 {
+            break;
+        }
+        let wait = client.call(Op::Wait, s, WAIT_READABLE as u64 | (2000u64 << 32), &[]);
+        if wait.status != Status::Ok {
+            client.fail(&[b"ping wait -> ", status_name(wait.status)]);
+            continue;
+        }
+        let got = client.call(Op::RecvFrom, s, UDP_PAYLOAD_MAX as u64, &[]);
+        let reply = client.payload(&got);
+        let source = Addr { ip, port: 0 }.encode();
+        let body = &reply[ADDR_LEN.min(reply.len())..];
+        if got.status == Status::Ok
+            && reply.len() >= ADDR_LEN
+            && reply[..ADDR_LEN] == source
+            && body == &payload[..len]
+            && got.result == len as u64
+        {
+            exact += 1;
+            client.out.line(&[
+                b"netprobe: ping ",
+                dec(i as u64).bytes(),
+                b" exact fnv=",
+                &hex32(fnv(body)),
+            ]);
+        } else {
+            client.fail(&[
+                b"ping ",
+                dec(i as u64).bytes(),
+                b" reply not exact fnv=",
+                &hex32(fnv(body)),
+            ]);
+        }
+    }
+    client.out.line(&[
+        b"netprobe: ping ",
+        dec(exact as u64).bytes(),
+        b"/",
+        dec(count as u64).bytes(),
+        b" exact",
     ]);
 }
 
@@ -1040,13 +1169,18 @@ extern "C" fn main(
         .is_some_and(|argv| vmo_read(argv, 0, argv_buf.as_mut_ptr(), argv_buf.len()) == 0);
     let mut args = unpack_argv(if read { &argv_buf[..] } else { &[] }).skip(1);
     let mode: &[u8] = args.next().unwrap_or(b"");
-    // `wire <ip> <port> [count]` takes the address where the other modes take a port.
-    let wire_ip = if mode == b"wire" {
+    // `wire <ip> <port> [count]` and `ping <ip> [count]` take an address where the other
+    // modes take a port; ping has no port, so its first number is the count.
+    let wire_ip = if mode == b"wire" || mode == b"ping" {
         args.next().and_then(parse_ipv4)
     } else {
         None
     };
-    let port = args.next().and_then(parse_u16);
+    let port = if mode == b"ping" {
+        None
+    } else {
+        args.next().and_then(parse_u16)
+    };
     let count = args.next().and_then(parse_u16);
     let Some(channel) = startup.net else {
         out.line(&[b"netprobe: no network grant (launch it as `net netprobe ...`)"]);
@@ -1098,6 +1232,9 @@ extern "C" fn main(
             port.unwrap_or(0),
             count.unwrap_or(4),
         ),
+        b"ping" if wire_ip.is_some_and(|ip| ip != [0; 4]) => {
+            ping(&mut client, wire_ip.unwrap_or([0; 4]), count.unwrap_or(4))
+        }
         b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
         b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
         b"tcperrors" => tcp_errors(&mut client),
@@ -1105,7 +1242,7 @@ extern "C" fn main(
         b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count]",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count]",
             ]);
             process_exit(2);
         }

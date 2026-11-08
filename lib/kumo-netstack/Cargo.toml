@@ -1,4 +1,5 @@
 #j813
+#j844
 [package]
 name = "kumo-netstack"
 authors.workspace = true
@@ -16,6 +17,8 @@ smoltcp = { version = "=0.14.0", default-features = false, features = [
     "socket-udp",
     "socket-tcp",
     "socket-icmp",
+    # NET8 (J844): the interface itself answers echo requests addressed to it (DESIGN/026 §8).
+    "auto-icmp-echo-reply",
 ] }
 
 [lib]

@@ -3,6 +3,7 @@
 //j815
 //j820
 //j843
+//j844
 
 //! The resident netstack: one Port, one loopback interface, sessions over granted channels
 //! (DESIGN/026). Sora transfers a control channel in `x1`; each control message is the tag `S`
@@ -28,7 +29,7 @@ use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid, port_bind,
     port_create, port_unbind, port_wait, timer_create,
 };
-use netstack::{After, Output, Server};
+use netstack::{After, IngressError, Output, Server};
 
 kumo_rt::entry!(main);
 
@@ -148,8 +149,10 @@ struct Frame {
     prefix: u8,
     /// `wire_delivered()` at the last CREDIT return.
     returned: u64,
-    /// RX_FRAMEs the wire device refused because its ingress ring was full.
+    /// RX_FRAMEs the wire device or the ingress policy refused.
     device_drops: u64,
+    /// First-refusal-of-each-kind bits, so a malformed-frame storm cannot flood the log.
+    refused: u8,
     /// Set once when the TX credit first runs out with egress still queued.
     backpressure_logged: bool,
 }
@@ -179,6 +182,7 @@ fn install_frame(
         prefix,
         returned: 0,
         device_drops: 0,
+        refused: 0,
         backpressure_logged: false,
     });
     log(log_level::NOTICE, b"netstack: frame channel granted\n");
@@ -260,8 +264,25 @@ fn serve_frame(frame: &mut Option<Frame>, server: &mut Server, port: Handle, now
             log(log_level::NOTICE, &line);
         }
         Body::RxFrame(bytes) => {
-            if server.push_wire_frame(bytes).is_err() {
+            if let Err(refusal) = server.push_wire_frame(bytes) {
                 f.device_drops += 1;
+                let (bit, name): (u8, &[u8]) = match refusal {
+                    IngressError::Detached => (0, b"detached"),
+                    IngressError::Device(_) => (1, b"ingress ring full"),
+                    IngressError::Truncated => (2, b"truncated"),
+                    IngressError::UnknownEthertype(_) => (3, b"unknown ethertype"),
+                    IngressError::Fragment => (4, b"fragment"),
+                    IngressError::BadIpv4Checksum => (5, b"bad ipv4 checksum"),
+                };
+                // First refusal of each kind per generation: a storm cannot flood the log.
+                if f.refused & (1 << bit) == 0 {
+                    f.refused |= 1 << bit;
+                    let mut line = Vec::with_capacity(48);
+                    line.extend_from_slice(b"netstack: wire ingress refused ");
+                    line.extend_from_slice(name);
+                    line.push(b'\n');
+                    log(log_level::NOTICE, &line);
+                }
             }
         }
         Body::Counters(counters) => {
