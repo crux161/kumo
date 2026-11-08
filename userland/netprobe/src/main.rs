@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
+//j845
 //j843
 //j844
 //j816
 //j817
-//j820
 
 //! `netprobe` — drive netstack's socket contract over a real granted channel (PLAN/020 NET2b).
 //!
@@ -384,7 +384,10 @@ fn wire(client: &mut Client, ip: [u8; 4], port: u16, count: u16) {
 
 /// NET8: ping a LAN peer. The peer's capture is the proof; each data body is the prefix, the
 /// index, then `index % 16` fill bytes, so a checker can match every request and reply.
-fn ping(client: &mut Client, ip: [u8; 4], count: u16) {
+/// `retries` bounds the wait for the wire: the autoexec runs a short foreground run that
+/// fails fast (its exit triggers boot's late service wave, which starts the NIC) and a long
+/// background run that is still retrying when the wave brings the wire up.
+fn ping(client: &mut Client, ip: [u8; 4], count: u16, retries: u32) {
     let count = count.clamp(1, 64);
     let s = client.icmp_socket();
     let ident = client.bind_any(s, 0);
@@ -420,8 +423,12 @@ fn ping(client: &mut Client, ip: [u8; 4], count: u16) {
             payload[len] = b'x';
             len += 1;
         }
-        // The wire may not be up yet: autoexec runs before the NIC finishes enumerating, so
-        // NetUnreachable and WouldBlock are retried (same bounds as `wire`).
+        // The wire may not be up yet: autoexec runs before the NIC finishes enumerating, and
+        // the boot's late service wave that starts the NIC only runs after the autoexec child
+        // exits (the TOWER's supervisor restart). So the budget is the caller's: a short
+        // foreground run triggers the wave, a long background run is still retrying when the
+        // wire arrives. Clamped so a typo cannot spin forever.
+        let retries = retries.clamp(1, 6000);
         let mut attempts = 0;
         loop {
             let status = client.sendto_addr(s, Addr { ip, port: 0 }, &payload[..len]);
@@ -442,7 +449,7 @@ fn ping(client: &mut Client, ip: [u8; 4], count: u16) {
                 break;
             }
             let retry = status == Status::NetUnreachable || status == Status::WouldBlock;
-            if !retry || attempts >= 300 {
+            if !retry || attempts >= retries {
                 client.fail(&[b"ping send -> ", status_name(status)]);
                 break;
             }
@@ -454,7 +461,7 @@ fn ping(client: &mut Client, ip: [u8; 4], count: u16) {
             };
             let _ = client.call(Op::Wait, s, WAIT_CONNECTED as u64 | (sleep_ms << 32), &[]);
         }
-        if attempts >= 300 {
+        if attempts >= retries {
             break;
         }
         let wait = client.call(Op::Wait, s, WAIT_READABLE as u64 | (2000u64 << 32), &[]);
@@ -1182,6 +1189,7 @@ extern "C" fn main(
         args.next().and_then(parse_u16)
     };
     let count = args.next().and_then(parse_u16);
+    let retries = args.next().and_then(parse_u16).map_or(1200, u32::from);
     let Some(channel) = startup.net else {
         out.line(&[b"netprobe: no network grant (launch it as `net netprobe ...`)"]);
         process_exit(2);
@@ -1232,9 +1240,12 @@ extern "C" fn main(
             port.unwrap_or(0),
             count.unwrap_or(4),
         ),
-        b"ping" if wire_ip.is_some_and(|ip| ip != [0; 4]) => {
-            ping(&mut client, wire_ip.unwrap_or([0; 4]), count.unwrap_or(4))
-        }
+        b"ping" if wire_ip.is_some_and(|ip| ip != [0; 4]) => ping(
+            &mut client,
+            wire_ip.unwrap_or([0; 4]),
+            count.unwrap_or(4),
+            retries,
+        ),
         b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
         b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
         b"tcperrors" => tcp_errors(&mut client),
@@ -1242,7 +1253,7 @@ extern "C" fn main(
         b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count]",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries]",
             ]);
             process_exit(2);
         }

@@ -76,7 +76,9 @@ def icmp_frame(frame):
     if len(frame) < 14 + ihl + 8:
         return None
     src, dst = frame[26:30], frame[30:34]
-    icmp = frame[14 + ihl:]
+    total = struct.unpack_from('>H', frame, 16)[0]
+    # Ethernet pads short frames to 60 bytes; the IP total length is the authority.
+    icmp = frame[14 + ihl:14 + total]
     kind = icmp[0]
     ident, seq_no = struct.unpack_from('>HH', icmp, 4)
     data = icmp[8:]

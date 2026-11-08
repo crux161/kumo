@@ -6,7 +6,10 @@ version, u32 count, then 80-byte entries of a 64-byte name plus u64 offset/size)
 the arm64 ESP tree into netboot/tftp, and proves the staged initrd differs from the build
 in that one entry alone. Sora runs the manifest input-less at boot and reads at most 256 B.
 
-Usage: scripts/net7b-stage.py ["net netprobe wire 192.168.0.106 7701 24"]
+Usage: scripts/net7b-stage.py [--replace] ["net netprobe wire 192.168.0.106 7701 24"]
+
+--replace swaps the image's whole autoexec manifest for the given lines (the 256-byte
+cap counts against the built-in manifest too); without it the lines are appended.
 Build the image with the console level you want first (KUMO_CONSOLE_LOGLEVEL=5 for proofs).
 """
 
@@ -34,13 +37,18 @@ def entries(data):
 
 
 def main():
-    line = (sys.argv[1] if len(sys.argv) > 1 else DEFAULT).encode() + b'\n'
+    args = sys.argv[1:]
+    replace = False
+    if args and args[0] == '--replace':
+        replace = True
+        args = args[1:]
+    line = (args[0] if args else DEFAULT).encode() + b'\n'
     built = (IMAGE / 'EFI/KUMO/initrd.img').read_bytes()
     items = []
     appended = False
     for name, data in entries(built):
         if name == AUTOEXEC:
-            data = data + line
+            data = line if replace else data + line
             appended = True
             assert len(data) <= 256, f'autoexec would be {len(data)} bytes (Sora reads 256)'
         items.append((name, data))
@@ -73,7 +81,7 @@ def main():
 
     print('initrd built ', len(built), 'bytes', hashlib.sha256(built).hexdigest())
     print('initrd staged', len(staged), 'bytes', hashlib.sha256(staged).hexdigest())
-    print('autoexec appends:', line.decode().strip())
+    print('autoexec ' + ('replaces with:' if replace else 'appends:'), line.decode().strip())
     print('stage ok: only etc/autoexec differs; TFTP root ready')
 
 

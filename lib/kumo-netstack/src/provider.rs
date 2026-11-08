@@ -1,4 +1,5 @@
 //j841
+//j845
 //! The provider side of KNF1 (DESIGN/026 §3): the mirror of [`crate::frame::Lane`].
 //!
 //! A frame provider (the ax88 NIC owner in NET7b) speaks this state machine over the frame
@@ -19,7 +20,11 @@ pub struct Provider {
     rx_granted: u32,
     rx_outstanding: u32,
     tx_credit: u32,
-    oldest_tx: u32,
+    /// Sequences of the inbound TX_FRAMEs awaiting their TX_DONE, oldest at `tx_head`.
+    /// CREDIT messages share the inbound sequence space, so consecutive TX sequences can
+    /// have gaps; every answer echoes the sequence its frame actually carried.
+    tx_sent: [u32; TX_CREDIT],
+    tx_head: usize,
     tx_in_flight: u32,
     counters: Counters,
 }
@@ -39,7 +44,8 @@ impl Provider {
             rx_granted: 0,
             rx_outstanding: 0,
             tx_credit: 0,
-            oldest_tx: 0,
+            tx_sent: [0; TX_CREDIT],
+            tx_head: 0,
             tx_in_flight: 0,
             counters: Counters {
                 rx_drop_no_credit: 0,
@@ -83,7 +89,8 @@ impl Provider {
         self.rx_granted = RX_CREDIT as u32;
         self.rx_outstanding = 0;
         self.tx_credit = TX_CREDIT as u32;
-        self.oldest_tx = 0;
+        self.tx_sent = [0; TX_CREDIT];
+        self.tx_head = 0;
         self.tx_in_flight = 0;
         self.counters = Counters {
             rx_drop_no_credit: 0,
@@ -126,15 +133,17 @@ impl Provider {
         Some(out)
     }
 
-    /// The in-order TX_DONE for the oldest unacknowledged TX_FRAME, returning one credit.
-    /// `None` when no TX_FRAME is outstanding (a driver error, counted by the caller).
+    /// The in-order TX_DONE for the oldest unacknowledged TX_FRAME, returning one credit
+    /// and echoing the sequence that frame actually carried (CREDITs share the sequence
+    /// space, so answers can be non-consecutive). `None` when no TX_FRAME is outstanding
+    /// (a driver error, counted by the caller).
     pub fn tx_done(&mut self, status: TxStatus) -> Option<Frame<'static>> {
         if self.tx_in_flight == 0 {
             return None;
         }
-        let answers = self.oldest_tx;
+        let answers = self.tx_sent[self.tx_head];
         let out = self.outbound(Body::TxDone { answers, status })?;
-        self.oldest_tx = self.oldest_tx.wrapping_add(1);
+        self.tx_head = (self.tx_head + 1) % TX_CREDIT;
         self.tx_in_flight -= 1;
         match status {
             TxStatus::HandedToBus => {}
@@ -170,9 +179,8 @@ impl Provider {
                 if self.tx_in_flight >= self.tx_credit {
                     return Err(Violation::CreditOverrun);
                 }
-                if self.tx_in_flight == 0 {
-                    self.oldest_tx = frame.sequence;
-                }
+                let slot = (self.tx_head + self.tx_in_flight as usize) % TX_CREDIT;
+                self.tx_sent[slot] = frame.sequence;
                 self.tx_in_flight += 1;
             }
             Body::Credit(credit) => {
@@ -321,6 +329,34 @@ mod tests {
         assert_eq!(provider.rx_outstanding(), 0);
         assert_eq!(provider.tx_credit(), TX_CREDIT as u32);
         assert_eq!(provider.accept(&tx(1, 1)), Err(Violation::StaleGeneration));
+    }
+
+    #[test]
+    fn tx_dones_answer_the_real_sequence_across_interleaved_credits() {
+        let mut provider = Provider::new();
+        let mut lane = Lane::new();
+        through_lane(&mut lane, &provider.hello(MAC));
+
+        // TX at sequence 1, a CREDIT takes sequence 2, the next TX takes sequence 3.
+        let tx: [u8; 60] = [0x33; 60];
+        let rx: [u8; 60] = [0x44; 60];
+        through_lane(&mut lane, &provider.send_rx(&rx).unwrap());
+        through_provider(&mut provider, &lane.send_tx(&tx).unwrap());
+        through_provider(&mut provider, &lane.return_rx(1).unwrap());
+        through_provider(&mut provider, &lane.send_tx(&tx).unwrap());
+
+        let first = provider.tx_done(TxStatus::HandedToBus).unwrap();
+        let second = provider.tx_done(TxStatus::HandedToBus).unwrap();
+        for (done, want) in [(first, 1u32), (second, 3u32)] {
+            match done.body {
+                Body::TxDone { answers, .. } => assert_eq!(answers, want),
+                _ => panic!("not a TX_DONE"),
+            }
+        }
+        assert!(provider.tx_done(TxStatus::HandedToBus).is_none());
+        // The lane matches both answers against the sequences it sent.
+        through_lane(&mut lane, &first);
+        through_lane(&mut lane, &second);
     }
 
     #[test]
