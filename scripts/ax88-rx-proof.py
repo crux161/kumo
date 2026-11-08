@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j834
+#j835
 """NET6 passive RX: the peer sender and the capture checker.
 
   send   broadcast the numbered test datagrams from this host (no root needed)
@@ -258,7 +259,7 @@ def receive_init(c, controller, slot):
                                   "status_reports", "rx_completions"], map(int, s.groups()))))
 
 
-def check(text, manifest, captured=None):
+def check(text, manifest, captured=None, census="NET6"):
     lines = live_lines(text)
     body = "\n".join(lines)
 
@@ -286,12 +287,12 @@ def check(text, manifest, captured=None):
     init = receive_init(Cursor(net5b), controller, slot)
     # Order: receive on, every frame, receive off, result, then NET6's summary.
     order = {k: next((i for i, l in enumerate(lines) if l.startswith(k)), None) for k in
-             ["NET5b write step=medium-receive", "NET5b write step=park-medium", "NET5b result", "NET6 rx aggregates", "NET6 census"]}
+             ["NET5b write step=medium-receive", "NET5b write step=park-medium", "NET5b result", "NET6 rx aggregates", f"{census} census"]}
     require(None not in order.values(), "missing receive window boundary")
     frames_at = [i for i, l in enumerate(lines) if l.startswith(("NET6 frame", "NET6 aggregate"))]
     require(frames_at and order["NET5b write step=medium-receive"] < frames_at[0] and frames_at[-1] < order["NET5b write step=park-medium"],
             "frames outside the receive window")
-    require(order["NET5b result"] < order["NET6 rx aggregates"] < order["NET6 census"], "summary order")
+    require(order["NET5b result"] < order["NET6 rx aggregates"] < order[f"{census} census"], "summary order")
 
     exact, ends, macs, fcs_flags, aggregates = {}, 0, set(), set(), []
     for l in net6:
@@ -320,7 +321,7 @@ def check(text, manifest, captured=None):
         if a:
             aggregates.append(tuple(map(int, a.groups())))
             continue
-        require(re.match(r"NET6 (rx aggregates=|rx test |rx bitmap |census )", l), f"unknown NET6 record {l!r}")
+        require(re.match(r"NET6 (rx aggregates=|rx test |rx bitmap )", l) or (census == "NET6" and l.startswith("NET6 census ")), f"unknown NET6 record {l!r}")
     require(sorted(exact) == list(range(EXACT)), f"exact phase incomplete: {sorted(set(range(EXACT)) - set(exact))}")
     require(len(macs) == 1 and len(fcs_flags) == 1, "inconsistent peer MAC or FCS pass-through")
     r = one(r"NET6 rx aggregates=(\d+) parse_errors=0 frames=(\d+) dropped=(\d+) dummies=(\d+) max_frames=(\d+) max_bytes=(\d+) arp=(\d+) ipv4=(\d+) ipv6=(\d+) other=(\d+) rx_completions=(\d+)", "aggregate summary")
@@ -344,8 +345,10 @@ def check(text, manifest, captured=None):
     require(digest == int(t[3], 16), "burst digest differs: some received burst payload is not the sender's")
     require(int(t[5]) + int(t[6]) == EXACT + len(received) + int(t[4]), "FCS counts differ from test frames")
     require((int(t[5]) > 0) == (True in fcs_flags), "FCS pass-through disagrees with exact frames")
-    k = one(rf"NET6 census controller={controller} slot={slot} registered=(\d+) routed=(\d+) consumed=(\d+) retired=(\d+) faults=0 ep0_queued=0 lanes=(\d+)/(\d+) custody=(\d+)/(\d+) rx_pending=1 status_pending=1 PASS", "passing census")
-    require(k[5] == k[6] == init["lanes"] and k[7] == k[8] == init["custody"], "census not flat or failed")
+    k = one(rf"{census} census controller={controller} slot={slot} registered=(\d+) routed=(\d+) consumed=(\d+) retired=(\d+) faults=0 ep0_queued=0 lanes=(\d+)/(\d+) custody=(\d+)/(\d+) rx_pending=1 status_pending=1 PASS", "passing census")
+    # NET7 adds the bulk OUT lane; it occupies one completion slot for the driver's life.
+    expected_lanes = str(int(init["lanes"]) + (1 if census == "NET7" else 0))
+    require(k[5] == k[6] == expected_lanes and k[7] == k[8] == init["custody"], "census not flat or failed")
     require(manifest["exact_sent"] == EXACT and manifest["burst_sent"] == BURST and manifest["end_sent"] >= 1, "sender manifest incomplete")
     capture = None
     if captured is not None:

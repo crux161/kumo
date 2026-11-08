@@ -1,4 +1,5 @@
 //j826
+//j835
 //! Explicit vendor/device control setups and little-endian payloads. Constructors
 //! expose MAC and PHY access only; no EEPROM, eFuse or reload opcode is representable.
 //! No request is submitted here. PHY page selection is never implicit. — TIMBERDOODLE
@@ -106,6 +107,11 @@ impl Request {
         request.setup[0] = 0x40;
         request.payload[..payload.len()].copy_from_slice(payload);
         Ok(request)
+    }
+    /// The reference link_reset()'s TX FIFO full/empty poll: vendor request 0x81,
+    /// register 0x8c, four bytes, read-only status. No state changes.
+    pub fn fifo_status() -> Self {
+        Self::new(Direction::In, 0x81, 0x8c, 0, 4)
     }
     pub fn phy_read(register: u8) -> Result<Self, Error> {
         if register > 31 {

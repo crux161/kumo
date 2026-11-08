@@ -1,4 +1,5 @@
 //j834
+//j835
 //! NET6 passive-RX test frames: a peer's numbered IPv4/UDP broadcasts to `PORT`, whose
 //! size and every payload byte follow from the sequence number alone. Each frame is
 //! verified in software (IPv4 header checksum, UDP checksum, payload) and summarized
@@ -312,6 +313,45 @@ impl Tally {
     pub fn exact_received(&self) -> u32 {
         self.exact_bits.count_ones()
     }
+}
+
+/// NET7a transmit test frames: broadcast on the IEEE local-experimental EtherType, so
+/// no host on the LAN interprets them. Payload: `TX_MAGIC`, sequence (u32 LE), frame
+/// length (u16 LE), version 1, a zero byte, then `pattern` bytes.
+pub const TX_ETHERTYPE: u16 = 0x88b5;
+pub const TX_MAGIC: [u8; 8] = *b"KUMOTX07";
+pub const TX_EXACT: u32 = 32;
+pub const TX_BURST: u32 = 2048;
+/// Exact-phase frame lengths: below the 60-byte minimum (the chip must pad), around the
+/// 512/1024 transfer boundary (504 and 1016 bytes + 8-byte prefix land exactly on it),
+/// and at the 1514-byte maximum.
+const TX_SIZES: [u16; TX_EXACT as usize] = [
+    30, 42, 59, 60, 61, 64, 100, 200, 400, 503, 504, 505, 511, 512, 513, 600, 800, 1000, 1015,
+    1016, 1017, 1023, 1024, 1025, 1200, 1400, 1500, 1510, 1511, 1512, 1513, 1514,
+];
+
+pub fn tx_frame_len(seq: u32) -> usize {
+    match TX_SIZES.get(seq as usize) {
+        Some(&n) => usize::from(n),
+        None => 60 + (seq as usize * 389) % 1455,
+    }
+}
+
+/// Write the frame for `seq` from `source` into `out`; `None` if `out` is too short.
+pub fn tx_frame(seq: u32, source: [u8; 6], out: &mut [u8]) -> Option<usize> {
+    let len = tx_frame_len(seq);
+    let frame = out.get_mut(..len)?;
+    frame[..6].fill(0xff);
+    frame[6..12].copy_from_slice(&source);
+    frame[12..14].copy_from_slice(&TX_ETHERTYPE.to_be_bytes());
+    frame[14..22].copy_from_slice(&TX_MAGIC);
+    frame[22..26].copy_from_slice(&seq.to_le_bytes());
+    frame[26..28].copy_from_slice(&(len as u16).to_le_bytes());
+    frame[28..30].copy_from_slice(&[1, 0]);
+    for (i, b) in frame[30..].iter_mut().enumerate() {
+        *b = pattern(seq, i);
+    }
+    Some(len)
 }
 
 #[cfg(test)]

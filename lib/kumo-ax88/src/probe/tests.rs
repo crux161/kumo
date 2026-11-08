@@ -1,4 +1,5 @@
 //j834
+//j835
 extern crate std;
 use super::*;
 use std::vec::Vec;
@@ -224,4 +225,36 @@ fn golden_values_pin_the_peer_payload_format() {
         d.wrapping_add(burst_term(s, fnv64(&frame(s)[42..])))
     });
     assert_eq!(all, 0x1be1_d7bb_e710_5c2b);
+}
+
+#[test]
+fn tx_frames_cover_padding_and_both_transfer_boundaries() {
+    let src = [0x1a, 0x2b, 0x3c, 0x4d, 0x29, 0x04];
+    let mut buf = [0u8; 1514];
+    let mut boundary = Vec::new();
+    for seq in 0..TX_EXACT + TX_BURST {
+        let n = tx_frame(seq, src, &mut buf).unwrap();
+        assert_eq!(n, tx_frame_len(seq));
+        assert!((30..=1514).contains(&n), "seq {seq} len {n}");
+        assert_eq!(
+            (&buf[..6], &buf[6..12], &buf[12..14]),
+            (&[0xff; 6][..], &src[..], &[0x88, 0xb5][..])
+        );
+        assert_eq!(u32::from_le_bytes(buf[22..26].try_into().unwrap()), seq);
+        assert!(buf[30..n]
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == pattern(seq, i)));
+        let header = crate::tx::Header::new(n, 512).unwrap();
+        if header.encode()[4..] == [0, 0x80, 0, 0x80] {
+            boundary.push(n);
+        }
+    }
+    assert_eq!(&boundary[..2], &[504, 1016]);
+    assert!(tx_frame(TX_EXACT - 1, src, &mut buf[..1513]).is_none());
+    // Pinned in scripts/ax88-tx-proof.py --self-test.
+    let n = tx_frame(1, src, &mut buf).unwrap();
+    assert_eq!(fnv64(&buf[..n]), 0x94e3_b3b6_42dd_8ed6);
+    let n = tx_frame(TX_EXACT + TX_BURST - 1, src, &mut buf).unwrap();
+    assert_eq!((n, fnv64(&buf[..n])), (1266, 0xecf3_6f7b_2369_b700));
 }

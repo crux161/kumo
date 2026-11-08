@@ -1,4 +1,5 @@
 //j831
+//j835
 //! NET4c-3 resident NIC lanes: the ordering rules, without hardware. drv-xhci issues
 //! the commands and reads the contexts back; this decides whether the next step is
 //! allowed. Arm only while Running. Stop only after every pending transfer was
@@ -12,9 +13,11 @@
 pub enum NicLane {
     Rx,
     Status,
+    /// NET7a bulk OUT; armed only while a frame is being handed to the bus.
+    Tx,
 }
 
-const LANES: [NicLane; 2] = [NicLane::Rx, NicLane::Status];
+const LANES: [NicLane; 3] = [NicLane::Rx, NicLane::Status, NicLane::Tx];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NicPhase {
@@ -61,7 +64,7 @@ pub struct NicCounts {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NicLifecycle {
     phase: NicPhase,
-    pending: [bool; 2],
+    pending: [bool; 3],
     counts: NicCounts,
 }
 
@@ -69,7 +72,7 @@ impl NicLifecycle {
     pub const fn new() -> Self {
         Self {
             phase: NicPhase::Idle,
-            pending: [false; 2],
+            pending: [false; 3],
             counts: NicCounts {
                 configures: 0,
                 arms: 0,
@@ -326,5 +329,24 @@ mod tests {
         );
         life.fail();
         assert_eq!(life.reclaimed(), Err(NicError::Phase(NicPhase::Failed)));
+    }
+
+    #[test]
+    fn a_pending_tx_transfer_blocks_the_verified_stop_like_any_lane() {
+        let mut life = NicLifecycle::new();
+        life.configured().unwrap();
+        life.armed(NicLane::Tx).unwrap();
+        assert_eq!(life.armed(NicLane::Tx), Err(NicError::Pending(NicLane::Tx)));
+        let mut life = NicLifecycle::new();
+        life.configured().unwrap();
+        life.armed(NicLane::Tx).unwrap();
+        assert_eq!(life.stopped(), Err(NicError::Pending(NicLane::Tx)));
+        assert_eq!(life.phase(), NicPhase::Failed);
+        let mut life = NicLifecycle::new();
+        life.configured().unwrap();
+        life.armed(NicLane::Tx).unwrap();
+        life.completed(NicLane::Tx).unwrap();
+        assert!(!life.is_pending(NicLane::Tx));
+        life.stopped().unwrap();
     }
 }

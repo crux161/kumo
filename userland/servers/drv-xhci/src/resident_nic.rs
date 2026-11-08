@@ -1,6 +1,7 @@
 //j831
 //j833
 //j834
+//j835
 //! NET4c-3: the ax88's resident RX and status lanes on the one controller owner. It is
 //! default-off: without KUMO_AX88_RESIDENT_PROOF the adapter stays unconfigured, as
 //! since NET0.
@@ -17,14 +18,17 @@
 //! `kumo_ax88::link` on this owner's EP0 instead of the cycling timeline; MAC
 //! receive stays off there too. KUMO_AX88_RX_PROOF (NET6) runs the same sequence with
 //! the receive goal and tallies every RX aggregate with `kumo_ax88::probe`; the peer's
-//! END frame concludes the window. Recovery class: stateless; the custody parent holds
-//! the DMA. — TIMBERDOODLE
+//! END frame concludes the window. KUMO_AX88_TX_PROOF (NET7a) also configures the bulk
+//! OUT lane: numbered frames from a ring and buffer in the same custodied page, each
+//! written only after the previous transfer's exact completion. Recovery class:
+//! stateless; the custody parent holds the DMA. — TIMBERDOODLE
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use drv_xhci::nic::{completed_length, NicLane, NicLifecycle, NicPhase};
 use kumo_abi::{Handle, VmarFlags};
-use kumo_ax88::link::{Goal, Link, StatusView};
+use kumo_ax88::control::{decode_mac, MacRegister, Request};
+use kumo_ax88::link::{Goal, Link, Port, StatusView};
 use kumo_ax88::probe::{self, Tally, Verdict};
 use kumo_ax88::profile::{Profile, Speed};
 use kumo_ax88::rx::{Aggregate, Packet};
@@ -64,7 +68,21 @@ const RING_TRBS: usize = 16;
 const RX_RING: u64 = 0x000;
 const STATUS_RING: u64 = 0x100;
 const STATUS_BUF: u64 = 0x200;
-const RINGS_LEN: u64 = 0x300;
+/// NET7a: the bulk OUT ring and one frame buffer (8-byte prefix + 1514), in the same
+/// page as the other rings, so neither can straddle a 64 KiB boundary.
+const TX_RING: u64 = 0x300;
+const TX_BUF: u64 = 0x400;
+const TX_BUF_LEN: u64 = 0x600;
+const RINGS_LEN: u64 = 0xa00;
+/// Exact-phase TX frames go one per proof tick from this long after receive turns on;
+/// the burst starts later, to overlap the peer's RX phases.
+const TX_EXACT_DELAY_NS: u64 = 2_000_000_000;
+const TX_BURST_DELAY_NS: u64 = 11_000_000_000;
+/// A submitted transfer whose exact completion never arrives must not wedge the proof.
+/// Full-duplex load starves OUT completions for tens of seconds (12.2 s and 32.5 s
+/// measured at seq 623 on metal), so the bound sits far above that before the schedule
+/// stops, once, with the endpoint state recorded.
+const TX_COMPLETION_TIMEOUT_NS: u64 = 120_000_000_000;
 const STATUS_LEN: u32 = kumo_ax88::status::STATUS_LEN as u32;
 
 /// Proof timeline, one tick per 100 ms: thirty idle ticks with both lanes pending and one
@@ -93,6 +111,34 @@ pub(super) fn note_hid_report() {
     }
     HID_REPORTS.fetch_add(1, Ordering::Relaxed);
 }
+
+/// NET7a: what was handed to the bus, frame by frame. Each frame is written into the
+/// TX buffer only while the lane is idle, i.e. after the previous transfer's exact
+/// completion; an error or short completion stops the schedule.
+#[derive(Clone, Copy, Default)]
+struct TxProof {
+    node: Option<[u8; 6]>,
+    receive_ns: u64,
+    next: u32,
+    submitted: u32,
+    completed: u32,
+    bytes: u64,
+    pad_frames: u32,
+    submit_ns: u64,
+    max_ns: u64,
+    errors: u32,
+}
+
+impl TxProof {
+    fn finished(&self) -> bool {
+        self.errors > 0 || self.completed == probe::TX_EXACT + probe::TX_BURST
+    }
+}
+
+struct TxScratch(core::cell::UnsafeCell<([u8; 1514], [u8; 1522])>);
+// SAFETY: drv-xhci is single-threaded, and `tx_pump` is the only way in.
+unsafe impl Sync for TxScratch {}
+static TX_SCRATCH: TxScratch = TxScratch(core::cell::UnsafeCell::new(([0; 1514], [0; 1522])));
 
 struct RxSnapshot(core::cell::UnsafeCell<[u8; NIC_RX_LEN as usize]>);
 // SAFETY: drv-xhci is single-threaded, and `rx_snapshot` is the only way in.
@@ -191,6 +237,8 @@ pub(super) struct NicResident {
     dev: NicHandoff,
     rx: Lane,
     status: Lane,
+    tx: Lane,
+    tx_proof: TxProof,
     life: NicLifecycle,
     link: Option<bool>,
     /// When the status lane's link bit last changed (NET5b's agreement check).
@@ -278,6 +326,8 @@ impl NicResident {
             return None;
         }
         let (status_address, rx_address) = (dev.profile.status().address, dev.profile.rx().address);
+        let tx_address = dev.profile.tx().address;
+        let tx_dci = lane_dci(tx_address)?;
         let (status_dci, rx_dci) = (lane_dci(status_address)?, lane_dci(rx_address)?);
         let lane =
             |ring_off: u64, buffer_off: u64, len: u64, dci: u8, address: u8| -> Option<Lane> {
@@ -306,6 +356,7 @@ impl NicResident {
                 })
             };
         let rx = lane(RX_RING, rx_off, NIC_RX_LEN, rx_dci, rx_address)?;
+        let tx = lane(TX_RING, rings + TX_BUF, TX_BUF_LEN, tx_dci, tx_address)?;
         let status = lane(
             STATUS_RING,
             rings + STATUS_BUF,
@@ -357,6 +408,8 @@ impl NicResident {
             dev,
             rx,
             status,
+            tx,
+            tx_proof: TxProof::default(),
             life: NicLifecycle::new(),
             link: None,
             status_changed_ns: 0,
@@ -381,6 +434,7 @@ impl NicResident {
         match lane {
             NicLane::Rx => &mut self.rx,
             NicLane::Status => &mut self.status,
+            NicLane::Tx => &mut self.tx,
         }
     }
 
@@ -419,22 +473,31 @@ impl NicResident {
             return Err("phase");
         }
         let stride = ContextSize::Bytes64;
-        let (Some(slot_off), Some(status_off), Some(rx_off)) = (
+        let tx = ax88_link::TX_ENABLED;
+        let (Some(slot_off), Some(status_off), Some(rx_off), Some(tx_off)) = (
             stride.input_offset(0),
             stride.input_offset(self.status.dci),
             stride.input_offset(self.rx.dci),
+            stride.input_offset(self.tx.dci),
         ) else {
             return Err("context offset");
         };
-        if status_off.max(rx_off) + 32 > OFF_OUTPUT_CTX {
+        if status_off.max(rx_off).max(if tx { tx_off } else { 0 }) + 32 > OFF_OUTPUT_CTX {
             return Err("input window");
         }
         let mut icc = InputControlContext::default();
-        if icc.add(0).is_err() || icc.add(self.status.dci).is_err() || icc.add(self.rx.dci).is_err()
+        if icc.add(0).is_err()
+            || icc.add(self.status.dci).is_err()
+            || icc.add(self.rx.dci).is_err()
+            || (tx && icc.add(self.tx.dci).is_err())
         {
             return Err("input flags");
         }
-        let entries = self.status.dci.max(self.rx.dci);
+        let entries = self
+            .status
+            .dci
+            .max(self.rx.dci)
+            .max(if tx { self.tx.dci } else { 0 });
         let mut slot = self.dev.slot_words;
         slot[0] = (slot[0] & !(0x1f << 27)) | ((entries as u32) << 27);
         let status_ep = self.dev.profile.status();
@@ -454,6 +517,13 @@ impl NicResident {
         write_ctx(input + slot_off as u64, slot);
         write_ctx(input + status_off as u64, status_ctx.words());
         write_ctx(input + rx_off as u64, rx_ctx.words());
+        if tx {
+            let tx_ep = self.dev.profile.tx();
+            let burst = tx_ep.companion.map_or(0, |c| c.max_burst);
+            let tx_ctx = EndpointContext::bulk_out(tx_ep.max_packet_size, burst, self.tx.ring_phys)
+                .map_err(|_| "tx context")?;
+            write_ctx(input + tx_off as u64, tx_ctx.words());
+        }
         dsb();
         let configure_start = clock_get();
         let configure =
@@ -468,7 +538,10 @@ impl NicResident {
         if slot.state != SlotState::Configured || slot.context_entries != entries {
             return Err("configured slot readback");
         }
-        for lane in [&self.status, &self.rx] {
+        for lane in [&self.status, &self.rx, &self.tx]
+            .into_iter()
+            .take(if tx { 3 } else { 2 })
+        {
             let restart = lane.ring.restart();
             let running = self.endpoint(lane).ok_or("endpoint va")?;
             if running.state != EndpointState::Running
@@ -480,7 +553,8 @@ impl NicResident {
         }
         self.life.configured().map_err(|_| "lifecycle configure")?;
         let clear_start = clock_get();
-        for address in [self.status.address, self.rx.address] {
+        let addresses = [self.status.address, self.rx.address, self.tx.address];
+        for &address in &addresses[..if tx { 3 } else { 2 }] {
             let clear_halt = [0x02, 0x01, 0x00, 0x00, address, 0x00, 0x00, 0x00];
             let mut ep0 = self.ep0();
             match control_no_data(
@@ -507,6 +581,9 @@ impl NicResident {
 
     /// Arm every Running lane without a transfer in flight. Never waits.
     pub(super) fn arm_idle(&mut self, io: &mut Mmio, layout: RegisterLayout) {
+        if ax88_link::TX_ENABLED {
+            self.tx_pump(io, layout);
+        }
         for lane in [NicLane::Rx, NicLane::Status] {
             if self.life.phase() != NicPhase::Running || self.life.is_pending(lane) {
                 continue;
@@ -527,6 +604,7 @@ impl NicResident {
         let config = match which {
             NicLane::Rx => NormalTransfer::bulk_in(lane.buffer.phys(), lane.len),
             NicLane::Status => NormalTransfer::interrupt_in(lane.buffer.phys(), lane.len),
+            NicLane::Tx => NormalTransfer::bulk_out(lane.buffer.phys(), lane.len),
         };
         let trb = Trb::normal_transfer(config).map_err(|_| ())?;
         let mut segment = lane.segment();
@@ -546,7 +624,7 @@ impl NicResident {
     }
 
     pub(super) fn ready(&self) -> bool {
-        [&self.rx, &self.status]
+        [&self.rx, &self.status, &self.tx]
             .into_iter()
             .filter_map(|lane| lane.ticket)
             .any(|ticket| completion_actors().has_ready(ticket).unwrap_or(false))
@@ -554,7 +632,7 @@ impl NicResident {
 
     /// Consume this owner's routed completions. Never waits for one.
     pub(super) fn service(&mut self) {
-        for which in [NicLane::Rx, NicLane::Status] {
+        for which in [NicLane::Rx, NicLane::Status, NicLane::Tx] {
             let Some(ticket) = self.lane_mut(which).ticket else {
                 continue;
             };
@@ -604,6 +682,7 @@ impl NicResident {
 
     fn deliver(&mut self, which: NicLane, actual: usize) {
         match which {
+            NicLane::Tx => self.tx_done(actual),
             NicLane::Status => {
                 self.status_reports += 1;
                 let bytes: [u8; 8] = self.status.buffer.read(0);
@@ -638,6 +717,119 @@ impl NicResident {
                     actual, frames
                 ));
             }
+        }
+    }
+
+    /// NET7a: hand the next due frame to the bulk OUT lane. Never waits.
+    fn tx_pump(&mut self, io: &mut Mmio, layout: RegisterLayout) {
+        let p = self.tx_proof;
+        let Some(node) = p.node else {
+            return;
+        };
+        let seq = p.next;
+        let now = clock_get();
+        if p.errors == 0
+            && self.life.is_pending(NicLane::Tx)
+            && p.submitted > p.completed
+            && now.saturating_sub(p.submit_ns) >= TX_COMPLETION_TIMEOUT_NS
+        {
+            let state = self.endpoint(&self.tx).map(|snapshot| snapshot.state);
+            self.tx_proof.errors += 1;
+            return ax88_record(format_args!(
+                "NET7 tx FAIL seq={} stage=deadline pending_ms={} submitted={} completed={} ep_state={:?}\n",
+                seq,
+                now.saturating_sub(p.submit_ns) / 1_000_000,
+                p.submitted,
+                p.completed,
+                state
+            ));
+        }
+        if p.errors > 0
+            || seq >= probe::TX_EXACT + probe::TX_BURST
+            || self.life.phase() != NicPhase::Running
+            || self.life.is_pending(NicLane::Tx)
+        {
+            return;
+        }
+        let due = p.receive_ns
+            + if seq < probe::TX_EXACT {
+                TX_EXACT_DELAY_NS + u64::from(seq) * TICK_NS
+            } else {
+                TX_BURST_DELAY_NS
+            };
+        if now < due {
+            return;
+        }
+        let mps = self.dev.profile.tx().max_packet_size;
+        // SAFETY: single-threaded; no earlier scratch borrow is live.
+        let (frame, out) = unsafe { &mut *TX_SCRATCH.0.get() };
+        let encoded = probe::tx_frame(seq, node, frame)
+            .ok_or(kumo_ax88::tx::Error::OutputShort)
+            .and_then(|len| kumo_ax88::tx::encode(&frame[..len], mps, out));
+        let Ok(n) = encoded else {
+            self.tx_proof.errors += 1;
+            return ax88_record(format_args!("NET7 tx FAIL seq={} stage=encode\n", seq));
+        };
+        self.tx.buffer.write_from(0, &out[..n]);
+        self.tx.len = n as u32;
+        if self.arm(NicLane::Tx, io, layout).is_err() {
+            self.tx_proof.errors += 1;
+            self.life.fail();
+            return ax88_record(format_args!(
+                "NET7 tx FAIL seq={} stage=arm; lanes retained\n",
+                seq
+            ));
+        }
+        let p = &mut self.tx_proof;
+        p.submitted += 1;
+        p.submit_ns = now;
+        if n.is_multiple_of(usize::from(mps)) {
+            p.pad_frames += 1;
+        }
+    }
+
+    /// NET7a: one exact OUT completion; the buffer may now take the next frame.
+    fn tx_done(&mut self, actual: usize) {
+        let len = self.tx.len as usize;
+        let mps = usize::from(self.dev.profile.tx().max_packet_size);
+        let p = &mut self.tx_proof;
+        let seq = p.next;
+        let took = clock_get().saturating_sub(p.submit_ns);
+        p.max_ns = p.max_ns.max(took);
+        if took >= 1_000_000_000 {
+            ax88_record(format_args!(
+                "NET7 tx slow seq={} ms={}\n",
+                seq,
+                took / 1_000_000
+            ));
+        }
+        if actual != len {
+            p.errors += 1;
+            return ax88_record(format_args!(
+                "NET7 tx FAIL seq={} stage=complete actual={} transfer={}\n",
+                seq, actual, len
+            ));
+        }
+        p.completed += 1;
+        p.bytes += (len - kumo_ax88::tx::PREFIX_LEN) as u64;
+        p.next += 1;
+        if seq >= probe::TX_EXACT && (seq - probe::TX_EXACT + 1).is_multiple_of(256) {
+            ax88_record(format_args!(
+                "NET7 tx progress seq={} completed={} ms={}\n",
+                seq,
+                p.completed,
+                clock_get().saturating_sub(p.receive_ns) / 1_000_000
+            ));
+        }
+        if seq < probe::TX_EXACT {
+            ax88_record(format_args!(
+                "NET7 tx seq={} len={} transfer={} pad={} us={}\n",
+                seq,
+                len - kumo_ax88::tx::PREFIX_LEN,
+                len,
+                len.is_multiple_of(mps) as u8,
+                took / 1_000
+            ));
         }
     }
 
@@ -706,7 +898,11 @@ impl NicResident {
         let page_va = self.dev.page_va;
         let slot = self.dev.slot_id;
         let mut ended = [Ended::Idle; 2];
-        for (n, which) in [NicLane::Rx, NicLane::Status].into_iter().enumerate() {
+        for (n, which) in [NicLane::Rx, NicLane::Status, NicLane::Tx]
+            .into_iter()
+            .enumerate()
+            .take(2)
+        {
             if !self.life.is_pending(which) {
                 continue;
             }
@@ -1080,7 +1276,8 @@ impl NicResident {
     ) -> bool {
         let controller = CONTROLLER_BASE.load(Ordering::Relaxed);
         let now = clock_get();
-        if ax88_link::RX_ENABLED && self.rx_tally.end > 0 {
+        let tx_done = !ax88_link::TX_ENABLED || self.tx_proof.finished();
+        if ax88_link::RX_ENABLED && self.rx_tally.end > 0 && tx_done {
             if self.rx_end_ns == 0 {
                 self.rx_end_ns = now;
             } else if now.saturating_sub(self.rx_end_ns) >= RX_SETTLE_NS {
@@ -1133,6 +1330,36 @@ impl NicResident {
             buffer,
         };
         let more = self.link_proof.tick(&mut port, status);
+        // NET7a: frames carry the node address the chip reports, read once receive is on.
+        if ax88_link::TX_ENABLED
+            && more
+            && self.tx_proof.node.is_none()
+            && self.tx_proof.errors == 0
+            && self.link_proof.receiving()
+        {
+            let mut bytes = [0u8; 6];
+            let read = port
+                .exchange(&Request::mac_read(MacRegister::NodeId), &mut bytes)
+                .ok()
+                .and_then(|()| decode_mac(&bytes).ok());
+            match read {
+                Some(mac) => {
+                    self.tx_proof.node = Some(mac);
+                    self.tx_proof.receive_ns = clock_get();
+                    ax88_record(format_args!(
+                        "NET7 tx node={} exact_in_ms={} burst_in_ms={} mps={}\n",
+                        Hex(&mac),
+                        TX_EXACT_DELAY_NS / 1_000_000,
+                        TX_BURST_DELAY_NS / 1_000_000,
+                        self.dev.profile.tx().max_packet_size
+                    ));
+                }
+                None => {
+                    self.tx_proof.errors += 1;
+                    ax88_record(format_args!("NET7 tx FAIL stage=node\n"));
+                }
+            }
+        }
         if !more {
             self.proof.done = true;
             self.link_finish(controller);
@@ -1167,33 +1394,67 @@ impl NicResident {
         let r = self.rx_tally;
         // NET5b keeps MAC receive off, so any RX completion is a finding there. NET6
         // needs every slow frame, some burst, the END frame and no invalid record.
-        let traffic = if ax88_link::RX_ENABLED {
-            r.parse_errors == 0
-                && r.invalid == 0
-                && r.duplicates == 0
-                && r.unexpected_seq == 0
-                && r.exact_received() == probe::EXACT
-                && r.burst_received > 0
-                && r.end > 0
-        } else {
-            self.rx_completions == 0
-        };
+        let x = self.tx_proof;
+        // Enabling TX adds one resident completion lane for the driver's life; the
+        // baseline was captured before its first arm.
+        let expected_lanes = p.lanes + usize::from(ax88_link::TX_ENABLED && x.submitted > 0);
+        let sent = !ax88_link::TX_ENABLED
+            || (x.errors == 0
+                && x.submitted == x.completed
+                && x.completed == probe::TX_EXACT + probe::TX_BURST
+                && !self.life.is_pending(NicLane::Tx));
+        let traffic = sent
+            && if ax88_link::RX_ENABLED {
+                r.parse_errors == 0
+                    && r.invalid == 0
+                    && r.duplicates == 0
+                    && r.unexpected_seq == 0
+                    && r.exact_received() == probe::EXACT
+                    && r.burst_received > 0
+                    && r.end > 0
+            } else {
+                self.rx_completions == 0
+            };
         if ax88_link::RX_ENABLED {
             self.receive_summary();
+        }
+        if ax88_link::TX_ENABLED {
+            let node = x.node.unwrap_or([0; 6]);
+            ax88_record(format_args!(
+                "NET7 tx summary node={} exact={}/{} burst={}/{} submitted={} completed={} bytes={} pad_frames={} errors={} max_us={} tx_pending={}\n",
+                Hex(&node),
+                x.completed.min(probe::TX_EXACT),
+                probe::TX_EXACT,
+                x.completed.saturating_sub(probe::TX_EXACT),
+                probe::TX_BURST,
+                x.submitted,
+                x.completed,
+                x.bytes,
+                x.pad_frames,
+                x.errors,
+                x.max_ns / 1_000,
+                self.life.is_pending(NicLane::Tx) as u8
+            ));
         }
         let pass = self.link_proof.outcome() == Some(true)
             && faults == 0
             && traffic
             && ep0_queued == 0
             && !self.pipe.is_quarantined()
-            && lanes == p.lanes
+            && lanes == expected_lanes
             && custody == p.custody
             && self.life.is_pending(NicLane::Rx)
             && self.life.is_pending(NicLane::Status)
             && (self.hid_idle_cc != Some(1) || hid > 0);
         ax88_record(format_args!(
             "{} census controller={:#x} slot={} registered={} routed={} consumed={} retired={} faults={} ep0_queued={} lanes={}/{} custody={}/{} rx_pending={} status_pending={} {}\n",
-            if ax88_link::RX_ENABLED { "NET6" } else { "NET5b" },
+            if ax88_link::TX_ENABLED {
+                "NET7"
+            } else if ax88_link::RX_ENABLED {
+                "NET6"
+            } else {
+                "NET5b"
+            },
             controller,
             self.dev.slot_id,
             after.registered - before.registered,
@@ -1202,7 +1463,7 @@ impl NicResident {
             after.retired - before.retired,
             faults,
             ep0_queued,
-            p.lanes,
+            expected_lanes,
             lanes,
             p.custody,
             custody,

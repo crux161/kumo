@@ -1,4 +1,5 @@
 //j826
+//j835
 use super::*;
 
 #[test]
@@ -93,4 +94,20 @@ fn mac_address_requires_exact_nonzero_unicast_value() {
     for bytes in [[2, 0, 0, 0, 0, 1], [0, 0x0e, 0xc6, 0x11, 0x22, 0x33]] {
         assert_eq!(decode_mac(&bytes), Ok(bytes));
     }
+}
+
+#[test]
+fn fifo_status_is_the_reference_0x81_0x8c_four_byte_read() {
+    let request = Request::fifo_status();
+    assert_eq!(
+        request.setup(),
+        [0xc0, 0x81, 0x8c, 0x00, 0x00, 0x00, 0x04, 0x00]
+    );
+    assert_eq!(request.direction(), Direction::In);
+    assert_eq!(request.transfer_len(), 4);
+    assert_eq!(request.validate_transferred(4), Ok(()));
+    assert_eq!(
+        request.validate_transferred(3),
+        Err(Error::CompletionLength)
+    );
 }
