@@ -2,6 +2,7 @@
 //j834
 //j836
 //j839
+//j840
 extern crate std;
 use super::*;
 use std::string::{String, ToString};

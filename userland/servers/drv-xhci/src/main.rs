@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j829
 //j830
 //j831
 //j832
 //j833
+//j840
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -3635,7 +3635,7 @@ fn run_hid_lanes(
                     }
                 }
                 if let Some(resident) = nic.as_mut() {
-                    resident.arm_idle(io, layout);
+                    resident.arm_idle(io, layout, image, evt);
                 }
                 let mut tick = false;
                 let waited = !hid_ready(lanes) && !nic.as_ref().is_some_and(|n| n.ready());

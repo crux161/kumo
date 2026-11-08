@@ -1,8 +1,8 @@
-//j833
 //j834
 //j835
 //j838
 //j839
+//j840
 //! NET4c-3: the ax88's resident RX and status lanes on the one controller owner. It is
 //! default-off: without KUMO_AX88_RESIDENT_PROOF the adapter stays unconfigured, as
 //! since NET0.
@@ -85,7 +85,7 @@ const TX_BURST_DELAY_NS: u64 = 11_000_000_000;
 const TX_EXACT_GAP_NS: u64 = 10_000_000;
 /// J839 experiment: ask for the reference TX re-arm every this many completions; the
 /// link tick performs it and records the chip's FIFO word.
-const TX_REARM_EVERY: u32 = 16;
+const TX_REARM_EVERY: u32 = 1;
 /// A submitted transfer whose exact completion never arrives must not wedge the proof.
 /// Full-duplex load starves OUT completions for tens of seconds (12.2 s and 32.5 s
 /// measured at seq 623 on metal), so the bound sits far above that before the schedule
@@ -588,9 +588,40 @@ impl NicResident {
     }
 
     /// Arm every Running lane without a transfer in flight. Never waits.
-    pub(super) fn arm_idle(&mut self, io: &mut Mmio, layout: RegisterLayout) {
+    pub(super) fn arm_idle(
+        &mut self,
+        io: &mut Mmio,
+        layout: RegisterLayout,
+        image: &mut NoOpCommandImage,
+        evt: &DmaTrbs,
+    ) {
         if ax88_link::TX_ENABLED {
             self.tx_pump(io, layout);
+            // The per-wake re-arm pump: the link tick runs at 10 Hz while frames flow at
+            // ~270/s, so the kick belongs here. Guarded to the receiving link.
+            if self.link_proof.receiving() {
+                let segment = self.ep0();
+                // SAFETY: the adapter's own page holds its EP0 data buffer for life.
+                let buffer = unsafe {
+                    DmaBuf::new(
+                        (self.dev.page_va as usize + OFF_DATA) as *mut u8,
+                        self.dev.page_phys + OFF_DATA as u64,
+                        8,
+                    )
+                };
+                let mut port = Ep0Port {
+                    io: &mut *io,
+                    layout,
+                    image: &mut *image,
+                    evt,
+                    ring: &mut self.dev.ep0_ring,
+                    segment,
+                    slot: self.dev.slot_id,
+                    pipe: &mut self.pipe,
+                    buffer,
+                };
+                let _ = kumo_ax88::link::rearm_take(&mut port);
+            }
         }
         for lane in [NicLane::Rx, NicLane::Status] {
             if self.life.phase() != NicPhase::Running || self.life.is_pending(lane) {
@@ -1154,7 +1185,7 @@ impl NicResident {
         }
         let cycle = tick - IDLE_TICKS;
         // Both lanes pending going in, so every cycle has exactly two verified stops.
-        self.arm_idle(io, layout);
+        self.arm_idle(io, layout, image, evt);
         let start = clock_get();
         self.last_start_ns = (0, 0);
         let result = self.stop(io, layout, image, cmd, evt);
@@ -1169,7 +1200,7 @@ impl NicResident {
             Ok(ended)
         });
         if result.is_ok() {
-            self.arm_idle(io, layout);
+            self.arm_idle(io, layout, image, evt);
         }
         let elapsed = clock_get().saturating_sub(start);
         self.proof.max_cycle_ns = self.proof.max_cycle_ns.max(elapsed);

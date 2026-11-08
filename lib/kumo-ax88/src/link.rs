@@ -2,6 +2,7 @@
 //j834
 //j836
 //j839
+//j840
 //! NET5b: minimal volatile initialization and link control for the NET0-profiled
 //! AX88179, as pure sequencing over an exact vendor-request port. Every value comes
 //! from the supplied ax88179_178a.c (reset, link_reset, set_rx_mode, unbind), cut to
@@ -182,6 +183,38 @@ static REARM_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 
 pub fn request_rearm() {
     REARM_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Consume the pending flag and, if set, run the re-arm on this port: RX_CTL 0000
+/// then START|AB|IPE and one 0x81|0x8c FIFO read, recorded for the peer capture.
+/// Callers gate on the link actually receiving; the fast path is the driver's
+/// every-wake pump, the link tick is the fallback. — TIMBERDOODLE
+pub fn rearm_take<P: Port>(port: &mut P) -> bool {
+    if !REARM_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let on = match Request::mac_write(
+        MacRegister::RxControl,
+        &(RX_CTL_START | RX_CTL_AB | RX_CTL_IPE).to_le_bytes(),
+    ) {
+        Ok(request) => request,
+        Err(_) => return false,
+    };
+    let Ok(off) = Request::mac_write(MacRegister::RxControl, &[0x00, 0x00]) else {
+        return false;
+    };
+    let mut back = [0u8; 6];
+    if port.exchange(&off, &mut back).is_err()
+        || port.exchange(&on, &mut back).is_err()
+        || port.exchange(&Request::fifo_status(), &mut back).is_err()
+    {
+        return false;
+    }
+    port.record(format_args!(
+        "NET7 tx rearm fifo={:#010x}\n",
+        u32::from_le_bytes([back[0], back[1], back[2], back[3]])
+    ));
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -741,22 +774,12 @@ impl Link {
     /// Runs a pending TX re-arm on the tick's own frame: RX_CTL 0000 then
     /// START|AB|IPE and one 0x81/0x8c FIFO read, recorded for the peer capture.
     fn rearm_if_pending<P: Port>(&mut self, port: &mut P) -> Step {
-        if !self.receiving || !REARM_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        if !self.receiving {
             return Ok(());
         }
-        let on = Request::mac_write(
-            MacRegister::RxControl,
-            &(RX_CTL_START | RX_CTL_AB | RX_CTL_IPE).to_le_bytes(),
-        )
-        .map_err(|_| Stop)?;
-        let off = Request::mac_write(MacRegister::RxControl, &[0x00, 0x00]).map_err(|_| Stop)?;
-        self.transfer(port, &off)?;
-        self.transfer(port, &on)?;
-        let fifo = self.transfer(port, &Request::fifo_status())?;
-        port.record(format_args!(
-            "NET7 tx rearm fifo={:#010x}\n",
-            u32::from_le_bytes([fifo[0], fifo[1], fifo[2], fifo[3]])
-        ));
+        if !rearm_take(port) {
+            return Ok(());
+        }
         Ok(())
     }
 
