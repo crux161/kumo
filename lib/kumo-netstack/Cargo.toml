@@ -19,6 +19,10 @@ smoltcp = { version = "=0.14.0", default-features = false, features = [
     "socket-icmp",
     # NET8 (J844): the interface itself answers echo requests addressed to it (DESIGN/026 §8).
     "auto-icmp-echo-reply",
+    # NET11 (J849): DHCP configuration as launcher policy; the client socket lives in the
+    # wire stack only (DESIGN/026 §8). No new crate enters the closure.
+    "proto-dhcpv4",
+    "socket-dhcpv4",
 ] }
 
 [lib]

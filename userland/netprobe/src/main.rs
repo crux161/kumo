@@ -1113,6 +1113,226 @@ fn tcpwire_churn(client: &mut Client, ip: [u8; 4], port: u16, retries: u32) -> b
     ok
 }
 
+/// NET11: watch the wire configuration the launcher's DHCP policy produces, then prove the
+/// lease carries traffic. The observable is GETNAME's local address on a socket connected
+/// to the peer: 0.0.0.0 until a lease, the leased address after, and 0.0.0.0 again when
+/// the lease expires. `seconds` bounds the window after the wire attaches; the connect
+/// phase before that is bounded separately.
+fn dhcp_watch(client: &mut Client, peer: [u8; 4], echo_port: u16, seconds: u16) {
+    let socket = client.udp_socket();
+    client.bind_any(socket, 0);
+    let pause = client.udp_socket();
+    client.bind_any(pause, 0);
+    let target = Addr {
+        ip: peer,
+        port: echo_port,
+    };
+    let (mut connected, mut last) = (false, [0u8; 4]);
+    let (mut acquired, mut lost, mut echoes, mut refused) = (0u32, 0u32, 0u32, 0u32);
+    let (mut odd, mut empty, mut rxerr, mut wto) = (0u32, 0u32, 0u32, 0u32);
+    let (mut observed, mut waiting) = (0u32, 0u32);
+    let mut port_logged = false;
+    while observed < u32::from(seconds) * 2 {
+        if !connected {
+            // The wire attaches with the late service wave; connect may be refused first.
+            let status = client.call(Op::Connect, socket, 0, &target.encode()).status;
+            if status == Status::Ok {
+                connected = true;
+            } else if status != Status::NetUnreachable {
+                client.fail(&[b"dhcp connect -> ", status_name(status)]);
+                break;
+            } else {
+                waiting += 1;
+                if waiting > 1200 {
+                    client.fail(&[b"dhcp: the wire never attached"]);
+                    break;
+                }
+            }
+        }
+        if connected {
+            observed += 1;
+            let names = client.call(Op::GetName, socket, 0, &[]);
+            if names.status == Status::Ok && names.len >= 8 {
+                let payload = client.payload(&names);
+                if !port_logged {
+                    port_logged = true;
+                    log_dhcp_port(payload[2], payload[3]);
+                }
+                let ip = [payload[4], payload[5], payload[6], payload[7]];
+                if ip != last {
+                    if ip == [0; 4] {
+                        if last != [0; 4] {
+                            lost += 1;
+                            log_dhcp(b"netprobe: dhcp lease lost");
+                        }
+                    } else {
+                        acquired += 1;
+                        log_dhcp_addr(ip);
+                    }
+                    last = ip;
+                }
+                if ip != [0; 4] {
+                    let mut probe = [0u8; 32];
+                    let n = dhcp_probe(&mut probe, observed);
+                    // A late echo from a previous probe must not desynchronize the
+                    // comparison: drain the socket before sending this one.
+                    loop {
+                        if client.call(Op::RecvFrom, socket, 64, &[]).status != Status::Ok {
+                            break;
+                        }
+                    }
+                    match client.call(Op::Send, socket, 0, &probe[..n]).status {
+                        Status::Ok => {
+                            if wait(client, socket, WAIT_READABLE, 300) == Status::Ok {
+                                let got = client.call(Op::RecvFrom, socket, 64, &[]);
+                                match got.status {
+                                    Status::Ok if got.len > ADDR_LEN => {
+                                        let payload = client.payload(&got);
+                                        if payload[ADDR_LEN..] == probe[..n] {
+                                            echoes += 1;
+                                        } else {
+                                            odd += 1;
+                                            if odd == 1 {
+                                                log_dhcp_recv(b"odd", got.len);
+                                            }
+                                        }
+                                    }
+                                    Status::Ok => {
+                                        empty += 1;
+                                        if empty == 1 {
+                                            log_dhcp_recv(b"empty", got.len);
+                                        }
+                                    }
+                                    other => {
+                                        rxerr += 1;
+                                        if rxerr == 1 {
+                                            client.fail(&[b"dhcp recv -> ", status_name(other)]);
+                                        }
+                                    }
+                                }
+                            } else {
+                                wto += 1;
+                            }
+                        }
+                        Status::NetUnreachable => refused += 1,
+                        _ => {}
+                    }
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+        let _ = wait(client, pause, WAIT_READABLE, 500);
+    }
+    let mut line = [0u8; 160];
+    let mut at = 0usize;
+    for part in [
+        &b"netprobe: dhcp acquired="[..],
+        dec(u64::from(acquired)).bytes(),
+        &b" lost="[..],
+        dec(u64::from(lost)).bytes(),
+        &b" echoes="[..],
+        dec(u64::from(echoes)).bytes(),
+        &b" refused="[..],
+        dec(u64::from(refused)).bytes(),
+        &b" odd="[..],
+        dec(u64::from(odd)).bytes(),
+        &b" empty="[..],
+        dec(u64::from(empty)).bytes(),
+        &b" rxerr="[..],
+        dec(u64::from(rxerr)).bytes(),
+        &b" wto="[..],
+        dec(u64::from(wto)).bytes(),
+        &b"\n"[..],
+    ] {
+        let take = part.len().min(line.len() - at);
+        line[at..at + take].copy_from_slice(&part[..take]);
+        at += take;
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line[..at]);
+    if acquired >= 1 && echoes >= 1 {
+        client.out.line(&[b"netprobe: dhcp lease lifecycle exact"]);
+    } else {
+        client.fail(&[b"dhcp campaign incomplete"]);
+    }
+}
+
+fn log_dhcp_recv(tag: &[u8], len: usize) {
+    let mut buf = [0u8; 96];
+    let mut at = 0usize;
+    for part in [
+        &b"netprobe: dhcp first "[..],
+        tag,
+        &b" len="[..],
+        dec(len as u64).bytes(),
+        &b"\n"[..],
+    ] {
+        let take = part.len().min(buf.len() - at);
+        buf[at..at + take].copy_from_slice(&part[..take]);
+        at += take;
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
+}
+
+fn log_dhcp_port(lo: u8, hi: u8) {
+    let port = u16::from_le_bytes([lo, hi]);
+    let mut buf = [0u8; 64];
+    let head = b"netprobe: dhcp bound port=";
+    buf[..head.len()].copy_from_slice(head);
+    let d = dec(u64::from(port));
+    let bytes = d.bytes();
+    let take = bytes.len().min(buf.len() - head.len());
+    buf[head.len()..head.len() + take].copy_from_slice(&bytes[..take]);
+    let mut at = head.len() + take;
+    buf[at] = b'\n';
+    at += 1;
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
+}
+
+fn dhcp_probe(buf: &mut [u8; 32], n: u32) -> usize {
+    let mut at = 0usize;
+    for part in [&b"kumo-dhcp "[..], dec(u64::from(n)).bytes()] {
+        let take = part.len().min(buf.len() - at);
+        buf[at..at + take].copy_from_slice(&part[..take]);
+        at += take;
+    }
+    at
+}
+
+fn log_dhcp(text: &[u8]) {
+    let mut buf = [0u8; 96];
+    let mut at = 0usize;
+    for part in [text, &b"\n"[..]] {
+        let take = part.len().min(buf.len() - at);
+        buf[at..at + take].copy_from_slice(&part[..take]);
+        at += take;
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
+}
+
+fn log_dhcp_addr(ip: [u8; 4]) {
+    let mut buf = [0u8; 96];
+    let head = b"netprobe: dhcp lease ";
+    buf[..head.len()].copy_from_slice(head);
+    let mut at = head.len();
+    for (i, byte) in ip.iter().enumerate() {
+        if i > 0 {
+            buf[at] = b'.';
+            at += 1;
+        }
+        let d = dec(u64::from(*byte));
+        let bytes = d.bytes();
+        let take = bytes.len().min(buf.len() - at);
+        buf[at..at + take].copy_from_slice(&bytes[..take]);
+        at += take;
+    }
+    if at < buf.len() {
+        buf[at] = b'\n';
+        at += 1;
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
+}
+
 fn udp(client: &mut Client) {
     let a = client.udp_socket();
     let b = client.udp_socket();
@@ -1787,7 +2007,12 @@ extern "C" fn main(
     let mode: &[u8] = args.next().unwrap_or(b"");
     // `wire <ip> <port> [count]` and `ping <ip> [count]` take an address where the other
     // modes take a port; ping has no port, so its first number is the count.
-    let wire_ip = if mode == b"wire" || mode == b"ping" || mode == b"peer" || mode == b"tcpwire" {
+    let wire_ip = if mode == b"wire"
+        || mode == b"ping"
+        || mode == b"peer"
+        || mode == b"tcpwire"
+        || mode == b"dhcp"
+    {
         args.next().and_then(parse_ipv4)
     } else {
         None
@@ -1870,6 +2095,14 @@ extern "C" fn main(
                 retries,
             )
         }
+        b"dhcp" if wire_ip.is_some_and(|ip| ip != [0; 4]) && port.is_some_and(|p| p != 0) => {
+            dhcp_watch(
+                &mut client,
+                wire_ip.unwrap_or([0; 4]),
+                port.unwrap_or(0),
+                count.unwrap_or(120),
+            )
+        }
         b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
         b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
         b"tcperrors" => tcp_errors(&mut client),
@@ -1877,7 +2110,7 @@ extern "C" fn main(
         b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries] | tcpwire <ip> <port> [retries]",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries] | tcpwire <ip> <port> [retries] | dhcp <ip> <echo-port> [seconds]",
             ]);
             process_exit(2);
         }

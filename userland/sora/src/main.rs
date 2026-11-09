@@ -2029,6 +2029,30 @@ fn log(msg: &[u8]) {
     debug_write(msg.as_ptr(), msg.len());
 }
 
+/// Kernel-log decimal append: prefix and digits in one NOTICE write, so a value cannot
+/// split across the console stream (debug_write) and the kernel-log ring (log_write).
+/// The NET11 grant line first printed as `server= client=` for exactly that reason.
+fn log_notice_dec(prefix: &[u8], mut value: u64) {
+    let mut buf = [0u8; 64];
+    let take = prefix.len().min(buf.len());
+    buf[..take].copy_from_slice(&prefix[..take]);
+    let mut at = take;
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let take = (digits.len() - i).min(buf.len() - at);
+    buf[at..at + take].copy_from_slice(&digits[i..i + take]);
+    at += take;
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
+}
+
 /// The log view's own records: terminal output, not kernel-log entries. The view reads the
 /// same ring it would otherwise narrate into, so its bookkeeping must not feed itself.
 /// — TIMBERDOODLE
@@ -2465,8 +2489,15 @@ const XHCI_STORAGE_BOOTSTRAP_TAG: u8 = b'b';
 const XHCI_FRAME_BOOTSTRAP_TAG: u8 = b'f';
 /// The admin message tag (to the driver) and netstack control tag carrying a frame-channel end.
 const FRAME_CHANNEL_TAG: u8 = b'F';
-/// NET11 brings DHCP; until then the wire interface takes a fixed LAN address, granted to
-/// netstack with the frame channel (DESIGN/026 §3).
+/// NET11: the alternative grant asks netstack to configure the wire interface by DHCP
+/// instead of the fixed address; the port pair rides the grant (67/68 by default, the
+/// isolated test server's ports in the proof).
+const CONTROL_DHCP_TAG: u8 = b'D';
+/// The NET11 policy: 0 keeps the static address; nonzero selects DHCP at the next grant.
+/// Set by the `netpolicy` shell word only — network configuration is a launcher decision.
+static NET_POLICY_DHCP: AtomicU32 = AtomicU32::new(0);
+static NET_POLICY_PORTS: AtomicU32 = AtomicU32::new((67 << 16) | 68);
+/// The static default, granted when the policy stays static (DESIGN/026 §3).
 const WIRE_ADDR: [u8; 4] = [192, 168, 0, 50];
 const WIRE_PREFIX: u8 = 24;
 
@@ -7216,6 +7247,49 @@ fn eval_command(
         } else {
             run_program_granted(initrd, &cmd.args, true);
         }
+    } else if cmd.name == "netpolicy" {
+        // netpolicy [static | dhcp [server_port client_port]]: choose how the resident
+        // netstack configures the wire interface. This is the NET11 policy surface: the
+        // configuration mode is a launcher decision, never a client's. The word takes
+        // effect at the next frame grant (netstack start or restart). — TIMBERDOODLE
+        match cmd.args.first().map(|a| a.as_str()) {
+            None => {
+                if NET_POLICY_DHCP.load(Ordering::Relaxed) != 0 {
+                    let ports = NET_POLICY_PORTS.load(Ordering::Relaxed);
+                    log(b"netpolicy: dhcp server_port=");
+                    log_dec(u64::from((ports >> 16) & 0xFFFF));
+                    log(b" client_port=");
+                    log_dec(u64::from(ports & 0xFFFF));
+                    log(b"\n");
+                } else {
+                    log(b"netpolicy: static 192.168.0.50/24\n");
+                }
+            }
+            Some("static") if cmd.args.len() == 1 => {
+                NET_POLICY_DHCP.store(0, Ordering::Relaxed);
+                log(b"netpolicy: static 192.168.0.50/24\n");
+            }
+            Some("dhcp") if cmd.args.len() <= 3 => {
+                let server: u16 = cmd.args.get(1).and_then(|a| a.parse().ok()).unwrap_or(67);
+                let client: u16 = cmd.args.get(2).and_then(|a| a.parse().ok()).unwrap_or(68);
+                if server == 0 || client == 0 || server == client {
+                    usage(b"usage: netpolicy dhcp [server_port client_port]\n");
+                } else {
+                    NET_POLICY_PORTS.store(
+                        (u32::from(server) << 16) | u32::from(client),
+                        Ordering::Relaxed,
+                    );
+                    NET_POLICY_DHCP.store(1, Ordering::Relaxed);
+                    log(b"netpolicy: dhcp server_port=");
+                    log_dec(u64::from(server));
+                    log(b" client_port=");
+                    log_dec(u64::from(client));
+                    log(b"\n");
+                }
+            }
+            _ => usage(b"usage: netpolicy [static | dhcp [server_port client_port]]\n"),
+        }
+        return true;
     } else if cmd.name == "run" {
         // run <program> [args...]: spawn bin/<program> and run it to completion, handing it
         // stdout + its arguments through the bootstrap startup message (x0) — no initrd, so a
@@ -7770,12 +7844,22 @@ fn grant_frame_channel(control: Handle) {
         );
         return;
     }
+    // NET11: the configuration mode is policy. Static grants the fixed address; DHCP
+    // grants the port pair and netstack acquires the address from a lease.
     let mut grant = [0u8; 6];
-    grant[0] = FRAME_CHANNEL_TAG;
-    grant[1..5].copy_from_slice(&WIRE_ADDR);
-    grant[5] = WIRE_PREFIX;
-    if channel_write_with_handle(control, grant.as_ptr(), grant.len(), stack) != Errno::Ok.status()
-    {
+    let len = if NET_POLICY_DHCP.load(Ordering::Relaxed) != 0 {
+        let ports = NET_POLICY_PORTS.load(Ordering::Relaxed);
+        grant[0] = CONTROL_DHCP_TAG;
+        grant[1..3].copy_from_slice(&(((ports >> 16) & 0xFFFF) as u16).to_le_bytes());
+        grant[3..5].copy_from_slice(&((ports & 0xFFFF) as u16).to_le_bytes());
+        5
+    } else {
+        grant[0] = FRAME_CHANNEL_TAG;
+        grant[1..5].copy_from_slice(&WIRE_ADDR);
+        grant[5] = WIRE_PREFIX;
+        6
+    };
+    if channel_write_with_handle(control, grant.as_ptr(), len, stack) != Errno::Ok.status() {
         let _ = handle_close(stack);
         kumo_rt::log_write(
             kumo_abi::sys::log_level::NOTICE,
@@ -7783,10 +7867,24 @@ fn grant_frame_channel(control: Handle) {
         );
         return;
     }
-    kumo_rt::log_write(
-        kumo_abi::sys::log_level::NOTICE,
-        b"netstack: frame channel granted to netstack and provider\n",
-    );
+    if NET_POLICY_DHCP.load(Ordering::Relaxed) != 0 {
+        let ports = NET_POLICY_PORTS.load(Ordering::Relaxed);
+        kumo_rt::log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"netstack: dhcp frame grant to netstack and provider\n",
+        );
+        log_notice_dec(
+            b"netstack: dhcp ports server=",
+            u64::from((ports >> 16) & 0xFFFF),
+        );
+        log_notice_dec(b" client=", u64::from(ports & 0xFFFF));
+        kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, b"\n");
+    } else {
+        kumo_rt::log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"netstack: frame channel granted to netstack and provider\n",
+        );
+    }
 }
 
 fn netstack_start() -> bool {

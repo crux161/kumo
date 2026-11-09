@@ -29,7 +29,7 @@ use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid, port_bind,
     port_create, port_unbind, port_wait, timer_create,
 };
-use netstack::{After, IngressError, Output, Server};
+use netstack::{After, IngressError, Output, Server, WireConfig, WireEvent};
 
 kumo_rt::entry!(main);
 
@@ -37,6 +37,8 @@ kumo_rt::entry!(main);
 const CONTROL_SESSION: u8 = b'S';
 /// A frame-channel grant: tag, IPv4 address (4 bytes), prefix (1), channel attached.
 const CONTROL_FRAME: u8 = b'F';
+/// NET11: a DHCP grant: tag, server port u16 LE, client port u16 LE.
+const CONTROL_DHCP: u8 = b'D';
 /// Timers shorter than this are rounded up, so a busy stack cannot spin the loop.
 const MIN_TIMER_NS: u64 = 1_000_000;
 
@@ -47,6 +49,53 @@ fn log(level: u8, message: &[u8]) {
 fn fail(message: &[u8]) -> ! {
     log(log_level::ERR, message);
     kumo_rt::process_exit(1)
+}
+
+/// NET11: lease events reach the serial console here (dmesg and the journal capture them).
+fn log_wire_events(server: &mut Server) {
+    while let Some(event) = server.take_wire_event() {
+        let mut line = Vec::with_capacity(96);
+        match event {
+            WireEvent::DhcpLease {
+                addr,
+                prefix,
+                router,
+            } => {
+                line.extend_from_slice(b"netstack: dhcp lease ");
+                push_ipv4(&mut line, addr);
+                line.push(b'/');
+                push_dec(&mut line, u64::from(prefix));
+                if let Some(router) = router {
+                    line.extend_from_slice(b" router ");
+                    push_ipv4(&mut line, router);
+                }
+                line.push(b'\n');
+            }
+            WireEvent::DhcpRenewed { addr, prefix } => {
+                line.extend_from_slice(b"netstack: dhcp renewed ");
+                push_ipv4(&mut line, addr);
+                line.push(b'/');
+                push_dec(&mut line, u64::from(prefix));
+                line.push(b'\n');
+            }
+            WireEvent::DhcpExpired => {
+                line.extend_from_slice(b"netstack: dhcp lease expired\n");
+            }
+            WireEvent::DhcpDiscardedByGeneration => {
+                line.extend_from_slice(b"netstack: dhcp lease discarded by interface generation\n");
+            }
+        }
+        log(log_level::NOTICE, &line);
+    }
+}
+
+fn push_ipv4(line: &mut Vec<u8>, addr: [u8; 4]) {
+    for (i, byte) in addr.iter().enumerate() {
+        if i > 0 {
+            line.push(b'.');
+        }
+        push_dec(line, u64::from(*byte));
+    }
 }
 
 fn valid(raw: u64) -> Option<Handle> {
@@ -145,8 +194,8 @@ struct Frame {
     channel: Handle,
     koid: u64,
     lane: Lane,
-    addr: [u8; 4],
-    prefix: u8,
+    /// NET11: the launcher's configuration mode, granted with the channel.
+    config: WireConfig,
     /// `wire_delivered()` at the last CREDIT return.
     returned: u64,
     /// RX_FRAMEs the wire device or the ingress policy refused.
@@ -164,8 +213,7 @@ fn install_frame(
     server: &mut Server,
     port: Handle,
     channel: Handle,
-    addr: [u8; 4],
-    prefix: u8,
+    config: WireConfig,
 ) {
     close_frame(frame, server, port);
     let koid = handle_koid(channel);
@@ -178,8 +226,7 @@ fn install_frame(
         channel,
         koid,
         lane: Lane::new(),
-        addr,
-        prefix,
+        config,
         returned: 0,
         device_drops: 0,
         refused: 0,
@@ -251,8 +298,11 @@ fn serve_frame(frame: &mut Option<Frame>, server: &mut Server, port: Handle, now
     }
     match message.body {
         Body::Hello(hello) => {
-            server.attach_wire(now, hello.mac, f.addr, f.prefix);
+            server.attach_wire_config(now, hello.mac, f.config);
             log(log_level::NOTICE, b"netstack: wire interface up\n");
+            if matches!(f.config, WireConfig::Dhcp { .. }) {
+                log(log_level::NOTICE, b"netstack: dhcp discovering\n");
+            }
         }
         Body::Link { up, mbps, .. } => {
             let mut line = Vec::with_capacity(64);
@@ -421,12 +471,33 @@ extern "C" fn main(
                         &mut server,
                         port,
                         channel,
-                        [grant[1], grant[2], grant[3], grant[4]],
-                        grant[5],
+                        WireConfig::Static {
+                            addr: [grant[1], grant[2], grant[3], grant[4]],
+                            prefix: grant[5],
+                        },
                     ),
                     None => log(
                         log_level::WARNING,
                         b"netstack: frame grant without a channel\n",
+                    ),
+                }
+            } else if n == 5 && grant[0] == CONTROL_DHCP {
+                let server_port = u16::from_le_bytes([grant[1], grant[2]]);
+                let client_port = u16::from_le_bytes([grant[3], grant[4]]);
+                match valid(raw) {
+                    Some(channel) => install_frame(
+                        &mut frame,
+                        &mut server,
+                        port,
+                        channel,
+                        WireConfig::Dhcp {
+                            server_port,
+                            client_port,
+                        },
+                    ),
+                    None => log(
+                        log_level::WARNING,
+                        b"netstack: dhcp grant without a channel\n",
                     ),
                 }
             } else if let Some(channel) = valid(raw) {
@@ -486,5 +557,6 @@ extern "C" fn main(
         channels.write(&mut out);
         channels.arm(&mut server, clock_get());
         pump_frame(&mut frame, &mut server);
+        log_wire_events(&mut server);
     }
 }

@@ -32,7 +32,7 @@ use kumo_netstack::smoltcp::iface::{
     Config, Interface, PollResult, SocketHandle, SocketSet, SocketStorage,
 };
 use kumo_netstack::smoltcp::phy::ChecksumCapabilities;
-use kumo_netstack::smoltcp::socket::{icmp, tcp, udp};
+use kumo_netstack::smoltcp::socket::{dhcpv4, icmp, tcp, udp};
 use kumo_netstack::smoltcp::time::Instant;
 use kumo_netstack::smoltcp::wire::{
     EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
@@ -173,18 +173,53 @@ pub enum IngressError {
 /// device. A shared table would let whichever interface polls first dispatch a socket's
 /// egress with its own addresses and medium (smoltcp's `poll` contract), so the wire gets
 /// its own `SocketSet` and the Server routes each operation to the right stack.
+/// NET11: the DHCP client's receive packet buffer (a DHCP message is far under 576 B).
+const DHCP_PACKET_BUFFER: usize = 576;
+
+/// NET11: how the wire interface is configured, chosen by the launcher's frame grant.
+#[derive(Clone, Copy)]
+pub enum WireConfig {
+    /// The fixed LAN address (the pre-NET11 behavior, unchanged).
+    Static { addr: [u8; 4], prefix: u8 },
+    /// DHCP with the granted port pair: 67/68 in production, the isolated test server's
+    /// ports in the proof. The client socket lives in this generation's wire stack.
+    Dhcp { server_port: u16, client_port: u16 },
+}
+
+/// NET11: lease lifecycle events, drained by the server loop and logged as NOTICE lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireEvent {
+    DhcpLease {
+        addr: [u8; 4],
+        prefix: u8,
+        router: Option<[u8; 4]>,
+    },
+    DhcpRenewed {
+        addr: [u8; 4],
+        prefix: u8,
+    },
+    DhcpExpired,
+    DhcpDiscardedByGeneration,
+}
+
 struct Wire {
     device: Box<FrameDevice>,
     iface: Interface,
     sockets: SocketSet<'static>,
     mac: [u8; 6],
+    config: WireConfig,
+    /// The address the stack currently answers on: the grant's, or the DHCP lease's.
     addr: [u8; 4],
     prefix: u8,
+    /// NET11: the DHCP socket in this generation's wire set (DHCP mode only).
+    dhcp: Option<SocketHandle>,
     /// NET8's ingress refusals: frames the policy kept out of the stack, by kind.
     refusals: Refusals,
 }
 
 pub struct Server {
+    /// NET11 lease events awaiting the loop's NOTICE logging.
+    wire_events: Vec<WireEvent>,
     iface: Interface,
     /// Boxed: the 16-slot ring is ~24 KB, more than a native child's 16 KiB default stack.
     device: Box<Loopback>,
@@ -321,6 +356,7 @@ impl Server {
             device,
             sockets,
             wire: None,
+            wire_events: Vec::new(),
             slots,
             sessions: (0..SESSIONS).map(|_| None).collect(),
             next_generation: 1,
@@ -368,24 +404,55 @@ impl Server {
     /// provider's MAC and the Sora-granted address (DESIGN/026 §3; DHCP is NET11). Every slot
     /// gains a wire UDP twin bound to the same port, so a bound port is one namespace reachable
     /// from both stacks.
+    /// The pre-NET11 static configuration, kept as the launcher's default.
     pub fn attach_wire(&mut self, now_ns: u64, mac: [u8; 6], addr: [u8; 4], prefix: u8) {
+        self.attach_wire_config(now_ns, mac, WireConfig::Static { addr, prefix });
+    }
+
+    /// NET11: DHCP configuration; the port pair is the granted one.
+    pub fn attach_wire_dhcp(
+        &mut self,
+        now_ns: u64,
+        mac: [u8; 6],
+        server_port: u16,
+        client_port: u16,
+    ) {
+        self.attach_wire_config(
+            now_ns,
+            mac,
+            WireConfig::Dhcp {
+                server_port,
+                client_port,
+            },
+        );
+    }
+
+    pub fn attach_wire_config(&mut self, now_ns: u64, mac: [u8; 6], config: WireConfig) {
+        // A lease never survives a different interface generation silently (NET11).
+        if let Some(old) = self.wire.as_ref() {
+            if matches!(old.config, WireConfig::Dhcp { .. }) && old.addr != [0; 4] {
+                self.wire_events.push(WireEvent::DhcpDiscardedByGeneration);
+            }
+        }
         let mut device = boxed_frame_device();
         let mut iface = Interface::new(
             Config::new(HardwareAddress::Ethernet(EthernetAddress(mac))),
             &mut *device,
             instant(now_ns),
         );
-        iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(
-                IpAddress::Ipv4(Ipv4Address::from(addr)),
-                prefix,
-            ));
-        });
+        if let WireConfig::Static { addr, prefix } = config {
+            iface.update_ip_addrs(|addrs| {
+                let _ = addrs.push(IpCidr::new(
+                    IpAddress::Ipv4(Ipv4Address::from(addr)),
+                    prefix,
+                ));
+            });
+        }
         // Half the table is the per-slot UDP twins; the rest serves the ICMP (NET8) and TCP
         // twin sockets created on demand (NET10): a slot is one kind at a time, so one
-        // on-demand socket per slot fits the reserve exactly.
+        // on-demand socket per slot fits the reserve exactly. NET11 adds the DHCP socket.
         let storage: &'static mut [SocketStorage<'static>] = Box::leak(
-            (0..2 * SOCKETS_TOTAL)
+            (0..2 * SOCKETS_TOTAL + 1)
                 .map(|_| SocketStorage::EMPTY)
                 .collect(),
         );
@@ -420,13 +487,31 @@ impl Server {
                 slot.wire_icmp = Some(sockets.add(wire_icmp_socket(slot.port)));
             }
         }
+        let dhcp = match config {
+            WireConfig::Static { .. } => None,
+            WireConfig::Dhcp {
+                server_port,
+                client_port,
+            } => {
+                let mut socket = dhcpv4::Socket::new();
+                socket.set_ports(server_port, client_port);
+                socket.set_receive_packet_buffer(leak(0u8, DHCP_PACKET_BUFFER));
+                Some(sockets.add(socket))
+            }
+        };
+        let (lease_addr, lease_prefix) = match config {
+            WireConfig::Static { addr, prefix } => (addr, prefix),
+            WireConfig::Dhcp { .. } => ([0; 4], 0),
+        };
         self.wire = Some(Wire {
             device,
             iface,
             sockets,
             mac,
-            addr,
-            prefix,
+            config,
+            addr: lease_addr,
+            prefix: lease_prefix,
+            dhcp,
             refusals: Refusals::default(),
         });
         // NET10: a listener is reachable from both stacks. Every armed backlog slot gains a
@@ -448,17 +533,34 @@ impl Server {
         }
     }
 
+    /// NET11: drain one lease event for the server loop's NOTICE logging.
+    pub fn take_wire_event(&mut self) -> Option<WireEvent> {
+        if self.wire_events.is_empty() {
+            None
+        } else {
+            Some(self.wire_events.remove(0))
+        }
+    }
+
     /// A new provider generation: discard wire-bound state (DESIGN/026 §3) and rebuild the
     /// stack over the same grant. Loopback sockets are untouched.
     pub fn reset_wire(&mut self, now_ns: u64) {
         let Some(wire) = self.wire.take() else {
             return;
         };
-        self.attach_wire(now_ns, wire.mac, wire.addr, wire.prefix);
+        if matches!(wire.config, WireConfig::Dhcp { .. }) && wire.addr != [0; 4] {
+            self.wire_events.push(WireEvent::DhcpDiscardedByGeneration);
+        }
+        self.attach_wire_config(now_ns, wire.mac, wire.config);
     }
 
     /// The frame channel closed: the stack and every wire twin go with it.
     pub fn detach_wire(&mut self) {
+        if let Some(wire) = self.wire.as_ref() {
+            if matches!(wire.config, WireConfig::Dhcp { .. }) && wire.addr != [0; 4] {
+                self.wire_events.push(WireEvent::DhcpDiscardedByGeneration);
+            }
+        }
         if self.wire.take().is_some() {
             for slot in &mut self.slots {
                 slot.wire_udp = None;
@@ -905,7 +1007,8 @@ impl Server {
                 Ok(data.len() as u64)
             }
             Err(udp::SendError::BufferFull) => Err(Status::WouldBlock),
-            Err(_) => Err(Status::InvalidArgument),
+            // NET11: with no lease the interface has no address to send from.
+            Err(udp::SendError::Unaddressable) => Err(Status::NetUnreachable),
         }
     }
 
@@ -1444,7 +1547,10 @@ impl Server {
                     wire.sockets
                         .get_mut::<tcp::Socket>(wire_handle)
                         .connect(wire.iface.context(), endpoint_of(addr), local)
-                        .map_err(|_| Status::InvalidArgument)?;
+                        .map_err(|e| match e {
+                            tcp::ConnectError::Unaddressable => Status::NetUnreachable,
+                            _ => Status::InvalidArgument,
+                        })?;
                     self.slots[index].tcp_on_wire = true;
                 }
                 self.slots[index].state = Tcp::Connecting;
@@ -1626,6 +1732,67 @@ impl Server {
                 }
             }
         }
+        // NET11: apply DHCP lease events to this generation's interface.
+        let mut lease_events: Vec<WireEvent> = Vec::new();
+        if let Some(wire) = self.wire.as_mut() {
+            if let Some(handle) = wire.dhcp {
+                for _ in 0..4 {
+                    let event = {
+                        let socket = wire.sockets.get_mut::<dhcpv4::Socket>(handle);
+                        match socket.poll() {
+                            Some(dhcpv4::Event::Configured(config)) => Some((
+                                config.address.address().octets(),
+                                config.address.prefix_len(),
+                                config.router.map(|r| r.octets()),
+                            )),
+                            Some(dhcpv4::Event::Deconfigured) => Some(([0; 4], 0, None)),
+                            None => None,
+                        }
+                    };
+                    let Some((addr, prefix, router)) = event else {
+                        break;
+                    };
+                    if addr == [0; 4] {
+                        // The pre-lease state reports Deconfigured once; a lease drop is
+                        // an event only when an address was actually held.
+                        if wire.addr != [0; 4] {
+                            wire.iface.update_ip_addrs(|addrs| addrs.clear());
+                            let _ = wire.iface.routes_mut().remove_default_ipv4_route();
+                            wire.addr = [0; 4];
+                            wire.prefix = 0;
+                            lease_events.push(WireEvent::DhcpExpired);
+                        }
+                    } else {
+                        wire.iface.update_ip_addrs(|addrs| {
+                            addrs.clear();
+                            let _ = addrs.push(IpCidr::new(
+                                IpAddress::Ipv4(Ipv4Address::from(addr)),
+                                prefix,
+                            ));
+                        });
+                        if let Some(router) = router {
+                            let _ = wire
+                                .iface
+                                .routes_mut()
+                                .add_default_ipv4_route(Ipv4Address::from(router));
+                        }
+                        let renewed = wire.addr == addr && wire.prefix == prefix;
+                        wire.addr = addr;
+                        wire.prefix = prefix;
+                        lease_events.push(if renewed {
+                            WireEvent::DhcpRenewed { addr, prefix }
+                        } else {
+                            WireEvent::DhcpLease {
+                                addr,
+                                prefix,
+                                router,
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        self.wire_events.extend(lease_events);
         // Sampling after the polls latches state windows (CloseWait, LastAck, TimeWait)
         // that a dispatch-only observe would miss.
         for index in 0..self.slots.len() {

@@ -2136,3 +2136,478 @@ fn wire_shutdown_behind_the_peer_fin_reads_eof_not_reset() {
         "an orderly close behind the peer's FIN is EOF, not ConnReset"
     );
 }
+// ---- NET11: DHCP configuration (host half against a fake isolated server) ------------------
+
+const DHCP_SERVER_PORT: u16 = 6767;
+const DHCP_CLIENT_PORT: u16 = 6868;
+const LEASE_IP: [u8; 4] = [192, 168, 0, 150];
+
+/// One step of the netstack clock. The wire interface's DHCP client dispatches into the
+/// device and consumes what the fake server pushed; no peer stack is involved.
+fn run_dhcp(server: &mut Server, ms: u64) -> Vec<Output> {
+    let mut out = Vec::new();
+    for _ in 0..ms {
+        clock::advance(MS);
+        server.poll(clock::now(), &mut out);
+    }
+    out
+}
+
+/// The fake server's DHCP reply, emitted with the crate's own repr so the packet shape is
+/// the wire's, not a hand-rolled approximation.
+fn dhcp_reply(ack: bool, xid: u32, chaddr: [u8; 6], include_server_id: bool) -> Vec<u8> {
+    use kumo_netstack::smoltcp::wire::{
+        DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, Ipv4Address,
+    };
+    let server = Ipv4Address::from(PEER_IP);
+    let repr = DhcpRepr {
+        message_type: if ack {
+            DhcpMessageType::Ack
+        } else {
+            DhcpMessageType::Offer
+        },
+        transaction_id: xid,
+        secs: 0,
+        client_hardware_address: EthernetAddress(chaddr),
+        client_ip: Ipv4Address::UNSPECIFIED,
+        your_ip: Ipv4Address::from(LEASE_IP),
+        server_ip: server,
+        router: Some(server),
+        subnet_mask: Some(Ipv4Address::from([255, 255, 255, 0])),
+        relay_agent_ip: Ipv4Address::UNSPECIFIED,
+        broadcast: false,
+        requested_ip: None,
+        client_identifier: Some(EthernetAddress(chaddr)),
+        server_identifier: include_server_id.then_some(server),
+        parameter_request_list: None,
+        dns_servers: None,
+        max_size: None,
+        renew_duration: Some(4),
+        rebind_duration: None,
+        lease_duration: Some(8),
+        additional_options: &[],
+    };
+    let mut dhcp = std::vec![0u8; repr.buffer_len()];
+    repr.emit(&mut DhcpPacket::new_unchecked(&mut dhcp[..]))
+        .expect("the reply is well-formed");
+    udp_frame_exact(
+        PEER_IP,
+        [255, 255, 255, 255],
+        DHCP_SERVER_PORT,
+        DHCP_CLIENT_PORT,
+        &dhcp,
+    )
+}
+
+/// One UDP frame between arbitrary addresses; the fixed helper peers are not enough once
+/// the destination is a leased address.
+fn udp_frame_exact(
+    src: [u8; 4],
+    dst: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let checksums = ChecksumCapabilities::default();
+    let udp = UdpRepr { src_port, dst_port };
+    let ip = Ipv4Repr {
+        src_addr: Ipv4Address::from(src),
+        dst_addr: Ipv4Address::from(dst),
+        next_header: IpProtocol::Udp,
+        payload_len: udp.header_len() + payload.len(),
+        hop_limit: 64,
+    };
+    let mut bytes = std::vec![0u8; ip.buffer_len() + ip.payload_len];
+    let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+    ip.emit(&mut packet, &checksums);
+    let mut datagram = UdpPacket::new_unchecked(packet.payload_mut());
+    let s: IpAddress = Ipv4Address::from(src).into();
+    let d: IpAddress = Ipv4Address::from(dst).into();
+    udp.emit(
+        &mut datagram,
+        &s,
+        &d,
+        payload.len(),
+        |out| out.copy_from_slice(payload),
+        &checksums,
+    );
+    ethernet_wrap(PEER_MAC, WIRE_MAC, EthernetProtocol::Ipv4, &bytes)
+}
+
+/// An ARP reply for a (source, target) pair; the client ARPs for the peer before its
+/// unicast renewals can leave.
+fn arp_reply_to(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+    use kumo_netstack::smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, EthernetAddress};
+    let mut payload = std::vec![0u8; 28];
+    let mut packet = ArpPacket::new_unchecked(&mut payload[..]);
+    ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Reply,
+        source_hardware_addr: EthernetAddress(PEER_MAC),
+        source_protocol_addr: Ipv4Address::from(src),
+        target_hardware_addr: EthernetAddress(WIRE_MAC),
+        target_protocol_addr: Ipv4Address::from(dst),
+    }
+    .emit(&mut packet);
+    ethernet_wrap(PEER_MAC, WIRE_MAC, EthernetProtocol::Arp, &payload)
+}
+
+/// Advance the clock, answer any ARP request with the peer's reply, and report the first
+/// DHCP frame the client emitted in the window: (xid, chaddr, 1 DISCOVER / 3 REQUEST).
+fn dhcp_step(server: &mut Server, ms: u64) -> Option<(u32, [u8; 6], u8)> {
+    use kumo_netstack::smoltcp::wire::{DhcpMessageType, DhcpPacket, DhcpRepr};
+    let mut found = None;
+    for _ in 0..ms {
+        run_dhcp(server, 1);
+        let mut frame = [0u8; FRAME_MAX];
+        while let Some(n) = server.take_wire_frame(&mut frame) {
+            let f = &frame[..n];
+            if f.len() >= 42 && f[12..14] == [0x08, 0x06] {
+                server
+                    .push_wire_frame(&arp_reply_to(PEER_IP, LEASE_IP))
+                    .expect("the ARP reply is admitted");
+                continue;
+            }
+            if found.is_some() || f.len() < 42 || f[12..14] != [0x08, 0x00] || f[23] != 17 {
+                continue;
+            }
+            let ihl = usize::from(f[14] & 0x0F) * 4;
+            let udp = 14 + ihl;
+            if f.len() < udp + 8 {
+                continue;
+            }
+            let src = u16::from_be_bytes([f[udp], f[udp + 1]]);
+            let dst = u16::from_be_bytes([f[udp + 2], f[udp + 3]]);
+            if src != DHCP_CLIENT_PORT || dst != DHCP_SERVER_PORT {
+                continue;
+            }
+            let Ok(packet) = DhcpPacket::new_checked(&f[udp + 8..n]) else {
+                continue;
+            };
+            let Ok(repr) = DhcpRepr::parse(&packet) else {
+                continue;
+            };
+            let kind = if repr.message_type == DhcpMessageType::Discover {
+                1
+            } else if repr.message_type == DhcpMessageType::Request {
+                3
+            } else {
+                0
+            };
+            found = Some((repr.transaction_id, repr.client_hardware_address.0, kind));
+        }
+    }
+    found
+}
+
+fn expect_dhcp(server: &mut Server, kind: u8) -> (u32, [u8; 6]) {
+    for _ in 0..6_000 {
+        if let Some((xid, chaddr, k)) = dhcp_step(server, 1) {
+            if k == kind {
+                return (xid, chaddr);
+            }
+        }
+    }
+    panic!("no DHCP kind {kind} from the client");
+}
+
+/// Acquire a lease through the fake server; returns the wire-bound UDP socket.
+fn acquire_lease(server: &mut Server, c: &mut Client) -> (u32, u16) {
+    let s = c.udp(server);
+    let port = c.bind(server, s, 0);
+    let peer = Addr {
+        ip: PEER_IP,
+        port: PEER_PORT,
+    };
+    assert_eq!(
+        c.at(server, Op::Connect, s, 0, &peer.encode()).status,
+        Status::Ok
+    );
+    let (xid, chaddr) = expect_dhcp(server, 1);
+    server
+        .push_wire_frame(&dhcp_reply(false, xid, chaddr, true))
+        .unwrap();
+    let (xid, chaddr) = expect_dhcp(server, 3);
+    server
+        .push_wire_frame(&dhcp_reply(true, xid, chaddr, true))
+        .unwrap();
+    run_dhcp(server, 5);
+    (s, port)
+}
+
+#[test]
+fn a_dhcp_lease_configures_the_wire_and_carries_traffic() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire_dhcp(clock::now(), WIRE_MAC, DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
+    let mut c = Client::open(&mut server);
+
+    // Before a lease: GETNAME says 0.0.0.0, TCP CONNECT to the peer is NetUnreachable,
+    // and nothing leaves the wire. The initial Deconfigured the socket reports is not a
+    // lease loss and must not surface as an event.
+    let s = c.udp(&mut server);
+    let port = c.bind(&mut server, s, 0);
+    let peer = Addr {
+        ip: PEER_IP,
+        port: PEER_PORT,
+    };
+    assert_eq!(
+        c.at(&mut server, Op::Connect, s, 0, &peer.encode()).status,
+        Status::Ok
+    );
+    let t = c.tcp(&mut server);
+    assert_eq!(
+        c.at(&mut server, Op::Connect, t, 0, &peer.encode()).status,
+        Status::NetUnreachable
+    );
+    run_dhcp(&mut server, 5);
+    assert!(
+        server.take_wire_event().is_none(),
+        "no lease events before a lease"
+    );
+    let names = c.at(&mut server, Op::GetName, s, 0, &[]);
+    assert_eq!(&names.payload[4..8], &[0, 0, 0, 0]);
+
+    let (s, port) = acquire_lease(&mut server, &mut c);
+    let names = c.at(&mut server, Op::GetName, s, 0, &[]);
+    assert_eq!(&names.payload[4..8], &LEASE_IP, "GETNAME reports the lease");
+    match server.take_wire_event() {
+        Some(WireEvent::DhcpLease {
+            addr,
+            prefix,
+            router,
+        }) => assert_eq!((addr, prefix, router), (LEASE_IP, 24, Some(PEER_IP))),
+        other => panic!("expected one DhcpLease, got {other:?}"),
+    }
+
+    // Traffic through the leased address: ARP, the datagram, the echo back.
+    let sent = c.sendto_to(&mut server, s, peer, b"dhcp says hello");
+    assert_eq!((sent.status, sent.result), (Status::Ok, 15));
+    let mut datagram: Option<Vec<u8>> = None;
+    for _ in 0..40 {
+        run_dhcp(&mut server, 1);
+        let mut frame = [0u8; FRAME_MAX];
+        while let Some(n) = server.take_wire_frame(&mut frame) {
+            let f = &frame[..n];
+            if f.len() >= 42 && f[12..14] == [0x08, 0x06] {
+                server
+                    .push_wire_frame(&arp_reply_to(PEER_IP, LEASE_IP))
+                    .expect("the ARP reply is admitted");
+                continue;
+            }
+            if f.len() >= 42 && f[12..14] == [0x08, 0x00] && f[23] == 17 {
+                datagram = Some(f.to_vec());
+                break;
+            }
+        }
+        if datagram.is_some() {
+            break;
+        }
+    }
+    let frame = datagram.expect("the datagram leaves after ARP resolves");
+    assert_eq!(&frame[0..6], &PEER_MAC);
+    server
+        .push_wire_frame(&udp_frame_exact(
+            PEER_IP,
+            LEASE_IP,
+            PEER_PORT,
+            port,
+            b"echo back",
+        ))
+        .unwrap();
+    let mut echoed = false;
+    for _ in 0..5 {
+        run_dhcp(&mut server, 1);
+        let got = c.recvfrom(&mut server, s, UDP_PAYLOAD_MAX as u16);
+        if got.status == Status::Ok {
+            if got.payload.len() > ADDR_LEN && &got.payload[ADDR_LEN..] == b"echo back" {
+                echoed = true;
+                break;
+            }
+        }
+    }
+    assert!(echoed, "the leased address carries a real datagram");
+}
+
+#[test]
+fn dhcp_ignores_mismatched_replies_and_answers_one_valid_offer() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire_dhcp(clock::now(), WIRE_MAC, DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
+    let mut c = Client::open(&mut server);
+    let s = c.udp(&mut server);
+    c.bind(&mut server, s, 0);
+    let (xid, chaddr) = expect_dhcp(&mut server, 1);
+
+    // A wrong xid, a wrong chaddr and a missing server identifier are all ignored: the
+    // client stays in Discovering and never REQUESTs.
+    server
+        .push_wire_frame(&dhcp_reply(false, xid ^ 0xFFFF_FFFF, chaddr, true))
+        .unwrap();
+    assert!(
+        dhcp_step(&mut server, 1_000).is_none(),
+        "a wrong-xid OFFER must not be answered"
+    );
+    let mut bad_mac = chaddr;
+    bad_mac[5] ^= 0x5A;
+    server
+        .push_wire_frame(&dhcp_reply(false, xid, bad_mac, true))
+        .unwrap();
+    assert!(
+        dhcp_step(&mut server, 1_000).is_none(),
+        "a wrong-chaddr OFFER must not be answered"
+    );
+    server
+        .push_wire_frame(&dhcp_reply(false, xid, chaddr, false))
+        .unwrap();
+    assert!(
+        dhcp_step(&mut server, 1_000).is_none(),
+        "an OFFER without a server identifier must not be answered"
+    );
+    assert!(
+        server.take_wire_event().is_none(),
+        "no lease from mismatched replies"
+    );
+
+    // The valid OFFER is the one that is answered.
+    server
+        .push_wire_frame(&dhcp_reply(false, xid, chaddr, true))
+        .unwrap();
+    let (rx, rchaddr) = expect_dhcp(&mut server, 3);
+    assert_eq!((rx, rchaddr), (xid, chaddr));
+    server
+        .push_wire_frame(&dhcp_reply(true, rx, rchaddr, true))
+        .unwrap();
+    run_dhcp(&mut server, 5);
+    assert!(matches!(
+        server.take_wire_event(),
+        Some(WireEvent::DhcpLease { .. })
+    ));
+}
+
+#[test]
+fn dhcp_renews_then_expires_and_deconfigures() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire_dhcp(clock::now(), WIRE_MAC, DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
+    let mut c = Client::open(&mut server);
+    let (s, _) = acquire_lease(&mut server, &mut c);
+    assert!(matches!(
+        server.take_wire_event(),
+        Some(WireEvent::DhcpLease { .. })
+    ));
+
+    // T1: the client renews (unicast; dhcp_step answers the ARP the unicast needs).
+    let (xid, chaddr) = expect_dhcp(&mut server, 3);
+    server
+        .push_wire_frame(&dhcp_reply(true, xid, chaddr, true))
+        .unwrap();
+    run_dhcp(&mut server, 5);
+    match server.take_wire_event() {
+        Some(WireEvent::DhcpRenewed { addr, .. }) => assert_eq!(addr, LEASE_IP),
+        other => panic!("expected a renewal, got {other:?}"),
+    }
+
+    // Silence: the lease lapses, the address clears, and the client re-DISCOVERs. The
+    // window drains the wire ring, so the client's own post-expiry DISCOVER is observed.
+    let (mut expired, mut rediscovered) = (false, false);
+    for _ in 0..12_000 {
+        if let Some((_, _, 1)) = dhcp_step(&mut server, 1) {
+            rediscovered = true;
+        }
+        if let Some(WireEvent::DhcpExpired) = server.take_wire_event() {
+            expired = true;
+        }
+        if expired && rediscovered {
+            break;
+        }
+    }
+    assert!(expired, "the lease expired without a server");
+    assert!(rediscovered, "a fresh DISCOVER follows the expiry");
+    let names = c.at(&mut server, Op::GetName, s, 0, &[]);
+    assert_eq!(
+        &names.payload[4..8],
+        &[0, 0, 0, 0],
+        "the address is cleared"
+    );
+    let peer = Addr {
+        ip: PEER_IP,
+        port: PEER_PORT,
+    };
+    let t = c.tcp(&mut server);
+    assert_eq!(
+        c.at(&mut server, Op::Connect, t, 0, &peer.encode()).status,
+        Status::NetUnreachable
+    );
+}
+
+#[test]
+fn no_dhcp_server_is_bounded_and_safe() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire_dhcp(clock::now(), WIRE_MAC, DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
+    let mut c = Client::open(&mut server);
+    let s = c.udp(&mut server);
+    c.bind(&mut server, s, 0);
+
+    // No replies at all for 25 s: the client retries on its own bounded schedule.
+    let mut discovers = 0u32;
+    for _ in 0..25_000 {
+        if let Some((_, _, 1)) = dhcp_step(&mut server, 1) {
+            discovers += 1;
+        }
+    }
+    assert!(
+        (2..=4).contains(&discovers),
+        "bounded DISCOVER retries, got {discovers}"
+    );
+    assert!(
+        server.take_wire_event().is_none(),
+        "no lease without a server"
+    );
+
+    // The stack still serves: loopback answers and names itself; the wire refuses.
+    let l = c.udp(&mut server);
+    let lport = c.bind(&mut server, l, 0);
+    let lo = Addr {
+        ip: [127, 0, 0, 1],
+        port: lport,
+    };
+    assert_eq!(
+        c.at(&mut server, Op::Connect, l, 0, &lo.encode()).status,
+        Status::Ok
+    );
+    let names = c.at(&mut server, Op::GetName, l, 0, &[]);
+    assert_eq!(&names.payload[4..8], &[127, 0, 0, 1]);
+    let peer = Addr {
+        ip: PEER_IP,
+        port: PEER_PORT,
+    };
+    let t = c.tcp(&mut server);
+    assert_eq!(
+        c.at(&mut server, Op::Connect, t, 0, &peer.encode()).status,
+        Status::NetUnreachable
+    );
+}
+
+#[test]
+fn a_generation_change_discards_the_lease() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire_dhcp(clock::now(), WIRE_MAC, DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
+    let mut c = Client::open(&mut server);
+    let (s, _) = acquire_lease(&mut server, &mut c);
+    assert!(matches!(
+        server.take_wire_event(),
+        Some(WireEvent::DhcpLease { .. })
+    ));
+
+    // A new provider generation never silently keeps the lease (NET11).
+    server.attach_wire_dhcp(clock::now(), WIRE_MAC, DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
+    assert!(matches!(
+        server.take_wire_event(),
+        Some(WireEvent::DhcpDiscardedByGeneration)
+    ));
+    let names = c.at(&mut server, Op::GetName, s, 0, &[]);
+    assert_eq!(
+        &names.payload[4..8],
+        &[0, 0, 0, 0],
+        "the leased address is gone"
+    );
+
+    // The new generation starts from Discovering, exactly like a cold attach.
+}
