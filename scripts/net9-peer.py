@@ -9,7 +9,7 @@ netprobe and scripts/net9-proof.py: index 0 is the zero-length datagram, index 1
 1472-byte maximum (prefix then zeros), every other index is the prefix plus i % 16 fill
 bytes.
 
-Usage: scripts/net9-peer.py [--port 7701] [--count 24] [--wait 600] [--send-to 192.168.0.50]
+Usage: scripts/net9-peer.py [--port 7701] [--count 24] [--wait 600]
 Exit: 0 PASS, 1 FAIL.
 """
 import argparse
@@ -33,7 +33,6 @@ def main():
     ap.add_argument('--count', type=int, default=24)
     ap.add_argument('--wait', type=float, default=600.0,
                     help='seconds to wait for kumo to appear')
-    ap.add_argument('--send-to', default='192.168.0.50')
     args = ap.parse_args()
     count = max(2, min(48, args.count))
     expected_kumo = [payload('kumo', i) for i in range(count)]

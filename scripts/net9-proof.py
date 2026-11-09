@@ -4,7 +4,7 @@
 Verifies, from one classic pcap (UDP port <port>):
   * every kumo-originated datagram (kumo-net9-<i>-), in order, byte-exact,
   * every peer-originated datagram (peer-net9-<i>-), in order, byte-exact,
-  * kumo's echo of each peer datagram and the peer's echo of each kumo datagram,
+  * kumo's echo of every peer datagram back, byte-exact (the peer does not echo),
   * the zero-length and 1472-byte maximum datagrams present in both initiations.
 The UDP length field is the authority, so Ethernet padding never counts.
 
@@ -65,9 +65,14 @@ def udp_frame(frame):
 def check(frames, port, count):
     """Return (ok, report lines) for a frame list; the self-test feeds synthetic frames.
 
-    The zero-length datagram and its echo are byte-identical, so they cannot be told
-    apart on the wire: each direction must carry exactly two empties, the original and
-    the echo, and that is what is counted.
+    The implemented exchange has three flows: kumo's numbered initiations, the peer's
+    numbered initiations, and kumo echoing each peer datagram back byte-exact. The peer
+    role (scripts/net9-peer.py) verifies kumo's datagrams at its own socket and does not
+    echo them, so a wire peer_echo flow is a protocol violation, not a missing flow.
+
+    The zero-length datagram is byte-identical to its echo, so only counts tell them
+    apart: kumo->peer must carry two empties (kumo's original and kumo's echo of the
+    peer's) and peer->kumo exactly one (the peer's original).
     """
     problems = []
     flows = {'kumo_orig': [], 'peer_orig': [], 'kumo_echo': [], 'peer_echo': []}
@@ -97,12 +102,11 @@ def check(frames, port, count):
                 flows['peer_echo'].append(exp_k.index(data))
             else:
                 problems.append(f'unexpected peer->kumo datagram {len(data)} B')
-    for direction in empties:
-        if empties[direction] != 2:
+    for direction, want in (('kumo_to_peer', 2), ('peer_to_kumo', 1)):
+        if empties[direction] != want:
             problems.append(
-                f'{direction}: {empties[direction]} zero-length datagrams, '
-                f'want 2 (original + echo)')
-    for name in flows:
+                f'{direction}: {empties[direction]} zero-length datagrams, want {want}')
+    for name in ('kumo_orig', 'peer_orig', 'kumo_echo'):
         got = flows[name]
         for i in range(1, count):
             n = got.count(i)
@@ -117,6 +121,9 @@ def check(frames, port, count):
         sizes = {len(table[idx]) for idx in flows[name]}
         if 1472 not in sizes:
             problems.append(f'{name}: 1472-byte datagram missing')
+    if flows['peer_echo']:
+        problems.append(
+            f'peer_echo: {len(flows["peer_echo"])} datagram(s); the peer does not echo')
     report = [f'{name}: {len(flow)}' for name, flow in flows.items()]
     report += [f'{name}: {n}' for name, n in empties.items()]
     return (not problems), problems + report
@@ -146,8 +153,6 @@ def self_test():
                                udp(PORT, 53000, p)))
         frames.append(ethernet(pmac, kmac, ipv4(kumo_ip, peer_ip, 8 + len(p)) +
                                udp(49152, PORT, p)))
-        frames.append(ethernet(kmac, pmac, ipv4(peer_ip, kumo_ip, 8 + len(k)) +
-                               udp(PORT, 53000, k)))
     ok, report = check(frames, PORT, COUNT)
     print('self-test positive:', 'PASS' if ok else 'FAIL', report)
     good = ok
@@ -165,6 +170,14 @@ def self_test():
     assert dropped, 'negative self-test could not drop a frame'
     ok, report = check(broken, PORT, COUNT)
     print('self-test negative:', 'PASS' if not ok else 'FAIL', report)
+    good = good and not ok
+
+    # Negative: a fabricated peer echo; the peer script never sends kumo payloads.
+    k1 = payload('kumo', 1)
+    stray = frames + [ethernet(kmac, pmac, ipv4(peer_ip, kumo_ip, 8 + len(k1)) +
+                               udp(PORT, 53000, k1))]
+    ok, report = check(stray, PORT, COUNT)
+    print('self-test peer-echo:', 'PASS' if not ok else 'FAIL', report)
     return good and not ok
 
 
@@ -196,7 +209,7 @@ def main(argv):
         print(line)
     if ok:
         print(f'NET9 proof green: {count}/{count} exact datagrams each way, '
-              f'both echoes, zero and 1472 present')
+              f"kumo's echo of every peer datagram, zero and 1472 present")
     else:
         print('NET9 proof RED')
     sys.exit(0 if ok else 1)
