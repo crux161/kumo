@@ -635,6 +635,484 @@ fn peer(client: &mut Client, ip: [u8; 4], port: u16, count: u16, retries: u32) {
     }
 }
 
+/// NET10: the wire-TCP campaign against the peer script, one phase per port:
+/// `<port>` client exchange, `<port>+1` server exchange, `<port>+2` refusal,
+/// `<port>+3` reset, `<port>+4` timeout and backpressure, `<port>+5` churn.
+fn tcpwire(client: &mut Client, ip: [u8; 4], port: u16, retries: u32) {
+    let retries = retries.clamp(1, 6000);
+    let mut failures = 0u32;
+    if !tcpwire_client_exchange(client, ip, port, retries) {
+        failures += 1;
+    }
+    if !tcpwire_server_exchange(client, port + 1) {
+        failures += 1;
+    }
+    if !tcpwire_refusal(client, ip, port + 2, retries) {
+        failures += 1;
+    }
+    if !tcpwire_reset(client, ip, port + 3, retries) {
+        failures += 1;
+    }
+    if !tcpwire_timeout(client, ip, port + 4, retries) {
+        failures += 1;
+    }
+    if !tcpwire_churn(client, ip, port + 5, retries) {
+        failures += 1;
+    }
+    client.out.line(&[
+        b"netprobe: tcpwire phases failed=",
+        dec(failures as u64).bytes(),
+    ]);
+    if failures != 0 {
+        client.fail(&[b"tcpwire campaign incomplete"]);
+    }
+}
+
+/// A NOTICE line on the serial console: the framebuffer alone would hide the campaign from
+/// the journal's capture.
+fn log_tcpwire(name: &[u8], ok: bool, bytes: u64, hash: u32) {
+    let d = dec(bytes);
+    let h = hex32(hash);
+    let mut buf = [0u8; 128];
+    let mut at = 0usize;
+    for part in [
+        &b"netprobe: tcpwire "[..],
+        name,
+        if ok { &b" exact "[..] } else { &b" FAIL "[..] },
+        d.bytes(),
+        &b" B fnv=0x"[..],
+        &h[..],
+        &b"\n"[..],
+    ] {
+        let take = part.len().min(buf.len() - at);
+        buf[at..at + take].copy_from_slice(&part[..take]);
+        at += take;
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
+}
+
+/// A stall during the stream: say so on the serial console (the framebuffer FAIL is not
+/// visible in a serial capture), naming the wait status and the interval number.
+fn log_stall(stalls: u32, status: Status) {
+    let d = dec(stalls as u64);
+    let name = status_name(status);
+    let mut buf = [0u8; 96];
+    let mut at = 0usize;
+    for part in [
+        &b"netprobe: tcpwire stall "[..],
+        d.bytes(),
+        &b" "[..],
+        name,
+        &b"\n"[..],
+    ] {
+        let take = part.len().min(buf.len() - at);
+        buf[at..at + take].copy_from_slice(&part[..take]);
+        at += take;
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
+}
+
+/// The framebuffer fail line is invisible in a serial capture; mirror a failing stream
+/// status on the serial console with its tag.
+fn log_status(tag: &[u8], status: Status) {
+    let name = status_name(status);
+    let mut buf = [0u8; 96];
+    let mut at = 0usize;
+    for part in [
+        &b"netprobe: tcpwire "[..],
+        tag,
+        &b" -> "[..],
+        name,
+        &b"\n"[..],
+    ] {
+        let take = part.len().min(buf.len() - at);
+        buf[at..at + take].copy_from_slice(&part[..take]);
+        at += take;
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
+}
+
+/// CONNECT to a wire address, retrying while the wire is absent and while the peer's
+/// listener is not up yet. Returns the socket, or 0 after the budget or a hard error.
+fn wire_connect_settled(client: &mut Client, ip: [u8; 4], port: u16, retries: u32) -> u32 {
+    let mut attempts = 0u32;
+    loop {
+        let socket = tcp_socket(client);
+        let status = client
+            .call(Op::Connect, socket, 0, &Addr { ip, port }.encode())
+            .status;
+        if status != Status::InProgress {
+            let _ = client.call(Op::Close, socket, 0, &[]);
+            if status == Status::NetUnreachable && attempts < retries {
+                attempts += 1;
+                // A bound, unconnected TCP socket's CONNECTED wait can only time out:
+                // a 500 ms sleep through netstack.
+                let pause = tcp_socket(client);
+                let _ = wait(client, pause, WAIT_CONNECTED, 500);
+                let _ = client.call(Op::Close, pause, 0, &[]);
+                continue;
+            }
+            client.fail(&[b"tcpwire connect -> ", status_name(status)]);
+            return 0;
+        }
+        match wait(client, socket, WAIT_CONNECTED, 5000) {
+            Status::Ok => return socket,
+            Status::ConnRefused | Status::TimedOut if attempts < retries => {
+                attempts += 1;
+                let _ = client.call(Op::Close, socket, 0, &[]);
+            }
+            other => {
+                client.fail(&[b"tcpwire wait -> ", status_name(other)]);
+                return 0;
+            }
+        }
+    }
+}
+
+/// Both directions carry STREAM_TOTAL bytes of the shared generator at once; each is
+/// verified byte-exact and hashed. Returns whether everything held.
+fn stream_both_ways(client: &mut Client, stream: u32) -> (bool, usize, u32) {
+    let (mut sent, mut got, mut partial) = (0usize, 0usize, 0u64);
+    let (mut hash, mut exact, mut shut, mut eof) = (FNV_START, true, false, false);
+    let mut stalls = 0u32;
+    let mut chunk = [0u8; STREAM_CHUNK];
+    for _ in 0..200_000 {
+        let mut progress = false;
+        if sent < STREAM_TOTAL {
+            let n = (STREAM_TOTAL - sent).min(STREAM_CHUNK);
+            for (i, byte) in chunk[..n].iter_mut().enumerate() {
+                *byte = stream_byte(sent + i);
+            }
+            let reply = client.call(Op::Send, stream, 0, &chunk[..n]);
+            match reply.status {
+                Status::Ok => {
+                    let accepted = reply.result as usize;
+                    if accepted < n {
+                        partial += 1;
+                    }
+                    sent += accepted;
+                    progress |= accepted > 0;
+                }
+                Status::WouldBlock => {}
+                other => {
+                    log_status(b"send", other);
+                    client.fail(&[b"tcpwire send -> ", status_name(other)]);
+                    return (false, got, hash);
+                }
+            }
+        } else if !shut {
+            let status = client.call(Op::Shutdown, stream, 2, &[]).status;
+            client.expect(b"tcpwire shutdown write", status, Status::Ok);
+            shut = true;
+        }
+        if !eof {
+            let reply = client.call(Op::Recv, stream, chunk.len() as u64, &[]);
+            match reply.status {
+                Status::Ok if reply.len == 0 => eof = true,
+                Status::Ok => {
+                    let n = reply.len;
+                    chunk[..n].copy_from_slice(client.payload(&reply));
+                    exact &= chunk[..n]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &byte)| byte == stream_byte(got + i));
+                    hash = fnv_step(hash, &chunk[..n]);
+                    got += n;
+                    progress = true;
+                }
+                Status::WouldBlock => {}
+                other => {
+                    log_status(b"recv", other);
+                    client.fail(&[b"tcpwire recv -> ", status_name(other)]);
+                    return (false, got, hash);
+                }
+            }
+        }
+        if shut && eof {
+            break;
+        }
+        if !progress {
+            let interest = if sent < STREAM_TOTAL {
+                WAIT_READABLE | WAIT_WRITABLE
+            } else {
+                WAIT_READABLE
+            };
+            let status = wait(client, stream, interest, 2000);
+            if status == Status::Ok {
+                stalls = 0;
+            } else {
+                // The peer's FIN trails its data by an RTO under loss; tolerate a
+                // bounded number of intervals, and name each one on the serial.
+                stalls += 1;
+                log_stall(stalls, status);
+                if status != Status::TimedOut || stalls >= 5 {
+                    client.fail(&[b"tcpwire stream stalled"]);
+                    return (false, got, hash);
+                }
+            }
+        }
+    }
+    let ok = exact && eof && shut && sent == STREAM_TOTAL && got == STREAM_TOTAL;
+    let hash_x = hex32(hash);
+    client.out.line(&[
+        b"netprobe: tcpwire sent ",
+        dec(sent as u64).bytes(),
+        b" B (",
+        dec(partial).bytes(),
+        b" partial); echo ",
+        dec(got as u64).bytes(),
+        b" B fnv=0x",
+        &hash_x,
+        if ok {
+            b" exact, then EOF"
+        } else {
+            b" NOT exact"
+        },
+    ]);
+    (ok, got, hash)
+}
+
+fn tcpwire_client_exchange(client: &mut Client, ip: [u8; 4], port: u16, retries: u32) -> bool {
+    let stream = wire_connect_settled(client, ip, port, retries);
+    if stream == 0 {
+        return false;
+    }
+    let (ok, got, hash) = stream_both_ways(client, stream);
+    let status = client.call(Op::Close, stream, 0, &[]).status;
+    let ok = ok && status == Status::Ok;
+    log_tcpwire(b"client", ok, got as u64, hash);
+    ok
+}
+
+fn tcpwire_server_exchange(client: &mut Client, port: u16) -> bool {
+    let listener = tcp_socket(client);
+    client.bind_any(listener, port);
+    let status = client.call(Op::Listen, listener, 2, &[]).status;
+    client.expect(b"tcpwire listen", status, Status::Ok);
+    // The peer connects after the wire is up; acceptable can take a while.
+    if wait(client, listener, WAIT_CONNECTED, 60_000) != Status::Ok {
+        client.fail(&[b"tcpwire no connection to accept"]);
+        return false;
+    }
+    let accepted = client.call(Op::Accept, listener, 0, &[]);
+    client.expect(b"tcpwire accept", accepted.status, Status::Ok);
+    if accepted.status != Status::Ok {
+        return false;
+    }
+    let stream = accepted.socket;
+    let (mut total, mut hash) = (0usize, FNV_START);
+    let mut chunk = [0u8; STREAM_CHUNK];
+    loop {
+        let reply = client.call(Op::Recv, stream, chunk.len() as u64, &[]);
+        match reply.status {
+            Status::Ok if reply.len == 0 => break,
+            Status::Ok => {
+                let n = reply.len;
+                chunk[..n].copy_from_slice(client.payload(&reply));
+                hash = fnv_step(hash, &chunk[..n]);
+                total += n;
+                let mut off = 0;
+                while off < n {
+                    let sent = client.call(Op::Send, stream, 0, &chunk[off..n]);
+                    match sent.status {
+                        Status::Ok => off += sent.result as usize,
+                        Status::WouldBlock => {
+                            if wait(client, stream, WAIT_WRITABLE, 2000) != Status::Ok {
+                                client.fail(&[b"tcpwire echo stalled"]);
+                                return false;
+                            }
+                        }
+                        other => {
+                            client.fail(&[b"tcpwire echo -> ", status_name(other)]);
+                            return false;
+                        }
+                    }
+                }
+            }
+            Status::WouldBlock => {
+                if wait(client, stream, WAIT_READABLE, 2000) != Status::Ok {
+                    client.fail(&[b"tcpwire echo read stalled"]);
+                    return false;
+                }
+            }
+            other => {
+                client.fail(&[b"tcpwire server recv -> ", status_name(other)]);
+                return false;
+            }
+        }
+    }
+    let _ = client.call(Op::Shutdown, stream, 2, &[]);
+    let status = client.call(Op::Close, stream, 0, &[]).status;
+    client.expect(b"tcpwire server close", status, Status::Ok);
+    let ok = total == STREAM_TOTAL && status == Status::Ok;
+    log_tcpwire(b"server", ok, total as u64, hash);
+    ok
+}
+
+fn tcpwire_refusal(client: &mut Client, ip: [u8; 4], port: u16, retries: u32) -> bool {
+    let mut attempts = 0u32;
+    let socket = loop {
+        let socket = tcp_socket(client);
+        let status = client
+            .call(Op::Connect, socket, 0, &Addr { ip, port }.encode())
+            .status;
+        if status == Status::InProgress {
+            break socket;
+        }
+        let _ = client.call(Op::Close, socket, 0, &[]);
+        if status != Status::NetUnreachable || attempts >= retries {
+            client.fail(&[b"tcpwire refusal connect -> ", status_name(status)]);
+            return false;
+        }
+        attempts += 1;
+        let pause = tcp_socket(client);
+        let _ = wait(client, pause, WAIT_CONNECTED, 500);
+        let _ = client.call(Op::Close, pause, 0, &[]);
+    };
+    let status = wait(client, socket, WAIT_CONNECTED, 5000);
+    let ok = status == Status::ConnRefused;
+    client.expect(b"tcpwire refusal", status, Status::ConnRefused);
+    log_tcpwire(b"refusal", ok, 0, 0);
+    let _ = client.call(Op::Close, socket, 0, &[]);
+    ok
+}
+
+fn tcpwire_reset(client: &mut Client, ip: [u8; 4], port: u16, retries: u32) -> bool {
+    let stream = wire_connect_settled(client, ip, port, retries);
+    if stream == 0 {
+        return false;
+    }
+    // The peer accepts, then aborts: the RST must surface as ConnReset on RECV.
+    let mut ok = false;
+    for _ in 0..50 {
+        let reply = client.call(Op::Recv, stream, 64, &[]);
+        match reply.status {
+            Status::WouldBlock => {
+                let _ = wait(client, stream, WAIT_READABLE, 200);
+            }
+            Status::ConnReset => {
+                ok = true;
+                break;
+            }
+            Status::Ok => {}
+            other => {
+                client.fail(&[b"tcpwire reset -> ", status_name(other)]);
+                break;
+            }
+        }
+    }
+    client.expect(
+        b"tcpwire reset",
+        if ok { Status::ConnReset } else { Status::Ok },
+        Status::ConnReset,
+    );
+    log_tcpwire(b"reset", ok, 0, 0);
+    let _ = client.call(Op::Close, stream, 0, &[]);
+    ok
+}
+
+fn tcpwire_timeout(client: &mut Client, ip: [u8; 4], port: u16, retries: u32) -> bool {
+    let stream = wire_connect_settled(client, ip, port, retries);
+    if stream == 0 {
+        return false;
+    }
+    let timed = wait(client, stream, WAIT_READABLE, 300) == Status::TimedOut;
+    // The peer never reads: the stream must reach backpressure (WouldBlock, not an endless
+    // accept of memory the peer's window cannot carry).
+    let mut blocked = false;
+    let block = [0x5Au8; STREAM_CHUNK];
+    for _ in 0..600 {
+        let status = client.call(Op::Send, stream, 0, &block).status;
+        if status == Status::WouldBlock {
+            blocked = true;
+            break;
+        }
+        if status != Status::Ok {
+            break;
+        }
+    }
+    let ok = timed && blocked;
+    client.expect(
+        b"tcpwire timeout readable",
+        if timed { Status::TimedOut } else { Status::Ok },
+        Status::TimedOut,
+    );
+    client.expect(
+        b"tcpwire backpressure",
+        if blocked {
+            Status::WouldBlock
+        } else {
+            Status::Ok
+        },
+        Status::WouldBlock,
+    );
+    log_tcpwire(b"timeout", ok, 0, 0);
+    let _ = client.call(Op::Close, stream, 0, &[]);
+    ok
+}
+
+fn tcpwire_churn(client: &mut Client, ip: [u8; 4], port: u16, retries: u32) -> bool {
+    let mut ok = true;
+    let mut cycles = 0u16;
+    for cycle in 0..10u16 {
+        let stream = wire_connect_settled(client, ip, port, retries);
+        if stream == 0 {
+            ok = false;
+            break;
+        }
+        let mut payload = [0u8; 256];
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte = (cycle as u8).wrapping_mul(31).wrapping_add(i as u8);
+        }
+        if client.call(Op::Send, stream, 0, &payload).status != Status::Ok {
+            ok = false;
+            break;
+        }
+        let _ = client.call(Op::Shutdown, stream, 2, &[]);
+        let (mut got, mut exact) = (0usize, true);
+        let mut echo = [0u8; 256];
+        for _ in 0..50 {
+            let reply = client.call(Op::Recv, stream, 256, &[]);
+            match reply.status {
+                Status::Ok if reply.len == 0 => break,
+                Status::Ok => {
+                    let n = reply.len;
+                    echo[..n].copy_from_slice(client.payload(&reply));
+                    exact &= (got..got + n).all(|i| {
+                        echo[i - got] == (cycle as u8).wrapping_mul(31).wrapping_add(i as u8)
+                    });
+                    got += n;
+                    if got >= payload.len() {
+                        break;
+                    }
+                }
+                Status::WouldBlock => {
+                    let _ = wait(client, stream, WAIT_READABLE, 500);
+                }
+                other => {
+                    client.fail(&[b"tcpwire churn recv -> ", status_name(other)]);
+                    exact = false;
+                    break;
+                }
+            }
+        }
+        let _ = client.call(Op::Close, stream, 0, &[]);
+        if !(exact && got == payload.len()) {
+            ok = false;
+            break;
+        }
+        cycles += 1;
+    }
+    let ok = ok && cycles == 10;
+    client.out.line(&[
+        b"netprobe: tcpwire churn ",
+        dec(cycles as u64).bytes(),
+        b"/10",
+    ]);
+    log_tcpwire(b"churn", ok, cycles as u64, 0);
+    ok
+}
+
 fn udp(client: &mut Client) {
     let a = client.udp_socket();
     let b = client.udp_socket();
@@ -1309,7 +1787,7 @@ extern "C" fn main(
     let mode: &[u8] = args.next().unwrap_or(b"");
     // `wire <ip> <port> [count]` and `ping <ip> [count]` take an address where the other
     // modes take a port; ping has no port, so its first number is the count.
-    let wire_ip = if mode == b"wire" || mode == b"ping" || mode == b"peer" {
+    let wire_ip = if mode == b"wire" || mode == b"ping" || mode == b"peer" || mode == b"tcpwire" {
         args.next().and_then(parse_ipv4)
     } else {
         None
@@ -1384,6 +1862,14 @@ extern "C" fn main(
             count.unwrap_or(24),
             retries,
         ),
+        b"tcpwire" if wire_ip.is_some_and(|ip| ip != [0; 4]) && port.is_some_and(|p| p != 0) => {
+            tcpwire(
+                &mut client,
+                wire_ip.unwrap_or([0; 4]),
+                port.unwrap_or(0),
+                retries,
+            )
+        }
         b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
         b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
         b"tcperrors" => tcp_errors(&mut client),
@@ -1391,7 +1877,7 @@ extern "C" fn main(
         b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries]",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries] | tcpwire <ip> <port> [retries]",
             ]);
             process_exit(2);
         }

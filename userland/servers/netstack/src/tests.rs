@@ -1,8 +1,8 @@
-//j817
 //j820
 //j843
 //j844
 //j846
+//j848
 
 extern crate std;
 
@@ -1409,5 +1409,730 @@ fn detaching_the_wire_stack_drops_wire_routing() {
     assert_eq!(
         c.sendto_to(&mut server, s, to, b"x").status,
         Status::NetUnreachable
+    );
+}
+
+// ---- NET10: TCP on the wire stack, against a real smoltcp peer ------------------------------
+
+/// The peer host: its own smoltcp interface and socket table over its own `FrameDevice`.
+/// Frames move between it and the server's wire stack through the same rings smoltcp drives,
+/// so the handshake, ACKs, windows, RTOs and FINs are all real TCP.
+struct WirePeer {
+    device: FrameDevice,
+    iface: Interface,
+    sockets: SocketSet<'static>,
+}
+
+impl WirePeer {
+    fn new(now_ns: u64) -> Self {
+        let mut device = FrameDevice::new();
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress(PEER_MAC))),
+            &mut device,
+            instant(now_ns),
+        );
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::from(PEER_IP)), 24))
+                .unwrap();
+        });
+        let storage: &'static mut [SocketStorage<'static>] =
+            Box::leak((0..4).map(|_| SocketStorage::EMPTY).collect());
+        Self {
+            device,
+            iface,
+            sockets: SocketSet::new(storage),
+        }
+    }
+
+    fn tcp(&mut self) -> SocketHandle {
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(leak(0u8, SOCKET_BUFFER)),
+            tcp::SocketBuffer::new(leak(0u8, SOCKET_BUFFER)),
+        );
+        self.sockets.add(socket)
+    }
+
+    fn listen(&mut self, handle: SocketHandle) {
+        self.sockets
+            .get_mut::<tcp::Socket>(handle)
+            .listen(PEER_PORT)
+            .expect("the peer listens");
+    }
+
+    fn poll(&mut self, now_ns: u64) {
+        self.iface
+            .poll(instant(now_ns), &mut self.device, &mut self.sockets);
+    }
+
+    /// Drain everything the peer's socket has received so far. `recv_slice` answers
+    /// `Ok(0)` for an open-but-empty socket, so the guard is `can_recv`.
+    fn received(&mut self, handle: SocketHandle) -> Vec<u8> {
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 700];
+        while socket.can_recv() {
+            match socket.recv_slice(&mut buf) {
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+}
+
+/// Move every frame between the two stacks: server egress into the peer's ingress ring and
+/// the peer's egress into the server's (through the real NET8 ingress policy).
+fn pump(server: &mut Server, peer: &mut WirePeer) -> usize {
+    let mut frame = [0u8; FRAME_MAX];
+    let mut moved = 0;
+    while let Some(n) = server.take_wire_frame(&mut frame) {
+        peer.device
+            .push_inbound(&frame[..n])
+            .expect("the peer's ingress ring has room");
+        moved += 1;
+    }
+    while let Some(n) = peer.device.take_outbound(&mut frame) {
+        server
+            .push_wire_frame(&frame[..n])
+            .expect("the server's ingress policy admits it");
+        moved += 1;
+    }
+    moved
+}
+
+fn run_wire(server: &mut Server, peer: &mut WirePeer, ms: u64) -> Vec<Output> {
+    let mut out = Vec::new();
+    for _ in 0..ms {
+        clock::advance(MS);
+        let now = clock::now();
+        peer.poll(now);
+        server.poll(now, &mut out);
+        pump(server, peer);
+    }
+    out
+}
+
+/// Is this frame a TCP segment carrying payload? The induced-loss test drops the first one.
+fn tcp_data(frame: &[u8]) -> bool {
+    if frame.len() < 34 || frame[12..14] != [0x08, 0x00] || frame[23] != 6 {
+        return false;
+    }
+    let ihl = usize::from(frame[14] & 0x0F) * 4;
+    if frame.len() < 14 + ihl + 20 {
+        return false;
+    }
+    let total = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+    total > ihl + 20
+}
+
+fn run_wire_dropping(server: &mut Server, peer: &mut WirePeer, drop: &mut usize, ms: u64) {
+    let mut out = Vec::new();
+    for _ in 0..ms {
+        clock::advance(MS);
+        let now = clock::now();
+        peer.poll(now);
+        server.poll(now, &mut out);
+        let mut frame = [0u8; FRAME_MAX];
+        while let Some(n) = server.take_wire_frame(&mut frame) {
+            if *drop > 0 && tcp_data(&frame[..n]) {
+                *drop -= 1;
+                continue;
+            }
+            peer.device
+                .push_inbound(&frame[..n])
+                .expect("the peer's ingress ring has room");
+        }
+        while let Some(n) = peer.device.take_outbound(&mut frame) {
+            server
+                .push_wire_frame(&frame[..n])
+                .expect("the server's ingress policy admits it");
+        }
+    }
+}
+
+fn wire_bind(client: &mut Client, server: &mut Server, socket: u32, port: u16) -> u16 {
+    let answer = client.at(
+        server,
+        Op::Bind,
+        socket,
+        0,
+        &Addr { ip: [0; 4], port }.encode(),
+    );
+    assert_eq!(answer.status, Status::Ok);
+    answer.result as u16
+}
+
+fn wire_connect(client: &mut Client, server: &mut Server, socket: u32) -> Status {
+    client
+        .at(
+            server,
+            Op::Connect,
+            socket,
+            0,
+            &Addr {
+                ip: PEER_IP,
+                port: PEER_PORT,
+            }
+            .encode(),
+        )
+        .status
+}
+
+fn wire_wait(
+    client: &mut Client,
+    server: &mut Server,
+    peer: &mut WirePeer,
+    socket: u32,
+    interest: u8,
+    timeout_ms: u64,
+) -> Answer {
+    let id = client.next_id;
+    client.next_id += 1;
+    let mut bytes = [0u8; 4096];
+    let len = encode_request(
+        &header(
+            Op::Wait,
+            socket,
+            client.generation,
+            interest as u64 | (timeout_ms << 32),
+            id,
+        ),
+        &[],
+        &mut bytes,
+    )
+    .expect("a WAIT request encodes");
+    let mut out = Vec::new();
+    assert_eq!(
+        server.handle(client.session, &bytes[..len], 0, clock::now(), &mut out),
+        After::Keep
+    );
+    for _ in 0..(timeout_ms + 100) {
+        if !out.is_empty() {
+            break;
+        }
+        out.extend(run_wire(server, peer, 1));
+    }
+    assert!(!out.is_empty(), "the WAIT settled before the deadline");
+    Client::read(&out.remove(0))
+}
+
+/// CONNECT from kumo to the peer's listener, WAIT for the handshake, and return the socket.
+fn wire_connected(
+    server: &mut Server,
+    peer: &mut WirePeer,
+    client: &mut Client,
+    listening: SocketHandle,
+) -> u32 {
+    let socket = client.tcp(server);
+    assert_eq!(wire_connect(client, server, socket), Status::InProgress);
+    let ready = wire_wait(client, server, peer, socket, WAIT_CONNECTED, 5000);
+    assert_eq!(ready.status, Status::Ok);
+    assert_ne!(ready.result & WAIT_CONNECTED as u64, 0);
+    // The peer's third ACK may still be in flight when kumo sees Established.
+    run_wire(server, peer, 5);
+    assert_eq!(
+        peer.sockets.get::<tcp::Socket>(listening).state(),
+        tcp::State::Established
+    );
+    socket
+}
+
+#[test]
+fn a_wire_tcp_stream_crosses_both_stacks_exactly() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let listening = peer.tcp();
+    peer.listen(listening);
+    let mut c = Client::open(&mut server);
+    let s = wire_connected(&mut server, &mut peer, &mut c, listening);
+
+    // kumo -> peer: a multi-buffer payload, sent in STREAM chunks while the peer drains.
+    let data = pattern(12_000, 3);
+    let (mut sent, mut got) = (0usize, Vec::new());
+    let mut partial = false;
+    let mut would_block = false;
+    for _ in 0..20_000 {
+        // Fill the transmit buffer before pumping: the tail chunk then only partially
+        // fits, which is the wire face of backpressure (the loopback test's slow reader
+        // produces the same partial SENDs).
+        while sent < data.len() {
+            let chunk = (data.len() - sent).min(700);
+            let answer = c.at(&mut server, Op::Send, s, 0, &data[sent..sent + chunk]);
+            match answer.status {
+                Status::Ok => {
+                    partial |= (answer.result as usize) < chunk;
+                    sent += answer.result as usize;
+                }
+                Status::WouldBlock => {
+                    would_block = true;
+                    break;
+                }
+                other => panic!("wire send -> {other:?}"),
+            }
+        }
+        got.extend(peer.received(listening));
+        if sent == data.len() && got.len() == data.len() {
+            break;
+        }
+        run_wire(&mut server, &mut peer, 2);
+    }
+    assert_eq!(got, data, "the kumo->peer stream is byte-exact");
+    assert!(partial, "partial SENDs were exercised on the wire");
+    assert!(would_block, "the full transmit buffer refused a SEND");
+
+    // peer -> kumo.
+    let back = pattern(12_000, 7);
+    let (mut pushed, mut echoed) = (0usize, Vec::new());
+    for _ in 0..20_000 {
+        if pushed < back.len() {
+            let socket = peer.sockets.get_mut::<tcp::Socket>(listening);
+            if let Ok(n) = socket.send_slice(&back[pushed..]) {
+                pushed += n;
+            }
+        }
+        let answer = c.at(&mut server, Op::Recv, s, 700, &[]);
+        match answer.status {
+            Status::Ok if answer.payload.is_empty() => {}
+            Status::Ok => echoed.extend_from_slice(&answer.payload),
+            Status::WouldBlock => {}
+            other => panic!("wire recv -> {other:?}"),
+        }
+        if pushed == back.len() && echoed.len() == back.len() {
+            break;
+        }
+        run_wire(&mut server, &mut peer, 2);
+    }
+    assert_eq!(echoed, back, "the peer->kumo stream is byte-exact");
+
+    // Orderly close: kumo's FIN reads as EOF on the peer; the peer's close as EOF on kumo.
+    assert_eq!(
+        c.at(&mut server, Op::Shutdown, s, 2, &[]).status,
+        Status::Ok
+    );
+    run_wire(&mut server, &mut peer, 100);
+    {
+        let mut buf = [0u8; 16];
+        let socket = peer.sockets.get_mut::<tcp::Socket>(listening);
+        assert!(
+            matches!(socket.recv_slice(&mut buf), Err(tcp::RecvError::Finished)),
+            "kumo's FIN is an orderly end at the peer"
+        );
+    }
+    peer.sockets.get_mut::<tcp::Socket>(listening).close();
+    let mut eof = false;
+    for _ in 0..2000 {
+        let answer = c.at(&mut server, Op::Recv, s, 64, &[]);
+        match answer.status {
+            Status::Ok if answer.payload.is_empty() => {
+                eof = true;
+                break;
+            }
+            Status::Ok => {}
+            Status::WouldBlock => {}
+            other => panic!("wire recv at close -> {other:?}"),
+        }
+        run_wire(&mut server, &mut peer, 2);
+    }
+    assert!(eof, "the peer's FIN reads as EOF on kumo");
+    assert_eq!(server.stats().stream_bytes_sent, data.len() as u64);
+    assert_eq!(server.stats().stream_bytes_received, back.len() as u64);
+}
+
+#[test]
+fn a_wire_listener_accepts_a_peer_connection() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let mut c = Client::open(&mut server);
+    let l = c.tcp(&mut server);
+    assert_eq!(wire_bind(&mut c, &mut server, l, WIRE_PORT), WIRE_PORT);
+    assert_eq!(c.at(&mut server, Op::Listen, l, 2, &[]).status, Status::Ok);
+
+    let remote = peer.tcp();
+    peer.sockets
+        .get_mut::<tcp::Socket>(remote)
+        .connect(
+            peer.iface.context(),
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::from(WIRE_IP)), WIRE_PORT),
+            PEER_PORT,
+        )
+        .expect("the peer connects");
+    run_wire(&mut server, &mut peer, 50);
+
+    let ready = wire_wait(&mut c, &mut server, &mut peer, l, WAIT_CONNECTED, 5000);
+    assert_eq!(ready.status, Status::Ok);
+    let accepted = c.at(&mut server, Op::Accept, l, 0, &[]);
+    assert_eq!(accepted.status, Status::Ok);
+    assert_eq!(accepted.socket as u64, accepted.result);
+    assert_eq!(
+        accepted.payload,
+        Addr {
+            ip: PEER_IP,
+            port: PEER_PORT
+        }
+        .encode()
+    );
+
+    // One message each way, byte-exact.
+    let stream = accepted.socket;
+    assert_eq!(
+        c.at(&mut server, Op::Send, stream, 0, b"from kumo").status,
+        Status::Ok
+    );
+    run_wire(&mut server, &mut peer, 50);
+    assert_eq!(peer.received(remote), b"from kumo".to_vec());
+
+    let socket = peer.sockets.get_mut::<tcp::Socket>(remote);
+    socket.send_slice(b"from peer").expect("the peer sends");
+    run_wire(&mut server, &mut peer, 50);
+    let answer = c.at(&mut server, Op::Recv, stream, 64, &[]);
+    assert_eq!(
+        (answer.status, answer.payload.as_slice()),
+        (Status::Ok, b"from peer".as_slice())
+    );
+
+    // Close both ends and check the names: kumo reports the wire address locally.
+    let names = c.at(&mut server, Op::GetName, stream, 0, &[]);
+    assert_eq!(
+        u16::from_le_bytes([names.payload[2], names.payload[3]]),
+        WIRE_PORT,
+        "the local port is the listener's"
+    );
+    assert_eq!(
+        &names.payload[4..8],
+        &WIRE_IP,
+        "local address is the wire address"
+    );
+    peer.sockets.get_mut::<tcp::Socket>(remote).close();
+    assert_eq!(
+        c.at(&mut server, Op::Close, stream, 0, &[]).status,
+        Status::Ok
+    );
+    assert_eq!(c.at(&mut server, Op::Close, l, 0, &[]).status, Status::Ok);
+    run_wire(&mut server, &mut peer, 300);
+    assert_eq!(server.busy_slots(), 0, "every slot came back");
+}
+
+#[test]
+fn a_wire_refusal_and_a_peer_reset_surface_as_statuses() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let mut c = Client::open(&mut server);
+
+    // No listener at the peer: its stack answers the SYN with RST.
+    let refused = c.tcp(&mut server);
+    assert_eq!(
+        wire_connect(&mut c, &mut server, refused),
+        Status::InProgress
+    );
+    let answer = wire_wait(
+        &mut c,
+        &mut server,
+        &mut peer,
+        refused,
+        WAIT_CONNECTED,
+        5000,
+    );
+    assert_eq!(answer.status, Status::ConnRefused);
+    let _ = c.at(&mut server, Op::Close, refused, 0, &[]);
+
+    // An accept-then-abort at the peer is a reset at kumo, not an orderly end.
+    let listening = peer.tcp();
+    peer.listen(listening);
+    let s = wire_connected(&mut server, &mut peer, &mut c, listening);
+    peer.sockets.get_mut::<tcp::Socket>(listening).abort();
+    let mut reset = false;
+    for _ in 0..2000 {
+        let answer = c.at(&mut server, Op::Recv, s, 64, &[]);
+        match answer.status {
+            Status::ConnReset => {
+                reset = true;
+                break;
+            }
+            Status::WouldBlock => {}
+            Status::Ok if answer.payload.is_empty() => {}
+            other => panic!("wire recv after peer abort -> {other:?}"),
+        }
+        run_wire(&mut server, &mut peer, 2);
+    }
+    assert!(reset, "the peer's RST surfaces as ConnReset");
+    let _ = c.at(&mut server, Op::Close, s, 0, &[]);
+    run_wire(&mut server, &mut peer, 200);
+}
+
+#[test]
+fn a_wire_tcp_retransmits_under_induced_loss() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let listening = peer.tcp();
+    peer.listen(listening);
+    let mut c = Client::open(&mut server);
+    let s = wire_connected(&mut server, &mut peer, &mut c, listening);
+
+    let message = pattern(512, 5);
+    assert_eq!(
+        c.at(&mut server, Op::Send, s, 0, &message).status,
+        Status::Ok
+    );
+    // Lose the segment carrying the message, then let the initial RTO (1000 ms) elapse.
+    let mut drops = 1;
+    run_wire_dropping(&mut server, &mut peer, &mut drops, 20);
+    assert_eq!(drops, 0, "the data segment was dropped");
+    assert_eq!(
+        peer.received(listening),
+        Vec::new(),
+        "nothing arrived while the segment was lost"
+    );
+    run_wire(&mut server, &mut peer, 2500);
+    assert_eq!(
+        peer.received(listening),
+        message,
+        "the retransmission delivered the message"
+    );
+}
+
+#[test]
+fn a_wire_stream_reaches_backpressure_and_deadlines() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let listening = peer.tcp();
+    peer.listen(listening);
+    let mut c = Client::open(&mut server);
+    let s = wire_connected(&mut server, &mut peer, &mut c, listening);
+
+    // The peer never reads: SEND eventually refuses rather than growing memory.
+    let block = [0x5Au8; STREAM_PAYLOAD_MAX];
+    let mut blocked = false;
+    for _ in 0..40 {
+        match c.at(&mut server, Op::Send, s, 0, &block).status {
+            Status::Ok => {}
+            Status::WouldBlock => {
+                blocked = true;
+                break;
+            }
+            other => panic!("wire send -> {other:?}"),
+        }
+    }
+    assert!(blocked, "the unread wire stream reaches backpressure");
+
+    // READABLE with no data answers the deadline, and the stack keeps running.
+    let answer = wire_wait(&mut c, &mut server, &mut peer, s, WAIT_READABLE, 120);
+    assert_eq!(answer.status, Status::TimedOut);
+}
+
+#[test]
+fn repeated_wire_connections_return_the_slot_census_flat() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let mut c = Client::open(&mut server);
+    for cycle in 0..6u8 {
+        let listening = peer.tcp();
+        peer.listen(listening);
+        let s = wire_connected(&mut server, &mut peer, &mut c, listening);
+        let msg = [cycle; 16];
+        assert_eq!(c.at(&mut server, Op::Send, s, 0, &msg).status, Status::Ok);
+        run_wire(&mut server, &mut peer, 50);
+        assert_eq!(peer.received(listening), msg.to_vec());
+        peer.sockets.get_mut::<tcp::Socket>(listening).close();
+        run_wire(&mut server, &mut peer, 50);
+        assert_eq!(c.at(&mut server, Op::Close, s, 0, &[]).status, Status::Ok);
+        run_wire(&mut server, &mut peer, 300);
+        peer.sockets.remove(listening);
+    }
+    assert_eq!(server.busy_slots(), 0, "every slot came back");
+    assert_eq!(server.live_sockets(), 0);
+}
+
+#[test]
+fn a_generation_change_resets_a_wire_stream() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let listening = peer.tcp();
+    peer.listen(listening);
+    let mut c = Client::open(&mut server);
+    let s = wire_connected(&mut server, &mut peer, &mut c, listening);
+
+    // The provider generation changes under a live stream: the stack is rebuilt and the
+    // stream is gone without a FIN, which is a reset, never a live connection.
+    server.reset_wire(clock::now());
+    assert_eq!(
+        c.at(&mut server, Op::Send, s, 0, b"gone").status,
+        Status::ConnReset
+    );
+    assert_eq!(
+        c.at(&mut server, Op::Recv, s, 64, &[]).status,
+        Status::ConnReset
+    );
+    assert_eq!(c.at(&mut server, Op::Close, s, 0, &[]).status, Status::Ok);
+    run_wire(&mut server, &mut peer, 100);
+    assert_eq!(server.busy_slots(), 0);
+}
+
+/// The metal peer's ordering: it sends its whole payload, half-closes at once (FIN races
+/// the stream), and only then reads. The stream test above lets the peer FIN arrive late;
+/// this one reproduces the client phase that printed FAIL on the board.
+#[test]
+fn a_wire_tcp_reads_eof_when_the_peer_fin_races_the_stream() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let listening = peer.tcp();
+    peer.listen(listening);
+    let mut c = Client::open(&mut server);
+    let s = wire_connected(&mut server, &mut peer, &mut c, listening);
+
+    let back = pattern(12_000, 7);
+    let data = pattern(12_000, 3);
+    let (mut pushed, mut peer_shut) = (0usize, false);
+    let (mut sent, mut got, mut peer_data) = (0usize, Vec::new(), Vec::new());
+    let (mut shut, mut eof) = (false, false);
+    for _ in 0..20_000 {
+        {
+            let socket = peer.sockets.get_mut::<tcp::Socket>(listening);
+            if pushed < back.len() {
+                if let Ok(n) = socket.send_slice(&back[pushed..]) {
+                    pushed += n;
+                }
+            } else if !peer_shut {
+                // The peer's half-close: FIN right after its payload.
+                socket.close();
+                peer_shut = true;
+            }
+        }
+        // The peer's application reads continuously, like the real peer's read_all.
+        peer_data.extend(peer.received(listening));
+        if sent < data.len() {
+            let chunk = (data.len() - sent).min(2048);
+            let answer = c.at(&mut server, Op::Send, s, 0, &data[sent..sent + chunk]);
+            match answer.status {
+                Status::Ok => sent += answer.result as usize,
+                Status::WouldBlock => {}
+                other => panic!("send -> {other:?}"),
+            }
+        } else if !shut {
+            assert_eq!(
+                c.at(&mut server, Op::Shutdown, s, 2, &[]).status,
+                Status::Ok
+            );
+            shut = true;
+        }
+        if !eof {
+            let answer = c.at(&mut server, Op::Recv, s, 2048, &[]);
+            match answer.status {
+                Status::Ok if answer.payload.is_empty() => eof = true,
+                Status::Ok => got.extend_from_slice(&answer.payload),
+                Status::WouldBlock => {}
+                other => panic!("recv -> {other:?}"),
+            }
+        }
+        if shut
+            && eof
+            && sent == data.len()
+            && pushed == back.len()
+            && peer_data.len() == data.len()
+        {
+            break;
+        }
+        run_wire(&mut server, &mut peer, 1);
+    }
+    assert_eq!(got, back, "the peer->kumo stream is byte-exact");
+    assert_eq!(
+        peer_data, data,
+        "the peer drained kumo's stream after half-closing"
+    );
+    assert!(eof, "kumo saw EOF after the racing FIN (eof={eof})");
+    assert!(shut, "kumo half-closed (shut={shut})");
+    assert_eq!(sent, data.len(), "kumo sent its whole stream (sent={sent})");
+    assert_eq!(pushed, back.len(), "the peer queued its whole stream");
+}
+
+/// The race the metal client phase hit: the peer's FIN arrives while its payload still
+/// sits unread in kumo's receive buffer. Kumo half-closes behind that payload, drains it,
+/// and one poll later the peer's ACK retires the socket to Closed. The orderly path must
+/// read as EOF, never as a reset, even though no dispatch observed CloseWait with an
+/// empty buffer to latch `peer_finished`.
+#[test]
+fn wire_shutdown_behind_the_peer_fin_reads_eof_not_reset() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut peer = WirePeer::new(clock::now());
+    let listening = peer.tcp();
+    peer.listen(listening);
+    let mut c = Client::open(&mut server);
+    let s = wire_connected(&mut server, &mut peer, &mut c, listening);
+
+    // The peer fills kumo's receive buffer and half-closes at once: its FIN waits behind
+    // data kumo has not read yet.
+    let back = pattern(SOCKET_BUFFER, 7);
+    {
+        let socket = peer.sockets.get_mut::<tcp::Socket>(listening);
+        assert!(matches!(socket.send_slice(&back), Ok(n) if n == back.len()));
+        socket.close();
+    }
+
+    // Kumo sends its own stream first (the peer drains it on its side), then half-closes
+    // while its receive buffer still holds the peer's payload.
+    let data = pattern(6_000, 3);
+    let (mut sent, mut peer_got) = (0usize, Vec::new());
+    for _ in 0..20_000 {
+        if sent < data.len() {
+            let chunk = (data.len() - sent).min(2048);
+            let answer = c.at(&mut server, Op::Send, s, 0, &data[sent..sent + chunk]);
+            match answer.status {
+                Status::Ok => sent += answer.result as usize,
+                Status::WouldBlock => {}
+                other => panic!("send -> {other:?}"),
+            }
+        }
+        peer_got.extend(peer.received(listening));
+        if sent == data.len() && peer_got.len() == data.len() {
+            break;
+        }
+        run_wire(&mut server, &mut peer, 2);
+    }
+    assert_eq!(sent, data.len(), "kumo sent its whole stream");
+    assert_eq!(peer_got, data, "the peer drained kumo's stream");
+    // Let the peer's payload and FIN settle into kumo's stack.
+    run_wire(&mut server, &mut peer, 20);
+
+    assert_eq!(
+        c.at(&mut server, Op::Shutdown, s, 2, &[]).status,
+        Status::Ok
+    );
+
+    // Drain the peer's payload; the socket is LastAck behind it.
+    let mut got = Vec::new();
+    for _ in 0..2_000 {
+        let answer = c.at(&mut server, Op::Recv, s, 2048, &[]);
+        match answer.status {
+            Status::Ok if answer.payload.is_empty() => {
+                panic!("EOF before the payload behind the FIN drained")
+            }
+            Status::Ok => got.extend_from_slice(&answer.payload),
+            Status::WouldBlock => {}
+            other => panic!("recv -> {other:?}"),
+        }
+        if got.len() == back.len() {
+            break;
+        }
+        run_wire(&mut server, &mut peer, 2);
+    }
+    assert_eq!(got, back, "the peer's payload behind its FIN is intact");
+
+    // One poll lets the peer's ACK retire kumo to Closed; the orderly close must still
+    // read as EOF, never as a reset.
+    run_wire(&mut server, &mut peer, 50);
+    let eof = c.at(&mut server, Op::Recv, s, 64, &[]);
+    assert_eq!(
+        (eof.status, eof.payload.is_empty()),
+        (Status::Ok, true),
+        "an orderly close behind the peer's FIN is EOF, not ConnReset"
     );
 }

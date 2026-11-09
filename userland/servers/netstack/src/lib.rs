@@ -101,6 +101,11 @@ struct Slot {
     /// The next echo-request sequence number this slot sends (NET8).
     icmp_seq: u16,
     tcp: SocketHandle,
+    /// The same slot's TCP socket on the wire stack (NET10): created on demand at CONNECT,
+    /// LISTEN arming or ACCEPT handoff; dropped with the generation or when the stream ends.
+    wire_tcp: Option<SocketHandle>,
+    /// Whether this slot's TCP connection or listener lives on the wire stack (NET10).
+    tcp_on_wire: bool,
     kind: SocketKind,
     /// `(session index, socket id)` while a client holds it.
     owner: Option<(usize, u32)>,
@@ -234,6 +239,14 @@ fn wire_icmp_socket(ident: u16) -> icmp::Socket<'static> {
     socket
 }
 
+/// One wire TCP socket, created on demand (NET10). Buffers come from the TCP budget.
+fn wire_tcp_socket() -> tcp::Socket<'static> {
+    tcp::Socket::new(
+        tcp::SocketBuffer::new(leak(0u8, SOCKET_BUFFER)),
+        tcp::SocketBuffer::new(leak(0u8, SOCKET_BUFFER)),
+    )
+}
+
 fn is_loopback(ip: [u8; 4]) -> bool {
     ip[0] == 127
 }
@@ -289,6 +302,8 @@ impl Server {
                 wire_icmp: None,
                 icmp_seq: 0,
                 tcp: sockets.add(tcp),
+                wire_tcp: None,
+                tcp_on_wire: false,
                 kind: SocketKind::Udp,
                 owner: None,
                 listener: None,
@@ -366,8 +381,9 @@ impl Server {
                 prefix,
             ));
         });
-        // Half the table is the per-slot UDP twins; the rest is reserved for the ICMP
-        // sockets created on demand (NET8), so one `SocketSet` serves both socket kinds.
+        // Half the table is the per-slot UDP twins; the rest serves the ICMP (NET8) and TCP
+        // twin sockets created on demand (NET10): a slot is one kind at a time, so one
+        // on-demand socket per slot fits the reserve exactly.
         let storage: &'static mut [SocketStorage<'static>] = Box::leak(
             (0..2 * SOCKETS_TOTAL)
                 .map(|_| SocketStorage::EMPTY)
@@ -413,6 +429,23 @@ impl Server {
             prefix,
             refusals: Refusals::default(),
         });
+        // NET10: a listener is reachable from both stacks. Every armed backlog slot gains a
+        // wire listener twin for this generation, and wire-bound streams from the previous
+        // generation are gone: their slots read as reset through the untouched loopback
+        // socket (Closed without a FIN), never as a live connection.
+        for index in 0..self.slots.len() {
+            let hidden = self.slots[index].listener.is_some();
+            let kind = self.slots[index].kind;
+            let port = self.slots[index].port;
+            self.slots[index].wire_tcp = None;
+            self.slots[index].tcp_on_wire = false;
+            if hidden && kind == SocketKind::Tcp {
+                if let Some(handle) = self.ensure_wire_tcp(index) {
+                    let wire = self.wire.as_mut().expect("a fresh generation");
+                    let _ = wire.sockets.get_mut::<tcp::Socket>(handle).listen(port);
+                }
+            }
+        }
     }
 
     /// A new provider generation: discard wire-bound state (DESIGN/026 §3) and rebuild the
@@ -430,6 +463,8 @@ impl Server {
             for slot in &mut self.slots {
                 slot.wire_udp = None;
                 slot.wire_icmp = None;
+                slot.wire_tcp = None;
+                slot.tcp_on_wire = false;
             }
         }
     }
@@ -548,18 +583,14 @@ impl Server {
     /// RST is held as draining until the next poll has sent it.
     fn abort(&mut self, index: usize) {
         let tcp_live = self.slots[index].kind == SocketKind::Tcp
-            && self
-                .sockets
-                .get::<tcp::Socket>(self.slots[index].tcp)
-                .state()
-                != tcp::State::Closed;
-        self.sockets
-            .get_mut::<tcp::Socket>(self.slots[index].tcp)
-            .abort();
+            && self.tcp_socket(index).state() != tcp::State::Closed;
+        self.tcp_socket_mut(index).abort();
         self.forget(index);
         if tcp_live {
             // Zero deadline: free on the next poll, after the RST has been dispatched.
             self.slots[index].draining = Some(0);
+        } else {
+            self.release_wire_tcp(index);
         }
     }
 
@@ -783,6 +814,64 @@ impl Server {
         Ok(())
     }
 
+    /// Bind the slot's wire TCP twin, creating it on demand (NET10); `None` without a wire.
+    /// The twin is reset so a previous connection or listener never leaks into the next one.
+    fn ensure_wire_tcp(&mut self, index: usize) -> Option<SocketHandle> {
+        let wire = self.wire.as_mut()?;
+        let handle = match self.slots[index].wire_tcp {
+            Some(handle) => handle,
+            None => {
+                let handle = wire.sockets.add(wire_tcp_socket());
+                self.slots[index].wire_tcp = Some(handle);
+                handle
+            }
+        };
+        wire.sockets.get_mut::<tcp::Socket>(handle).abort();
+        Some(handle)
+    }
+
+    /// Drop the slot's wire TCP twin; a generation change takes the whole socket set with it.
+    fn release_wire_tcp(&mut self, index: usize) {
+        if let (Some(wire), Some(handle)) = (self.wire.as_mut(), self.slots[index].wire_tcp.take())
+        {
+            wire.sockets.remove(handle);
+        }
+        self.slots[index].tcp_on_wire = false;
+    }
+
+    /// The slot's routed TCP socket: its wire twin while the slot lives on the wire stack,
+    /// the loopback socket otherwise (NET10).
+    fn tcp_socket(&self, index: usize) -> &tcp::Socket<'static> {
+        let slot = &self.slots[index];
+        if slot.tcp_on_wire {
+            let handle = slot.wire_tcp.expect("a wire TCP slot owns its twin");
+            self.wire
+                .as_ref()
+                .expect("a wire TCP slot has a wire stack")
+                .sockets
+                .get::<tcp::Socket>(handle)
+        } else {
+            self.sockets.get::<tcp::Socket>(slot.tcp)
+        }
+    }
+
+    fn tcp_socket_mut(&mut self, index: usize) -> &mut tcp::Socket<'static> {
+        let on_wire = self.slots[index].tcp_on_wire;
+        if on_wire {
+            let handle = self.slots[index]
+                .wire_tcp
+                .expect("a wire TCP slot owns its twin");
+            self.wire
+                .as_mut()
+                .expect("a wire TCP slot has a wire stack")
+                .sockets
+                .get_mut::<tcp::Socket>(handle)
+        } else {
+            let handle = self.slots[index].tcp;
+            self.sockets.get_mut::<tcp::Socket>(handle)
+        }
+    }
+
     fn send_datagram(&mut self, index: usize, to: Addr, data: &[u8]) -> Result<u64, Status> {
         let to_wire = !is_loopback(to.ip);
         if to_wire && self.wire.is_none() {
@@ -823,17 +912,21 @@ impl Server {
     /// Promote a CONNECT that completed, and remember a FIN once seen, so a later Closed state
     /// can be told apart from a reset.
     fn observe(&mut self, index: usize) {
-        let slot = &self.slots[index];
-        if slot.kind != SocketKind::Tcp {
+        if self.slots[index].kind != SocketKind::Tcp {
             return;
         }
-        let socket = self.sockets.get::<tcp::Socket>(slot.tcp);
-        let state = socket.state();
-        let finished = !socket.may_recv()
-            && !matches!(
+        let (state, finished) = {
+            let socket = self.tcp_socket(index);
+            let state = socket.state();
+            (
                 state,
-                tcp::State::Closed | tcp::State::SynSent | tcp::State::Listen
-            );
+                !socket.may_recv()
+                    && !matches!(
+                        state,
+                        tcp::State::Closed | tcp::State::SynSent | tcp::State::Listen
+                    ),
+            )
+        };
         let slot = &mut self.slots[index];
         if slot.state == Tcp::Connecting && state == tcp::State::Established {
             slot.state = Tcp::Stream;
@@ -887,7 +980,7 @@ impl Server {
             }
             return Ok(mask);
         }
-        let socket = self.sockets.get::<tcp::Socket>(slot.tcp);
+        let socket = self.tcp_socket(index);
         match slot.state {
             Tcp::Fresh => Ok(0),
             Tcp::Connecting => {
@@ -916,27 +1009,45 @@ impl Server {
         }
     }
 
-    /// A backlog slot of `listener` whose connection is established and can be accepted.
-    fn acceptable(&self, listener: usize) -> Option<usize> {
-        self.slots.iter().position(|slot| {
-            matches!(slot.listener, Some((l, _)) if l == listener)
-                && matches!(
-                    self.sockets.get::<tcp::Socket>(slot.tcp).state(),
-                    tcp::State::Established | tcp::State::CloseWait
-                )
-        })
+    /// A backlog slot of `listener` whose connection is established and can be accepted,
+    /// with whether it arrived on the wire stack (NET10).
+    fn acceptable(&self, listener: usize) -> Option<(usize, bool)> {
+        fn established(socket: &tcp::Socket<'_>) -> bool {
+            matches!(
+                socket.state(),
+                tcp::State::Established | tcp::State::CloseWait
+            )
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            if !matches!(slot.listener, Some((l, _)) if l == listener) {
+                continue;
+            }
+            if established(self.sockets.get::<tcp::Socket>(slot.tcp)) {
+                return Some((index, false));
+            }
+            if let (Some(wire), Some(handle)) = (self.wire.as_ref(), slot.wire_tcp) {
+                if established(wire.sockets.get::<tcp::Socket>(handle)) {
+                    return Some((index, true));
+                }
+            }
+        }
+        None
     }
 
-    /// Arm one more hidden listener for `listener`; false when no slot is free.
+    /// Arm one more hidden listener for `listener`; false when no slot is free. With a wire
+    /// attached the hidden slot listens on both stacks: a bound port is one namespace.
     fn arm_backlog(&mut self, listener: usize, session: usize) -> bool {
         let port = self.slots[listener].port;
         let Some(index) = self.slots.iter().position(Slot::is_free) else {
             return false;
         };
-        let slot = &mut self.slots[index];
-        slot.kind = SocketKind::Tcp;
-        slot.port = port;
-        slot.listener = Some((listener, session));
+        {
+            let slot = &mut self.slots[index];
+            slot.kind = SocketKind::Tcp;
+            slot.port = port;
+            slot.listener = Some((listener, session));
+            slot.tcp_on_wire = false;
+        }
         let armed = self
             .sockets
             .get_mut::<tcp::Socket>(self.slots[index].tcp)
@@ -944,8 +1055,28 @@ impl Server {
             .is_ok();
         if !armed {
             self.forget(index);
+            return false;
         }
-        armed
+        if self.wire.is_some() {
+            let Some(handle) = self.ensure_wire_tcp(index) else {
+                self.forget(index);
+                return false;
+            };
+            let armed = self
+                .wire
+                .as_mut()
+                .expect("a wire was just checked")
+                .sockets
+                .get_mut::<tcp::Socket>(handle)
+                .listen(port)
+                .is_ok();
+            if !armed {
+                self.release_wire_tcp(index);
+                self.forget(index);
+                return false;
+            }
+        }
+        true
     }
 
     fn dispatch(&mut self, session: usize, request: &Request<'_>, now_ns: u64) -> Answer {
@@ -1149,6 +1280,7 @@ impl Server {
                 let wire_addr = self.wire.as_ref().map_or(LOOPBACK, |wire| wire.addr);
                 let local_ip = match slot.kind {
                     SocketKind::Icmp => self.wire.as_ref().map_or([0; 4], |wire| wire.addr),
+                    SocketKind::Tcp if slot.tcp_on_wire => wire_addr,
                     _ => match slot.peer {
                         Some(peer) if !is_loopback(peer.ip) => wire_addr,
                         _ => LOOPBACK,
@@ -1159,10 +1291,7 @@ impl Server {
                     port: slot.port,
                 };
                 let peer = if slot.kind == SocketKind::Tcp {
-                    self.sockets
-                        .get::<tcp::Socket>(slot.tcp)
-                        .remote_endpoint()
-                        .map(addr_of)
+                    self.tcp_socket(index).remote_endpoint().map(addr_of)
                 } else {
                     slot.peer
                 };
@@ -1190,6 +1319,7 @@ impl Server {
         self.stats.sockets_freed += 1;
         let slot = &self.slots[index];
         if slot.kind == SocketKind::Udp || slot.state == Tcp::Fresh {
+            self.release_wire_tcp(index);
             self.forget(index);
             return;
         }
@@ -1203,10 +1333,9 @@ impl Server {
             return;
         }
         // Connecting or Stream: FIN now, free once the exchange finishes or at the deadline.
-        let handle = slot.tcp;
         let kind = slot.kind;
         let port = slot.port;
-        self.sockets.get_mut::<tcp::Socket>(handle).close();
+        self.tcp_socket_mut(index).close();
         self.forget(index);
         let slot = &mut self.slots[index];
         slot.kind = kind;
@@ -1293,7 +1422,7 @@ impl Server {
                     Tcp::Connecting => return Err(Status::InProgress),
                     _ => return Err(Status::AlreadyConnected),
                 }
-                if !is_loopback(addr.ip) {
+                if !is_loopback(addr.ip) && self.wire.is_none() {
                     return Err(Status::NetUnreachable);
                 }
                 if addr.port == 0 {
@@ -1301,10 +1430,23 @@ impl Server {
                 }
                 self.ensure_bound(index)?;
                 let local = self.slots[index].port;
-                self.sockets
-                    .get_mut::<tcp::Socket>(handle)
-                    .connect(self.iface.context(), endpoint_of(addr), local)
-                    .map_err(|_| Status::InvalidArgument)?;
+                if is_loopback(addr.ip) {
+                    self.release_wire_tcp(index);
+                    self.sockets
+                        .get_mut::<tcp::Socket>(handle)
+                        .connect(self.iface.context(), endpoint_of(addr), local)
+                        .map_err(|_| Status::InvalidArgument)?;
+                } else {
+                    let Some(wire_handle) = self.ensure_wire_tcp(index) else {
+                        return Err(Status::NetUnreachable);
+                    };
+                    let wire = self.wire.as_mut().expect("checked above");
+                    wire.sockets
+                        .get_mut::<tcp::Socket>(wire_handle)
+                        .connect(wire.iface.context(), endpoint_of(addr), local)
+                        .map_err(|_| Status::InvalidArgument)?;
+                    self.slots[index].tcp_on_wire = true;
+                }
                 self.slots[index].state = Tcp::Connecting;
                 Ok(Answer::status(Status::InProgress, socket))
             }
@@ -1332,7 +1474,7 @@ impl Server {
                 if self.slots[index].state != Tcp::Listener {
                     return Err(Status::InvalidArgument);
                 }
-                let ready = self.acceptable(index).ok_or(Status::WouldBlock)?;
+                let (ready, on_wire) = self.acceptable(index).ok_or(Status::WouldBlock)?;
                 let s = self.sessions[session].as_mut().ok_or(Status::BadSocket)?;
                 if s.sockets >= SOCKETS_PER_SESSION {
                     return Err(Status::QuotaExceeded);
@@ -1340,19 +1482,37 @@ impl Server {
                 let id = s.next_socket;
                 s.next_socket += 1;
                 s.sockets += 1;
-                let slot = &mut self.slots[ready];
-                slot.listener = None;
-                slot.owner = Some((session, id));
-                slot.state = Tcp::Stream;
-                let peer = self
-                    .sockets
-                    .get::<tcp::Socket>(slot.tcp)
-                    .remote_endpoint()
-                    .map(addr_of)
-                    .unwrap_or(Addr {
-                        ip: [0; 4],
-                        port: 0,
-                    });
+                {
+                    let slot = &mut self.slots[ready];
+                    slot.listener = None;
+                    slot.owner = Some((session, id));
+                    slot.state = Tcp::Stream;
+                    slot.tcp_on_wire = on_wire;
+                }
+                let peer = if on_wire {
+                    // The loopback twin was listening on the same port; it is not this stream.
+                    self.sockets
+                        .get_mut::<tcp::Socket>(self.slots[ready].tcp)
+                        .abort();
+                    let handle = self.slots[ready].wire_tcp.expect("a wire twin");
+                    self.wire
+                        .as_ref()
+                        .expect("a wire ACCEPT has its stack")
+                        .sockets
+                        .get::<tcp::Socket>(handle)
+                        .remote_endpoint()
+                        .map(addr_of)
+                } else {
+                    self.release_wire_tcp(ready);
+                    self.sockets
+                        .get::<tcp::Socket>(self.slots[ready].tcp)
+                        .remote_endpoint()
+                        .map(addr_of)
+                };
+                let peer = peer.unwrap_or(Addr {
+                    ip: [0; 4],
+                    port: 0,
+                });
                 self.stats.connections_accepted += 1;
                 // Keep the backlog full; if no slot is free the listener runs one short.
                 let _ = self.arm_backlog(index, session);
@@ -1365,14 +1525,17 @@ impl Server {
                     Tcp::Connecting => return Err(Status::WouldBlock),
                     _ => return Err(Status::NotConnected),
                 }
-                let tcp = self.sockets.get_mut::<tcp::Socket>(handle);
-                if tcp.state() == tcp::State::Closed {
-                    return Err(Status::ConnReset);
-                }
-                if !tcp.may_send() {
-                    return Err(Status::ShutDown);
-                }
-                match tcp.send_slice(data) {
+                let sent = {
+                    let tcp = self.tcp_socket_mut(index);
+                    if tcp.state() == tcp::State::Closed {
+                        return Err(Status::ConnReset);
+                    }
+                    if !tcp.may_send() {
+                        return Err(Status::ShutDown);
+                    }
+                    tcp.send_slice(data)
+                };
+                match sent {
                     Ok(0) if !data.is_empty() => Err(Status::WouldBlock),
                     Ok(sent) => {
                         self.stats.stream_bytes_sent += sent as u64;
@@ -1392,14 +1555,22 @@ impl Server {
                     return Ok(Answer::ok(socket, 0));
                 }
                 let finished = slot.peer_finished;
-                let tcp = self.sockets.get_mut::<tcp::Socket>(handle);
-                if tcp.can_recv() {
-                    let mut data = vec![0u8; max as usize];
-                    let n = tcp.recv_slice(&mut data).map_err(|_| Status::ConnReset)?;
-                    data.truncate(n);
+                let read = {
+                    let tcp = self.tcp_socket_mut(index);
+                    if tcp.can_recv() {
+                        let mut data = vec![0u8; max as usize];
+                        let n = tcp.recv_slice(&mut data).map_err(|_| Status::ConnReset)?;
+                        data.truncate(n);
+                        Some((n, data))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((n, data)) = read {
                     self.stats.stream_bytes_received += n as u64;
                     return Ok(Answer::payload(socket, n as u64, data));
                 }
+                let tcp = self.tcp_socket(index);
                 if tcp.may_recv() {
                     return Err(Status::WouldBlock);
                 }
@@ -1418,7 +1589,14 @@ impl Server {
                     self.slots[index].read_shut = true;
                 }
                 if write {
-                    self.sockets.get_mut::<tcp::Socket>(handle).close();
+                    // Entering CloseWait means the peer's FIN was already received, so the
+                    // stream ends orderly even if the socket reaches Closed before another
+                    // dispatch samples the state (the FIN-behind-payload race: the peer's
+                    // ACK would otherwise make RECV answer ConnReset).
+                    if self.tcp_socket(index).state() == tcp::State::CloseWait {
+                        self.slots[index].peer_finished = true;
+                    }
+                    self.tcp_socket_mut(index).close();
                 }
                 Ok(Answer::ok(socket, 0))
             }
@@ -1448,21 +1626,28 @@ impl Server {
                 }
             }
         }
+        // Sampling after the polls latches state windows (CloseWait, LastAck, TimeWait)
+        // that a dispatch-only observe would miss.
+        for index in 0..self.slots.len() {
+            if self.slots[index].kind == SocketKind::Tcp {
+                self.observe(index);
+            }
+        }
         for index in 0..self.slots.len() {
             let Some(deadline) = self.slots[index].draining else {
                 continue;
             };
-            let handle = self.slots[index].tcp;
-            let state = self.sockets.get::<tcp::Socket>(handle).state();
+            let state = self.tcp_socket(index).state();
             let done = matches!(state, tcp::State::Closed | tcp::State::TimeWait);
             if done || now_ns >= deadline {
                 // The FIN exchange (or the RST abort queued) has gone out; reset and reuse.
-                self.sockets.get_mut::<tcp::Socket>(handle).abort();
+                self.tcp_socket_mut(index).abort();
                 if !done {
                     // A deadline reset still owes the peer its RST: one more poll.
                     self.slots[index].draining = Some(0);
                     continue;
                 }
+                self.release_wire_tcp(index);
                 self.forget(index);
             }
         }
