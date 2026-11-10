@@ -1137,7 +1137,9 @@ fn build_autoexec() -> Vec<u8> {
       run args alpha beta\n\
       cat etc/autoexec\n\
       wc etc/autoexec\n\
-      relibc i-a3\n"
+      relibc i-a3\n\
+      run relibc-smoke udp-nogrant\n\
+      net relibc-smoke udp\n"
         .to_vec()
 }
 
