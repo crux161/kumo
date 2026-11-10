@@ -4,6 +4,7 @@
 //j547
 //j548
 //j549
+//j862
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -24,9 +25,11 @@ pub mod block;
 
 use kumo_fatfs::{DirEntry, FatVolume, FatWriteError, SectorReader, SectorWriter};
 use kumo_vfs::{
-    encode_open_ok, encode_status, encode_write_ok, DirReplyWriter, Request, MAX_WRITE_DATA,
-    OPEN_CREATE, OPEN_READ, OPEN_WRITE, VFS_ACCESS_DENIED, VFS_BAD_HANDLE, VFS_BAD_REQUEST,
-    VFS_IO_ERROR, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_FOUND, VFS_NO_SPACE, VFS_OK, WRITE_HEADER_LEN,
+    encode_open_ok, encode_stat_ok, encode_status, encode_write_ok, DirReplyWriter, Request,
+    LOCK_EX, LOCK_SH, LOCK_UN, MAX_WRITE_DATA, OPEN_CREATE, OPEN_READ, OPEN_WRITE,
+    STAT_KIND_DIRECTORY, STAT_KIND_FILE, VFS_ACCESS_DENIED, VFS_BAD_HANDLE, VFS_BAD_REQUEST,
+    VFS_EXISTS, VFS_IO_ERROR, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_EMPTY, VFS_NOT_FOUND,
+    VFS_NOT_SUPPORTED, VFS_NO_SPACE, VFS_OK, VFS_WOULD_BLOCK, WRITE_HEADER_LEN,
 };
 
 /// Maximum number of open file handles in this first fixed table.
@@ -58,6 +61,8 @@ pub struct OpenFile {
     entry: DirEntry,
     readable: bool,
     writable: bool,
+    /// Advisory lock held through this open handle (SH3): 0, `LOCK_SH`, or `LOCK_EX`.
+    lock: u8,
 }
 
 impl OpenTable {
@@ -74,6 +79,7 @@ impl OpenTable {
                     entry,
                     readable: options & OPEN_READ != 0,
                     writable: options & OPEN_WRITE != 0,
+                    lock: 0,
                 });
                 return Some((index + 1) as u32);
             }
@@ -199,6 +205,14 @@ pub fn dispatch<R: SectorReader + SectorWriter>(
         }
         Some(Request::Flush { handle }) => flush(volume, reader, open_files, handle, reply),
         Some(Request::ReadDir { path, start }) => read_dir(volume, reader, path, start, reply),
+        Some(Request::Mkdir { path }) => mkdir(volume, reader, path, reply),
+        Some(Request::Unlink { path }) => unlink(volume, reader, path, reply),
+        Some(Request::Rmdir { path }) => rmdir(volume, reader, path, reply),
+        Some(Request::Rename { from, to }) => rename(volume, reader, from, to, reply),
+        Some(Request::Stat { path }) => stat(volume, reader, path, reply),
+        Some(Request::Lock { handle, operation }) => lock(open_files, handle, operation, reply),
+        // FAT has no hard links; the documented fallback lives in the client.
+        Some(Request::Link { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
         None => write_status(reply, VFS_BAD_REQUEST),
     }
 }
@@ -394,6 +408,141 @@ fn directory_cluster<R: SectorReader>(
         }),
         Some(_) => Err(VFS_NOT_DIR),
         None => Err(VFS_NOT_FOUND),
+    }
+}
+
+/// Create the directory at `path` (SH3). Existence is checked first so the answer is
+/// `VFS_EXISTS`; a missing parent or an unrepresentable 8.3 name answers `VFS_BAD_REQUEST`
+/// (the protocol has no separate ENOENT-for-parent status).
+fn mkdir<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    path: &[u8],
+    reply: &mut [u8],
+) -> usize {
+    if volume.resolve_path(io, path).is_some() {
+        return write_status(reply, VFS_EXISTS);
+    }
+    match volume.create_dir(io, path).and_then(|_| volume.flush(io)) {
+        Ok(()) => write_status(reply, VFS_OK),
+        Err(error) => write_status(reply, mutation_status(error)),
+    }
+}
+
+/// Remove the file at `path` (SH3).
+fn unlink<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    path: &[u8],
+    reply: &mut [u8],
+) -> usize {
+    match volume.resolve_path(io, path) {
+        None => write_status(reply, VFS_NOT_FOUND),
+        Some(entry) if entry.is_dir() => write_status(reply, VFS_IS_DIR),
+        Some(_) => match volume.remove_file(io, path).and_then(|_| volume.flush(io)) {
+            Ok(()) => write_status(reply, VFS_OK),
+            Err(error) => write_status(reply, mutation_status(error)),
+        },
+    }
+}
+
+/// Remove the empty directory at `path` (SH3). A populated directory answers
+/// `VFS_NOT_EMPTY`, mirroring rmdir's `ENOTEMPTY`.
+fn rmdir<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    path: &[u8],
+    reply: &mut [u8],
+) -> usize {
+    match volume.resolve_path(io, path) {
+        None => write_status(reply, VFS_NOT_FOUND),
+        Some(entry) if !entry.is_dir() => write_status(reply, VFS_NOT_DIR),
+        Some(_) => match volume.remove_dir(io, path).and_then(|_| volume.flush(io)) {
+            Ok(()) => write_status(reply, VFS_OK),
+            Err(FatWriteError::Invalid) => write_status(reply, VFS_NOT_EMPTY),
+            Err(error) => write_status(reply, mutation_status(error)),
+        },
+    }
+}
+
+/// Rename the file `from` to `to`, replacing an existing file (SH3). Directory
+/// renames answer `VFS_NOT_SUPPORTED`: FAT would also have to rewrite `..`.
+fn rename<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    from: &[u8],
+    to: &[u8],
+    reply: &mut [u8],
+) -> usize {
+    match volume.resolve_path(io, from) {
+        None => write_status(reply, VFS_NOT_FOUND),
+        Some(entry) if entry.is_dir() => write_status(reply, VFS_NOT_SUPPORTED),
+        Some(_) => match volume.rename(io, from, to).and_then(|_| volume.flush(io)) {
+            Ok(()) => write_status(reply, VFS_OK),
+            Err(error) => write_status(reply, mutation_status(error)),
+        },
+    }
+}
+
+/// Stat `path` (SH3): the kind and byte size, with the synthetic POSIX mode FAT
+/// cannot store (0755 for directories, 0644 for files).
+fn stat<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    path: &[u8],
+    reply: &mut [u8],
+) -> usize {
+    match volume.resolve_path(io, path) {
+        None => write_status(reply, VFS_NOT_FOUND),
+        Some(entry) => {
+            let (kind, mode) = if entry.is_dir() {
+                (STAT_KIND_DIRECTORY, 0o755)
+            } else {
+                (STAT_KIND_FILE, 0o644)
+            };
+            write_frame(reply, &encode_stat_ok(kind, mode, entry.size as u64))
+        }
+    }
+}
+
+/// Advisory locks over the open table (SH3). A shared lock conflicts with another
+/// handle's exclusive lock; an exclusive lock conflicts with any other holder. The
+/// holder may upgrade or downgrade its own lock while it is the only holder. Locks
+/// are per open handle and, until SH3-c's shared mount server, per process instance.
+fn lock(open_files: &mut OpenTable, handle: u32, operation: u8, reply: &mut [u8]) -> usize {
+    let Some(index) = usize::try_from(handle)
+        .ok()
+        .and_then(|raw| raw.checked_sub(1))
+        .filter(|index| *index < MAX_OPEN_FILES)
+    else {
+        return write_status(reply, VFS_BAD_HANDLE);
+    };
+    if open_files.slots[index].is_none() {
+        return write_status(reply, VFS_BAD_HANDLE);
+    }
+    match operation {
+        LOCK_UN => {
+            if let Some(file) = open_files.slots[index].as_mut() {
+                file.lock = 0;
+            }
+            write_status(reply, VFS_OK)
+        }
+        LOCK_SH | LOCK_EX => {
+            let exclusive = operation == LOCK_EX;
+            let conflict = open_files.slots.iter().enumerate().any(|(other, slot)| {
+                other != index
+                    && (*slot)
+                        .is_some_and(|file| file.lock != 0 && (exclusive || file.lock == LOCK_EX))
+            });
+            if conflict {
+                return write_status(reply, VFS_WOULD_BLOCK);
+            }
+            if let Some(file) = open_files.slots[index].as_mut() {
+                file.lock = operation;
+            }
+            write_status(reply, VFS_OK)
+        }
+        _ => write_status(reply, VFS_BAD_REQUEST),
     }
 }
 
@@ -1120,5 +1269,321 @@ mod tests {
         let payload = read_payload(&reply[..n]).unwrap();
         assert_eq!(&payload[..6], b"hello!");
         assert!(payload[6..].iter().all(|byte| *byte == 0));
+    }
+
+    fn writable() -> (FatVolume, WritableDisk) {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).expect("mount");
+        (volume, disk)
+    }
+
+    /// One request/reply exchange through the same dispatcher the server runs.
+    fn call(
+        volume: &FatVolume,
+        disk: &mut WritableDisk,
+        table: &mut OpenTable,
+        reply: &mut [u8],
+        request: Request<'_>,
+    ) -> alloc::vec::Vec<u8> {
+        let frame = encode_request(request);
+        let n = dispatch(volume, disk, table, &frame, reply);
+        reply[..n].to_vec()
+    }
+
+    #[test]
+    fn mkdir_stat_and_exists_through_dispatch() {
+        let (volume, mut disk) = writable();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let request = encode_request(Request::mkdir(b"/WORK"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_OK]);
+        let request = encode_request(Request::mkdir(b"/WORK"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_EXISTS]);
+
+        let request = encode_request(Request::stat(b"/WORK"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        let dir = kumo_vfs::parse_stat_reply(&reply[..n]).unwrap();
+        assert_eq!(dir.kind, STAT_KIND_DIRECTORY);
+        assert_eq!(dir.mode, 0o755);
+
+        let request = encode_request(Request::stat(b"/HELLO.TXT"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        let file = kumo_vfs::parse_stat_reply(&reply[..n]).unwrap();
+        assert_eq!(file.kind, STAT_KIND_FILE);
+        assert_eq!(file.size, 6);
+        assert_eq!(file.mode, 0o644);
+
+        let request = encode_request(Request::stat(b"/NOPE.TXT"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_NOT_FOUND]);
+    }
+
+    #[test]
+    fn unlink_and_rmdir_statuses_through_dispatch() {
+        let (volume, mut disk) = writable();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::unlink(b"/HELLO.TXT")
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::unlink(b"/HELLO.TXT")
+            ),
+            alloc::vec![VFS_NOT_FOUND]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::unlink(b"/EFI")
+            ),
+            alloc::vec![VFS_IS_DIR]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::rmdir(b"/HELLO.TXT")
+            ),
+            alloc::vec![VFS_NOT_FOUND]
+        );
+        // rmdir on a regular file answers NOT_DIR (the server fixture has no
+        // README.TXT, so create one to exercise the kind check).
+        volume.create_file(&mut disk, b"/FILE.TXT").unwrap();
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::rmdir(b"/FILE.TXT")
+            ),
+            alloc::vec![VFS_NOT_DIR]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::mkdir(b"/WORK")
+            ),
+            alloc::vec![VFS_OK]
+        );
+        let mut child = volume.create_file(&mut disk, b"/WORK/A.TXT").unwrap();
+        volume.set_file_len(&mut disk, &mut child, 2).unwrap();
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::rmdir(b"/WORK")
+            ),
+            alloc::vec![VFS_NOT_EMPTY]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::unlink(b"/WORK/A.TXT")
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::rmdir(b"/WORK")
+            ),
+            alloc::vec![VFS_OK]
+        );
+    }
+
+    #[test]
+    fn rename_through_dispatch_and_refusals() {
+        let (volume, mut disk) = writable();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let mut temp = volume.create_file(&mut disk, b"/SAVE.TMP").unwrap();
+        volume.set_file_len(&mut disk, &mut temp, 3).unwrap();
+        volume
+            .write_file_at(&mut disk, &mut temp, 0, b"new")
+            .unwrap();
+        let mut old = volume.create_file(&mut disk, b"/SAVE.TXT").unwrap();
+        volume.set_file_len(&mut disk, &mut old, 4).unwrap();
+        volume
+            .write_file_at(&mut disk, &mut old, 0, b"old!")
+            .unwrap();
+
+        let request = encode_request(Request::rename(b"/SAVE.TMP", b"/SAVE.TXT"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_OK]);
+        let landed = volume.resolve_path(&mut disk, b"/SAVE.TXT").unwrap();
+        let mut out = [0u8; 8];
+        let got = volume.read_file(&mut disk, &landed, &mut out);
+        assert_eq!(&out[..got], b"new");
+
+        let request = encode_request(Request::rename(b"/NOPE.TXT", b"/OTHER.TXT"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_NOT_FOUND]);
+
+        let request = encode_request(Request::mkdir(b"/WORK"));
+        let _ = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        let request = encode_request(Request::rename(b"/WORK", b"/OTHER"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_NOT_SUPPORTED]);
+    }
+
+    #[test]
+    fn advisory_locks_lock_upgrade_and_release_through_dispatch() {
+        let (volume, mut disk) = writable();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let first = {
+            let bytes = call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::open(b"/HELLO.TXT"),
+            );
+            parse_open_reply(&bytes).unwrap().0
+        };
+        let second = {
+            let bytes = call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::open(b"/HELLO.TXT"),
+            );
+            parse_open_reply(&bytes).unwrap().0
+        };
+        assert_ne!(first, second);
+
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(first, LOCK_EX)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(second, LOCK_SH)
+            ),
+            alloc::vec![VFS_WOULD_BLOCK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(first, LOCK_UN)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(second, LOCK_SH)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(first, LOCK_EX)
+            ),
+            alloc::vec![VFS_WOULD_BLOCK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(first, LOCK_SH)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(second, LOCK_UN)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(first, LOCK_EX)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(first, LOCK_UN)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        assert_eq!(
+            call(
+                &volume,
+                &mut disk,
+                &mut table,
+                &mut reply,
+                Request::lock(99, LOCK_SH)
+            ),
+            alloc::vec![VFS_BAD_HANDLE]
+        );
     }
 }
