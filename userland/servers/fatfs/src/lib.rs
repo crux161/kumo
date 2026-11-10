@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j514
 //j547
 //j548
 //j549
 //j862
+//j863
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -23,7 +23,7 @@ extern crate alloc;
 
 pub mod block;
 
-use kumo_fatfs::{DirEntry, FatVolume, FatWriteError, SectorReader, SectorWriter};
+use kumo_fatfs::{DirEntry, DirLocation, FatVolume, FatWriteError, SectorReader, SectorWriter};
 use kumo_vfs::{
     encode_open_ok, encode_stat_ok, encode_status, encode_write_ok, DirReplyWriter, Request,
     LOCK_EX, LOCK_SH, LOCK_UN, MAX_WRITE_DATA, OPEN_CREATE, OPEN_READ, OPEN_WRITE,
@@ -172,6 +172,218 @@ impl FatServer {
 impl Default for FatServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Sessions the mount-scoped server admits (SH3-c). Small on purpose: every session
+/// reserves an open table, and the first user is a two-process lock/rename proof.
+pub const MAX_SESSIONS: usize = 4;
+/// Advisory locks the shared registry tracks at once.
+pub const MAX_LOCKS: usize = 8;
+
+/// One advisory lock held through an open entry (SH3-c). The key is the entry's
+/// on-disk location: FAT has no stable inode, so a rename gives the file a new
+/// identity and a later open of the new name re-locks under it. Documented, not
+/// silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LockEntry {
+    key: DirLocation,
+    session: usize,
+    mode: u8,
+}
+
+/// Cross-session advisory locks for the mount-scoped server (SH3-c1). Unlike the
+/// per-launch table's slot-local lock, these conflict between sessions, which is
+/// what makes flock meaningful across processes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockRegistry {
+    entries: [Option<LockEntry>; MAX_LOCKS],
+}
+
+impl LockRegistry {
+    pub const fn new() -> Self {
+        LockRegistry {
+            entries: [None; MAX_LOCKS],
+        }
+    }
+
+    fn conflicts(&self, key: DirLocation, session: usize, exclusive: bool) -> bool {
+        self.entries.iter().flatten().any(|entry| {
+            entry.key == key && entry.session != session && (exclusive || entry.mode == LOCK_EX)
+        })
+    }
+
+    fn set(&mut self, key: DirLocation, session: usize, mode: u8) -> bool {
+        let mut free = None;
+        for (index, slot) in self.entries.iter_mut().enumerate() {
+            match slot {
+                Some(entry) if entry.key == key && entry.session == session => {
+                    entry.mode = mode;
+                    return true;
+                }
+                Some(_) => {}
+                None if free.is_none() => free = Some(index),
+                None => {}
+            }
+        }
+        if let Some(index) = free {
+            self.entries[index] = Some(LockEntry { key, session, mode });
+            return true;
+        }
+        false
+    }
+
+    fn clear(&mut self, key: DirLocation, session: usize) {
+        for slot in self.entries.iter_mut() {
+            if slot.is_some_and(|entry| entry.key == key && entry.session == session) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+impl Default for LockRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The mount-scoped server state (SH3-c1): one open table per client session and a
+/// registry of advisory locks shared across them. The volume bytes are shared by
+/// construction, so one session's rename is immediately visible to another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedServer {
+    pub sessions: [OpenTable; MAX_SESSIONS],
+    pub locks: LockRegistry,
+}
+
+impl SharedServer {
+    pub const fn new() -> Self {
+        SharedServer {
+            sessions: [OpenTable::new(); MAX_SESSIONS],
+            locks: LockRegistry::new(),
+        }
+    }
+}
+
+impl Default for SharedServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Handle one request for `session` of a mount-scoped server (SH3-c1). Open-handle
+/// requests index that session's table; metadata requests reuse the same handlers;
+/// locks flow through the cross-session registry.
+pub fn dispatch_shared<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    server: &mut SharedServer,
+    session: usize,
+    request: &[u8],
+    reply: &mut [u8],
+) -> usize {
+    if session >= MAX_SESSIONS {
+        return write_status(reply, VFS_BAD_REQUEST);
+    }
+    match Request::decode(request) {
+        Some(Request::Open { path }) => open(
+            volume,
+            io,
+            &mut server.sessions[session],
+            path,
+            OPEN_READ,
+            reply,
+        ),
+        Some(Request::OpenOptions { path, options }) => open(
+            volume,
+            io,
+            &mut server.sessions[session],
+            path,
+            options,
+            reply,
+        ),
+        Some(Request::Read {
+            handle,
+            offset,
+            len,
+        }) => read(
+            volume,
+            io,
+            &server.sessions[session],
+            handle,
+            offset,
+            len,
+            reply,
+        ),
+        Some(Request::Write {
+            handle,
+            offset,
+            data,
+        }) => write(
+            volume,
+            io,
+            &mut server.sessions[session],
+            handle,
+            offset,
+            data,
+            reply,
+        ),
+        Some(Request::SetLen { handle, len }) => set_len(
+            volume,
+            io,
+            &mut server.sessions[session],
+            handle,
+            len,
+            reply,
+        ),
+        Some(Request::Flush { handle }) => {
+            flush(volume, io, &server.sessions[session], handle, reply)
+        }
+        Some(Request::ReadDir { path, start }) => read_dir(volume, io, path, start, reply),
+        Some(Request::Mkdir { path }) => mkdir(volume, io, path, reply),
+        Some(Request::Unlink { path }) => unlink(volume, io, path, reply),
+        Some(Request::Rmdir { path }) => rmdir(volume, io, path, reply),
+        Some(Request::Rename { from, to }) => rename(volume, io, from, to, reply),
+        Some(Request::Stat { path }) => stat(volume, io, path, reply),
+        Some(Request::Lock { handle, operation }) => {
+            lock_session(server, session, handle, operation, reply)
+        }
+        Some(Request::Link { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
+        None => write_status(reply, VFS_BAD_REQUEST),
+    }
+}
+
+/// Advisory lock over the cross-session registry (SH3-c1).
+fn lock_session(
+    server: &mut SharedServer,
+    session: usize,
+    handle: u32,
+    operation: u8,
+    reply: &mut [u8],
+) -> usize {
+    let Some(file) = server.sessions[session].get(handle) else {
+        return write_status(reply, VFS_BAD_HANDLE);
+    };
+    let Some(location) = file.entry.location else {
+        return write_status(reply, VFS_BAD_HANDLE);
+    };
+    match operation {
+        LOCK_UN => {
+            server.locks.clear(location, session);
+            write_status(reply, VFS_OK)
+        }
+        LOCK_SH | LOCK_EX => {
+            let exclusive = operation == LOCK_EX;
+            if server.locks.conflicts(location, session, exclusive) {
+                return write_status(reply, VFS_WOULD_BLOCK);
+            }
+            if !server.locks.set(location, session, operation) {
+                return write_status(reply, VFS_NO_SPACE);
+            }
+            write_status(reply, VFS_OK)
+        }
+        _ => write_status(reply, VFS_BAD_REQUEST),
     }
 }
 
@@ -1584,6 +1796,123 @@ mod tests {
                 Request::lock(99, LOCK_SH)
             ),
             alloc::vec![VFS_BAD_HANDLE]
+        );
+    }
+
+    fn shared_call(
+        volume: &FatVolume,
+        disk: &mut WritableDisk,
+        server: &mut SharedServer,
+        session: usize,
+        reply: &mut [u8],
+        request: Request<'_>,
+    ) -> alloc::vec::Vec<u8> {
+        let frame = encode_request(request);
+        let n = dispatch_shared(volume, disk, server, session, &frame, reply);
+        reply[..n].to_vec()
+    }
+
+    fn shared_open(
+        volume: &FatVolume,
+        disk: &mut WritableDisk,
+        server: &mut SharedServer,
+        session: usize,
+        path: &[u8],
+    ) -> u32 {
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let bytes = shared_call(
+            volume,
+            disk,
+            server,
+            session,
+            &mut reply,
+            Request::open(path),
+        );
+        parse_open_reply(&bytes).expect("open").0
+    }
+
+    #[test]
+    fn shared_sessions_contend_for_an_advisory_lock() {
+        let (volume, mut disk) = writable();
+        let mut server = SharedServer::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let first = shared_open(&volume, &mut disk, &mut server, 0, b"/HELLO.TXT");
+        let second = shared_open(&volume, &mut disk, &mut server, 1, b"/HELLO.TXT");
+        let mut lock = |session: usize, handle: u32, operation: u8| {
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                session,
+                &mut reply,
+                Request::lock(handle, operation),
+            )
+        };
+        assert_eq!(lock(0, first, LOCK_EX), alloc::vec![VFS_OK]);
+        assert_eq!(lock(1, second, LOCK_SH), alloc::vec![VFS_WOULD_BLOCK]);
+        assert_eq!(lock(0, first, LOCK_UN), alloc::vec![VFS_OK]);
+        assert_eq!(lock(1, second, LOCK_SH), alloc::vec![VFS_OK]);
+        assert_eq!(lock(0, first, LOCK_EX), alloc::vec![VFS_WOULD_BLOCK]);
+        assert_eq!(lock(1, second, LOCK_EX), alloc::vec![VFS_OK]);
+        assert_eq!(lock(1, second, LOCK_UN), alloc::vec![VFS_OK]);
+        assert_eq!(lock(1, 77, LOCK_SH), alloc::vec![VFS_BAD_HANDLE]);
+        let mut out = [0u8; REPLY_BUF_BYTES];
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                MAX_SESSIONS,
+                &mut out,
+                Request::stat(b"/HELLO.TXT")
+            ),
+            alloc::vec![VFS_BAD_REQUEST]
+        );
+    }
+
+    #[test]
+    fn shared_rename_is_visible_to_the_other_session() {
+        let (volume, mut disk) = writable();
+        let mut server = SharedServer::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let mut temp = volume.create_file(&mut disk, b"/SAVE.TMP").unwrap();
+        volume.set_file_len(&mut disk, &mut temp, 3).unwrap();
+        volume
+            .write_file_at(&mut disk, &mut temp, 0, b"new")
+            .unwrap();
+
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                0,
+                &mut reply,
+                Request::rename(b"/SAVE.TMP", b"/SAVE.TXT")
+            ),
+            alloc::vec![VFS_OK]
+        );
+        let bytes = shared_call(
+            &volume,
+            &mut disk,
+            &mut server,
+            1,
+            &mut reply,
+            Request::stat(b"/SAVE.TXT"),
+        );
+        let stat = kumo_vfs::parse_stat_reply(&bytes).expect("stat");
+        assert_eq!(stat.kind, STAT_KIND_FILE);
+        assert_eq!(stat.size, 3);
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                1,
+                &mut reply,
+                Request::stat(b"/SAVE.TMP")
+            ),
+            alloc::vec![VFS_NOT_FOUND]
         );
     }
 }
