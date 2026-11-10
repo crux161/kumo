@@ -7121,6 +7121,11 @@ fn eval_command(
         debug_write(b"ruststd: Rust std smoke\n".as_ptr(), 24);
         let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
         let count = command_argv_slots(cmd, &mut slots);
+        // `ruststd net` is the std::net campaign: the same launcher policy as the `net`
+        // word, granted only because the campaign names itself. The gate mode keeps no
+        // network session.
+        // argv[0] is the builtin word itself; the campaign mode is argv[1].
+        let wants_net = count >= 2 && slots[1] == b"net";
         // A finite stdin keeps fd 0 open: std's unix init sanitizes the standard fds and
         // would otherwise try to open /dev/null, which this image does not have.
         run_with_startup_input(
@@ -7133,7 +7138,7 @@ fn eval_command(
             false,
             false,
             StdinMode::Finite(b"\n"),
-            false,
+            wants_net,
         );
         return true;
     } else if cmd.name == "relibc" {

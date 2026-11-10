@@ -441,6 +441,17 @@ fn fd_alloc() -> Option<c_int> {
     None
 }
 
+/// Claim the lowest free descriptor at or above `min` (POSIX F_DUPFD semantics).
+fn fd_alloc_from(min: c_int) -> Option<c_int> {
+    let start = usize::try_from(min.max(3)).ok()?;
+    for index in start..FD_SLOTS {
+        if let Some(FdSlot::Closed) = fd_slot(index as c_int) {
+            return Some(index as c_int);
+        }
+    }
+    None
+}
+
 fn close_handle(handle: u32) {
     if handle != 0 {
         let _ = syscall4(SYSCALL_HANDLE_CLOSE, u64::from(handle), 0, 0, 0);
@@ -1041,6 +1052,23 @@ impl Sys {
             sys_ioctl::{TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGWINSZ},
         };
 
+        // FIONBIO: std's set_nonblocking asks through ioctl, not fcntl.
+        if request == crate::header::sys_ioctl::constants::FIONBIO {
+            if out.is_null() {
+                return Err(Errno(EFAULT));
+            }
+            let value = unsafe { core::ptr::read_unaligned(out.cast::<c_int>()) };
+            let slot = fd_slot(fd).ok_or(Errno(EBADF))?;
+            return match slot {
+                FdSlot::Socket { flags, .. } => {
+                    *flags = if value != 0 { FD_SOCK_NONBLOCK } else { 0 };
+                    Ok(0)
+                }
+                FdSlot::Closed => Err(Errno(EBADF)),
+                _ => Err(Errno(ENOTTY)),
+            };
+        }
+
         match fd_slot(fd).map(|slot| *slot) {
             None | Some(FdSlot::Closed) => return Err(Errno(EBADF)),
             Some(FdSlot::File { .. }) | Some(FdSlot::Socket { .. }) => {
@@ -1297,8 +1325,8 @@ impl Pal for Sys {
     /// F_GETFL / F_SETFL with O_NONBLOCK: the only descriptor flag this backend owns.
     fn fcntl(fildes: c_int, cmd: c_int, arg: c_ulonglong) -> Result<c_int> {
         use crate::header::bits_open_flags::O_NONBLOCK;
-        use crate::header::errno::{EBADF, EINVAL};
-        use crate::header::fcntl::{F_GETFL, F_SETFL};
+        use crate::header::errno::{EBADF, EINVAL, EMFILE};
+        use crate::header::fcntl::{F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL};
 
         let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
         match cmd {
@@ -1323,6 +1351,18 @@ impl Pal for Sys {
                 FdSlot::Closed => Err(Errno(EBADF)),
                 _ => Err(Errno(EINVAL)),
             },
+            // dup() is the trait default `fcntl(F_DUPFD, 0)`; std's try_clone lands here.
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                if matches!(*slot, FdSlot::Closed) {
+                    return Err(Errno(EBADF));
+                }
+                let source = *slot;
+                let Some(new) = fd_alloc_from(arg as c_int) else {
+                    return Err(Errno(EMFILE));
+                };
+                *fd_slot(new).ok_or(Errno(EBADF))? = source;
+                Ok(new)
+            }
             _ => Err(Errno(EINVAL)),
         }
     }
@@ -2415,7 +2455,7 @@ impl PalSocket for Sys {
         if info.1 == SOCKET_KIND_TCP {
             return stream_recv(
                 info,
-                flags & MSG_DONTWAIT != 0,
+                flags & MSG_DONTWAIT != 0 || info.2 & FD_SOCK_NONBLOCK != 0,
                 buf.cast::<u8>(),
                 len,
                 address,
@@ -2424,7 +2464,7 @@ impl PalSocket for Sys {
         }
         let id = info.0;
         let max = len.min(KNS1_UDP_PAYLOAD_MAX);
-        let nonblock = flags & MSG_DONTWAIT != 0;
+        let nonblock = flags & MSG_DONTWAIT != 0 || info.2 & FD_SOCK_NONBLOCK != 0;
         loop {
             let (status, _reply_socket, _result, payload_len) =
                 net_call(KNS1_OP_RECV_FROM, id, max as u64, 0, &[])?;
@@ -2432,17 +2472,9 @@ impl PalSocket for Sys {
                 if nonblock {
                     return Err(Errno(EAGAIN));
                 }
-                let (wait_status, _reply_socket, _result, _len) = net_call(
-                    KNS1_OP_WAIT,
-                    id,
-                    u64::from(KNS1_WAIT_READABLE) | (2000u64 << 32),
-                    0,
-                    &[],
-                )?;
-                match wait_status {
-                    0 | 15 => {}
-                    other => return Err(net_status_errno(other)),
-                }
+                // The descriptor's SO_RCVTIMEO bounds the wait (0 blocks; expiry is
+                // EAGAIN) — the same rule the stream path follows.
+                wait_interest(id, KNS1_WAIT_READABLE, info.3)?;
                 continue;
             }
             net_status_ok(status)?;
@@ -2536,9 +2568,16 @@ impl PalSocket for Sys {
         option_len: socklen_t,
     ) -> Result<()> {
         use crate::header::errno::{EINVAL, ENOPROTOOPT};
-        use crate::header::sys_socket::constants::{SO_RCVTIMEO, SO_SNDTIMEO, SOL_SOCKET};
+        use crate::header::sys_socket::constants::{
+            SO_RCVTIMEO, SO_REUSEADDR, SO_SNDTIMEO, SOL_SOCKET,
+        };
 
         let _ = socket_info(socket)?;
+        if level == SOL_SOCKET && option_name == SO_REUSEADDR {
+            // The stack releases the port when the socket closes, so binding a recently
+            // closed port already succeeds: the reuse flag's guarantee is vacuous here.
+            return Ok(());
+        }
         if level == SOL_SOCKET && (option_name == SO_RCVTIMEO || option_name == SO_SNDTIMEO) {
             if option_value.is_null() || (option_len as usize) < core::mem::size_of::<timeval>() {
                 return Err(Errno(EINVAL));

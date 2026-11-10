@@ -46,6 +46,35 @@ pub struct KumoArgs {
     argv: *const *const u8,
 }
 
+// The serial record interleaves sources per write; every acceptance line goes out as ONE
+// formatted LogWrite entry.
+fn ring_line(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write as _;
+    struct RingBuf {
+        buf: [u8; 200],
+        at: usize,
+    }
+    impl core::fmt::Write for RingBuf {
+        fn write_str(&mut self, part: &str) -> core::fmt::Result {
+            let take = part.len().min(self.buf.len() - self.at);
+            self.buf[self.at..self.at + take].copy_from_slice(&part.as_bytes()[..take]);
+            self.at += take;
+            Ok(())
+        }
+    }
+    let mut line = RingBuf {
+        buf: [0u8; 200],
+        at: 0,
+    };
+    let _ = write!(line, "std: net {}", args);
+    let _ = write!(line, "\n");
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line.buf[..line.at]);
+}
+
+macro_rules! netlog {
+    ($($arg:tt)*) => { ring_line(format_args!($($arg)*)) };
+}
+
 static mut ARGV_IMAGE: [u8; 256] = [0; 256];
 static mut ARGV_PTRS: [*const u8; 17] = [core::ptr::null(); 17];
 
@@ -126,6 +155,247 @@ fn main() {
         let _ = write!(line, "\n");
         let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line.buf[..line.at]);
     }));
+    if std::env::args().nth(1).as_deref() == Some("net") {
+        net_campaign();
+        return;
+    }
+    gate_ib();
+}
+
+/// The stream generator, shared by sender and verifier (the C smoke's contract).
+fn stream_byte(index: usize) -> u8 {
+    ((index * 31 + 7) & 0xFF) as u8
+}
+
+/// NET14: std::net over the PAL — UdpSocket and TcpListener/TcpStream on loopback, with
+/// try_clone, nonblocking/read-timeout readiness, and a server-failure wake.
+///
+/// The child's stack is 16 KiB, so nothing here may hold a whole stream: sends generate
+/// bytes chunk by chunk and the echo drains what it just read.
+#[inline(never)]
+fn net_campaign() {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::time::Duration;
+
+    let mut failures = 0u32;
+    macro_rules! check {
+        ($cond:expr, $msg:literal) => {
+            if $cond {
+                netlog!("{} -> OK", $msg);
+            } else {
+                failures += 1;
+                netlog!("{} -> FAIL", $msg);
+            }
+        };
+    }
+
+    // Numeric SocketAddrs throughout: the &str path goes through getaddrinfo, which the
+    // PAL does not provide (PLAN/020's scope is numeric IPv4).
+    let addr_a = SocketAddr::from(([127, 0, 0, 1], 7811));
+    let addr_b = SocketAddr::from(([127, 0, 0, 1], 7812));
+    // UDP: exact bytes both ways, source address, the size bounds, WouldBlock, timeout.
+    let (a, b) = match (UdpSocket::bind(addr_a), UdpSocket::bind(addr_b)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            netlog!("udp bind -> FAIL {:?}", e);
+            return;
+        }
+    };
+    let mut got = [0u8; 64];
+    let sent = a.send_to(b"kumo-std-udp", addr_b);
+    let recv = b.recv_from(&mut got);
+    let exact = matches!((sent, recv), (Ok(12), Ok((12, src)))
+        if &got[..12] == b"kumo-std-udp"
+            && src.port() == 7811
+            && src.ip().is_loopback());
+    check!(exact, "udp datagram+source");
+    let zero = a.send_to(&[], addr_b).is_ok()
+        && matches!(b.recv_from(&mut got), Ok((0, _)));
+    check!(zero, "udp zero-length");
+    let mut big = [0u8; 1472];
+    for (i, byte) in big.iter_mut().enumerate() {
+        *byte = i as u8;
+    }
+    // (big_got below is one chunk, not a stream.)
+    let mut big_got = [0u8; 1472];
+    let big_ok = a.send_to(&big, addr_b).is_ok()
+        && matches!(b.recv_from(&mut big_got), Ok((1472, _)))
+        && big_got == big;
+    check!(big_ok, "udp 1472-byte bound");
+    b.set_nonblocking(true).ok();
+    let would_block =
+        matches!(b.recv_from(&mut got), Err(ref e) if e.kind() == ErrorKind::WouldBlock);
+    check!(would_block, "udp nonblocking WouldBlock");
+    b.set_nonblocking(false).ok();
+    b.set_read_timeout(Some(Duration::from_millis(300))).ok();
+    let timed = matches!(
+        b.recv_from(&mut got),
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut
+    );
+    check!(timed, "udp read timeout");
+    b.set_read_timeout(None).ok();
+    let recover = a.send_to(b"after", addr_b).is_ok()
+        && matches!(b.recv_from(&mut got), Ok((5, _))) && &got[..5] == b"after";
+    check!(recover, "udp after timeout");
+
+    // TCP: pair, 12000-byte echo pump, shutdown/EOF, try_clone, server-failure wake.
+    let addr_tcp = SocketAddr::from(([127, 0, 0, 1], 7813));
+    let listener = match TcpListener::bind(addr_tcp) {
+        Ok(l) => l,
+        Err(e) => {
+            failures += 1;
+            netlog!("tcp listener -> FAIL {:?} campaign failed={}", e, failures);
+            return;
+        }
+    };
+    let client = match TcpStream::connect(addr_tcp) {
+        Ok(c) => c,
+        Err(e) => {
+            failures += 1;
+            netlog!("tcp connect -> FAIL {:?} campaign failed={}", e, failures);
+            return;
+        }
+    };
+    let mut client = match client.try_clone() {
+        Ok(c) => c,
+        Err(_) => {
+            failures += 1;
+            netlog!("tcp try_clone -> FAIL campaign failed={}", failures);
+            return;
+        }
+    };
+    let mut server = match listener.accept() {
+        Ok((s, peer)) => {
+            check!(peer.port() != 0, "tcp accept peer");
+            s
+        }
+        Err(e) => {
+            failures += 1;
+            netlog!("tcp accept -> FAIL {:?} campaign failed={}", e, failures);
+            return;
+        }
+    };
+    client.set_nonblocking(true).ok();
+    server.set_nonblocking(true).ok();
+    const TOTAL: usize = 12_000;
+    const CHUNK: usize = 2048;
+    let mut send_buf = [0u8; CHUNK];
+    let mut srv_buf = [0u8; CHUNK];
+    let mut cli_buf = [0u8; CHUNK];
+    let (mut sent, mut echoed, mut got_total) = (0usize, 0usize, 0usize);
+    // The echo buffer holds exactly one read; these track that chunk, not the stream.
+    let (mut srv_pending, mut srv_written) = (0usize, 0usize);
+    let (mut client_shut, mut server_shut, mut server_eof, mut client_eof) =
+        (false, false, false, false);
+    let mut exact_stream = true;
+    for _ in 0..400_000 {
+        if client_eof && server_eof && got_total == TOTAL {
+            break;
+        }
+        if sent < TOTAL {
+            let n = (TOTAL - sent).min(CHUNK);
+            for (i, byte) in send_buf[..n].iter_mut().enumerate() {
+                *byte = stream_byte(sent + i);
+            }
+            match client.write(&send_buf[..n]) {
+                Ok(0) => {}
+                Ok(w) => sent += w,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    exact_stream = false;
+                    break;
+                }
+            }
+        } else if !client_shut {
+            client_shut = client.shutdown(Shutdown::Write).is_ok();
+        }
+        if srv_written == srv_pending {
+            match server.read(&mut srv_buf) {
+                Ok(0) => server_eof = true,
+                Ok(n) => {
+                    srv_pending = n;
+                    srv_written = 0;
+                    echoed += n;
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    exact_stream = false;
+                    break;
+                }
+            }
+        }
+        while srv_written < srv_pending {
+            match server.write(&srv_buf[srv_written..srv_pending]) {
+                Ok(0) => break,
+                Ok(w) => srv_written += w,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    exact_stream = false;
+                    break;
+                }
+            }
+        }
+        if server_eof && srv_written == srv_pending && !server_shut {
+            server_shut = server.shutdown(Shutdown::Write).is_ok();
+        }
+        match client.read(&mut cli_buf) {
+            Ok(0) => client_eof = true,
+            Ok(n) => {
+                if got_total + n > TOTAL {
+                    exact_stream = false;
+                    break;
+                }
+                for (i, byte) in cli_buf[..n].iter().enumerate() {
+                    if *byte != stream_byte(got_total + i) {
+                        exact_stream = false;
+                        break;
+                    }
+                }
+                if !exact_stream {
+                    break;
+                }
+                got_total += n;
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => {
+                exact_stream = false;
+                break;
+            }
+        }
+    }
+    check!(
+        exact_stream && client_shut && server_eof && client_eof && got_total == TOTAL,
+        "tcp 12000-byte duplex + shutdown + EOF"
+    );
+
+    // Server failure wakes the client: closing the peer ends a blocked read promptly.
+    let addr_wake = SocketAddr::from(([127, 0, 0, 1], 7814));
+    let pair = TcpListener::bind(addr_wake).ok().and_then(|l| {
+        let c = TcpStream::connect(addr_wake).ok()?;
+        let (srv, _) = l.accept().ok()?;
+        Some((c, srv))
+    });
+    if let Some((mut wake_client, wake_server)) = pair {
+        wake_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .ok();
+        drop(wake_server);
+        let woke = matches!(wake_client.read(&mut cli_buf), Ok(0));
+        check!(woke, "server failure wake");
+    } else {
+        failures += 1;
+        netlog!("server failure wake -> FAIL campaign failed={}", failures);
+        return;
+    }
+
+    netlog!("campaign failed={}", failures);
+    if failures == 0 {
+        netlog!("loopback -> OK");
+    }
+}
+
+fn gate_ib() {
     let start = Instant::now();
     print!("std: gate I-b -> ");
     let text = std::fs::read_to_string("/HELLO.TXT").unwrap_or_default();

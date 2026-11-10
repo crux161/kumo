@@ -104,6 +104,17 @@ int _Unwind_Backtrace(void *trace, void *arg) {
 
 // std's random path: the getrandom function (not the syscall()) with /dev/urandom as the
 // fallback, which kumo cannot provide. Same documented clock-mixed generator as SYS_getrandom.
+// std's TcpListener::accept calls accept4 with SOCK_CLOEXEC. relibc exports accept();
+// the flag is vacuous on kumo (no exec), so forward.
+struct sockaddr;
+typedef unsigned int socklen_t;
+extern int accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
+
+int accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
+    (void)flags;
+    return accept(fd, addr, addrlen);
+}
+
 extern char *strerror(int errnum);
 
 int __xpg_strerror_r(int errnum, char *buf, usize buflen) {
