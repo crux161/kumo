@@ -1,6 +1,7 @@
 #![no_std]
 //j514
 //j547
+//j860
 
 //! `kumo-vfs` — the wire protocol for KUMO's filesystem servers.
 //!
@@ -39,6 +40,22 @@ pub const OP_FLUSH: u8 = 0x05;
 /// Op code: list a directory from one of its entries on (J547). Reply: a [`DirReplyWriter`]
 /// frame, `[VFS_OK][count]` then `count` records; a count of zero means the listing is done.
 pub const OP_READ_DIR: u8 = 0x06;
+/// Op code: create a directory at `path` (SH3). Reply: one status byte.
+pub const OP_MKDIR: u8 = 0x07;
+/// Op code: remove the file at `path` (SH3). Reply: one status byte.
+pub const OP_UNLINK: u8 = 0x08;
+/// Op code: remove the empty directory at `path` (SH3). Reply: one status byte.
+pub const OP_RMDIR: u8 = 0x09;
+/// Op code: rename `from` to `to`, replacing an existing file (SH3). One status byte.
+pub const OP_RENAME: u8 = 0x0a;
+/// Op code: stat `path` (SH3). Reply: [`STAT_REPLY_LEN`] bytes.
+pub const OP_STAT: u8 = 0x0b;
+/// Op code: link `from` as `to` (SH3). FAT has no hard links; a server answers
+/// [`VFS_NOT_SUPPORTED`] and the client falls back to its documented copy path.
+pub const OP_LINK: u8 = 0x0c;
+/// Op code: advisory lock the open file `handle` (SH3). Reply: one status byte;
+/// [`VFS_WOULD_BLOCK`] means another open handle holds the lock.
+pub const OP_LOCK: u8 = 0x0d;
 
 /// Open option: the returned handle may read.
 pub const OPEN_READ: u8 = 1 << 0;
@@ -66,6 +83,32 @@ pub const VFS_ACCESS_DENIED: u8 = 0x06;
 pub const VFS_IO_ERROR: u8 = 0x07;
 /// Reply status: a directory was asked for, and the path names a file (J547).
 pub const VFS_NOT_DIR: u8 = 0x08;
+/// Reply status: the target already exists (SH3 mkdir, or a refused rename target).
+pub const VFS_EXISTS: u8 = 0x09;
+/// Reply status: the directory is not empty (SH3 rmdir).
+pub const VFS_NOT_EMPTY: u8 = 0x0a;
+/// Reply status: an advisory lock is held elsewhere (SH3 lock).
+pub const VFS_WOULD_BLOCK: u8 = 0x0b;
+/// Reply status: the operation is not supported on this volume (e.g. link on FAT).
+pub const VFS_NOT_SUPPORTED: u8 = 0x0c;
+
+/// Lock operation: shared (read) lock.
+pub const LOCK_SH: u8 = 1 << 0;
+/// Lock operation: exclusive (write) lock.
+pub const LOCK_EX: u8 = 1 << 1;
+/// Lock operation: release this handle's lock.
+pub const LOCK_UN: u8 = 1 << 2;
+/// Every lock operation bit this protocol defines; exactly one is sent per request.
+pub const LOCK_KNOWN: u8 = LOCK_SH | LOCK_EX | LOCK_UN;
+/// Wire length of a [`Request::Lock`] frame: `op(1) + handle(4) + operation(1)`.
+pub const LOCK_REQUEST_LEN: usize = 6;
+
+/// Wire length of a successful stat reply: `status(1) + kind(1) + mode(2) + size(8)`.
+pub const STAT_REPLY_LEN: usize = 12;
+/// Stat kind: a regular file.
+pub const STAT_KIND_FILE: u8 = 0;
+/// Stat kind: a directory.
+pub const STAT_KIND_DIRECTORY: u8 = 1;
 
 /// Directory-record flag: the entry is itself a directory.
 pub const DIR_RECORD_DIRECTORY: u8 = 1 << 0;
@@ -113,6 +156,21 @@ pub enum Request<'a> {
     Flush { handle: u32 },
     /// List the directory at `path`, skipping its first `start` entries (J547).
     ReadDir { path: &'a [u8], start: u32 },
+    /// Create a directory at `path` (SH3).
+    Mkdir { path: &'a [u8] },
+    /// Remove the file at `path` (SH3).
+    Unlink { path: &'a [u8] },
+    /// Remove the empty directory at `path` (SH3).
+    Rmdir { path: &'a [u8] },
+    /// Rename `from` to `to`, replacing an existing file atomically (SH3).
+    Rename { from: &'a [u8], to: &'a [u8] },
+    /// Stat `path` (SH3).
+    Stat { path: &'a [u8] },
+    /// Link `from` as `to` (SH3); a server without hard links answers
+    /// [`VFS_NOT_SUPPORTED`].
+    Link { from: &'a [u8], to: &'a [u8] },
+    /// Advisory lock `handle` (SH3); one of [`LOCK_SH`], [`LOCK_EX`], [`LOCK_UN`].
+    Lock { handle: u32, operation: u8 },
 }
 
 impl<'a> Request<'a> {
@@ -148,6 +206,41 @@ impl<'a> Request<'a> {
 
     pub const fn flush(handle: u32) -> Request<'a> {
         Request::Flush { handle }
+    }
+
+    /// A mkdir request for `path`.
+    pub const fn mkdir(path: &'a [u8]) -> Request<'a> {
+        Request::Mkdir { path }
+    }
+
+    /// An unlink request for `path`.
+    pub const fn unlink(path: &'a [u8]) -> Request<'a> {
+        Request::Unlink { path }
+    }
+
+    /// An rmdir request for `path`.
+    pub const fn rmdir(path: &'a [u8]) -> Request<'a> {
+        Request::Rmdir { path }
+    }
+
+    /// A rename request from `from` to `to`.
+    pub const fn rename(from: &'a [u8], to: &'a [u8]) -> Request<'a> {
+        Request::Rename { from, to }
+    }
+
+    /// A stat request for `path`.
+    pub const fn stat(path: &'a [u8]) -> Request<'a> {
+        Request::Stat { path }
+    }
+
+    /// A link request from `from` to `to`.
+    pub const fn link(from: &'a [u8], to: &'a [u8]) -> Request<'a> {
+        Request::Link { from, to }
+    }
+
+    /// A lock request for `handle` and exactly one [`LOCK_KNOWN`] operation.
+    pub const fn lock(handle: u32, operation: u8) -> Request<'a> {
+        Request::Lock { handle, operation }
     }
 
     /// Encode into `buf`; returns the number of bytes written, or `None` if `buf`
@@ -231,6 +324,54 @@ impl<'a> Request<'a> {
                 out[7..].copy_from_slice(path);
                 Some(n)
             }
+            Request::Mkdir { path }
+            | Request::Unlink { path }
+            | Request::Rmdir { path }
+            | Request::Stat { path } => {
+                if path.len() > MAX_PATH {
+                    return None;
+                }
+                let op = match *self {
+                    Request::Mkdir { .. } => OP_MKDIR,
+                    Request::Unlink { .. } => OP_UNLINK,
+                    Request::Rmdir { .. } => OP_RMDIR,
+                    _ => OP_STAT,
+                };
+                let n = 3 + path.len();
+                let out = buf.get_mut(..n)?;
+                out[0] = op;
+                out[1..3].copy_from_slice(&(path.len() as u16).to_le_bytes());
+                out[3..].copy_from_slice(path);
+                Some(n)
+            }
+            Request::Rename { from, to } | Request::Link { from, to } => {
+                if from.len() > MAX_PATH || to.len() > MAX_PATH {
+                    return None;
+                }
+                let op = match *self {
+                    Request::Rename { .. } => OP_RENAME,
+                    _ => OP_LINK,
+                };
+                let n = 5 + from.len() + to.len();
+                let out = buf.get_mut(..n)?;
+                out[0] = op;
+                out[1..3].copy_from_slice(&(from.len() as u16).to_le_bytes());
+                out[3..3 + from.len()].copy_from_slice(from);
+                let at = 3 + from.len();
+                out[at..at + 2].copy_from_slice(&(to.len() as u16).to_le_bytes());
+                out[at + 2..n].copy_from_slice(to);
+                Some(n)
+            }
+            Request::Lock { handle, operation } => {
+                if operation & !LOCK_KNOWN != 0 || operation.count_ones() != 1 {
+                    return None;
+                }
+                let out = buf.get_mut(..LOCK_REQUEST_LEN)?;
+                out[0] = OP_LOCK;
+                out[1..5].copy_from_slice(&handle.to_le_bytes());
+                out[5] = operation;
+                Some(LOCK_REQUEST_LEN)
+            }
         }
     }
 
@@ -294,6 +435,48 @@ impl<'a> Request<'a> {
                 Some(Request::ReadDir {
                     path: raw.get(7..7 + plen)?,
                     start,
+                })
+            }
+            OP_MKDIR | OP_UNLINK | OP_RMDIR | OP_STAT => {
+                let plen = u16::from_le_bytes(raw.get(1..3)?.try_into().ok()?) as usize;
+                if plen > MAX_PATH {
+                    return None;
+                }
+                let path = raw.get(3..3 + plen)?;
+                Some(match *raw.first()? {
+                    OP_MKDIR => Request::Mkdir { path },
+                    OP_UNLINK => Request::Unlink { path },
+                    OP_RMDIR => Request::Rmdir { path },
+                    _ => Request::Stat { path },
+                })
+            }
+            OP_RENAME | OP_LINK => {
+                let plen = u16::from_le_bytes(raw.get(1..3)?.try_into().ok()?) as usize;
+                if plen > MAX_PATH {
+                    return None;
+                }
+                let from = raw.get(3..3 + plen)?;
+                let at = 3 + plen;
+                let tlen = u16::from_le_bytes(raw.get(at..at + 2)?.try_into().ok()?) as usize;
+                if tlen > MAX_PATH {
+                    return None;
+                }
+                let to = raw.get(at + 2..at + 2 + tlen)?;
+                Some(if *raw.first()? == OP_RENAME {
+                    Request::Rename { from, to }
+                } else {
+                    Request::Link { from, to }
+                })
+            }
+            OP_LOCK => {
+                let b = raw.get(..LOCK_REQUEST_LEN)?;
+                let operation = b[5];
+                if operation & !LOCK_KNOWN != 0 || operation.count_ones() != 1 {
+                    return None;
+                }
+                Some(Request::Lock {
+                    handle: u32::from_le_bytes(b[1..5].try_into().ok()?),
+                    operation,
                 })
             }
             _ => None,
@@ -472,6 +655,44 @@ pub fn parse_write_reply(resp: &[u8]) -> Result<u32, VfsError> {
             Ok(u32::from_le_bytes(
                 b[1..5].try_into().map_err(|_| VfsError::Malformed)?,
             ))
+        }
+        Some(&status) => Err(VfsError::Status(status)),
+    }
+}
+
+/// Encode a successful stat reply: kind, synthetic POSIX mode, and byte size.
+pub fn encode_stat_ok(kind: u8, mode: u16, size: u64) -> [u8; STAT_REPLY_LEN] {
+    let mut b = [0u8; STAT_REPLY_LEN];
+    b[0] = VFS_OK;
+    b[1] = kind;
+    b[2..4].copy_from_slice(&mode.to_le_bytes());
+    b[4..12].copy_from_slice(&size.to_le_bytes());
+    b
+}
+
+/// A decoded stat reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatReply {
+    pub kind: u8,
+    pub mode: u16,
+    pub size: u64,
+}
+
+/// Parse a stat reply; the kind must be one this protocol defines.
+pub fn parse_stat_reply(resp: &[u8]) -> Result<StatReply, VfsError> {
+    match resp.first() {
+        None => Err(VfsError::Empty),
+        Some(&VFS_OK) => {
+            let b = resp.get(..STAT_REPLY_LEN).ok_or(VfsError::Malformed)?;
+            let kind = b[1];
+            if kind != STAT_KIND_FILE && kind != STAT_KIND_DIRECTORY {
+                return Err(VfsError::Malformed);
+            }
+            Ok(StatReply {
+                kind,
+                mode: u16::from_le_bytes([b[2], b[3]]),
+                size: u64::from_le_bytes(b[4..12].try_into().map_err(|_| VfsError::Malformed)?),
+            })
         }
         Some(&status) => Err(VfsError::Status(status)),
     }
@@ -680,5 +901,132 @@ mod tests {
         let (_, records) =
             parse_dir_reply(&[VFS_OK, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, b'A']).unwrap();
         assert_eq!(records.count(), 1);
+    }
+
+    #[test]
+    fn metadata_requests_round_trip() {
+        let mut buf = [0u8; 3 + MAX_PATH];
+        for req in [
+            Request::mkdir(b"/WORK"),
+            Request::unlink(b"/WORK/TMP"),
+            Request::rmdir(b"/WORK/DONE"),
+            Request::stat(b"/WORK/OUT.BIN"),
+        ] {
+            let n = req.encode_into(&mut buf).unwrap();
+            assert_eq!(Request::decode(&buf[..n]), Some(req));
+        }
+        let lock = Request::lock(0x0102_0304, LOCK_EX);
+        let n = lock.encode_into(&mut buf).unwrap();
+        assert_eq!(n, LOCK_REQUEST_LEN);
+        assert_eq!(Request::decode(&buf[..n]), Some(lock));
+    }
+
+    #[test]
+    fn two_path_requests_round_trip() {
+        let mut buf = [0u8; 5 + 2 * MAX_PATH];
+        let rename = Request::rename(b"/A/OLD.TXT", b"/A/NEW.TXT");
+        let n = rename.encode_into(&mut buf).unwrap();
+        assert_eq!(Request::decode(&buf[..n]), Some(rename));
+        let link = Request::link(b"/A/NEW.TXT", b"/B/ALIAS.TXT");
+        let n = link.encode_into(&mut buf).unwrap();
+        assert_eq!(Request::decode(&buf[..n]), Some(link));
+        // Both paths at the maximum still fit one frame.
+        let long_a = [b'a'; MAX_PATH];
+        let long_b = [b'b'; MAX_PATH];
+        let big = Request::rename(&long_a, &long_b);
+        let n = big.encode_into(&mut buf).unwrap();
+        assert_eq!(n, 5 + 2 * MAX_PATH);
+        assert_eq!(Request::decode(&buf[..n]), Some(big));
+    }
+
+    #[test]
+    fn overlong_paths_are_rejected() {
+        let long = [b'x'; MAX_PATH + 1];
+        let mut buf = [0u8; 3 + MAX_PATH + 1];
+        assert_eq!(Request::mkdir(&long).encode_into(&mut buf), None);
+        assert_eq!(Request::rename(&long, b"/T").encode_into(&mut buf), None);
+        // A decoded frame whose declared length exceeds MAX_PATH is refused
+        // (the header alone decides; the appended bytes exercise the truncation path).
+        let mut frame = [0u8; 3 + MAX_PATH + 1];
+        frame[0] = OP_MKDIR;
+        frame[1..3].copy_from_slice(&((MAX_PATH + 1) as u16).to_le_bytes());
+        frame[3..].copy_from_slice(&long);
+        assert_eq!(Request::decode(&frame), None);
+    }
+
+    #[test]
+    fn lock_operations_are_validated() {
+        let mut buf = [0u8; LOCK_REQUEST_LEN];
+        assert_eq!(Request::lock(1, 0).encode_into(&mut buf), None);
+        assert_eq!(
+            Request::lock(1, LOCK_SH | LOCK_EX).encode_into(&mut buf),
+            None
+        );
+        assert_eq!(
+            Request::lock(1, LOCK_EX | LOCK_UN).encode_into(&mut buf),
+            None
+        );
+        assert_eq!(Request::lock(1, 0x80).encode_into(&mut buf), None);
+        assert_eq!(Request::decode(&[OP_LOCK, 1, 0, 0, 0, 0]), None);
+        assert_eq!(Request::decode(&[OP_LOCK, 1, 0, 0, 0, 0x08]), None);
+    }
+
+    #[test]
+    fn stat_reply_round_trips_and_rejects_malformed() {
+        let ok = encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0);
+        assert_eq!(
+            parse_stat_reply(&ok),
+            Ok(StatReply {
+                kind: STAT_KIND_DIRECTORY,
+                mode: 0o755,
+                size: 0,
+            })
+        );
+        let file = encode_stat_ok(STAT_KIND_FILE, 0o644, 4096);
+        assert_eq!(
+            parse_stat_reply(&file),
+            Ok(StatReply {
+                kind: STAT_KIND_FILE,
+                mode: 0o644,
+                size: 4096,
+            })
+        );
+        assert_eq!(parse_stat_reply(&[]), Err(VfsError::Empty));
+        assert_eq!(parse_stat_reply(&[VFS_OK]), Err(VfsError::Malformed));
+        let mut bad_kind = ok;
+        bad_kind[1] = 7;
+        assert_eq!(parse_stat_reply(&bad_kind), Err(VfsError::Malformed));
+        assert_eq!(
+            parse_stat_reply(&[VFS_NOT_FOUND]),
+            Err(VfsError::Status(VFS_NOT_FOUND))
+        );
+    }
+
+    #[test]
+    fn new_statuses_are_distinct() {
+        let old = [
+            VFS_OK,
+            VFS_NOT_FOUND,
+            VFS_BAD_HANDLE,
+            VFS_IS_DIR,
+            VFS_BAD_REQUEST,
+            VFS_NO_SPACE,
+            VFS_ACCESS_DENIED,
+            VFS_IO_ERROR,
+            VFS_NOT_DIR,
+        ];
+        for (i, a) in old.iter().enumerate() {
+            for b in &old[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        for status in [
+            VFS_EXISTS,
+            VFS_NOT_EMPTY,
+            VFS_WOULD_BLOCK,
+            VFS_NOT_SUPPORTED,
+        ] {
+            assert!(!old.contains(&status));
+        }
     }
 }
