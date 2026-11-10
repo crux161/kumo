@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j508
 //j514
 //j545
 //j549
 //j559
+//j864
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -20,10 +20,16 @@
 //! sector and nothing outside the partition can be named.
 
 use fatfs::block::{BlockSectors, BlockTransport};
-use fatfs::{FatServer, Transport};
+use fatfs::{
+    dispatch_shared, FatServer, SharedServer, Transport, MAX_SESSIONS, REPLY_BUF_BYTES,
+    REQUEST_BUF_BYTES, SESSION_READ_ONLY, SESSION_READ_WRITE,
+};
 use kumo_abi::{Handle, VmarFlags};
 use kumo_fatfs::{FatVolume, SectorReader, SectorWriter, SECTOR_SIZE};
-use kumo_rt::{channel_read, channel_read_with_handle, channel_write, vmar_map};
+use kumo_rt::{
+    channel_read, channel_read_with_handle, channel_write, handle_close, handle_koid, port_bind,
+    port_create, port_unbind, port_wait, vmar_map,
+};
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
 /// allows.
@@ -114,6 +120,102 @@ impl BlockTransport for ChannelBlocks {
     }
 }
 
+fn valid(raw: u64) -> Option<Handle> {
+    (raw != 0 && raw != u64::MAX).then_some(Handle(raw as u32))
+}
+
+/// Serve a mount-scoped volume (SH3-c2): one mount, many client sessions. The bootstrap
+/// channel stays open as the session-control channel; each `[b'S'][access]` grant carries
+/// the server end of one client channel, and requests dispatch through the shared server
+/// (per-session open tables, cross-session advisory locks). A closed session releases its
+/// locks and table; a closed control channel with no sessions left ends the process.
+fn serve_mount(control: Handle, blocks: Handle, block_count: u64) -> ! {
+    let mut disk = BlockSectors::new(ChannelBlocks { channel: blocks }, block_count);
+    let Ok(volume) = FatVolume::mount(&mut disk) else {
+        fail(b"fatfs: mount-scoped block mount failed\n");
+    };
+    let Some(port) = valid(port_create()) else {
+        fail(b"fatfs: mount-scoped port create failed\n");
+    };
+    let control_koid = handle_koid(control);
+    if control_koid == u64::MAX || port_bind(port, control) != 0 {
+        fail(b"fatfs: mount-scoped control bind failed\n");
+    }
+    log_info(b"fatfs: serving a mount\n");
+    let mut server = SharedServer::new();
+    let mut sessions: [Option<(Handle, u64)>; MAX_SESSIONS] = [None; MAX_SESSIONS];
+    let mut request_buf = [0u8; REQUEST_BUF_BYTES];
+    let mut reply_buf = [0u8; REPLY_BUF_BYTES];
+    loop {
+        let source = port_wait(port);
+        if source == control_koid {
+            let mut grant = [0u8; 2];
+            let (n, raw) = channel_read_with_handle(control, grant.as_mut_ptr(), grant.len());
+            if n == 0 {
+                let _ = port_unbind(port, control);
+                if sessions.iter().all(Option::is_none) {
+                    kumo_rt::process_exit(0);
+                }
+                continue;
+            }
+            if n == 2 && grant[0] == b'S' {
+                let Some(channel) = valid(raw) else {
+                    continue;
+                };
+                let koid = handle_koid(channel);
+                let Some(index) = sessions.iter().position(Option::is_none) else {
+                    log_info(b"fatfs: session full; grant refused\n");
+                    let _ = handle_close(channel);
+                    continue;
+                };
+                if koid == u64::MAX || port_bind(port, channel) != 0 {
+                    let _ = handle_close(channel);
+                    continue;
+                }
+                sessions[index] = Some((channel, koid));
+                server.set_access(
+                    index,
+                    if grant[1] == 0 {
+                        SESSION_READ_ONLY
+                    } else {
+                        SESSION_READ_WRITE
+                    },
+                );
+                log_info(b"fatfs: session granted\n");
+            } else if let Some(extra) = valid(raw) {
+                let _ = handle_close(extra);
+            }
+        } else if let Some(index) = sessions
+            .iter()
+            .position(|entry| entry.is_some_and(|(_, koid)| koid == source))
+        {
+            let Some((channel, _)) = sessions[index] else {
+                continue;
+            };
+            let n = channel_read(channel, request_buf.as_mut_ptr(), request_buf.len());
+            if n == 0 || n > request_buf.len() as u64 {
+                let _ = port_unbind(port, channel);
+                let _ = handle_close(channel);
+                sessions[index] = None;
+                server.close_session(index);
+                log_info(b"fatfs: session closed\n");
+            } else {
+                let reply_len = dispatch_shared(
+                    &volume,
+                    &mut disk,
+                    &mut server,
+                    index,
+                    &request_buf[..n as usize],
+                    &mut reply_buf,
+                );
+                if reply_len != 0 {
+                    let _ = channel_write(channel, reply_buf.as_ptr(), reply_len);
+                }
+            }
+        }
+    }
+}
+
 /// Serve a block-backed volume until the vfs peer closes (J545).
 fn serve_blocks(channel: Handle, blocks: Handle, block_count: u64) -> ! {
     let mut disk = BlockSectors::new(ChannelBlocks { channel: blocks }, block_count);
@@ -163,6 +265,11 @@ extern "C" fn main(
 
     let mut header = [0u8; 16];
     let (n, vmo_raw) = channel_read_with_handle(channel, header.as_mut_ptr(), header.len());
+    if vmo_raw != 0 && drv_blk::decode_mount_bootstrap(&header[..n.min(header.len())]).is_some() {
+        let block_count = drv_blk::decode_mount_bootstrap(&header[..n.min(header.len())])
+            .expect("checked mount bootstrap");
+        serve_mount(channel, Handle(vmo_raw as u32), block_count);
+    }
     if vmo_raw != 0 {
         if let Some(block_count) = drv_blk::decode_client_bootstrap(&header[..n.min(header.len())])
         {

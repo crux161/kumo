@@ -1,9 +1,9 @@
 #![no_std]
-//j413
 //j414
 //j545
 //j550
 //j803
+//j864
 
 //! `drv-blk` — a minimal ramdisk block device over a VMO.
 //!
@@ -363,6 +363,27 @@ pub fn encode_client_bootstrap(block_count: u64) -> [u8; CLIENT_BOOTSTRAP_LEN] {
     buf[0] = CLIENT_BOOTSTRAP_TAG;
     buf[1..].copy_from_slice(&block_count.to_le_bytes());
     buf
+}
+
+/// First byte of the bootstrap a *mount-scoped* filesystem server receives (SH3-c2):
+/// `[CLIENT_MOUNT_TAG][block_count: u64 LE]`. Same shape as the per-launch bootstrap,
+/// a different tag: this server keeps the channel for session grants after mounting.
+pub const CLIENT_MOUNT_TAG: u8 = b'M';
+
+/// Encode the bootstrap that starts a mount-scoped filesystem server.
+pub fn encode_mount_bootstrap(block_count: u64) -> [u8; CLIENT_BOOTSTRAP_LEN] {
+    let mut buf = [0u8; CLIENT_BOOTSTRAP_LEN];
+    buf[0] = CLIENT_MOUNT_TAG;
+    buf[1..].copy_from_slice(&block_count.to_le_bytes());
+    buf
+}
+
+/// The volume's block count from a mount bootstrap; `None` for any other message.
+pub fn decode_mount_bootstrap(raw: &[u8]) -> Option<u64> {
+    if raw.len() != CLIENT_BOOTSTRAP_LEN || raw[0] != CLIENT_MOUNT_TAG {
+        return None;
+    }
+    Some(u64::from_le_bytes(raw[1..].try_into().ok()?))
 }
 
 /// The volume's block count from a client bootstrap; `None` for any other message, such as the

@@ -178,6 +178,11 @@ impl Default for FatServer {
 /// Sessions the mount-scoped server admits (SH3-c). Small on purpose: every session
 /// reserves an open table, and the first user is a two-process lock/rename proof.
 pub const MAX_SESSIONS: usize = 4;
+/// Session access byte: reads only (SH3-c2). The launcher's grant stays authoritative:
+/// the shared server holds an rw block channel, so a read-only session is enforced here.
+pub const SESSION_READ_ONLY: u8 = 0;
+/// Session access byte: reads and mutations.
+pub const SESSION_READ_WRITE: u8 = 1;
 /// Advisory locks the shared registry tracks at once.
 pub const MAX_LOCKS: usize = 8;
 
@@ -233,6 +238,14 @@ impl LockRegistry {
         false
     }
 
+    fn clear_session(&mut self, session: usize) {
+        for slot in self.entries.iter_mut() {
+            if slot.is_some_and(|entry| entry.session == session) {
+                *slot = None;
+            }
+        }
+    }
+
     fn clear(&mut self, key: DirLocation, session: usize) {
         for slot in self.entries.iter_mut() {
             if slot.is_some_and(|entry| entry.key == key && entry.session == session) {
@@ -255,6 +268,8 @@ impl Default for LockRegistry {
 pub struct SharedServer {
     pub sessions: [OpenTable; MAX_SESSIONS],
     pub locks: LockRegistry,
+    /// Per-session access (SH3-c2): the launcher's grant, enforced at the server.
+    pub access: [u8; MAX_SESSIONS],
 }
 
 impl SharedServer {
@@ -262,7 +277,26 @@ impl SharedServer {
         SharedServer {
             sessions: [OpenTable::new(); MAX_SESSIONS],
             locks: LockRegistry::new(),
+            access: [SESSION_READ_WRITE; MAX_SESSIONS],
         }
+    }
+
+    /// Admit `session` with the launcher-granted access byte (SH3-c2).
+    pub fn set_access(&mut self, session: usize, access: u8) {
+        if let Some(slot) = self.access.get_mut(session) {
+            *slot = access;
+        }
+    }
+
+    /// Drop a closed session's locks and open table (SH3-c2): a dead client must not
+    /// hold advisory locks against the survivors.
+    pub fn close_session(&mut self, session: usize) {
+        if session >= MAX_SESSIONS {
+            return;
+        }
+        self.locks.clear_session(session);
+        self.sessions[session] = OpenTable::new();
+        self.access[session] = SESSION_READ_WRITE;
     }
 }
 
@@ -270,6 +304,24 @@ impl Default for SharedServer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Does this request mutate the volume? Read-only sessions are refused exactly these
+/// (SH3-c2); locks and reads are not mutations.
+fn request_writes(request: &Request<'_>) -> bool {
+    matches!(
+        request,
+        Request::OpenOptions { options, .. }
+            if options & (OPEN_WRITE | OPEN_CREATE) != 0
+    ) || matches!(
+        request,
+        Request::Write { .. }
+            | Request::SetLen { .. }
+            | Request::Mkdir { .. }
+            | Request::Unlink { .. }
+            | Request::Rmdir { .. }
+            | Request::Rename { .. }
+    )
 }
 
 /// Handle one request for `session` of a mount-scoped server (SH3-c1). Open-handle
@@ -286,7 +338,11 @@ pub fn dispatch_shared<R: SectorReader + SectorWriter>(
     if session >= MAX_SESSIONS {
         return write_status(reply, VFS_BAD_REQUEST);
     }
-    match Request::decode(request) {
+    let decoded = Request::decode(request);
+    if server.access[session] == SESSION_READ_ONLY && decoded.as_ref().is_some_and(request_writes) {
+        return write_status(reply, VFS_ACCESS_DENIED);
+    }
+    match decoded {
         Some(Request::Open { path }) => open(
             volume,
             io,
@@ -1913,6 +1969,107 @@ mod tests {
                 Request::stat(b"/SAVE.TMP")
             ),
             alloc::vec![VFS_NOT_FOUND]
+        );
+    }
+
+    #[test]
+    fn read_only_sessions_cannot_mutate_the_volume() {
+        let (volume, mut disk) = writable();
+        let mut server = SharedServer::new();
+        server.set_access(1, SESSION_READ_ONLY);
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+
+        // The read-only session reads fine.
+        let bytes = shared_call(
+            &volume,
+            &mut disk,
+            &mut server,
+            1,
+            &mut reply,
+            Request::stat(b"/HELLO.TXT"),
+        );
+        assert_eq!(
+            kumo_vfs::parse_stat_reply(&bytes).expect("stat").kind,
+            STAT_KIND_FILE
+        );
+        // Every mutation shape is refused before any handler runs.
+        for request in [
+            Request::open_options(b"/NEW.TXT", OPEN_READ | OPEN_WRITE | OPEN_CREATE),
+            Request::write(1, 0, b"x"),
+            Request::set_len(1, 1),
+            Request::mkdir(b"/WORK"),
+            Request::unlink(b"/HELLO.TXT"),
+            Request::rmdir(b"/EFI"),
+            Request::rename(b"/HELLO.TXT", b"/OTHER.TXT"),
+        ] {
+            let reply_bytes = shared_call(&volume, &mut disk, &mut server, 1, &mut reply, request);
+            assert_eq!(reply_bytes, alloc::vec![VFS_ACCESS_DENIED], "{:?}", request);
+        }
+        // The rw session still mutates.
+        let reply_bytes = shared_call(
+            &volume,
+            &mut disk,
+            &mut server,
+            0,
+            &mut reply,
+            Request::mkdir(b"/WORK"),
+        );
+        assert_eq!(reply_bytes, alloc::vec![VFS_OK]);
+    }
+
+    #[test]
+    fn closing_a_session_releases_its_locks_and_table() {
+        let (volume, mut disk) = writable();
+        let mut server = SharedServer::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let first = shared_open(&volume, &mut disk, &mut server, 0, b"/HELLO.TXT");
+        let second = shared_open(&volume, &mut disk, &mut server, 1, b"/HELLO.TXT");
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                0,
+                &mut reply,
+                Request::lock(first, LOCK_EX)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        // The durable lock blocks the other session until the holder is closed.
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                1,
+                &mut reply,
+                Request::lock(second, LOCK_SH)
+            ),
+            alloc::vec![VFS_WOULD_BLOCK]
+        );
+        server.close_session(0);
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                1,
+                &mut reply,
+                Request::lock(second, LOCK_SH)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        // The closed session's handles are gone.
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                0,
+                &mut reply,
+                Request::flush(first)
+            ),
+            alloc::vec![VFS_BAD_HANDLE]
         );
     }
 }

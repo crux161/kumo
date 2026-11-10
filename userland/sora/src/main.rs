@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j837
 //j843
 //j856
 //j857
 //j859
+//j864
 
 extern crate alloc;
 
@@ -921,7 +921,7 @@ fn bitmap_file(initrd: Handle, path: &[u8]) -> Result<(Handle, u64), &'static [u
             if !media().is_some_and(|media| media.name.as_bytes() == name) {
                 return Err(b"bmp-view: no such volume\n");
             }
-            let fs = spawn_media_fatfs(initrd, BlockAccess::ReadOnly)
+            let fs = media_session(BlockAccess::ReadOnly)
                 .ok_or(b"bmp-view: filesystem unavailable\n".as_slice())?;
             return bitmap_volume_file(fs, path);
         }
@@ -2624,6 +2624,8 @@ struct Media {
     control: Handle,
     /// Its storage controller, the `N` of `/dev/disk<N>s1` (J766).
     device: usize,
+    /// The mount-scoped `fatfs` server process (SH3-c2), killed on umount or device loss.
+    process: Handle,
 }
 
 /// J766: the volume each storage controller's driver offers, mounted or not. `mount` mounts one
@@ -2643,13 +2645,20 @@ fn set_device(index: usize, device: Option<Device>) {
     DEVICES.set(devices);
 }
 
-/// Mount the offered volume of controller `index` as `/media/<name>`, and say so.
-fn mount_device(index: usize, device: Device, name: sora::MediaName) {
+/// Mount the offered volume of controller `index` as `/media/<name>`, and say so. The
+/// volume is served by ONE mount-scoped `fatfs` (SH3-c2), not a per-launch instance: every
+/// client gets a session on it, which is what makes advisory locks and renames shared.
+fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaName) {
+    let Some((control, process)) = spawn_mount_fatfs(initrd, device) else {
+        log(b"media: mount-scoped server unavailable\n");
+        return;
+    };
     set_media(Some(Media {
         name,
         ready: device.ready,
-        control: device.control,
+        control,
         device: index,
+        process,
     }));
     notice(&[
         b"media: ",
@@ -2662,6 +2671,12 @@ fn mount_device(index: usize, device: Device, name: sora::MediaName) {
             b" (fat32)\n"
         },
     ]);
+    // Health probe through one short-lived session (the J545 check, now against the
+    // resident server's mount path).
+    if let Some(client) = media_session(BlockAccess::ReadOnly) {
+        check_volume_directory(Some(client), b"/");
+        diag(b"media: mount-scoped check done\n");
+    }
 }
 
 struct MediaCell(core::cell::UnsafeCell<Option<Media>>);
@@ -7054,7 +7069,7 @@ fn eval_command(
         return true;
     }
     if cmd.name == "mount" {
-        mount_command(cmd, cwd);
+        mount_command(cmd, cwd, initrd);
         return true;
     }
     if cmd.name == "umount" {
@@ -7546,8 +7561,12 @@ fn media_offered(
         if index == sora::NVME_STORAGE {
             nvme_unavailable();
         }
-        if media().is_some_and(|media| media.control == control) {
+        if let Some(gone) = media().filter(|media| media.control == control) {
             set_media(None);
+            if gone.process.0 != 0 {
+                let _ = process_kill(gone.process);
+                let _ = handle_close(gone.process);
+            }
             log(b"media: driver gone; volume removed\n");
         }
         return false;
@@ -7623,17 +7642,7 @@ fn media_ready(initrd: Handle, index: usize, control: Handle, ready: drv_blk::Me
     } else {
         b"\n"
     });
-    mount_device(index, device, name);
-    // J545's end-to-end check: mount the volume once through a block-backed `fatfs`, then let
-    // that instance go. Its mount crosses every new hop (Sora's connect, the driver's resident
-    // loop, the block protocol), and its exit returns the driver's client slot. — TIMBERDOODLE
-    match spawn_media_fatfs(initrd, BlockAccess::ReadOnly) {
-        Some(vfs) => {
-            let _ = handle_close(vfs);
-            diag(b"media: mount check started\n");
-        }
-        None => log(b"media: mount check spawn fail\n"),
-    }
+    mount_device(initrd, index, device, name);
     true
 }
 
@@ -11433,7 +11442,7 @@ fn log_line(parts: &[&[u8]], status: u8) {
 /// `-t`. With no operand it lists every offered volume: the mounted one as Linux prints it, the
 /// others as waiting. A device mounts at the given `/media/<name>`, or without one at the name it
 /// takes by itself: its label, else its serial. Failures exit 32, as Linux's `mount` does.
-fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
+fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory, initrd: Handle) {
     let mounted = media();
     let Some(operand) = cmd.args.first() else {
         for (index, device) in DEVICES.get().iter().enumerate() {
@@ -11516,7 +11525,7 @@ fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
             ],
             32,
         ),
-        None => mount_device(index, device, name),
+        None => mount_device(initrd, index, device, name),
     }
 }
 
@@ -11558,6 +11567,11 @@ fn umount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
         return;
     }
     set_media(None);
+    if media.process.0 != 0 {
+        let _ = process_kill(media.process);
+        let _ = handle_close(media.process);
+    }
+    let _ = handle_close(media.control);
     notice(&[
         b"media: ",
         &sora::disk_path(media.device),
@@ -11591,7 +11605,7 @@ fn check_directory(initrd: Handle, path: &str) -> Result<(), DirectoryError> {
             if !media().is_some_and(|volume| volume.name.as_bytes() == name) {
                 return Err(DirectoryError::NotFound);
             }
-            return check_volume_directory(spawn_media_fatfs(initrd, BlockAccess::ReadOnly), path);
+            return check_volume_directory(media_session(BlockAccess::ReadOnly), path);
         }
         sora::MediaRoute::Elsewhere => {}
     }
@@ -11655,11 +11669,24 @@ fn check_volume_directory(fs: Option<Handle>, path: &[u8]) -> Result<(), Directo
 /// J545: start a `fatfs` instance over the registered stick and return its vfs client channel.
 /// The instance gets its own block channel, whose other end goes to the stick's driver first;
 /// when the instance exits, the driver sees that channel close and frees the client slot.
-fn spawn_media_fatfs(initrd: Handle, access: BlockAccess) -> Option<Handle> {
-    let media = media()?;
+/// Spawn the mount-scoped `fatfs` for one offered volume (SH3-c2): a kept process handle,
+/// a mount-mode bootstrap, and the control channel sessions are granted over.
+fn spawn_mount_fatfs(initrd: Handle, device: Device) -> Option<(Handle, Handle)> {
+    let (control_raw, server_raw) = channel_create_pair();
+    if control_raw == u64::MAX || server_raw == u64::MAX {
+        for end in [control_raw, server_raw] {
+            if end != u64::MAX {
+                let _ = handle_close(Handle(end as u32));
+            }
+        }
+        log(b"media: control channel unavailable\n");
+        return None;
+    }
+    let control = Handle(control_raw as u32);
+    let server = Handle(server_raw as u32);
     let (block_client_raw, block_server_raw) = channel_create_pair();
     if block_client_raw == u64::MAX || block_server_raw == u64::MAX {
-        for end in [block_client_raw, block_server_raw] {
+        for end in [control_raw, server_raw, block_client_raw, block_server_raw] {
             if end != u64::MAX {
                 let _ = handle_close(Handle(end as u32));
             }
@@ -11668,59 +11695,95 @@ fn spawn_media_fatfs(initrd: Handle, access: BlockAccess) -> Option<Handle> {
         return None;
     }
     let block_client = Handle(block_client_raw as u32);
-    let block_server = Handle(block_server_raw as u32);
+    let access = if device.ready.read_only {
+        BlockAccess::ReadOnly
+    } else {
+        BlockAccess::ReadWrite
+    };
     let connect = drv_blk::encode_connect(access);
-    if channel_write_with_handle(media.control, connect.as_ptr(), connect.len(), block_server)
-        != Errno::Ok.status()
+    if channel_write_with_handle(
+        device.control,
+        connect.as_ptr(),
+        connect.len(),
+        Handle(block_server_raw as u32),
+    ) != Errno::Ok.status()
     {
+        let _ = handle_close(control);
+        let _ = handle_close(server);
         let _ = handle_close(block_client);
-        let _ = handle_close(block_server);
         log(b"media: driver connect failed\n");
         return None;
     }
+    let bootstrap = drv_blk::encode_mount_bootstrap(device.ready.block_count);
+    if channel_write_with_handle(control, bootstrap.as_ptr(), bootstrap.len(), block_client)
+        != Errno::Ok.status()
+    {
+        let _ = handle_close(control);
+        let _ = handle_close(server);
+        let _ = handle_close(block_client);
+        log(b"media: mount bootstrap failed\n");
+        return None;
+    }
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    let mut kept = None;
+    if !run_elf_threads(
+        initrd,
+        FATFS_PATH.as_bytes(),
+        0,
+        server_raw,
+        flags,
+        b"fatfs",
+        0,
+        Some(&mut kept),
+    ) {
+        let _ = handle_close(control);
+        let _ = handle_close(server);
+        return None;
+    }
+    let Some(process) = kept else {
+        let _ = handle_close(control);
+        let _ = handle_close(server);
+        return None;
+    };
+    Some((control, process))
+}
 
-    let (vfs_client_raw, fatfs_end_raw) = channel_create_pair();
-    if vfs_client_raw == u64::MAX || fatfs_end_raw == u64::MAX {
-        for end in [vfs_client_raw, fatfs_end_raw] {
+/// Mint one client session on the mount-scoped server (SH3-c2): `[b'S'][access]` carries
+/// the server end over the control channel; the client end becomes the program's fs grant.
+fn media_session(access: BlockAccess) -> Option<Handle> {
+    let media = media()?;
+    let (client_raw, server_raw) = channel_create_pair();
+    if client_raw == u64::MAX || server_raw == u64::MAX {
+        for end in [client_raw, server_raw] {
             if end != u64::MAX {
                 let _ = handle_close(Handle(end as u32));
             }
         }
-        let _ = handle_close(block_client);
-        log(b"media: vfs channel unavailable\n");
+        log(b"media: session channel unavailable\n");
         return None;
     }
-    let vfs_client = Handle(vfs_client_raw as u32);
-    let bootstrap = drv_blk::encode_client_bootstrap(media.ready.block_count);
+    let client = Handle(client_raw as u32);
+    let grant = [
+        b'S',
+        if matches!(access, BlockAccess::ReadWrite) {
+            1u8
+        } else {
+            0u8
+        },
+    ];
     if channel_write_with_handle(
-        vfs_client,
-        bootstrap.as_ptr(),
-        bootstrap.len(),
-        block_client,
+        media.control,
+        grant.as_ptr(),
+        grant.len(),
+        Handle(server_raw as u32),
     ) != Errno::Ok.status()
     {
-        let _ = handle_close(block_client);
-        let _ = handle_close(vfs_client);
-        let _ = handle_close(Handle(fatfs_end_raw as u32));
-        log(b"media: fatfs bootstrap failed\n");
+        let _ = handle_close(client);
+        let _ = handle_close(Handle(server_raw as u32));
+        log(b"media: session grant failed\n");
         return None;
     }
-    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
-    if !run_elf(
-        initrd,
-        FATFS_PATH.as_bytes(),
-        0,
-        fatfs_end_raw,
-        flags,
-        b"fatfs",
-    ) {
-        // Closing the client drops the queued bootstrap, and with it the block channel: the
-        // driver sees it close and frees the slot it had bound.
-        let _ = handle_close(vfs_client);
-        let _ = handle_close(Handle(fatfs_end_raw as u32));
-        return None;
-    }
-    Some(vfs_client)
+    Some(client)
 }
 
 fn fat_image_alias(initrd: Handle) -> Option<(u64, u64)> {
@@ -11984,7 +12047,7 @@ fn run_with_startup_input_with_env(
     let fs_child = match fs {
         FsGrant::None => None,
         FsGrant::Image => spawn_fatfs(initrd),
-        FsGrant::Media(access) => spawn_media_fatfs(initrd, access),
+        FsGrant::Media(access) => media_session(access),
     };
     let tty_child = if grant_tty {
         spawn_ttyd_control(initrd)
