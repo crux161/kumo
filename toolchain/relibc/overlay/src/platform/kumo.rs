@@ -1,8 +1,8 @@
-//j557
 //j759
 //j856
 //j859
 //j866
+//j867
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -95,7 +95,6 @@ const VFS_OP_RMDIR: u8 = 0x09;
 const VFS_OP_RENAME: u8 = 0x0a;
 const VFS_OP_STAT: u8 = 0x0b;
 const VFS_OP_LINK: u8 = 0x0c;
-#[allow(dead_code)] // SH3-d2b: advisory locks arrive with flock
 const VFS_OP_LOCK: u8 = 0x0d;
 const VFS_OP_CHMOD: u8 = 0x0e;
 const VFS_OPEN_READ: u8 = 1 << 0;
@@ -117,12 +116,11 @@ const VFS_NOT_SUPPORTED: u8 = 0x0c;
 const VFS_STAT_REPLY_LEN: usize = 12;
 const VFS_STAT_KIND_FILE: u8 = 0;
 const VFS_STAT_KIND_DIRECTORY: u8 = 1;
-#[allow(dead_code)] // SH3-d2b: flock operation bits
 const VFS_LOCK_SH: u8 = 1 << 0;
-#[allow(dead_code)] // SH3-d2b: flock operation bits
 const VFS_LOCK_EX: u8 = 1 << 1;
-#[allow(dead_code)] // SH3-d2b: flock operation bits
 const VFS_LOCK_UN: u8 = 1 << 2;
+/// Wire length of a lock request: `op(1) + handle(4) + operation(1)`.
+const LOCK_REQUEST_LEN: usize = 6;
 const VFS_MAX_PATH: usize = 255;
 const VFS_READ_REQUEST_LEN: usize = 17;
 const VFS_OPEN_REPLY_LEN: usize = 13;
@@ -495,6 +493,23 @@ fn vfs_status(request: &[u8]) -> Result<()> {
         return Err(vfs_errno(reply[0]));
     }
     Ok(())
+}
+
+/// One `OP_LOCK` exchange (`[op][handle][operation]`, one status byte) for an open
+/// file handle (SH3-d2b). A conflicting holder answers WOULD_BLOCK, which `vfs_errno`
+/// maps to EAGAIN — the errno both flock(2) with LOCK_NB and the fcntl lock calls
+/// report. — TIMBERDOODLE
+fn vfs_lock(fildes: c_int, operation: u8) -> Result<()> {
+    use crate::header::errno::EBADF;
+
+    let Some(FdSlot::File { handle, .. }) = fd_slot(fildes).map(|slot| *slot) else {
+        return Err(Errno(EBADF));
+    };
+    let mut request = [0u8; LOCK_REQUEST_LEN];
+    request[0] = VFS_OP_LOCK;
+    request[1..5].copy_from_slice(&handle.to_le_bytes());
+    request[5] = operation;
+    vfs_status(&request)
 }
 
 /// Encode a one-path SH3 request (`[op][len u16][path]`) and exchange it.
@@ -1595,8 +1610,23 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// Advisory locks over the vfs `OP_LOCK` (SH3-d2b). POSIX operation bits are
+    /// LOCK_SH=1, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8; the wire carries exactly one of
+    /// SH=1, EX=2, UN=4, so LOCK_UN maps 8 to 4 and LOCK_NB is stripped. The server's
+    /// lock is non-blocking by design: a conflicting request answers EAGAIN, which is
+    /// also what a LOCK_NB caller expects. The ABI has no sleep primitive to park a
+    /// blocking caller, so a contending blocking request deviates the same way —
+    /// recorded in JOURNAL/867; LOCK_NB is exact. — TIMBERDOODLE
     fn flock(fd: c_int, operation: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::sys_file::{LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN};
+
+        let wire = match operation & !LOCK_NB {
+            LOCK_SH => VFS_LOCK_SH,
+            LOCK_EX => VFS_LOCK_EX,
+            LOCK_UN => VFS_LOCK_UN,
+            _ => return Err(Errno(crate::header::errno::EINVAL)),
+        };
+        vfs_lock(fd, wire)
     }
 
     /// stat/lstat/fstat all land here (the Pal defaults route to this one method). Path
@@ -1670,7 +1700,10 @@ impl Pal for Sys {
     fn fcntl(fildes: c_int, cmd: c_int, arg: c_ulonglong) -> Result<c_int> {
         use crate::header::bits_open_flags::O_NONBLOCK;
         use crate::header::errno::{EBADF, EINVAL, EMFILE};
-        use crate::header::fcntl::{F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL};
+        use crate::header::fcntl::{
+            F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_GETLK, F_RDLCK, F_SETFL, F_SETLK, F_SETLKW,
+            F_UNLCK, F_WRLCK, flock as flock_record,
+        };
 
         let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
         match cmd {
@@ -1695,6 +1728,35 @@ impl Pal for Sys {
                 FdSlot::Closed => Err(Errno(EBADF)),
                 _ => Err(Errno(EINVAL)),
             },
+            // POSIX record locks are whole-file here (SH3-d2b): the wire lock has no
+            // range, so l_start/l_len/l_whence are accepted and ignored. The C fcntl
+            // passes the caller's struct pointer as c_ulonglong without translation.
+            // F_SETLKW shares F_SETLK's one-shot answer for the flock deviation's
+            // reason: no sleep primitive exists to park a contending caller.
+            F_GETLK | F_SETLK | F_SETLKW => {
+                if !matches!(*slot, FdSlot::File { .. }) {
+                    return Err(Errno(EBADF));
+                }
+                if arg == 0 {
+                    return Err(Errno(EINVAL));
+                }
+                let record = unsafe { &mut *(arg as usize as *mut flock_record) };
+                if cmd == F_GETLK {
+                    // No wire query exists; this backend knows of no conflicting holder
+                    // when asked, so the whole-file answer is F_UNLCK. Recorded
+                    // approximation (JOURNAL/867).
+                    record.l_type = F_UNLCK as _;
+                    return Ok(0);
+                }
+                let operation = match record.l_type as c_int {
+                    F_RDLCK => VFS_LOCK_SH,
+                    F_WRLCK => VFS_LOCK_EX,
+                    F_UNLCK => VFS_LOCK_UN,
+                    _ => return Err(Errno(EINVAL)),
+                };
+                vfs_lock(fildes, operation)?;
+                Ok(0)
+            }
             // dup() is the trait default `fcntl(F_DUPFD, 0)`; std's try_clone lands here.
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 if matches!(*slot, FdSlot::Closed) {

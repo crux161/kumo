@@ -2,6 +2,7 @@
 #j821
 #j856
 #j866
+#j867
 """AXH: build, boot and check native NET2 loopback/recovery; restore the default image.
 
 No NIC, credentials or board access. Artifacts remain under build/verification. POST is
@@ -99,6 +100,17 @@ CASES = (
         "std: sh3 file stat -> OK",
         "std: sh3 rename -> OK",
         "std: sh3 read back -> OK",
+        "std: sh3 lock ex -> OK",
+        "std: sh3 lock conflict ex -> OK",
+        "std: sh3 lock conflict sh -> OK",
+        "std: sh3 unlock -> OK",
+        "std: sh3 lock sh -> OK",
+        "std: sh3 lock ex vs sh -> OK",
+        "std: sh3 shared unlock -> OK",
+        "std: sh3 blocking lock free -> OK",
+        "std: sh3 fcntl setlk -> OK",
+        "std: sh3 fcntl unlock -> OK",
+        "std: sh3 fcntl getlk -> OK",
         "std: sh3 old name gone -> OK",
         "std: sh3 unlink -> OK",
         "std: sh3 rmdir -> OK",

@@ -1,8 +1,8 @@
-//j853
 //j856
 //j857
 //j859
 //j866
+//j867
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -969,6 +969,44 @@ fn sh3_probe() {
         fs::read_to_string(b).map(|t| t == "kumo").unwrap_or(false),
         "read back"
     );
+    // SH3-d2b: advisory locks. Both handles share this launch's fatfs server, whose
+    // per-launch lock table conflicts across handles, so contention is observable in
+    // one process. The blocking form runs only uncontended: the ABI has no sleep
+    // primitive to park a contending caller (recorded deviation).
+    let h1 = fs::File::open(b);
+    let h2 = fs::File::open(b);
+    match (&h1, &h2) {
+        (Ok(h1), Ok(h2)) => {
+            check!(h1.try_lock().is_ok(), "lock ex");
+            check!(
+                matches!(h2.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                "lock conflict ex"
+            );
+            check!(
+                matches!(h2.try_lock_shared(), Err(fs::TryLockError::WouldBlock)),
+                "lock conflict sh"
+            );
+            check!(h1.unlock().is_ok(), "unlock");
+            check!(h2.try_lock_shared().is_ok(), "lock sh");
+            check!(
+                matches!(h1.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                "lock ex vs sh"
+            );
+            check!(h2.unlock().is_ok(), "shared unlock");
+            check!(h1.lock().is_ok() && h1.unlock().is_ok(), "blocking lock free");
+            // The fcntl record-lock surface through lockf(3): F_TLOCK/F_ULOCK route to
+            // F_SETLK, F_TEST to F_GETLK's whole-file approximation.
+            use std::os::unix::io::AsRawFd;
+            unsafe extern "C" {
+                fn lockf(fd: i32, function: i32, size: i64) -> i32;
+            }
+            let fd = h1.as_raw_fd();
+            check!(unsafe { lockf(fd, 2, 0) } == 0, "fcntl setlk");
+            check!(unsafe { lockf(fd, 0, 0) } == 0, "fcntl unlock");
+            check!(unsafe { lockf(fd, 3, 0) } == 0, "fcntl getlk");
+        }
+        _ => sh3log!("lock handles -> FAIL"),
+    }
     check!(
         fs::metadata(a)
             .map(|_| false)
