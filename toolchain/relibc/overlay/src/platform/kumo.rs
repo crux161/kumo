@@ -145,6 +145,7 @@ const KNS1_OP_SHUTDOWN: u16 = 11;
 const KNS1_OP_CLOSE: u16 = 12;
 const KNS1_OP_WAIT: u16 = 13;
 const KNS1_OP_GET_NAME: u16 = 14;
+const KNS1_OP_RESOLVE: u16 = 15;
 const KNS1_SOCKET_UDP: u64 = 1;
 const KNS1_SOCKET_TCP: u64 = 2;
 const KNS1_LISTEN_BACKLOG_MAX: u64 = 4;
@@ -1046,6 +1047,59 @@ pub unsafe extern "C" fn __relibc_kumo_start(
 }
 
 impl Sys {
+    /// NET15: resolve a dotted name through the NET12 resolver over the session channel.
+    ///
+    /// Polls under the launcher's own netprobe cadence: InProgress and NetUnreachable
+    /// are retried while a temporary unbound UDP socket parks the caller in the
+    /// netstack's Wait for 200 ms each step — never a spin, because a spinning child
+    /// outranks Sora and can starve the very service wave that wires the NIC.
+    pub fn resolve_host(host: &str) -> Result<[u8; 4], Errno> {
+        use crate::header::errno::{ECONNREFUSED, EINVAL, EIO, ENOENT, ETIMEDOUT};
+
+        let name = host.as_bytes();
+        if name.is_empty() || name.len() > 255 {
+            return Err(Errno(EINVAL));
+        }
+        let (status, _s, pause, _len) = net_call(KNS1_OP_SOCKET, 0, KNS1_SOCKET_UDP, 0, &[])?;
+        if status != 0 {
+            return Err(Errno(EIO));
+        }
+        // The reply's result word is u64; socket ids ride the u32 fields.
+        let pause = pause as u32;
+        let mut attempts = 0u32;
+        let mut outcome = Err(Errno(ETIMEDOUT));
+        loop {
+            let (status, _s, result, _len) = net_call(KNS1_OP_RESOLVE, 0, 0, 0, name)?;
+            match status {
+                0 => {
+                    outcome = Ok((result as u32).to_be_bytes());
+                    break;
+                }
+                14 | 20 => {
+                    attempts += 1;
+                    if attempts > 1500 {
+                        break;
+                    }
+                    let _ = wait_interest(pause, KNS1_WAIT_READABLE, 200);
+                }
+                22 => {
+                    outcome = Err(Errno(ENOENT));
+                    break;
+                }
+                23 => {
+                    outcome = Err(Errno(ECONNREFUSED));
+                    break;
+                }
+                _ => {
+                    outcome = Err(Errno(EIO));
+                    break;
+                }
+            }
+        }
+        let _ = net_call(KNS1_OP_CLOSE, pause, 0, 0, &[]);
+        outcome
+    }
+
     pub unsafe fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> Result<c_int> {
         use crate::header::{
             errno::{EBADF, EFAULT, EIO, ENOTTY},

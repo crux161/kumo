@@ -21,7 +21,7 @@ Mode `tcp` expects the TCP fallback connection to arrive (policy on); mode `notc
 expects it to be refused (policy off, MessageTooLarge).
 
 Usage: scripts/net12-dns.py tcp|notcp [--port 6801] [--tcp-port 6802]
-       [--bad-source-port 6809] [--wait 240]
+       [--bad-source-port 6809] [--wait 240] [--addr 192.168.0.77]
 Exit: 0 PASS, 1 FAIL.
 """
 import argparse
@@ -32,6 +32,9 @@ import threading
 import time
 
 A_ADDR = '192.168.0.77'
+# NET15: the A record for kumo.test must name the host that actually serves the
+# TCP duplex, so the address is overridable on the command line.
+
 A_TTL = 3
 FLAGS_OK = 0x8180
 FLAG_TC = 0x0200
@@ -76,13 +79,16 @@ def a_answer(ttl=A_TTL):
 
 
 def main():
+    global A_ADDR
     ap = argparse.ArgumentParser()
     ap.add_argument('mode', choices=['tcp', 'notcp'])
     ap.add_argument('--port', type=int, default=6801)
     ap.add_argument('--tcp-port', type=int, default=6802)
     ap.add_argument('--bad-source-port', type=int, default=6809)
     ap.add_argument('--wait', type=float, default=240.0)
+    ap.add_argument('--addr', default=A_ADDR)
     args = ap.parse_args()
+    A_ADDR = args.addr
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

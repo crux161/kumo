@@ -161,6 +161,37 @@ index cfc5a32..934fc46 100644
  
  // These POSIX symbols must have these values regardless of OS
 diff --git a/src/header/netdb/mod.rs b/src/header/netdb/mod.rs
+--- a/src/header/netdb/mod.rs
++++ b/src/header/netdb/mod.rs
+@@ -93,5 +93,5 @@ pub struct addrinfo {
+     ai_addrlen: socklen_t,     /* length of ai_addr */
+-    ai_canonname: *mut c_char, /* canonical name for hostname */
+     ai_addr: *mut sockaddr,    /* binary address */
++    ai_canonname: *mut c_char, /* canonical name for hostname */
+     ai_next: *mut addrinfo,    /* next structure in linked list */
+ }
+diff --git a/src/header/netdb/lookup.rs b/src/header/netdb/lookup.rs
+--- a/src/header/netdb/lookup.rs
++++ b/src/header/netdb/lookup.rs
+@@ -34,7 +34,17 @@ pub fn lookup_host(host: &str) -> Result<LookupHost, c_int> {
+         return Ok(vec![in_addr {
+             s_addr: host_direct_addr,
+         }]);
+     }
++
++    // NET15: KUMO has no resolv.conf; resolution rides the launcher-granted NET12
++    // resolver over the netstack session (Sys::resolve_host in the overlay).
++    #[cfg(target_os = "kumo")]
++    {
++        let octets = Sys::resolve_host(host).map_err(|e| e.0)?;
++        return Ok(vec![in_addr {
++            s_addr: u32::from_ne_bytes(octets),
++        }]);
++    }
+ 
+     let dns_string = get_dns_server().map_err(|e| e.0)?;
+ 
+diff --git a/src/header/netdb/mod.rs b/src/header/netdb/mod.rs
 index 3668161..dd96b25 100644
 --- a/src/header/netdb/mod.rs
 +++ b/src/header/netdb/mod.rs
