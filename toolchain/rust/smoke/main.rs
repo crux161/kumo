@@ -1,8 +1,8 @@
-//j856
 //j857
 //j859
 //j866
 //j867
+//j868
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -1007,6 +1007,54 @@ fn sh3_probe() {
         }
         _ => sh3log!("lock handles -> FAIL"),
     }
+
+    // SH3-d2c: directory iteration through std::fs::read_dir (opendir -> getdents ->
+    // OP_READ_DIR pages). The subdirectory makes the listing mixed-type, and the root
+    // listing exercises paging across the image's own entries.
+    check!(fs::create_dir("/SH3DIR/SUB").is_ok(), "mkdir sub");
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut file_ok = false;
+            let mut sub_ok = false;
+            let mut count = 0usize;
+            for entry in entries.flatten() {
+                count += 1;
+                let name = entry.file_name();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if name == "B.TXT" && !is_dir {
+                    file_ok = true;
+                }
+                if name == "SUB" && is_dir {
+                    sub_ok = true;
+                }
+            }
+            check!(count == 2 && file_ok && sub_ok, "read dir");
+        }
+        Err(_) => sh3log!("read dir -> FAIL"),
+    }
+    match fs::read_dir("/") {
+        Ok(entries) => {
+            let mut have_dir = false;
+            let mut have_efi = false;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if name == "SH3DIR" && is_dir {
+                    have_dir = true;
+                }
+                if name == "EFI" && is_dir {
+                    have_efi = true;
+                }
+            }
+            check!(have_dir && have_efi, "read dir root");
+        }
+        Err(_) => sh3log!("read dir root -> FAIL"),
+    }
+    match fs::read_dir("/SH3DIR/SUB") {
+        Ok(entries) => check!(entries.flatten().next().is_none(), "read dir empty"),
+        Err(_) => sh3log!("read dir empty -> FAIL"),
+    }
+    check!(fs::remove_dir("/SH3DIR/SUB").is_ok(), "rmdir sub");
     check!(
         fs::metadata(a)
             .map(|_| false)

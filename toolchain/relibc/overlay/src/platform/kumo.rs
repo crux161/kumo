@@ -1,8 +1,8 @@
-//j759
 //j856
 //j859
 //j866
 //j867
+//j868
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -87,8 +87,14 @@ const VFS_OP_OPEN_OPTIONS: u8 = 0x02;
 const VFS_OP_WRITE: u8 = 0x03;
 const VFS_OP_SET_LEN: u8 = 0x04;
 const VFS_OP_FLUSH: u8 = 0x05;
-#[allow(dead_code)] // SH3-d2c: directory iteration arrives with the Dir slot
 const VFS_OP_READ_DIR: u8 = 0x06;
+/// The server's inline reply ceiling bounds one listing page; a smaller client buffer
+/// would make ChannelRead truncate the page silently, so reads always take this much.
+const VFS_READ_DIR_BUF: usize = 1024;
+/// Fixed bytes of one listing record: `flags(1) + size(8) + name_len(1)`.
+const VFS_DIR_RECORD_HEADER: usize = 10;
+/// Record flag: the entry is itself a directory.
+const VFS_DIR_RECORD_DIRECTORY: u8 = 1 << 0;
 const VFS_OP_MKDIR: u8 = 0x07;
 const VFS_OP_UNLINK: u8 = 0x08;
 const VFS_OP_RMDIR: u8 = 0x09;
@@ -246,6 +252,14 @@ enum FdSlot {
         handle: u32,
         offset: u64,
         size: u64,
+    },
+    /// A directory opened with O_DIRECTORY (SH3-d2c): the resolved path this launch's
+    /// server lists, plus the entry-index cursor posix_getdents resumes from. getdents
+    /// itself is stateless — the caller owns the cookie — so it leaves the cursor.
+    Dir {
+        path: [u8; VFS_MAX_PATH],
+        path_len: u16,
+        cursor: u32,
     },
     /// A socket in this process's netstack session; the id names it inside KNS1.
     Socket {
@@ -510,6 +524,70 @@ fn vfs_lock(fildes: c_int, operation: u8) -> Result<()> {
     request[1..5].copy_from_slice(&handle.to_le_bytes());
     request[5] = operation;
     vfs_status(&request)
+}
+
+/// Fetch one `OP_READ_DIR` page for `path` from entry `start` and lay whole `dirent`
+/// records into `buf` (SH3-d2c). Each record carries the musl aarch64 layout std and
+/// libc read: `d_ino` at 0, the resume cookie at 8, `d_reclen` at 16, `d_type` at 18
+/// and the NUL-terminated name from 19 — the same shape relibc's DIR consumes. Records
+/// never straddle the returned length, cookies are entry indexes (record i's cookie is
+/// the index of the record after it), and a record that cannot fit is EINVAL for the
+/// caller to grow the buffer and retry from the same cookie. — TIMBERDOODLE
+fn dir_read_page(path: &[u8], start: u32, buf: &mut [u8]) -> Result<usize> {
+    use crate::header::{
+        dirent::{DT_DIR, DT_REG},
+        errno::{EINVAL, EIO},
+    };
+
+    let mut request = [0u8; 7 + VFS_MAX_PATH];
+    request[0] = VFS_OP_READ_DIR;
+    request[1..5].copy_from_slice(&start.to_le_bytes());
+    request[5..7].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    request[7..7 + path.len()].copy_from_slice(path);
+    let mut reply = [0u8; VFS_READ_DIR_BUF];
+    let n = vfs_call(&request[..7 + path.len()], &mut reply)?;
+    if reply[0] != VFS_OK {
+        return Err(vfs_errno(reply[0]));
+    }
+    if n < 2 {
+        return Err(Errno(EIO));
+    }
+    let count = reply[1];
+    let mut at = 2usize;
+    let mut written = 0usize;
+    for i in 0..u32::from(count) {
+        let header = reply.get(at..at + VFS_DIR_RECORD_HEADER).ok_or(Errno(EIO))?;
+        let flags = header[0];
+        let name_len = usize::from(header[9]);
+        if name_len > 255 {
+            return Err(Errno(EIO));
+        }
+        let name = reply
+            .get(at + VFS_DIR_RECORD_HEADER..at + VFS_DIR_RECORD_HEADER + name_len)
+            .ok_or(Errno(EIO))?;
+        at += VFS_DIR_RECORD_HEADER + name_len;
+        let reclen = (19 + name_len + 1 + 7) & !7;
+        if written + reclen > buf.len() {
+            if written == 0 {
+                return Err(Errno(EINVAL));
+            }
+            break;
+        }
+        let rec = &mut buf[written..written + reclen];
+        rec.fill(0);
+        let cookie = u64::from(start) + u64::from(i) + 1;
+        rec[0..8].copy_from_slice(&cookie.to_le_bytes()); // d_ino: synthetic
+        rec[8..16].copy_from_slice(&cookie.to_le_bytes()); // d_off: resume cookie
+        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        rec[18] = if flags & VFS_DIR_RECORD_DIRECTORY != 0 {
+            DT_DIR as u8
+        } else {
+            DT_REG as u8
+        };
+        rec[19..19 + name_len].copy_from_slice(name);
+        written += reclen;
+    }
+    Ok(written)
 }
 
 /// Encode a one-path SH3 request (`[op][len u16][path]`) and exchange it.
@@ -1356,7 +1434,7 @@ impl Sys {
 
         match fd_slot(fd).map(|slot| *slot) {
             None | Some(FdSlot::Closed) => return Err(Errno(EBADF)),
-            Some(FdSlot::File { .. }) | Some(FdSlot::Socket { .. }) => {
+            Some(FdSlot::File { .. }) | Some(FdSlot::Socket { .. }) | Some(FdSlot::Dir { .. }) => {
                 return Err(Errno(ENOTTY));
             }
             Some(FdSlot::Input(_)) | Some(FdSlot::Output(_)) => {}
@@ -1664,6 +1742,12 @@ impl Pal for Sys {
                     fill_stat(buf, 0o140000, 0o666, 1, 0); // S_IFSOCK
                     return Ok(());
                 }
+                FdSlot::Dir { .. } => {
+                    // The same synthetic directory shape the path branch reports
+                    // (SH3-d2c): fdopendir's S_IFDIR gate and stat's nlink ride on it.
+                    fill_stat(buf, 0o040000, 0o755, 2, 0); // S_IFDIR
+                    return Ok(());
+                }
             }
         };
         let mut resolved = [0u8; VFS_MAX_PATH];
@@ -1701,8 +1785,8 @@ impl Pal for Sys {
         use crate::header::bits_open_flags::O_NONBLOCK;
         use crate::header::errno::{EBADF, EINVAL, EMFILE};
         use crate::header::fcntl::{
-            F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_GETLK, F_RDLCK, F_SETFL, F_SETLK, F_SETLKW,
-            F_UNLCK, F_WRLCK, flock as flock_record,
+            F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_RDLCK, F_SETFD, F_SETFL,
+            F_SETLK, F_SETLKW, F_UNLCK, F_WRLCK, flock as flock_record,
         };
 
         let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
@@ -1727,6 +1811,12 @@ impl Pal for Sys {
                 }
                 FdSlot::Closed => Err(Errno(EBADF)),
                 _ => Err(Errno(EINVAL)),
+            },
+            // fdopendir sets FD_CLOEXEC; there is no exec on kumo, so the flag is
+            // inherently set and both calls are no-ops on any open slot (SH3-d2c).
+            F_GETFD | F_SETFD => match *slot {
+                FdSlot::Closed => Err(Errno(EBADF)),
+                _ => Ok(0),
             },
             // POSIX record locks are whole-file here (SH3-d2b): the wire lock has no
             // range, so l_start/l_len/l_whence are accepted and ignored. The C fcntl
@@ -1873,16 +1963,51 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// Page OP_READ_DIR from the caller's entry-index cookie (SH3-d2c). Only whole,
+    /// 8-byte-aligned dirent records are emitted; a record that does not fit the
+    /// caller's buffer is the grow signal (EINVAL, retried with the same cookie), and a
+    /// zero-record page is end-of-listing. The server is stateless across pages, so no
+    /// per-fd cursor is kept here.
     fn getdents(fd: c_int, buf: &mut [u8], opaque_offset: u64) -> Result<usize> {
-        Err(unsupported())
+        use crate::header::errno::{EBADF, EINVAL};
+
+        let Ok(start) = u32::try_from(opaque_offset) else {
+            return Err(Errno(EINVAL));
+        };
+        let Some(FdSlot::Dir { path, path_len, .. }) = fd_slot(fd).map(|slot| *slot) else {
+            return Err(Errno(EBADF));
+        };
+        dir_read_page(&path[..usize::from(path_len)], start, buf)
     }
 
+    /// The cookie is the entry index itself and the server pages statelessly, so a
+    /// seek has nothing to do beyond validating the descriptor (SH3-d2c).
     fn dir_seek(fd: c_int, opaque_offset: u64) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::{EBADF, EINVAL};
+
+        if opaque_offset > u64::from(u32::MAX) {
+            return Err(Errno(EINVAL));
+        }
+        match fd_slot(fd).map(|slot| *slot) {
+            Some(FdSlot::Dir { .. }) => Ok(()),
+            _ => Err(Errno(EBADF)),
+        }
     }
 
+    /// Read one record's length and resume cookie from the fixed musl dirent offsets
+    /// (d_off at 8, d_reclen at 16). A zero or short record is malformed; returning
+    /// None surfaces EIO rather than looping forever (SH3-d2c).
     unsafe fn dent_reclen_offset(this_dent: &[u8], offset: usize) -> Option<(u16, u64)> {
-        None
+        let _ = offset;
+        if this_dent.len() < 19 {
+            return None;
+        }
+        let reclen = u16::from_le_bytes([this_dent[16], this_dent[17]]);
+        if reclen < 19 {
+            return None;
+        }
+        let next = u64::from_le_bytes(this_dent[8..16].try_into().unwrap());
+        Some((reclen, next))
     }
 
     fn getegid() -> gid_t {
@@ -2130,8 +2255,10 @@ impl Pal for Sys {
     /// integer fd.
     fn openat(dirfd: c_int, path: CStr, oflag: c_int, mode: mode_t) -> Result<c_int> {
         use crate::header::{
-            errno::{EINVAL, EMFILE, ENAMETOOLONG},
-            fcntl::{AT_FDCWD, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY},
+            errno::{EINVAL, EIO, EMFILE, ENAMETOOLONG, ENOTDIR},
+            fcntl::{
+                AT_FDCWD, O_ACCMODE, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+            },
         };
 
         if dirfd != AT_FDCWD {
@@ -2158,6 +2285,40 @@ impl Pal for Sys {
         }
         let mut resolved = [0u8; VFS_MAX_PATH];
         let path = vfs_path(path, &mut resolved)?;
+        // O_DIRECTORY (SH3-d2c): directories are opened as path records, not server
+        // handles. One OP_STAT gates existence and kind, so opendir fails like POSIX
+        // (ENOENT / ENOTDIR) instead of at the first listing.
+        if oflag & O_DIRECTORY != 0 {
+            if options != VFS_OPEN_READ {
+                return Err(Errno(EINVAL));
+            }
+            let mut stat_request = [0u8; 3 + VFS_MAX_PATH];
+            stat_request[0] = VFS_OP_STAT;
+            stat_request[1..3].copy_from_slice(&(path.len() as u16).to_le_bytes());
+            stat_request[3..3 + path.len()].copy_from_slice(path);
+            let mut stat_reply = [0u8; VFS_STAT_REPLY_LEN];
+            let n = vfs_call(&stat_request[..3 + path.len()], &mut stat_reply)?;
+            if stat_reply[0] != VFS_OK {
+                return Err(vfs_errno(stat_reply[0]));
+            }
+            if n < VFS_STAT_REPLY_LEN {
+                return Err(Errno(EIO));
+            }
+            if stat_reply[1] != VFS_STAT_KIND_DIRECTORY {
+                return Err(Errno(ENOTDIR));
+            }
+            let fildes = fd_alloc().ok_or(Errno(EMFILE))?;
+            let mut dir_path = [0u8; VFS_MAX_PATH];
+            dir_path[..path.len()].copy_from_slice(path);
+            if let Some(slot) = fd_slot(fildes) {
+                *slot = FdSlot::Dir {
+                    path: dir_path,
+                    path_len: path.len() as u16,
+                    cursor: 0,
+                };
+            }
+            return Ok(fildes);
+        }
         let fildes = fd_alloc().ok_or(Errno(EMFILE))?;
 
         let mut request = [0u8; 4 + VFS_MAX_PATH];
@@ -2202,8 +2363,32 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// The per-fd form: resume from the slot's cursor and advance it by the records
+    /// actually emitted, mirroring the lseek protocol the reference backends use
+    /// (SH3-d2c). A record that cannot fit is EINVAL, as for getdents.
     fn posix_getdents(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
-        Err(unsupported())
+        use crate::header::errno::EBADF;
+
+        let Some(FdSlot::Dir {
+            path,
+            path_len,
+            cursor,
+        }) = fd_slot(fildes).map(|slot| *slot)
+        else {
+            return Err(Errno(EBADF));
+        };
+        let n = dir_read_page(&path[..usize::from(path_len)], cursor, buf)?;
+        let mut at = 0usize;
+        let mut emitted = 0u32;
+        while at < n {
+            let reclen = u16::from_le_bytes([buf[at + 16], buf[at + 17]]);
+            at += usize::from(reclen);
+            emitted += 1;
+        }
+        if let Some(FdSlot::Dir { cursor, .. }) = fd_slot(fildes) {
+            *cursor += emitted;
+        }
+        Ok(n)
     }
 
     unsafe fn rlct_clone(
