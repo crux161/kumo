@@ -1,8 +1,8 @@
-//j535
 //j557
 //j759
 //j856
 //j859
+//j866
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -87,6 +87,17 @@ const VFS_OP_OPEN_OPTIONS: u8 = 0x02;
 const VFS_OP_WRITE: u8 = 0x03;
 const VFS_OP_SET_LEN: u8 = 0x04;
 const VFS_OP_FLUSH: u8 = 0x05;
+#[allow(dead_code)] // SH3-d2c: directory iteration arrives with the Dir slot
+const VFS_OP_READ_DIR: u8 = 0x06;
+const VFS_OP_MKDIR: u8 = 0x07;
+const VFS_OP_UNLINK: u8 = 0x08;
+const VFS_OP_RMDIR: u8 = 0x09;
+const VFS_OP_RENAME: u8 = 0x0a;
+const VFS_OP_STAT: u8 = 0x0b;
+const VFS_OP_LINK: u8 = 0x0c;
+#[allow(dead_code)] // SH3-d2b: advisory locks arrive with flock
+const VFS_OP_LOCK: u8 = 0x0d;
+const VFS_OP_CHMOD: u8 = 0x0e;
 const VFS_OPEN_READ: u8 = 1 << 0;
 const VFS_OPEN_WRITE: u8 = 1 << 1;
 const VFS_OPEN_CREATE: u8 = 1 << 2;
@@ -94,8 +105,24 @@ const VFS_OK: u8 = 0x00;
 const VFS_NOT_FOUND: u8 = 0x01;
 const VFS_BAD_HANDLE: u8 = 0x02;
 const VFS_IS_DIR: u8 = 0x03;
+const VFS_BAD_REQUEST: u8 = 0x04;
 const VFS_NO_SPACE: u8 = 0x05;
 const VFS_ACCESS_DENIED: u8 = 0x06;
+const VFS_IO_ERROR: u8 = 0x07;
+const VFS_NOT_DIR: u8 = 0x08;
+const VFS_EXISTS: u8 = 0x09;
+const VFS_NOT_EMPTY: u8 = 0x0a;
+const VFS_WOULD_BLOCK: u8 = 0x0b;
+const VFS_NOT_SUPPORTED: u8 = 0x0c;
+const VFS_STAT_REPLY_LEN: usize = 12;
+const VFS_STAT_KIND_FILE: u8 = 0;
+const VFS_STAT_KIND_DIRECTORY: u8 = 1;
+#[allow(dead_code)] // SH3-d2b: flock operation bits
+const VFS_LOCK_SH: u8 = 1 << 0;
+#[allow(dead_code)] // SH3-d2b: flock operation bits
+const VFS_LOCK_EX: u8 = 1 << 1;
+#[allow(dead_code)] // SH3-d2b: flock operation bits
+const VFS_LOCK_UN: u8 = 1 << 2;
 const VFS_MAX_PATH: usize = 255;
 const VFS_READ_REQUEST_LEN: usize = 17;
 const VFS_OPEN_REPLY_LEN: usize = 13;
@@ -419,16 +446,118 @@ fn vfs_path<'a>(path: &'a [u8], buf: &'a mut [u8; VFS_MAX_PATH]) -> Result<&'a [
 
 /// Map a vfs status byte onto the closest honest errno.
 fn vfs_errno(status: u8) -> Errno {
-    use crate::header::errno::{EACCES, EBADF, EIO, EISDIR, ENOENT, ENOSPC};
+    use crate::header::errno::{
+        EACCES, EAGAIN, EBADF, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
+        EOPNOTSUPP,
+    };
 
     match status {
         VFS_NOT_FOUND => Errno(ENOENT),
         VFS_BAD_HANDLE => Errno(EBADF),
         VFS_IS_DIR => Errno(EISDIR),
+        VFS_BAD_REQUEST => Errno(EINVAL),
         VFS_NO_SPACE => Errno(ENOSPC),
         VFS_ACCESS_DENIED => Errno(EACCES),
+        VFS_IO_ERROR => Errno(EIO),
+        VFS_NOT_DIR => Errno(ENOTDIR),
+        VFS_EXISTS => Errno(EEXIST),
+        VFS_NOT_EMPTY => Errno(ENOTEMPTY),
+        VFS_WOULD_BLOCK => Errno(EAGAIN),
+        VFS_NOT_SUPPORTED => Errno(EOPNOTSUPP),
         _ => Errno(EIO),
     }
+}
+
+/// Resolve an `…at` call's path against this process's filesystem root. `AT_FDCWD` is the
+/// only base that exists so far — a process's cwd is the capability's root — and a
+/// directory-descriptor base arrives with SH3-d2c's `Dir` slots. — TIMBERDOODLE
+fn at_path<'a>(dirfd: c_int, path: &'a [u8], buf: &'a mut [u8; VFS_MAX_PATH]) -> Result<&'a [u8]> {
+    use crate::header::{
+        errno::{EINVAL, ENAMETOOLONG},
+        fcntl::AT_FDCWD,
+    };
+
+    if dirfd != AT_FDCWD {
+        return Err(Errno(EINVAL));
+    }
+    if path.is_empty() {
+        return Err(Errno(ENAMETOOLONG));
+    }
+    vfs_path(path, buf)
+}
+
+/// One status-only `kumo-vfs` exchange. The SH3 namespace ops answer exactly one status
+/// byte on success or failure alike; `vfs_call` already rejects a dead channel.
+fn vfs_status(request: &[u8]) -> Result<()> {
+    let mut reply = [0u8; 4];
+    vfs_call(request, &mut reply)?;
+    if reply[0] != VFS_OK {
+        return Err(vfs_errno(reply[0]));
+    }
+    Ok(())
+}
+
+/// Encode a one-path SH3 request (`[op][len u16][path]`) and exchange it.
+fn vfs_path_status(op: u8, path: &[u8]) -> Result<()> {
+    use crate::header::errno::ENAMETOOLONG;
+
+    if path.len() > VFS_MAX_PATH {
+        return Err(Errno(ENAMETOOLONG));
+    }
+    let mut request = [0u8; 3 + VFS_MAX_PATH];
+    request[0] = op;
+    request[1..3].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    request[3..3 + path.len()].copy_from_slice(path);
+    vfs_status(&request[..3 + path.len()])
+}
+
+/// Encode a two-path SH3 request (`[op][len u16][from][len u16][to]`) and exchange it.
+fn vfs_two_path_status(op: u8, from: &[u8], to: &[u8]) -> Result<()> {
+    use crate::header::errno::ENAMETOOLONG;
+
+    if from.len() > VFS_MAX_PATH || to.len() > VFS_MAX_PATH {
+        return Err(Errno(ENAMETOOLONG));
+    }
+    let mut request = [0u8; 5 + 2 * VFS_MAX_PATH];
+    request[0] = op;
+    request[1..3].copy_from_slice(&(from.len() as u16).to_le_bytes());
+    request[3..3 + from.len()].copy_from_slice(from);
+    let at = 3 + from.len();
+    request[at..at + 2].copy_from_slice(&(to.len() as u16).to_le_bytes());
+    request[at + 2..at + 2 + to.len()].copy_from_slice(to);
+    vfs_status(&request[..at + 2 + to.len()])
+}
+
+/// Ask the server to record a synthetic mode (SH3-d). FAT stores no permission bits; the
+/// mount-scoped server keeps the value in its mode table and reports it from stat. A
+/// per-launch server owns no table and answers `NOT_SUPPORTED`, which callers treat as
+/// "keep the synthetic default", not as a failure.
+fn vfs_chmod(path: &[u8], mode: mode_t) -> Result<()> {
+    use crate::header::errno::ENAMETOOLONG;
+
+    if path.len() > VFS_MAX_PATH {
+        return Err(Errno(ENAMETOOLONG));
+    }
+    let mut request = [0u8; 5 + VFS_MAX_PATH];
+    request[0] = VFS_OP_CHMOD;
+    request[1..3].copy_from_slice(&((mode & 0o7777) as u16).to_le_bytes());
+    request[3..5].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    request[5..5 + path.len()].copy_from_slice(path);
+    vfs_status(&request[..5 + path.len()])
+}
+
+/// Fill a `stat` from the fields FAT can honestly answer. Device, inode, owner, and
+/// timestamps stay zero — the wire reply carries none — while kind, mode (synthetic, per
+/// SH3-d), and size are real. `stat::default()` seeds the struct so every field is
+/// written even when the caller's out-pointer is uninitialized. — TIMBERDOODLE
+fn fill_stat(mut buf: Out<'_, stat>, file_type: mode_t, mode: u16, nlink: u64, size: u64) {
+    let mut st = stat::default();
+    st.st_mode = file_type | mode_t::from(mode & 0o7777);
+    st.st_nlink = nlink as _;
+    st.st_size = size as _;
+    st.st_blksize = 512;
+    st.st_blocks = size.div_ceil(512) as _;
+    unsafe { *buf.as_mut_ptr() = st };
 }
 
 fn fd_slot(fildes: c_int) -> Option<&'static mut FdSlot> {
@@ -1440,7 +1569,22 @@ impl Pal for Sys {
     }
 
     fn fchmodat(dirfd: c_int, path: Option<CStr>, mode: mode_t, flags: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{EINVAL, EOPNOTSUPP},
+            fcntl::AT_SYMLINK_NOFOLLOW,
+        };
+
+        if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let Some(path) = path.map(|p| p.to_bytes()).filter(|p| !p.is_empty()) else {
+            // fchmod on an open descriptor: the synthetic table is keyed by path and this
+            // backend keeps no fd→path record yet, so be explicit instead of lying.
+            return Err(Errno(EOPNOTSUPP));
+        };
+        let mut resolved = [0u8; VFS_MAX_PATH];
+        let path = at_path(dirfd, path, &mut resolved)?;
+        vfs_chmod(path, mode)
     }
 
     fn fchownat(fildes: c_int, path: CStr, owner: uid_t, group: gid_t, flags: c_int) -> Result<()> {
@@ -1455,8 +1599,67 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// stat/lstat/fstat all land here (the Pal defaults route to this one method). Path
+    /// stats run over `OP_STAT`; an fd stat (`AT_EMPTY_PATH`) answers from the descriptor
+    /// table, where a file's size is the one recorded at open — a documented admission
+    /// until the fd→path table arrives with SH3-d2c. — TIMBERDOODLE
     fn fstatat(fildes: c_int, path: Option<CStr>, buf: Out<stat>, flags: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{EBADF, EINVAL, EIO, ENOENT},
+            fcntl::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW},
+        };
+
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let path = path.map(|p| p.to_bytes()).filter(|p| !p.is_empty());
+        let Some(path) = path else {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(Errno(ENOENT));
+            }
+            let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
+            match *slot {
+                FdSlot::Closed => return Err(Errno(EBADF)),
+                FdSlot::File { size, .. } => {
+                    fill_stat(buf, 0o100000, 0o644, 1, size); // S_IFREG
+                    return Ok(());
+                }
+                FdSlot::Input(_) | FdSlot::Output(_) => {
+                    // A granted channel reads as a character device, as POSIX tty/pipe
+                    // fstat does.
+                    fill_stat(buf, 0o020000, 0o666, 1, 0); // S_IFCHR
+                    return Ok(());
+                }
+                FdSlot::Socket { .. } => {
+                    fill_stat(buf, 0o140000, 0o666, 1, 0); // S_IFSOCK
+                    return Ok(());
+                }
+            }
+        };
+        let mut resolved = [0u8; VFS_MAX_PATH];
+        let path = at_path(fildes, path, &mut resolved)?;
+        let mut request = [0u8; 3 + VFS_MAX_PATH];
+        request[0] = VFS_OP_STAT;
+        request[1..3].copy_from_slice(&(path.len() as u16).to_le_bytes());
+        request[3..3 + path.len()].copy_from_slice(path);
+        let mut reply = [0u8; VFS_STAT_REPLY_LEN];
+        let n = vfs_call(&request[..3 + path.len()], &mut reply)?;
+        if reply[0] != VFS_OK {
+            return Err(vfs_errno(reply[0]));
+        }
+        if n < VFS_STAT_REPLY_LEN {
+            return Err(Errno(EIO));
+        }
+        let kind = reply[1];
+        let mode = u16::from_le_bytes(reply[2..4].try_into().unwrap());
+        let size = u64::from_le_bytes(reply[4..12].try_into().unwrap());
+        let (file_type, nlink): (mode_t, u64) = match kind {
+            VFS_STAT_KIND_DIRECTORY => (0o040000, 2), // S_IFDIR
+            VFS_STAT_KIND_FILE => (0o100000, 1),      // S_IFREG
+            _ => (0, 0),
+        };
+        fill_stat(buf, file_type, mode, nlink, size);
+        Ok(())
     }
 
     fn fstatvfs(fildes: c_int, buf: Out<statvfs>) -> Result<()> {
@@ -1733,7 +1936,18 @@ impl Pal for Sys {
     }
 
     fn linkat(fd1: c_int, oldpath: CStr, fd2: c_int, newpath: CStr, flags: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::EINVAL;
+
+        if flags != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let mut old_resolved = [0u8; VFS_MAX_PATH];
+        let oldpath = at_path(fd1, oldpath.to_bytes(), &mut old_resolved)?;
+        let mut new_resolved = [0u8; VFS_MAX_PATH];
+        let newpath = at_path(fd2, newpath.to_bytes(), &mut new_resolved)?;
+        // FAT has no hard links; the server answers NOT_SUPPORTED, which maps to
+        // EOPNOTSUPP for the caller's copy fallback.
+        vfs_two_path_status(VFS_OP_LINK, oldpath, newpath)
     }
 
     fn lseek(fildes: c_int, offset: off_t, whence: c_int) -> Result<off_t> {
@@ -1741,7 +1955,14 @@ impl Pal for Sys {
     }
 
     fn mkdirat(fildes: c_int, path: CStr, mode: mode_t) -> Result<()> {
-        Err(unsupported())
+        let mut resolved = [0u8; VFS_MAX_PATH];
+        let path = at_path(fildes, path.to_bytes(), &mut resolved)?;
+        vfs_path_status(VFS_OP_MKDIR, path)?;
+        // FAT has no permission bits; record the requested mode in the server's synthetic
+        // table when there is one. A per-launch server answers NOT_SUPPORTED and the
+        // directory simply keeps the default synthetic mode.
+        let _ = vfs_chmod(path, mode);
+        Ok(())
     }
 
     fn mkfifoat(dir_fd: c_int, path: CStr, mode: mode_t) -> Result<()> {
@@ -2025,7 +2246,19 @@ impl Pal for Sys {
         new_path: CStr,
         flags: c_uint,
     ) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::EINVAL;
+
+        // RENAME_NOREPLACE and RENAME_EXCHANGE have no cheap FAT implementation; refusing
+        // unknown flags rather than silently dropping them keeps the atomic-rename
+        // promise honest.
+        if flags != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let mut old_resolved = [0u8; VFS_MAX_PATH];
+        let old_path = at_path(old_dir, old_path.to_bytes(), &mut old_resolved)?;
+        let mut new_resolved = [0u8; VFS_MAX_PATH];
+        let new_path = at_path(new_dir, new_path.to_bytes(), &mut new_resolved)?;
+        vfs_two_path_status(VFS_OP_RENAME, old_path, new_path)
     }
 
     fn sched_yield() -> Result<()> {
@@ -2104,7 +2337,19 @@ impl Pal for Sys {
     }
 
     fn unlinkat(fd: c_int, path: CStr, flags: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::{errno::EINVAL, fcntl::AT_REMOVEDIR};
+
+        if flags & !AT_REMOVEDIR != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let mut resolved = [0u8; VFS_MAX_PATH];
+        let path = at_path(fd, path.to_bytes(), &mut resolved)?;
+        let op = if flags & AT_REMOVEDIR != 0 {
+            VFS_OP_RMDIR
+        } else {
+            VFS_OP_UNLINK
+        };
+        vfs_path_status(op, path)
     }
 
     fn waitpid(pid: pid_t, stat_loc: Option<Out<c_int>>, options: c_int) -> Result<pid_t> {

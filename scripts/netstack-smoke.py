@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j821
 #j856
+#j866
 """AXH: build, boot and check native NET2 loopback/recovery; restore the default image.
 
 No NIC, credentials or board access. Artifacts remain under build/verification. POST is
@@ -85,6 +86,24 @@ CASES = (
         "std: net recovery -> OK",
         "netstack-proof: std fresh client done",
     ), ready=2),
+    # SH3-d2: the Rust std metadata surface. std::fs create_dir/metadata/write/rename/
+    # remove_file/remove_dir reach relibc's mkdirat/fstatat/renameat2/unlinkat, which
+    # speak the SH3 vfs ops to this launch's fatfs server. Net-free by design: no net
+    # word runs, so Sora never starts the netstack supervisor and ready=0 asserts that
+    # this boot has no netstack instance at all. — TIMBERDOODLE
+    Case("fsmeta", b"echo AXH fsmeta begins\nruststd fsmeta\necho AXH fsmeta ends\n", (
+        "std: sh3 mkdir -> OK",
+        "std: sh3 root stat -> OK",
+        "std: sh3 stat dir -> OK",
+        "std: sh3 file write -> OK",
+        "std: sh3 file stat -> OK",
+        "std: sh3 rename -> OK",
+        "std: sh3 read back -> OK",
+        "std: sh3 old name gone -> OK",
+        "std: sh3 unlink -> OK",
+        "std: sh3 rmdir -> OK",
+        "std: sh3 stat removed dir -> OK",
+    ), ready=0),
 )
 POST_NAMES = ("CONSOLE ROUTE", "BLOCK SERVE", "BLOCK FAT32", "BLOCK FILE", "NET LOOPBACK")
 POST_ALL = ("USERLAND EL0", "SORA HANDSHAKE", *POST_NAMES, "HANDLE XFER", "PORT BIND")
@@ -271,7 +290,7 @@ def main():
             manifest["passed"] = manifest.get("proofs_passed", False) and manifest.get("default_restored", False)
             manifest["total_seconds"] = round(time.monotonic() - started, 3)
             (work / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"NET2/AXH green: five proofs passed; default image restored ({manifest['total_seconds']}s)", flush=True)
+    print(f"NET2/AXH green: {len(CASES)} proofs passed; default image restored ({manifest['total_seconds']}s)", flush=True)
 
 
 class TranscriptTests(unittest.TestCase):

@@ -754,3 +754,97 @@ diff --git a/src/header/elf/mod.rs b/src/header/elf/mod.rs
  
  pub type Elf32_Xword = uint64_t;
  pub type Elf32_Sxword = int64_t;
+
+diff --git a/src/header/bits_nlink-t/mod.rs b/src/header/bits_nlink-t/mod.rs
+index 5d0052e..6d48ad8 100644
+--- a/src/header/bits_nlink-t/mod.rs
++++ b/src/header/bits_nlink-t/mod.rs
+@@ -1,5 +1,5 @@
+-use crate::platform::types::c_ulong;
++use crate::platform::types::c_uint;
+ 
+ /// Used for link counts.
+ #[allow(non_camel_case_types)]
+-pub type nlink_t = c_ulong;
++pub type nlink_t = c_uint;
+diff --git a/src/header/sys_stat/mod.rs b/src/header/sys_stat/mod.rs
+index b02b36f..a57075e 100644
+--- a/src/header/sys_stat/mod.rs
++++ b/src/header/sys_stat/mod.rs
+@@ -10,8 +10,8 @@ use crate::{
+     platform::{
+         Pal, Sys,
+         types::{
+-            blkcnt_t, blksize_t, c_char, c_int, c_long, dev_t, gid_t, ino_t, mode_t, nlink_t,
+-            off_t, uid_t,
++            blkcnt_t, c_char, c_int, c_long, c_uint, c_ulong, dev_t, gid_t, ino_t, mode_t,
++            nlink_t, off_t, uid_t,
+         },
+     },
+ };
+@@ -83,25 +83,30 @@ pub struct stat {
+     pub st_dev: dev_t,
+     /// File serial number.
+     pub st_ino: ino_t,
+-    /// Number of hard links to the file.
+-    pub st_nlink: nlink_t,
+     /// Mode of file.
+     pub st_mode: mode_t,
++    /// Number of hard links to the file.
++    pub st_nlink: nlink_t,
+     /// User ID of file.
+     pub st_uid: uid_t,
+     /// Group ID of file.
+     pub st_gid: gid_t,
+     /// Device ID (if file is character or block special).
+     pub st_rdev: dev_t,
++    /// Reserved; aligns `st_size` to the musl aarch64 offset.
++    pub __pad0: c_ulong,
+     /// For regular files, the file size in bytes.
+     /// For symbolic links, the length in bytes of the pathname contained
+     /// in the symbolic link.
+     /// For a shared or typed memory object, the length in bytes.
+     /// For other file types, the use of this field is unspecified.
+     pub st_size: off_t,
+-    /// A file system-specific preferred I/O block size for this object.
+-    /// In some file system types, this may vary from file to file.
+-    pub st_blksize: blksize_t,
++    /// A file system-specific preferred I/O block size. Four bytes in the musl
++    /// aarch64 layout the Rust libc crate (0.2.185) defines; the C header's
++    /// blksize_t remains a long for callers.
++    pub st_blksize: c_int,
++    /// Reserved; aligns `st_blocks` to the musl aarch64 offset.
++    pub __pad1: c_int,
+     /// Number of blocks allocated for this object.
+     pub st_blocks: blkcnt_t,
+ 
+@@ -112,10 +117,8 @@ pub struct stat {
+     /// Last file status change timestamp.
+     pub st_ctim: timespec,
+ 
+-    // Compared to glibc, our struct is for some reason 24 bytes too small.
+-    // Accessing atime works, so clearly the struct isn't incorrect...
+-    // This works.
+-    pub _pad: [c_char; 24],
++    /// Reserved for the C library, as musl's layout provides.
++    pub __unused: [c_uint; 2],
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/chmod.html>.
+diff --git a/src/platform/types.rs b/src/platform/types.rs
+index 649b3aa..90a9373 100644
+--- a/src/platform/types.rs
++++ b/src/platform/types.rs
+@@ -102,8 +102,10 @@ pub type dev_t = c_ulonglong;
+ pub type ino_t = c_ulonglong;
+ /// The `reclen_t` type provided in [`sys/types.h`](crate::header::sys_types).
+ pub type reclen_t = c_ushort;
+-/// The `nlink_t` type provided in [`sys/types.h`](crate::header::sys_types).
+-pub type nlink_t = c_ulong;
++/// The `nlink_t` type provided in [`sys/types.h`](crate::header::sys_types). Musl's
++/// aarch64 ABI — the one the Rust libc crate compiled std against — is `unsigned int`;
++/// the wider type shifts every field after `st_nlink` in `struct stat`.
++pub type nlink_t = c_uint;
+ /// The `blksize_t` type provided in [`sys/types.h`](crate::header::sys_types).
+ pub type blksize_t = c_long;
+ /// The `blkcnt_t` type provided in [`sys/types.h`](crate::header::sys_types).

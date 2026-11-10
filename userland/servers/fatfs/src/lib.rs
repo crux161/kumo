@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j548
 //j549
 //j862
 //j863
 //j865
+//j866
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -832,12 +832,22 @@ fn rename<R: SectorReader + SectorWriter>(
 
 /// Stat `path` (SH3): the kind and byte size, with the synthetic POSIX mode FAT
 /// cannot store (0755 for directories, 0644 for files).
+/// A path naming the filesystem root: no components at all (`""`, `"/"`, `"//"`).
+fn is_root_path(path: &[u8]) -> bool {
+    !path.iter().any(|&b| b != b'/')
+}
+
 fn stat<R: SectorReader + SectorWriter>(
     volume: &FatVolume,
     io: &mut R,
     path: &[u8],
     reply: &mut [u8],
 ) -> usize {
+    // The volume root has no directory entry for resolve_path to find; POSIX stats "/"
+    // as a directory. Answer for it directly (SH3-d2a). — TIMBERDOODLE
+    if is_root_path(path) {
+        return write_frame(reply, &encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0));
+    }
     match volume.resolve_path(io, path) {
         None => write_status(reply, VFS_NOT_FOUND),
         Some(entry) => {
@@ -860,6 +870,11 @@ fn stat_with_modes<R: SectorReader + SectorWriter>(
     path: &[u8],
     reply: &mut [u8],
 ) -> usize {
+    // The root has no directory entry and therefore no location key, so its mode is the
+    // synthetic default rather than anything a chmod could have recorded.
+    if is_root_path(path) {
+        return write_frame(reply, &encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0));
+    }
     match volume.resolve_path(io, path) {
         None => write_status(reply, VFS_NOT_FOUND),
         Some(entry) => {
@@ -2277,5 +2292,20 @@ mod tests {
             ),
             alloc::vec![VFS_ACCESS_DENIED]
         );
+    }
+
+    #[test]
+    fn root_stat_answers_directory() {
+        let (volume, mut disk) = writable();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        for path in [&b"/"[..], b"", b"//"] {
+            let request = encode_request(Request::stat(path));
+            let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+            let root = kumo_vfs::parse_stat_reply(&reply[..n]).unwrap();
+            assert_eq!(root.kind, STAT_KIND_DIRECTORY);
+            assert_eq!(root.mode, 0o755);
+            assert_eq!(root.size, 0);
+        }
     }
 }

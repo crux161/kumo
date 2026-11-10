@@ -2,6 +2,7 @@
 //j856
 //j857
 //j859
+//j866
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -72,6 +73,35 @@ macro_rules! envlog {
     ($($arg:tt)*) => { env_line(format_args!($($arg)*)) };
 }
 
+/// SH3-d: the std::fs metadata proof's ring record, one formatted entry under
+/// "std: sh3".
+fn sh3_line(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write as _;
+    struct RingBuf {
+        buf: [u8; 200],
+        at: usize,
+    }
+    impl core::fmt::Write for RingBuf {
+        fn write_str(&mut self, part: &str) -> core::fmt::Result {
+            let take = part.len().min(self.buf.len() - self.at);
+            self.buf[self.at..self.at + take].copy_from_slice(&part.as_bytes()[..take]);
+            self.at += take;
+            Ok(())
+        }
+    }
+    let mut line = RingBuf {
+        buf: [0u8; 200],
+        at: 0,
+    };
+    let _ = write!(line, "std: sh3 {}", args);
+    let _ = write!(line, "\n");
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line.buf[..line.at]);
+}
+
+macro_rules! sh3log {
+    ($($arg:tt)*) => { sh3_line(format_args!($($arg)*)) };
+}
+
 
 
 fn main() {
@@ -115,6 +145,10 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("env") => {
             env_probe();
+            return;
+        }
+        Some("fsmeta") => {
+            sh3_probe();
             return;
         }
         Some("net") => {
@@ -891,6 +925,64 @@ fn net_campaign() {
     if failures == 0 {
         netlog!("loopback -> OK");
     }
+}
+
+/// SH3-d: the std::fs metadata proof. Every call below lands on a Pal method the KUMO
+/// overlay grew in SH3-d2 (mkdirat, fstatat, renameat2, unlinkat); this process's
+/// launcher-spawned fatfs server answers them over the image that holds this binary.
+/// 8.3 names only, matching the FAT driver's recorded scope. — TIMBERDOODLE
+#[inline(never)]
+fn sh3_probe() {
+    use std::fs;
+    use std::io::ErrorKind;
+    macro_rules! check {
+        ($cond:expr, $msg:literal) => {
+            if $cond {
+                sh3log!("{} -> OK", $msg);
+            } else {
+                sh3log!("{} -> FAIL", $msg);
+            }
+        };
+    }
+
+    let dir = "/SH3DIR";
+    let a = "/SH3DIR/A.TXT";
+    let b = "/SH3DIR/B.TXT";
+    check!(fs::create_dir(dir).is_ok(), "mkdir");
+    check!(
+        fs::metadata("/").map(|m| m.is_dir()).unwrap_or(false),
+        "root stat"
+    );
+    check!(
+        fs::metadata(dir).map(|m| m.is_dir()).unwrap_or(false),
+        "stat dir"
+    );
+    check!(fs::write(a, b"kumo").is_ok(), "file write");
+    check!(
+        fs::metadata(a)
+            .map(|m| m.len() == 4 && m.is_file())
+            .unwrap_or(false),
+        "file stat"
+    );
+    check!(fs::rename(a, b).is_ok(), "rename");
+    check!(
+        fs::read_to_string(b).map(|t| t == "kumo").unwrap_or(false),
+        "read back"
+    );
+    check!(
+        fs::metadata(a)
+            .map(|_| false)
+            .unwrap_or_else(|e| e.kind() == ErrorKind::NotFound),
+        "old name gone"
+    );
+    check!(fs::remove_file(b).is_ok(), "unlink");
+    check!(fs::remove_dir(dir).is_ok(), "rmdir");
+    check!(
+        fs::metadata(dir)
+            .map(|_| false)
+            .unwrap_or_else(|e| e.kind() == ErrorKind::NotFound),
+        "stat removed dir"
+    );
 }
 
 fn gate_ib() {
