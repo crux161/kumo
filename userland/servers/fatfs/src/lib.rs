@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j547
 //j548
 //j549
 //j862
 //j863
+//j865
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -185,6 +185,9 @@ pub const SESSION_READ_ONLY: u8 = 0;
 pub const SESSION_READ_WRITE: u8 = 1;
 /// Advisory locks the shared registry tracks at once.
 pub const MAX_LOCKS: usize = 8;
+/// Recorded synthetic permission modes the shared server tracks (SH3-d). FAT stores
+/// no modes; this soft state is what stat reports until a restart drops it.
+pub const MAX_MODES: usize = 8;
 
 /// One advisory lock held through an open entry (SH3-c). The key is the entry's
 /// on-disk location: FAT has no stable inode, so a rename gives the file a new
@@ -195,6 +198,71 @@ struct LockEntry {
     key: DirLocation,
     session: usize,
     mode: u8,
+}
+
+/// One recorded synthetic mode (SH3-d), keyed like the locks by the entry's location.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModeEntry {
+    key: DirLocation,
+    mode: u16,
+}
+
+/// The synthetic permission modes a shared server records (SH3-d).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeTable {
+    entries: [Option<ModeEntry>; MAX_MODES],
+}
+
+impl ModeTable {
+    pub const fn new() -> Self {
+        ModeTable {
+            entries: [None; MAX_MODES],
+        }
+    }
+
+    fn get(&self, key: DirLocation) -> Option<u16> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.mode)
+    }
+
+    fn set(&mut self, key: DirLocation, mode: u16) -> bool {
+        let mut free = None;
+        for slot in self.entries.iter_mut() {
+            match slot {
+                Some(entry) if entry.key == key => {
+                    entry.mode = mode;
+                    return true;
+                }
+                Some(_) => {}
+                None if free.is_none() => free = Some(()),
+                None => {}
+            }
+        }
+        if let Some(()) = free {
+            if let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(ModeEntry { key, mode });
+                return true;
+            }
+        }
+        false
+    }
+
+    fn clear(&mut self, key: DirLocation) {
+        for slot in self.entries.iter_mut() {
+            if slot.is_some_and(|entry| entry.key == key) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+impl Default for ModeTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Cross-session advisory locks for the mount-scoped server (SH3-c1). Unlike the
@@ -270,6 +338,8 @@ pub struct SharedServer {
     pub locks: LockRegistry,
     /// Per-session access (SH3-c2): the launcher's grant, enforced at the server.
     pub access: [u8; MAX_SESSIONS],
+    /// Recorded synthetic modes (SH3-d).
+    pub modes: ModeTable,
 }
 
 impl SharedServer {
@@ -278,6 +348,7 @@ impl SharedServer {
             sessions: [OpenTable::new(); MAX_SESSIONS],
             locks: LockRegistry::new(),
             access: [SESSION_READ_WRITE; MAX_SESSIONS],
+            modes: ModeTable::new(),
         }
     }
 
@@ -321,6 +392,7 @@ fn request_writes(request: &Request<'_>) -> bool {
             | Request::Unlink { .. }
             | Request::Rmdir { .. }
             | Request::Rename { .. }
+            | Request::Chmod { .. }
     )
 }
 
@@ -401,9 +473,12 @@ pub fn dispatch_shared<R: SectorReader + SectorWriter>(
         Some(Request::Unlink { path }) => unlink(volume, io, path, reply),
         Some(Request::Rmdir { path }) => rmdir(volume, io, path, reply),
         Some(Request::Rename { from, to }) => rename(volume, io, from, to, reply),
-        Some(Request::Stat { path }) => stat(volume, io, path, reply),
+        Some(Request::Stat { path }) => stat_with_modes(volume, io, &server.modes, path, reply),
         Some(Request::Lock { handle, operation }) => {
             lock_session(server, session, handle, operation, reply)
+        }
+        Some(Request::Chmod { path, mode }) => {
+            chmod_shared(volume, io, &mut server.modes, path, mode, reply)
         }
         Some(Request::Link { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
         None => write_status(reply, VFS_BAD_REQUEST),
@@ -479,6 +554,9 @@ pub fn dispatch<R: SectorReader + SectorWriter>(
         Some(Request::Rename { from, to }) => rename(volume, reader, from, to, reply),
         Some(Request::Stat { path }) => stat(volume, reader, path, reply),
         Some(Request::Lock { handle, operation }) => lock(open_files, handle, operation, reply),
+        // The per-launch image server records no modes (SH3-d scope): the mount-scoped
+        // server does. Documented, not silent.
+        Some(Request::Chmod { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
         // FAT has no hard links; the documented fallback lives in the client.
         Some(Request::Link { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
         None => write_status(reply, VFS_BAD_REQUEST),
@@ -769,6 +847,57 @@ fn stat<R: SectorReader + SectorWriter>(
                 (STAT_KIND_FILE, 0o644)
             };
             write_frame(reply, &encode_stat_ok(kind, mode, entry.size as u64))
+        }
+    }
+}
+
+/// Stat with the recorded synthetic mode (SH3-d): a chmod override wins over the
+/// kind's default.
+fn stat_with_modes<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    modes: &ModeTable,
+    path: &[u8],
+    reply: &mut [u8],
+) -> usize {
+    match volume.resolve_path(io, path) {
+        None => write_status(reply, VFS_NOT_FOUND),
+        Some(entry) => {
+            let (kind, default_mode) = if entry.is_dir() {
+                (STAT_KIND_DIRECTORY, 0o755)
+            } else {
+                (STAT_KIND_FILE, 0o644)
+            };
+            let mode = entry
+                .location
+                .and_then(|location| modes.get(location))
+                .unwrap_or(default_mode);
+            write_frame(reply, &encode_stat_ok(kind, mode, entry.size as u64))
+        }
+    }
+}
+
+/// Record a synthetic mode for `path` (SH3-d). The permissions bits are kept; the
+/// file-type bits belong to stat's kind and are ignored here.
+fn chmod_shared<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    modes: &mut ModeTable,
+    path: &[u8],
+    mode: u16,
+    reply: &mut [u8],
+) -> usize {
+    match volume.resolve_path(io, path) {
+        None => write_status(reply, VFS_NOT_FOUND),
+        Some(entry) => {
+            let Some(location) = entry.location else {
+                return write_status(reply, VFS_NOT_FOUND);
+            };
+            if modes.set(location, mode & 0o777) {
+                write_status(reply, VFS_OK)
+            } else {
+                write_status(reply, VFS_NO_SPACE)
+            }
         }
     }
 }
@@ -2070,6 +2199,83 @@ mod tests {
                 Request::flush(first)
             ),
             alloc::vec![VFS_BAD_HANDLE]
+        );
+    }
+
+    #[test]
+    fn chmod_records_a_mode_that_stat_reports_across_sessions() {
+        let (volume, mut disk) = writable();
+        let mut server = SharedServer::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                0,
+                &mut reply,
+                Request::chmod(b"/HELLO.TXT", 0o640)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        let bytes = shared_call(
+            &volume,
+            &mut disk,
+            &mut server,
+            1,
+            &mut reply,
+            Request::stat(b"/HELLO.TXT"),
+        );
+        let stat = kumo_vfs::parse_stat_reply(&bytes).expect("stat");
+        assert_eq!(stat.mode, 0o640);
+        assert_eq!(stat.size, 6);
+        // A second chmod replaces the recorded value; the file-type bits are ignored.
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                1,
+                &mut reply,
+                Request::chmod(b"/HELLO.TXT", 0o100600)
+            ),
+            alloc::vec![VFS_OK]
+        );
+        let bytes = shared_call(
+            &volume,
+            &mut disk,
+            &mut server,
+            0,
+            &mut reply,
+            Request::stat(b"/HELLO.TXT"),
+        );
+        assert_eq!(
+            kumo_vfs::parse_stat_reply(&bytes).expect("stat").mode,
+            0o600
+        );
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                0,
+                &mut reply,
+                Request::chmod(b"/NOPE.TXT", 0o600)
+            ),
+            alloc::vec![VFS_NOT_FOUND]
+        );
+        // Read-only sessions cannot chmod.
+        server.set_access(2, SESSION_READ_ONLY);
+        assert_eq!(
+            shared_call(
+                &volume,
+                &mut disk,
+                &mut server,
+                2,
+                &mut reply,
+                Request::chmod(b"/HELLO.TXT", 0o777)
+            ),
+            alloc::vec![VFS_ACCESS_DENIED]
         );
     }
 }

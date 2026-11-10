@@ -2,6 +2,7 @@
 //j514
 //j547
 //j860
+//j865
 
 //! `kumo-vfs` — the wire protocol for KUMO's filesystem servers.
 //!
@@ -56,6 +57,9 @@ pub const OP_LINK: u8 = 0x0c;
 /// Op code: advisory lock the open file `handle` (SH3). Reply: one status byte;
 /// [`VFS_WOULD_BLOCK`] means another open handle holds the lock.
 pub const OP_LOCK: u8 = 0x0d;
+/// Op code: record a synthetic permission mode for `path` (SH3-d). FAT stores no
+/// modes; a server keeps the recorded value in soft state and reports it from stat.
+pub const OP_CHMOD: u8 = 0x0e;
 
 /// Open option: the returned handle may read.
 pub const OPEN_READ: u8 = 1 << 0;
@@ -171,6 +175,8 @@ pub enum Request<'a> {
     Link { from: &'a [u8], to: &'a [u8] },
     /// Advisory lock `handle` (SH3); one of [`LOCK_SH`], [`LOCK_EX`], [`LOCK_UN`].
     Lock { handle: u32, operation: u8 },
+    /// Record a synthetic permission mode for `path` (SH3-d).
+    Chmod { path: &'a [u8], mode: u16 },
 }
 
 impl<'a> Request<'a> {
@@ -241,6 +247,11 @@ impl<'a> Request<'a> {
     /// A lock request for `handle` and exactly one [`LOCK_KNOWN`] operation.
     pub const fn lock(handle: u32, operation: u8) -> Request<'a> {
         Request::Lock { handle, operation }
+    }
+
+    /// A chmod request recording `mode` for `path`.
+    pub const fn chmod(path: &'a [u8], mode: u16) -> Request<'a> {
+        Request::Chmod { path, mode }
     }
 
     /// Encode into `buf`; returns the number of bytes written, or `None` if `buf`
@@ -372,6 +383,18 @@ impl<'a> Request<'a> {
                 out[5] = operation;
                 Some(LOCK_REQUEST_LEN)
             }
+            Request::Chmod { path, mode } => {
+                if path.len() > MAX_PATH {
+                    return None;
+                }
+                let n = 5 + path.len();
+                let out = buf.get_mut(..n)?;
+                out[0] = OP_CHMOD;
+                out[1..3].copy_from_slice(&mode.to_le_bytes());
+                out[3..5].copy_from_slice(&(path.len() as u16).to_le_bytes());
+                out[5..].copy_from_slice(path);
+                Some(n)
+            }
         }
     }
 
@@ -477,6 +500,17 @@ impl<'a> Request<'a> {
                 Some(Request::Lock {
                     handle: u32::from_le_bytes(b[1..5].try_into().ok()?),
                     operation,
+                })
+            }
+            OP_CHMOD => {
+                let mode = u16::from_le_bytes(raw.get(1..3)?.try_into().ok()?);
+                let plen = u16::from_le_bytes(raw.get(3..5)?.try_into().ok()?) as usize;
+                if plen > MAX_PATH {
+                    return None;
+                }
+                Some(Request::Chmod {
+                    path: raw.get(5..5 + plen)?,
+                    mode,
                 })
             }
             _ => None,
@@ -919,6 +953,9 @@ mod tests {
         let n = lock.encode_into(&mut buf).unwrap();
         assert_eq!(n, LOCK_REQUEST_LEN);
         assert_eq!(Request::decode(&buf[..n]), Some(lock));
+        let chmod = Request::chmod(b"/WORK/OUT.BIN", 0o640);
+        let n = chmod.encode_into(&mut buf).unwrap();
+        assert_eq!(Request::decode(&buf[..n]), Some(chmod));
     }
 
     #[test]
@@ -944,6 +981,7 @@ mod tests {
         let long = [b'x'; MAX_PATH + 1];
         let mut buf = [0u8; 3 + MAX_PATH + 1];
         assert_eq!(Request::mkdir(&long).encode_into(&mut buf), None);
+        assert_eq!(Request::chmod(&long, 0o755).encode_into(&mut buf), None);
         assert_eq!(Request::rename(&long, b"/T").encode_into(&mut buf), None);
         // A decoded frame whose declared length exceeds MAX_PATH is refused
         // (the header alone decides; the appended bytes exercise the truncation path).
