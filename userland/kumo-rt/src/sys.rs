@@ -1,8 +1,8 @@
-//j743
 //j790
 //j815
 //j824
 //j825
+//j859
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -514,6 +514,11 @@ pub const STARTUP_TAG_TTY: u8 = b't';
 /// sends one; a program without it cannot address the network at all.
 pub const STARTUP_TAG_NET: u8 = b'n';
 
+/// SH2: a read-only env VMO in the argv wire format (`[count u32][K=V\0 ...]`,
+/// `kumo_abi::pack_argv`). Only a launcher word that grants an environment sends one;
+/// without it the program's environment is empty, never ambient.
+pub const STARTUP_TAG_ENV: u8 = b'v';
+
 /// Explicit capabilities supplied to a newly started program. Each present field came
 /// from one transferred handle on the bootstrap channel; absent fields grant no authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -526,6 +531,7 @@ pub struct Startup {
     pub fs: Option<Handle>,
     pub tty: Option<Handle>,
     pub net: Option<Handle>,
+    pub env: Option<Handle>,
 }
 
 impl Startup {
@@ -541,6 +547,7 @@ impl Startup {
             STARTUP_TAG_FS => &mut self.fs,
             STARTUP_TAG_TTY => &mut self.tty,
             STARTUP_TAG_NET => &mut self.net,
+            STARTUP_TAG_ENV => &mut self.env,
             _ => return Some(handle),
         };
         slot.replace(handle)

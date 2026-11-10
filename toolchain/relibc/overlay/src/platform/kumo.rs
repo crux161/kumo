@@ -1,8 +1,8 @@
-//j514
 //j535
 //j557
 //j759
 //j856
+//j859
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -73,6 +73,9 @@ const STARTUP_TAG_TTY: u8 = b't';
 /// launches receive the client end of a `kns1` session channel; absent, sockets do not
 /// exist in this process (DESIGN/026 §4). — TIMBERDOODLE
 const STARTUP_TAG_NET: u8 = b'n';
+/// SH2: mirror of `kumo-rt`'s `STARTUP_TAG_ENV`; the env VMO uses the argv wire
+/// format (`[count u32][K=V\0 ...]`) and only an explicit launcher grant sends one.
+const STARTUP_TAG_ENV: u8 = b'v';
 
 // The `kumo-vfs` wire protocol. relibc is built from its own vendored source tree by a
 // separate cargo invocation, so it cannot depend on the `kumo-vfs` crate; these constants
@@ -172,10 +175,14 @@ const PAGE_SIZE: usize = 4096;
 /// Bytes of packed argv KUMO can deliver. `VmoRead` copies at most 256 bytes per call and
 /// the launcher packs into a 256-byte buffer, so one read is always the whole vector.
 const ARGV_BYTES: usize = 256;
+/// The env block rides one page-bounded VMO; 256 bytes matches VMO_TRANSFER_MAX, so
+/// a single VmoRead moves the whole grant (the ABI caps one call at that many bytes).
+const ENV_BYTES: usize = 256;
 /// Arguments the startup image has room for, matching the launcher's own argv ceiling.
 const ARGV_MAX: usize = 16;
+const ENV_MAX: usize = 16;
 /// `argc`, `argv` and its terminator, an empty `envp`, then five auxiliary-vector pairs.
-const STARTUP_WORDS: usize = 1 + (ARGV_MAX + 1) + 1 + 10;
+const STARTUP_WORDS: usize = 1 + (ARGV_MAX + 1) + 1 + (ENV_MAX + 1) + 10;
 /// Exit status for a startup precondition that failed before stdio existed. Distinct so a
 /// silent abort can never be mistaken for a run that reached `main`.
 const STARTUP_FAILURE_STATUS: c_int = 70;
@@ -245,6 +252,7 @@ static mut NET_MESSAGE: [u8; KNS1_MESSAGE_MAX] = [0; KNS1_MESSAGE_MAX];
 /// The packed argv page as delivered, kept for the lifetime of the process because the
 /// `argv` pointers relibc publishes borrow the strings in place.
 static mut ARGV_IMAGE: [u8; ARGV_BYTES] = [0; ARGV_BYTES];
+static mut ENV_IMAGE: [u8; ENV_BYTES] = [0; ENV_BYTES];
 
 /// The SysV initial-process image relibc reads through [`Stack`]. Both statics are written
 /// exactly once, by the startup thread, before any other thread can exist.
@@ -877,8 +885,9 @@ fn startup_fail(message: &[u8]) -> ! {
 ///
 /// Unknown capabilities are closed rather than becoming ambient authority. Returns the
 /// granted argv VMO, or `0` when the launcher granted none. — KESTREL / TIMBERDOODLE
-fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
+fn take_bootstrap_capabilities(bootstrap: u32) -> (u32, u32) {
     let mut argv_vmo = 0_u32;
+    let mut env_vmo = 0_u32;
     let mut tag = 0_u8;
     loop {
         let (count, raw_handle) = channel_read_with_handle(bootstrap, &mut tag);
@@ -899,6 +908,9 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
             STARTUP_TAG_FS => install_startup_handle(&FS_HANDLE, handle),
             STARTUP_TAG_TTY => install_startup_handle(&TTY_HANDLE, handle),
             STARTUP_TAG_NET => install_startup_handle(&NET_HANDLE, handle),
+            STARTUP_TAG_ENV => {
+                close_handle(core::mem::replace(&mut env_vmo, handle));
+            }
             _ => close_handle(handle),
         }
     }
@@ -933,7 +945,46 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
             *slot = FdSlot::Output(handle);
         }
     }
-    argv_vmo
+    (argv_vmo, env_vmo)
+}
+
+/// SH2: turn a granted env VMO into relibc's environment. The strings are copied out
+/// and leaked for the process lifetime (as `start.rs`'s `copy_string_array` does), the
+/// pointer array lands in `OUR_ENVIRON`, and `environ` names it, so relibc's getenv,
+/// setenv and unsetenv keep owning one array. No grant installs the empty environment.
+/// — TIMBERDOODLE
+unsafe fn install_environ(env_vmo: u32) {
+    use alloc::ffi::CString;
+    use alloc::vec::Vec;
+
+    let mut pointers: Vec<*mut c_char> = Vec::new();
+    if env_vmo != 0 {
+        let mut buffer = [0u8; ENV_BYTES];
+        if vmo_read(env_vmo, 0, buffer.as_mut_ptr(), ENV_BYTES) == 0 {
+            let count = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+            let mut pos = 4usize;
+            let mut taken = 0usize;
+            while taken < count.min(ENV_MAX) && pos < ENV_BYTES {
+                let start = pos;
+                while pos < ENV_BYTES && buffer[pos] != 0 {
+                    pos += 1;
+                }
+                if pos == ENV_BYTES {
+                    break;
+                }
+                if let Ok(text) = CString::new(&buffer[start..pos]) {
+                    pointers.push(text.into_raw());
+                    taken += 1;
+                }
+                pos += 1;
+            }
+        }
+    }
+    pointers.push(core::ptr::null_mut());
+    unsafe {
+        crate::platform::OUR_ENVIRON.unsafe_set(pointers);
+        crate::platform::environ = crate::platform::OUR_ENVIRON.unsafe_mut().as_mut_ptr();
+    }
 }
 
 /// Lay KUMO's granted capabilities out as the SysV initial-process image.
@@ -944,7 +995,7 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
 /// ambient authority wearing a POSIX name. `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` are read from
 /// this image's own mapped ELF header, which is how relibc's static TLS setup finds
 /// `PT_TLS` without the kernel loader growing a POSIX opinion. — TIMBERDOODLE
-unsafe fn build_startup_image(argv_vmo: u32) -> &'static Stack {
+unsafe fn build_startup_image(argv_vmo: u32, env_vmo: u32) -> &'static Stack {
     unsafe extern "C" {
         /// Defined by the linker when the ELF header is covered by a `PT_LOAD` segment.
         static __ehdr_start: [u8; 64];
@@ -952,6 +1003,7 @@ unsafe fn build_startup_image(argv_vmo: u32) -> &'static Stack {
 
     let image = (&raw mut STARTUP_IMAGE).cast::<usize>();
     let argv_bytes = (&raw mut ARGV_IMAGE).cast::<u8>();
+    let env_bytes = (&raw mut ENV_IMAGE).cast::<u8>();
 
     let mut argc = 0_usize;
     if argv_vmo != 0 && vmo_read(argv_vmo, 0, argv_bytes, ARGV_BYTES) == 0 {
@@ -973,10 +1025,31 @@ unsafe fn build_startup_image(argv_vmo: u32) -> &'static Stack {
         }
     }
 
+    // SH2: the env block, same walk as argv; an ungranted program gets an empty envp,
+    // which is exactly "no environment", not an ambient one.
+    let mut envc = 0_usize;
+    if env_vmo != 0 && vmo_read(env_vmo, 0, env_bytes, ENV_BYTES) == 0 {
+        let header = unsafe { core::ptr::read_unaligned(env_bytes.cast::<[u8; 4]>()) };
+        let packed = u32::from_le_bytes(header) as usize;
+        let mut pos = header.len();
+        while envc < packed.min(ENV_MAX) && pos < ENV_BYTES {
+            let start = pos;
+            while pos < ENV_BYTES && unsafe { *env_bytes.add(pos) } != 0 {
+                pos += 1;
+            }
+            if pos == ENV_BYTES {
+                break;
+            }
+            unsafe { image.add(2 + argc + envc).write(env_bytes.add(start) as usize) };
+            envc += 1;
+            pos += 1;
+        }
+    }
+
     unsafe {
         image.write(argc);
         image.add(1 + argc).write(0);
-        image.add(2 + argc).write(0);
+        image.add(2 + argc + envc).write(0);
     }
 
     let ehdr = (&raw const __ehdr_start).cast::<u8>();
@@ -987,7 +1060,7 @@ unsafe fn build_startup_image(argv_vmo: u32) -> &'static Stack {
     let phentsize = unsafe { core::ptr::read_unaligned(ehdr.add(54).cast::<u16>()) } as usize;
     let phnum = unsafe { core::ptr::read_unaligned(ehdr.add(56).cast::<u16>()) } as usize;
 
-    let auxv = 3 + argc;
+    let auxv = 3 + argc + envc;
     let vector = [
         AT_PHDR,
         ehdr as usize + phoff,
@@ -1015,7 +1088,9 @@ unsafe fn build_startup_image(argv_vmo: u32) -> &'static Stack {
 /// which owns its parse and close. std owns the rest of its runtime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __kumo_startup(bootstrap: u64) -> u32 {
-    let argv_vmo = take_bootstrap_capabilities(bootstrap as u32);
+    let (argv_vmo, env_vmo) = take_bootstrap_capabilities(bootstrap as u32);
+    unsafe { install_environ(env_vmo) };
+    close_handle(env_vmo);
     // The std entry bypasses relibc_start_v1, which is what normally initializes stdio
     // and the main thread's Pthread record. Without this, exit's flush_io_streams walks
     // a null FILE and faults, and pthread_self has no record (J856). Mirror start.rs's
@@ -1051,9 +1126,10 @@ pub unsafe extern "C" fn __relibc_kumo_start(
         )
     };
 
-    let argv_vmo = take_bootstrap_capabilities(bootstrap as u32);
-    let stack = unsafe { build_startup_image(argv_vmo) };
+    let (argv_vmo, env_vmo) = take_bootstrap_capabilities(bootstrap as u32);
+    let stack = unsafe { build_startup_image(argv_vmo, env_vmo) };
     close_handle(argv_vmo);
+    close_handle(env_vmo);
     unsafe { crate::start::relibc_start_v1(stack, main) }
 }
 

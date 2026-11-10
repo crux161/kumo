@@ -1,6 +1,7 @@
 //j853
 //j856
 //j857
+//j859
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -41,6 +42,34 @@ fn ring_line(args: core::fmt::Arguments<'_>) {
 
 macro_rules! netlog {
     ($($arg:tt)*) => { ring_line(format_args!($($arg)*)) };
+}
+
+/// SH2: the env proof's ring record, one formatted entry under "std: env".
+fn env_line(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write as _;
+    struct RingBuf {
+        buf: [u8; 200],
+        at: usize,
+    }
+    impl core::fmt::Write for RingBuf {
+        fn write_str(&mut self, part: &str) -> core::fmt::Result {
+            let take = part.len().min(self.buf.len() - self.at);
+            self.buf[self.at..self.at + take].copy_from_slice(&part.as_bytes()[..take]);
+            self.at += take;
+            Ok(())
+        }
+    }
+    let mut line = RingBuf {
+        buf: [0u8; 200],
+        at: 0,
+    };
+    let _ = write!(line, "std: env {}", args);
+    let _ = write!(line, "\n");
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line.buf[..line.at]);
+}
+
+macro_rules! envlog {
+    ($($arg:tt)*) => { env_line(format_args!($($arg)*)) };
 }
 
 
@@ -84,6 +113,10 @@ fn main() {
     // The mode word is the launcher's grant word: only `net` opens a netstack
     // session (slots[1] == "net"), so the wire campaign rides extra arguments.
     match std::env::args().nth(1).as_deref() {
+        Some("env") => {
+            env_probe();
+            return;
+        }
         Some("net") => {
             let args: Vec<String> = std::env::args().collect();
             if args.len() >= 5 {
@@ -102,6 +135,41 @@ fn main() {
         _ => {}
     }
     gate_ib();
+}
+
+/// SH2: the environment proof. A granted environment must be visible through std
+/// (`std::env`, i.e. relibc's environ), a missing grant must be empty rather than
+/// ambient, and setenv/unsetenv must round-trip. The ring records are the evidence.
+#[inline(never)]
+fn env_probe() {
+    let path = std::env::var("PATH");
+    let home = std::env::var("HOME");
+    let total = std::env::vars().count();
+    if path.is_ok() || home.is_ok() {
+        match &path {
+            Ok(value) => envlog!("PATH={} -> OK", value),
+            Err(_) => envlog!("PATH -> FAIL"),
+        }
+        match &home {
+            Ok(value) => envlog!("HOME={} -> OK", value),
+            Err(_) => envlog!("HOME -> FAIL"),
+        }
+        envlog!("granted ({} vars) -> OK", total);
+    } else if total == 0 {
+        envlog!("empty (no grant) -> OK");
+    } else {
+        envlog!("empty (no grant) -> FAIL vars={}", total);
+    }
+    // SAFETY: single-threaded probe; no other thread reads the environment.
+    unsafe { std::env::set_var("KUMO_SET", "1") };
+    let set = std::env::var("KUMO_SET").ok().as_deref() == Some("1");
+    unsafe { std::env::remove_var("KUMO_SET") };
+    let removed = std::env::var("KUMO_SET").is_err();
+    if set && removed {
+        envlog!("set+remove -> OK");
+    } else {
+        envlog!("set+remove -> FAIL");
+    }
 }
 
 /// The pre-wire retry, mirroring the NET13a C smoke's proven loop: autoexec runs

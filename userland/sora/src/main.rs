@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j829
 //j837
 //j843
 //j856
 //j857
+//j859
 
 extern crate alloc;
 
@@ -31,8 +31,8 @@ use kumo_rt::{
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
     port_wait, process_create, process_kill, process_run, process_wait, resource_create_child,
     resource_mint_mmio, syscall_handle, thread_create, thread_start, timer_create, vmar_map,
-    vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_FS,
-    STARTUP_TAG_NET, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
+    vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_ENV,
+    STARTUP_TAG_FS, STARTUP_TAG_NET, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
 };
 use kumoza::{parse, DirectoryError, WorkingDirectory};
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -7298,6 +7298,10 @@ fn eval_command(
                 }
             }
         }
+    } else if cmd.name == "env" {
+        // env NAME=VALUE ... <program> [args...]: launch with exactly the granted
+        // environment (SH2). No other launcher word mints one. — TIMBERDOODLE
+        run_env_command(initrd, cmd)
     } else if cmd.name == "bg" {
         // bg <run|net> <program> [args...]: start one program without waiting for it; `wait`
         // later drains its output. One job at a time (J816, NET2b-2). — TIMBERDOODLE
@@ -7722,6 +7726,29 @@ static BG_PROCESS: AtomicU32 = AtomicU32::new(0);
 /// Start `argv` as the background job. It reuses the interactive launch, which returns as soon
 /// as the child parks or exits and hands back its ends without draining them; the job reads no
 /// input, so its stdin writer is closed at once. — TIMBERDOODLE
+fn run_env_command(initrd: Handle, cmd: &kumoza::Command) {
+    let mut env: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    let mut index = 0;
+    while index < cmd.args.len() {
+        let arg = cmd.args[index].as_bytes();
+        if !arg.contains(&b'=') {
+            break;
+        }
+        if arg.first() == Some(&b'=') {
+            usage(b"usage: env NAME=VALUE ... <program> [args...]\n");
+            return;
+        }
+        env.push(arg);
+        index += 1;
+    }
+    if index == cmd.args.len() {
+        usage(b"usage: env NAME=VALUE ... <program> [args...]\n");
+        return;
+    }
+    let program: alloc::vec::Vec<alloc::string::String> = cmd.args[index..].to_vec();
+    run_program_granted_with_env(initrd, &program, false, Some(&env));
+}
+
 fn run_program_background(initrd: Handle, argv: &[alloc::string::String], grant_net: bool) {
     if BG_STDOUT.load(Ordering::Relaxed) != 0 {
         log(b"bg: a background job is still running; `wait` for it first\n");
@@ -11836,6 +11863,34 @@ fn run_with_startup_input(
     stdin: StdinMode<'_>,
     grant_net: bool,
 ) -> Option<InteractiveChild> {
+    run_with_startup_input_with_env(
+        initrd,
+        path,
+        name,
+        argv,
+        grant_initrd,
+        fs,
+        grant_tty,
+        bind_stdout,
+        stdin,
+        grant_net,
+        None,
+    )
+}
+
+fn run_with_startup_input_with_env(
+    initrd: Handle,
+    path: &[u8],
+    name: &[u8],
+    argv: Option<&[&[u8]]>,
+    grant_initrd: bool,
+    fs: FsGrant,
+    grant_tty: bool,
+    bind_stdout: bool,
+    stdin: StdinMode<'_>,
+    grant_net: bool,
+    env: Option<&[&[u8]]>,
+) -> Option<InteractiveChild> {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
     if stdout_read_raw == u64::MAX || stdout_write_raw == u64::MAX {
         log(name);
@@ -11915,6 +11970,10 @@ fn run_with_startup_input(
         Some(slots) => argv_transfer_handle(slots),
         None => 0,
     };
+    let env_child_raw = match env {
+        Some(pairs) => env_transfer_handle(pairs),
+        None => 0,
+    };
     let initrd_child_raw = if grant_initrd {
         handle_duplicate(initrd, Rights::READ | Rights::TRANSFER)
     } else {
@@ -11939,11 +11998,12 @@ fn run_with_startup_input(
         None
     };
     let argv_bad = argv.is_some() && (argv_child_raw == 0 || argv_child_raw == u64::MAX);
+    let env_bad = env.is_some() && (env_child_raw == 0 || env_child_raw == u64::MAX);
     let initrd_bad = grant_initrd && (initrd_child_raw == 0 || initrd_child_raw == u64::MAX);
     let fs_bad = fs != FsGrant::None && fs_child.is_none();
     let tty_bad = grant_tty && tty_child.is_none();
     let net_bad = grant_net && net_child.is_none();
-    if argv_bad || initrd_bad || fs_bad || tty_bad || net_bad {
+    if argv_bad || env_bad || initrd_bad || fs_bad || tty_bad || net_bad {
         for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
             let _ = handle_close(handle);
         }
@@ -11952,6 +12012,9 @@ fn run_with_startup_input(
         }
         if argv.is_some() && !argv_bad {
             let _ = handle_close(Handle(argv_child_raw as u32));
+        }
+        if env.is_some() && !env_bad {
+            let _ = handle_close(Handle(env_child_raw as u32));
         }
         if grant_initrd && !initrd_bad {
             let _ = handle_close(Handle(initrd_child_raw as u32));
@@ -11975,7 +12038,7 @@ fn run_with_startup_input(
 
     // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd], [fs], [tty], [net]. Order
     // is immaterial — the child installs by tag — but kept deterministic for serial diagnosis.
-    let mut tags: [(u8, Handle); 7] = [(0, Handle(0)); 7];
+    let mut tags: [(u8, Handle); 8] = [(0, Handle(0)); 8];
     let mut expected = 0usize;
     if let Some(stdin_read) = stdin_read {
         tags[expected] = (STARTUP_TAG_STDIN, stdin_read);
@@ -12001,6 +12064,10 @@ fn run_with_startup_input(
     }
     if let Some(net) = net_child {
         tags[expected] = (STARTUP_TAG_NET, net);
+        expected += 1;
+    }
+    if env_child_raw != 0 {
+        tags[expected] = (STARTUP_TAG_ENV, Handle(env_child_raw as u32));
         expected += 1;
     }
 
@@ -12464,6 +12531,15 @@ const MAX_ARGV: usize = 16;
 /// would silently replace its arguments (observed in the restart proof). — TIMBERDOODLE
 /// Returns `0` if the VMO is unavailable or argv overflows the 256-byte buffer. The child `vmo_read`s the
 /// handle and walks it with `kumo_abi::unpack_argv`.
+fn env_transfer_handle(pairs: &[&[u8]]) -> u64 {
+    let Some(vmo) = write_argv(pairs) else {
+        return 0;
+    };
+    let grant = handle_duplicate(vmo, Rights::READ | Rights::TRANSFER);
+    let _ = handle_close(vmo);
+    grant
+}
+
 fn argv_transfer_handle(slots: &[&[u8]]) -> u64 {
     let Some(vmo) = write_argv(slots) else {
         return 0;
@@ -12531,6 +12607,15 @@ fn program_path<'a>(name: &[u8], path: &'a mut [u8; 64]) -> Option<&'a [u8]> {
 }
 
 fn run_program_granted(initrd: Handle, argv: &[alloc::string::String], grant_net: bool) -> bool {
+    run_program_granted_with_env(initrd, argv, grant_net, None)
+}
+
+fn run_program_granted_with_env(
+    initrd: Handle,
+    argv: &[alloc::string::String],
+    grant_net: bool,
+    env: Option<&[&[u8]]>,
+) -> bool {
     let name = match argv.first() {
         Some(n) => n.as_bytes(),
         None => return false,
@@ -12577,7 +12662,7 @@ fn run_program_granted(initrd: Handle, argv: &[alloc::string::String], grant_net
             false,
         );
     } else {
-        run_with_startup_input(
+        run_with_startup_input_with_env(
             initrd,
             full,
             full,
@@ -12588,6 +12673,7 @@ fn run_program_granted(initrd: Handle, argv: &[alloc::string::String], grant_net
             false,
             StdinMode::None,
             grant_net,
+            env,
         );
     }
     true
