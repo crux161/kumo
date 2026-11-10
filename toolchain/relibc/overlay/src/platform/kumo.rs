@@ -126,18 +126,31 @@ const KNS1_HEADER_LEN: usize = 32;
 const KNS1_ADDR_LEN: usize = 8;
 const KNS1_FAMILY_IPV4: u16 = 2;
 const KNS1_WAIT_READABLE: u8 = 1;
+const KNS1_WAIT_WRITABLE: u8 = 2;
+const KNS1_WAIT_CONNECTED: u8 = 4;
 const KNS1_UDP_PAYLOAD_MAX: usize = 1472;
-const KNS1_MESSAGE_MAX: usize = KNS1_HEADER_LEN + KNS1_ADDR_LEN + KNS1_UDP_PAYLOAD_MAX;
+const KNS1_STREAM_PAYLOAD_MAX: usize = 2048;
+const KNS1_MESSAGE_MAX: usize = KNS1_HEADER_LEN + KNS1_STREAM_PAYLOAD_MAX;
 const KNS1_OP_HELLO: u16 = 1;
 const KNS1_OP_SOCKET: u16 = 2;
 const KNS1_OP_BIND: u16 = 3;
+const KNS1_OP_CONNECT: u16 = 4;
+const KNS1_OP_LISTEN: u16 = 5;
+const KNS1_OP_ACCEPT: u16 = 6;
+const KNS1_OP_SEND: u16 = 7;
 const KNS1_OP_SEND_TO: u16 = 8;
+const KNS1_OP_RECV: u16 = 9;
 const KNS1_OP_RECV_FROM: u16 = 10;
+const KNS1_OP_SHUTDOWN: u16 = 11;
 const KNS1_OP_CLOSE: u16 = 12;
 const KNS1_OP_WAIT: u16 = 13;
+const KNS1_OP_GET_NAME: u16 = 14;
 const KNS1_SOCKET_UDP: u64 = 1;
-/// IPPROTO_UDP: the only protocol `socket(AF_INET, SOCK_DGRAM, …)` accepts.
+const KNS1_SOCKET_TCP: u64 = 2;
+const KNS1_LISTEN_BACKLOG_MAX: u64 = 4;
+/// IPPROTO_UDP / IPPROTO_TCP: the only protocols `socket()` accepts.
 const KNS1_IPPROTO_UDP: c_int = 17;
+const KNS1_IPPROTO_TCP: c_int = 6;
 /// `sizeof(struct sockaddr_in)`: family, port, address, and eight zero bytes.
 const SOCKADDR_IN_LEN: usize = 16;
 
@@ -201,8 +214,17 @@ enum FdSlot {
         offset: u64,
         size: u64,
     },
-    /// A UDP socket in this process's netstack session; the id names it inside KNS1.
-    Socket { id: u32 },
+    /// A socket in this process's netstack session; the id names it inside KNS1.
+    Socket {
+        id: u32,
+        /// KNS1 socket kind: 1 = UDP, 2 = TCP.
+        kind: u8,
+        /// Bit 0: O_NONBLOCK (fcntl F_SETFL); survives dup2, as POSIX requires.
+        flags: u8,
+        /// SO_RCVTIMEO / SO_SNDTIMEO in milliseconds; 0 = no timeout (block forever).
+        rcv_timeo_ms: u16,
+        snd_timeo_ms: u16,
+    },
 }
 
 /// Descriptors this backend can hold. POSIX programs expect 0/1/2 to be stdio, so the table
@@ -603,11 +625,184 @@ fn net_call(
     Ok((status, reply_socket, result, len))
 }
 
+
+const FD_SOCK_NONBLOCK: u8 = 1;
+const SOCKET_KIND_UDP: u8 = 1;
+const SOCKET_KIND_TCP: u8 = 2;
+
+fn socket_info(fildes: c_int) -> Result<(u32, u8, u8, u16, u16)> {
+    use crate::header::errno::{EBADF, ENOTSOCK};
+
+    match fd_slot(fildes).map(|slot| *slot) {
+        Some(FdSlot::Socket {
+            id,
+            kind,
+            flags,
+            rcv_timeo_ms,
+            snd_timeo_ms,
+        }) => Ok((id, kind, flags, rcv_timeo_ms, snd_timeo_ms)),
+        Some(FdSlot::Closed) | None => Err(Errno(EBADF)),
+        Some(_) => Err(Errno(ENOTSOCK)),
+    }
+}
+
+/// How many descriptors other than `skip` name the same session socket.
+fn socket_alias_count(id: u32, skip: c_int) -> usize {
+    let mut count = 0;
+    for index in 0..FD_SLOTS {
+        if index as c_int == skip {
+            continue;
+        }
+        if let Some(FdSlot::Socket { id: other, .. }) = fd_slot(index as c_int) {
+            if *other == id {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Wait for `interest` on a socket, honoring a POSIX timeout budget: 0 blocks until
+/// ready; otherwise expiry answers EAGAIN. The bounded windows keep every single KNS1
+/// wait under the stack's own 60 s cap.
+fn wait_interest(id: u32, interest: u8, timeout_ms: u16) -> Result<()> {
+    use crate::header::errno::EAGAIN;
+
+    const WINDOW_MS: u32 = 2000;
+    let mut remaining = if timeout_ms == 0 {
+        None
+    } else {
+        Some(u32::from(timeout_ms))
+    };
+    loop {
+        let window = remaining.map_or(WINDOW_MS, |r| r.clamp(1, WINDOW_MS));
+        let (status, _s, _r, _len) = net_call(
+            KNS1_OP_WAIT,
+            id,
+            u64::from(interest) | (u64::from(window) << 32),
+            0,
+            &[],
+        )?;
+        match status {
+            0 => return Ok(()),
+            15 => {
+                if let Some(r) = remaining.as_mut() {
+                    *r = r.saturating_sub(window);
+                    if *r == 0 {
+                        return Err(Errno(EAGAIN));
+                    }
+                }
+            }
+            other => return Err(net_status_errno(other)),
+        }
+    }
+}
+
+/// Stream send: one KNS1 SEND per call, so partial sends surface exactly as POSIX
+/// defines them. A full buffer blocks through WAIT_WRITABLE unless nonblocking.
+fn stream_send(info: (u32, u8, u8, u16, u16), data: &[u8]) -> Result<usize> {
+    use crate::header::errno::EAGAIN;
+
+    let (id, _kind, flags, _rcv, snd_timeo) = info;
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let chunk = &data[..data.len().min(KNS1_STREAM_PAYLOAD_MAX)];
+    loop {
+        let (status, _s, result, _len) = net_call(KNS1_OP_SEND, id, 0, 0, chunk)?;
+        match status {
+            0 => return Ok(result as usize),
+            13 => {
+                if flags & FD_SOCK_NONBLOCK != 0 {
+                    return Err(Errno(EAGAIN));
+                }
+                wait_interest(id, KNS1_WAIT_WRITABLE, snd_timeo)?;
+            }
+            other => return Err(net_status_errno(other)),
+        }
+    }
+}
+
+/// Stream receive: one KNS1 RECV per call; a zero-length answer is the orderly EOF.
+fn stream_recv(
+    info: (u32, u8, u8, u16, u16),
+    nonblock: bool,
+    out: *mut u8,
+    len: usize,
+    address: *mut sockaddr,
+    address_len: *mut socklen_t,
+) -> Result<usize> {
+    use crate::header::errno::EAGAIN;
+
+    let (id, _kind, _flags, rcv_timeo, _snd) = info;
+    if len == 0 {
+        return Ok(0);
+    }
+    let max = len.min(KNS1_STREAM_PAYLOAD_MAX);
+    loop {
+        let (status, _s, _result, payload_len) = net_call(KNS1_OP_RECV, id, max as u64, 0, &[])?;
+        match status {
+            0 => {
+                let message = unsafe { (&raw const NET_MESSAGE).as_ref().unwrap() };
+                let data = &message[KNS1_HEADER_LEN..KNS1_HEADER_LEN + payload_len];
+                let take = data.len().min(max);
+                if take > 0 {
+                    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), out, take) };
+                }
+                if !address.is_null() && !address_len.is_null() {
+                    fill_sockaddr_from_getname(id, true, address, address_len)?;
+                }
+                return Ok(take);
+            }
+            13 => {
+                if nonblock {
+                    return Err(Errno(EAGAIN));
+                }
+                wait_interest(id, KNS1_WAIT_READABLE, rcv_timeo)?;
+            }
+            other => return Err(net_status_errno(other)),
+        }
+    }
+}
+
+/// Fill a C sockaddr from KNS1 GETNAME (payload: local addr then peer addr).
+fn fill_sockaddr_from_getname(
+    id: u32,
+    peer: bool,
+    address: *mut sockaddr,
+    address_len: *mut socklen_t,
+) -> Result<()> {
+    use crate::header::errno::EIO;
+
+    let (status, _s, _r, payload_len) = net_call(KNS1_OP_GET_NAME, id, 0, 0, &[])?;
+    net_status_ok(status)?;
+    if payload_len < 2 * KNS1_ADDR_LEN {
+        return Err(Errno(EIO));
+    }
+    let message = unsafe { (&raw const NET_MESSAGE).as_ref().unwrap() };
+    let base = KNS1_HEADER_LEN + if peer { KNS1_ADDR_LEN } else { 0 };
+    let filled = sockaddr_in_fill(
+        [
+            message[base + 4],
+            message[base + 5],
+            message[base + 6],
+            message[base + 7],
+        ],
+        le16(message, base + 2),
+    );
+    let cap = unsafe { (*address_len as usize).min(SOCKADDR_IN_LEN) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(filled.as_ptr(), address.cast::<u8>(), cap);
+        *address_len = SOCKADDR_IN_LEN as socklen_t;
+    }
+    Ok(())
+}
+
 fn socket_id(fildes: c_int) -> Result<u32> {
     use crate::header::errno::{EBADF, ENOTSOCK};
 
     match fd_slot(fildes).map(|slot| *slot) {
-        Some(FdSlot::Socket { id }) => Ok(id),
+        Some(FdSlot::Socket { id, .. }) => Ok(id),
         Some(FdSlot::Closed) | None => Err(Errno(EBADF)),
         Some(_) => Err(Errno(ENOTSOCK)),
     }
@@ -1002,18 +1197,42 @@ impl Pal for Sys {
         let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
         match core::mem::replace(slot, FdSlot::Closed) {
             FdSlot::Closed => Err(Errno(EBADF)),
-            FdSlot::Socket { id } => {
-                // Release the session's socket as well; a closed descriptor is closed
-                // even if the session died first, so the status is not the caller's.
-                let _ = net_call(KNS1_OP_CLOSE, id, 0, 0, &[]);
+            FdSlot::Socket { id, .. } => {
+                // Release the session's socket when this was its last descriptor; a
+                // dup2 alias keeps it alive, and a dead session cannot fail the close.
+                if socket_alias_count(id, fildes) == 0 {
+                    let _ = net_call(KNS1_OP_CLOSE, id, 0, 0, &[]);
+                }
                 Ok(())
             }
             _ => Ok(()),
         }
     }
 
+    /// POSIX dup2: the target is replaced by an alias of the source; a socket alias
+    /// keeps the session entry alive until the last descriptor naming it closes.
     fn dup2(fildes: c_int, fildes2: c_int) -> Result<c_int> {
-        Err(unsupported())
+        use crate::header::errno::EBADF;
+
+        let source = *fd_slot(fildes).ok_or(Errno(EBADF))?;
+        if matches!(source, FdSlot::Closed) {
+            return Err(Errno(EBADF));
+        }
+        if fildes2 < 0 || fildes2 as usize >= FD_SLOTS {
+            return Err(Errno(EBADF));
+        }
+        if fildes == fildes2 {
+            return Ok(fildes2);
+        }
+        let target = *fd_slot(fildes2).ok_or(Errno(EBADF))?;
+        if let FdSlot::Socket { id, .. } = target {
+            *fd_slot(fildes2).ok_or(Errno(EBADF))? = FdSlot::Closed;
+            if socket_alias_count(id, fildes2) == 0 {
+                let _ = net_call(KNS1_OP_CLOSE, id, 0, 0, &[]);
+            }
+        }
+        *fd_slot(fildes2).ok_or(Errno(EBADF))? = source;
+        Ok(fildes2)
     }
 
     unsafe fn execve(path: CStr, argv: *const *mut c_char, envp: *const *mut c_char) -> Result<()> {
@@ -1067,8 +1286,37 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// F_GETFL / F_SETFL with O_NONBLOCK: the only descriptor flag this backend owns.
     fn fcntl(fildes: c_int, cmd: c_int, arg: c_ulonglong) -> Result<c_int> {
-        Err(unsupported())
+        use crate::header::bits_open_flags::O_NONBLOCK;
+        use crate::header::errno::{EBADF, EINVAL};
+        use crate::header::fcntl::{F_GETFL, F_SETFL};
+
+        let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
+        match cmd {
+            F_GETFL => match *slot {
+                FdSlot::Closed => Err(Errno(EBADF)),
+                FdSlot::Socket { flags, .. } => Ok(if flags & FD_SOCK_NONBLOCK != 0 {
+                    O_NONBLOCK
+                } else {
+                    0
+                }),
+                _ => Ok(0),
+            },
+            F_SETFL => match slot {
+                FdSlot::Socket { flags, .. } => {
+                    *flags = if (arg as c_int) & O_NONBLOCK != 0 {
+                        FD_SOCK_NONBLOCK
+                    } else {
+                        0
+                    };
+                    Ok(0)
+                }
+                FdSlot::Closed => Err(Errno(EBADF)),
+                _ => Err(Errno(EINVAL)),
+            },
+            _ => Err(Errno(EINVAL)),
+        }
     }
 
     unsafe fn fork() -> Result<pid_t> {
@@ -1500,7 +1748,20 @@ impl Pal for Sys {
                 offset,
                 size,
             } => (handle, offset, size),
-            FdSlot::Socket { .. } => return Err(Errno(ENOTCONN)),
+            FdSlot::Socket { kind, .. } => {
+                if kind != SOCKET_KIND_TCP {
+                    return Err(Errno(ENOTCONN));
+                }
+                let info = socket_info(fildes)?;
+                return stream_recv(
+                    info,
+                    info.2 & FD_SOCK_NONBLOCK != 0,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                );
+            }
             _ => return Err(Errno(EBADF)),
         };
         if offset >= size {
@@ -1715,6 +1976,10 @@ impl Pal for Sys {
                 }
                 Ok(total)
             }
+            Some(FdSlot::Socket { kind, .. }) if kind == SOCKET_KIND_TCP => {
+                let info = socket_info(fildes)?;
+                stream_send(info, buf)
+            }
             Some(FdSlot::Socket { .. }) => Err(Errno(ENOTCONN)),
             _ => Err(Errno(EBADF)),
         }
@@ -1820,12 +2085,64 @@ impl PalSocket for Sys {
         address: *mut sockaddr,
         address_len: *mut socklen_t,
     ) -> Result<c_int> {
-        let _ = (socket, address, address_len);
-        Err(unsupported())
+        use crate::header::errno::{EAGAIN, EMFILE};
+
+        let info = socket_info(socket)?;
+        let (id, _kind, flags, _rcv, _snd) = info;
+        loop {
+            let (status, new_id, _result, payload_len) = net_call(KNS1_OP_ACCEPT, id, 0, 0, &[])?;
+            match status {
+                0 => {
+                    let Some(fildes) = fd_alloc() else {
+                        let _ = net_call(KNS1_OP_CLOSE, new_id, 0, 0, &[]);
+                        return Err(Errno(EMFILE));
+                    };
+                    if let Some(slot) = fd_slot(fildes) {
+                        *slot = FdSlot::Socket {
+                            id: new_id,
+                            kind: SOCKET_KIND_TCP,
+                            flags: 0,
+                            rcv_timeo_ms: 0,
+                            snd_timeo_ms: 0,
+                        };
+                    }
+                    if !address.is_null() && !address_len.is_null() && payload_len >= KNS1_ADDR_LEN {
+                        let message = unsafe { (&raw const NET_MESSAGE).as_ref().unwrap() };
+                        let base = KNS1_HEADER_LEN;
+                        let filled = sockaddr_in_fill(
+                            [
+                                message[base + 4],
+                                message[base + 5],
+                                message[base + 6],
+                                message[base + 7],
+                            ],
+                            le16(message, base + 2),
+                        );
+                        let cap = unsafe { (*address_len as usize).min(SOCKADDR_IN_LEN) };
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                filled.as_ptr(),
+                                address.cast::<u8>(),
+                                cap,
+                            );
+                            *address_len = SOCKADDR_IN_LEN as socklen_t;
+                        }
+                    }
+                    return Ok(fildes);
+                }
+                13 => {
+                    if flags & FD_SOCK_NONBLOCK != 0 {
+                        return Err(Errno(EAGAIN));
+                    }
+                    wait_interest(id, KNS1_WAIT_CONNECTED, 0)?;
+                }
+                other => return Err(net_status_errno(other)),
+            }
+        }
     }
 
     unsafe fn bind(socket: c_int, address: *const sockaddr, address_len: socklen_t) -> Result<()> {
-        let id = socket_id(socket)?;
+        let (id, _kind, _flags, _rcv, _snd) = socket_info(socket)?;
         let (ip, port) = unsafe { sockaddr_in_parse(address, address_len) }?;
         let mut payload = [0u8; KNS1_ADDR_LEN];
         payload[0..2].copy_from_slice(&KNS1_FAMILY_IPV4.to_le_bytes());
@@ -1835,13 +2152,47 @@ impl PalSocket for Sys {
         net_status_ok(status)
     }
 
+    /// Stream connect. The session answers InProgress while the handshake runs;
+    /// nonblocking callers get EINPROGRESS and may poll through getsockopt(SO_ERROR),
+    /// blocking callers wait CONNECTED in one bounded 60 s window.
     unsafe fn connect(
         socket: c_int,
         address: *const sockaddr,
         address_len: socklen_t,
     ) -> Result<c_int> {
-        let _ = (socket, address, address_len);
-        Err(unsupported())
+        use crate::header::errno::{EINPROGRESS, EOPNOTSUPP, ETIMEDOUT};
+
+        let (id, kind, flags, _rcv, _snd) = socket_info(socket)?;
+        if kind != SOCKET_KIND_TCP {
+            return Err(Errno(EOPNOTSUPP));
+        }
+        let (ip, port) = unsafe { sockaddr_in_parse(address, address_len) }?;
+        let mut payload = [0u8; KNS1_ADDR_LEN];
+        payload[0..2].copy_from_slice(&KNS1_FAMILY_IPV4.to_le_bytes());
+        payload[2..4].copy_from_slice(&port.to_le_bytes());
+        payload[4..8].copy_from_slice(&ip);
+        let (status, _reply_socket, _result, _len) = net_call(KNS1_OP_CONNECT, id, 0, 0, &payload)?;
+        match status {
+            0 => Ok(0),
+            14 => {
+                if flags & FD_SOCK_NONBLOCK != 0 {
+                    return Err(Errno(EINPROGRESS));
+                }
+                let (wait_status, _s, _r, _l) = net_call(
+                    KNS1_OP_WAIT,
+                    id,
+                    u64::from(KNS1_WAIT_CONNECTED) | (60_000u64 << 32),
+                    0,
+                    &[],
+                )?;
+                match wait_status {
+                    0 => Ok(0),
+                    15 => Err(Errno(ETIMEDOUT)),
+                    other => Err(net_status_errno(other)),
+                }
+            }
+            other => Err(net_status_errno(other)),
+        }
     }
 
     unsafe fn getpeername(
@@ -1849,8 +2200,37 @@ impl PalSocket for Sys {
         address: *mut sockaddr,
         address_len: *mut socklen_t,
     ) -> Result<()> {
-        let _ = (socket, address, address_len);
-        Err(unsupported())
+        use crate::header::errno::ENOTCONN;
+
+        let (id, _kind, _flags, _rcv, _snd) = socket_info(socket)?;
+        let (status, _s, _r, payload_len) = net_call(KNS1_OP_GET_NAME, id, 0, 0, &[])?;
+        net_status_ok(status)?;
+        if payload_len < 2 * KNS1_ADDR_LEN {
+            return Err(Errno(crate::header::errno::EIO));
+        }
+        let message = unsafe { (&raw const NET_MESSAGE).as_ref().unwrap() };
+        let base = KNS1_HEADER_LEN + KNS1_ADDR_LEN;
+        if le16(message, base + 2) == 0 {
+            return Err(Errno(ENOTCONN));
+        }
+        if address.is_null() || address_len.is_null() {
+            return Ok(());
+        }
+        let filled = sockaddr_in_fill(
+            [
+                message[base + 4],
+                message[base + 5],
+                message[base + 6],
+                message[base + 7],
+            ],
+            le16(message, base + 2),
+        );
+        let cap = unsafe { (*address_len as usize).min(SOCKADDR_IN_LEN) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(filled.as_ptr(), address.cast::<u8>(), cap);
+            *address_len = SOCKADDR_IN_LEN as socklen_t;
+        }
+        Ok(())
     }
 
     unsafe fn getsockname(
@@ -1858,10 +2238,36 @@ impl PalSocket for Sys {
         address: *mut sockaddr,
         address_len: *mut socklen_t,
     ) -> Result<()> {
-        let _ = (socket, address, address_len);
-        Err(unsupported())
+        let (id, _kind, _flags, _rcv, _snd) = socket_info(socket)?;
+        let (status, _s, _r, payload_len) = net_call(KNS1_OP_GET_NAME, id, 0, 0, &[])?;
+        net_status_ok(status)?;
+        if payload_len < 2 * KNS1_ADDR_LEN {
+            return Err(Errno(crate::header::errno::EIO));
+        }
+        if address.is_null() || address_len.is_null() {
+            return Ok(());
+        }
+        let message = unsafe { (&raw const NET_MESSAGE).as_ref().unwrap() };
+        let base = KNS1_HEADER_LEN;
+        let filled = sockaddr_in_fill(
+            [
+                message[base + 4],
+                message[base + 5],
+                message[base + 6],
+                message[base + 7],
+            ],
+            le16(message, base + 2),
+        );
+        let cap = unsafe { (*address_len as usize).min(SOCKADDR_IN_LEN) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(filled.as_ptr(), address.cast::<u8>(), cap);
+            *address_len = SOCKADDR_IN_LEN as socklen_t;
+        }
+        Ok(())
     }
 
+    /// SO_RCVTIMEO / SO_SNDTIMEO are real (stored and honored) and SO_ERROR reports the
+    /// pending connect error; anything else refuses by name (ENOPROTOOPT).
     unsafe fn getsockopt(
         socket: c_int,
         level: c_int,
@@ -1869,13 +2275,78 @@ impl PalSocket for Sys {
         option_value: *mut c_void,
         option_len: *mut socklen_t,
     ) -> Result<()> {
-        let _ = (socket, level, option_name, option_value, option_len);
-        Err(unsupported())
+        use crate::header::errno::{EINPROGRESS, EINVAL, ENOPROTOOPT};
+        use crate::header::sys_socket::constants::{
+            SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SOL_SOCKET,
+        };
+
+        let (id, _kind, _flags, rcv_timeo, snd_timeo) = socket_info(socket)?;
+        if option_value.is_null() || option_len.is_null() {
+            return Err(Errno(EINVAL));
+        }
+        if level == SOL_SOCKET && (option_name == SO_RCVTIMEO || option_name == SO_SNDTIMEO) {
+            let ms = if option_name == SO_RCVTIMEO {
+                rcv_timeo
+            } else {
+                snd_timeo
+            };
+            let value = timeval {
+                tv_sec: time_t::from(ms / 1000),
+                // u32 arithmetic: u16 microsecond math wraps (300 * 1000 > 65535).
+                tv_usec: (u32::from(ms % 1000) * 1000) as suseconds_t,
+            };
+            let cap = unsafe { (*option_len as usize).min(core::mem::size_of::<timeval>()) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&raw const value).cast::<u8>(),
+                    option_value.cast::<u8>(),
+                    cap,
+                );
+                *option_len = core::mem::size_of::<timeval>() as socklen_t;
+            }
+            return Ok(());
+        }
+        if level == SOL_SOCKET && option_name == SO_ERROR {
+            // Zero when established, EINPROGRESS while the handshake runs, and the
+            // session's own refusal otherwise: never a fake zero.
+            let (status, _s, result, _l) = net_call(
+                KNS1_OP_WAIT,
+                id,
+                u64::from(KNS1_WAIT_CONNECTED),
+                0,
+                &[],
+            )?;
+            let value: c_int = match status {
+                0 if result & u64::from(KNS1_WAIT_CONNECTED) != 0 => 0,
+                0 => EINPROGRESS,
+                9 => crate::header::errno::ECONNREFUSED,
+                other => net_status_errno(other).0,
+            };
+            let cap = unsafe { (*option_len as usize).min(core::mem::size_of::<c_int>()) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&raw const value).cast::<u8>(),
+                    option_value.cast::<u8>(),
+                    cap,
+                );
+                *option_len = core::mem::size_of::<c_int>() as socklen_t;
+            }
+            return Ok(());
+        }
+        Err(Errno(ENOPROTOOPT))
     }
 
     fn listen(socket: c_int, backlog: c_int) -> Result<()> {
-        let _ = (socket, backlog);
-        Err(unsupported())
+        use crate::header::errno::EOPNOTSUPP;
+
+        let (id, kind, _flags, _rcv, _snd) = socket_info(socket)?;
+        if kind != SOCKET_KIND_TCP {
+            return Err(Errno(EOPNOTSUPP));
+        }
+        let backlog = backlog.clamp(1, KNS1_LISTEN_BACKLOG_MAX as c_int) as u64;
+        let (status, _reply_socket, _result, _len) =
+            net_call(KNS1_OP_LISTEN, id, backlog, 0, &[])?;
+        net_status_ok(status)
     }
 
     unsafe fn recvfrom(
@@ -1889,21 +2360,30 @@ impl PalSocket for Sys {
         use crate::header::errno::{EAGAIN, EFAULT, EIO};
         use crate::header::sys_socket::constants::MSG_DONTWAIT;
 
-        let id = socket_id(socket)?;
+        let info = socket_info(socket)?;
         if len != 0 && buf.is_null() {
             return Err(Errno(EFAULT));
         }
         if len == 0 {
             return Ok(0);
         }
+        if info.1 == SOCKET_KIND_TCP {
+            return stream_recv(
+                info,
+                flags & MSG_DONTWAIT != 0,
+                buf.cast::<u8>(),
+                len,
+                address,
+                address_len,
+            );
+        }
+        let id = info.0;
         let max = len.min(KNS1_UDP_PAYLOAD_MAX);
         let nonblock = flags & MSG_DONTWAIT != 0;
         loop {
             let (status, _reply_socket, _result, payload_len) =
                 net_call(KNS1_OP_RECV_FROM, id, max as u64, 0, &[])?;
             if status == 13 {
-                // WouldBlock: netstack answers immediately by contract; blocking is the
-                // client's WAIT, exactly as netprobe drives it under `kns1`.
                 if nonblock {
                     return Err(Errno(EAGAIN));
                 }
@@ -1915,7 +2395,6 @@ impl PalSocket for Sys {
                     &[],
                 )?;
                 match wait_status {
-                    // Ready, or this bounded window lapsed: go ask again.
                     0 | 15 => {}
                     other => return Err(net_status_errno(other)),
                 }
@@ -1925,8 +2404,6 @@ impl PalSocket for Sys {
             if payload_len < KNS1_ADDR_LEN {
                 return Err(Errno(EIO));
             }
-            // SAFETY: single-threaded exchange buffer; the reply header precedes the
-            // addr+data payload exactly as `net_exchange` validated.
             let message = unsafe { (&raw const NET_MESSAGE).as_ref().unwrap() };
             let payload = &message[KNS1_HEADER_LEN..KNS1_HEADER_LEN + payload_len];
             let data = &payload[KNS1_ADDR_LEN..];
@@ -1943,7 +2420,6 @@ impl PalSocket for Sys {
                     *address_len = SOCKADDR_IN_LEN as socklen_t;
                 }
             }
-            // POSIX's default without MSG_TRUNC: the number of bytes copied.
             return Ok(take);
         }
     }
@@ -1966,17 +2442,27 @@ impl PalSocket for Sys {
         dest_addr: *const sockaddr,
         dest_len: socklen_t,
     ) -> Result<usize> {
-        use crate::header::errno::{EDESTADDRREQ, EMSGSIZE, EFAULT};
+        use crate::header::errno::{EDESTADDRREQ, EISCONN, EMSGSIZE, EFAULT};
 
         let _ = flags;
-        let id = socket_id(socket)?;
-        if len > KNS1_UDP_PAYLOAD_MAX {
-            return Err(Errno(EMSGSIZE));
-        }
+        let info = socket_info(socket)?;
         if len != 0 && buf.is_null() {
             return Err(Errno(EFAULT));
         }
-        // No connect() in this slice: an unaddressed UDP send has nowhere to go.
+        if info.1 == SOCKET_KIND_TCP {
+            if !dest_addr.is_null() && dest_len != 0 {
+                return Err(Errno(EISCONN));
+            }
+            let data = if len == 0 {
+                &[][..]
+            } else {
+                unsafe { core::slice::from_raw_parts(buf.cast::<u8>(), len) }
+            };
+            return stream_send(info, data);
+        }
+        if len > KNS1_UDP_PAYLOAD_MAX {
+            return Err(Errno(EMSGSIZE));
+        }
         if dest_addr.is_null() || dest_len == 0 {
             return Err(Errno(EDESTADDRREQ));
         }
@@ -1992,7 +2478,7 @@ impl PalSocket for Sys {
         payload[4..8].copy_from_slice(&ip);
         payload[KNS1_ADDR_LEN..KNS1_ADDR_LEN + data.len()].copy_from_slice(data);
         let (status, _reply_socket, _result, _payload_len) =
-            net_call(KNS1_OP_SEND_TO, id, 0, 0, &payload[..KNS1_ADDR_LEN + data.len()])?;
+            net_call(KNS1_OP_SEND_TO, info.0, 0, 0, &payload[..KNS1_ADDR_LEN + data.len()])?;
         net_status_ok(status)?;
         Ok(data.len())
     }
@@ -2004,39 +2490,96 @@ impl PalSocket for Sys {
         option_value: *const c_void,
         option_len: socklen_t,
     ) -> Result<()> {
-        let _ = (socket, level, option_name, option_value, option_len);
-        Err(unsupported())
+        use crate::header::errno::{EINVAL, ENOPROTOOPT};
+        use crate::header::sys_socket::constants::{SO_RCVTIMEO, SO_SNDTIMEO, SOL_SOCKET};
+
+        let _ = socket_info(socket)?;
+        if level == SOL_SOCKET && (option_name == SO_RCVTIMEO || option_name == SO_SNDTIMEO) {
+            if option_value.is_null() || (option_len as usize) < core::mem::size_of::<timeval>() {
+                return Err(Errno(EINVAL));
+            }
+            let value = unsafe { core::ptr::read_unaligned(option_value.cast::<timeval>()) };
+            let secs = u32::try_from(value.tv_sec.max(0)).unwrap_or(u32::MAX);
+            let usecs = u32::try_from(value.tv_usec.max(0)).unwrap_or(0);
+            let ms = secs
+                .saturating_mul(1000)
+                .saturating_add(usecs / 1000)
+                .min(u32::from(u16::MAX)) as u16;
+            let slot = fd_slot(socket).ok_or(Errno(EINVAL))?;
+            match slot {
+                FdSlot::Socket {
+                    rcv_timeo_ms,
+                    snd_timeo_ms,
+                    ..
+                } => {
+                    if option_name == SO_RCVTIMEO {
+                        *rcv_timeo_ms = ms;
+                    } else {
+                        *snd_timeo_ms = ms;
+                    }
+                    Ok(())
+                }
+                _ => Err(Errno(EINVAL)),
+            }
+        } else {
+            Err(Errno(ENOPROTOOPT))
+        }
     }
 
     fn shutdown(socket: c_int, how: c_int) -> Result<()> {
-        let _ = (socket, how);
-        Err(unsupported())
+        use crate::header::errno::{EINVAL, ENOTCONN};
+
+        let (id, kind, _flags, _rcv, _snd) = socket_info(socket)?;
+        if kind != SOCKET_KIND_TCP {
+            return Err(Errno(ENOTCONN));
+        }
+        // POSIX how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR; KNS1 bits: 1 read, 2 write.
+        let bits = match how {
+            0 => 1u64,
+            1 => 2u64,
+            2 => 3u64,
+            _ => return Err(Errno(EINVAL)),
+        };
+        let (status, _reply_socket, _result, _len) =
+            net_call(KNS1_OP_SHUTDOWN, id, bits, 0, &[])?;
+        net_status_ok(status)
     }
 
     unsafe fn socket(domain: c_int, kind: c_int, protocol: c_int) -> Result<c_int> {
         use crate::header::errno::{EAFNOSUPPORT, EMFILE, EPROTONOSUPPORT};
-        use crate::header::sys_socket::constants::{AF_INET, SOCK_DGRAM};
+        use crate::header::sys_socket::constants::{
+            AF_INET, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM,
+        };
 
         if domain != AF_INET {
             return Err(Errno(EAFNOSUPPORT));
         }
-        // NET13a is the UDP subset: a stream socket must fail by name, not half-work.
-        if kind != SOCK_DGRAM {
+        let nonblock = kind & SOCK_NONBLOCK != 0;
+        let base = kind & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+        let (kns1_kind, fd_kind, proto) = if base == SOCK_DGRAM {
+            (KNS1_SOCKET_UDP, SOCKET_KIND_UDP, KNS1_IPPROTO_UDP)
+        } else if base == SOCK_STREAM {
+            (KNS1_SOCKET_TCP, SOCKET_KIND_TCP, KNS1_IPPROTO_TCP)
+        } else {
+            return Err(Errno(EPROTONOSUPPORT));
+        };
+        if protocol != 0 && protocol != proto {
             return Err(Errno(EPROTONOSUPPORT));
         }
-        if protocol != 0 && protocol != KNS1_IPPROTO_UDP {
-            return Err(Errno(EPROTONOSUPPORT));
-        }
-        let (status, id, _result, _len) = net_call(KNS1_OP_SOCKET, 0, KNS1_SOCKET_UDP, 0, &[])?;
+        let (status, id, _result, _len) = net_call(KNS1_OP_SOCKET, 0, kns1_kind, 0, &[])?;
         net_status_ok(status)?;
         let Some(fildes) = fd_alloc() else {
-            // The descriptor table ran out after the session made the socket: free the
-            // netstack-side entry rather than leaking it.
             let _ = net_call(KNS1_OP_CLOSE, id, 0, 0, &[]);
             return Err(Errno(EMFILE));
         };
         if let Some(slot) = fd_slot(fildes) {
-            *slot = FdSlot::Socket { id };
+            *slot = FdSlot::Socket {
+                id,
+                kind: fd_kind,
+                flags: if nonblock { FD_SOCK_NONBLOCK } else { 0 },
+                rcv_timeo_ms: 0,
+                snd_timeo_ms: 0,
+            };
         }
         Ok(fildes)
     }

@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <termios.h>
 #include <time.h>
@@ -125,9 +126,11 @@ static int udp_loopback(void) {
     if (socket(AF_INET6, SOCK_DGRAM, 0) != -1 || errno != EAFNOSUPPORT) {
         return udp_fail("socket AF_INET6");
     }
-    errno = 0;
-    if (socket(AF_INET, SOCK_STREAM, 0) != -1 || errno != EPROTONOSUPPORT) {
-        return udp_fail("socket SOCK_STREAM");
+    /* NET13b opened the stream half: a plain SOCK_STREAM socket must work here now. */
+    {
+        const int stream = socket(AF_INET, SOCK_STREAM, 0);
+        if (stream < 3) return udp_fail("socket SOCK_STREAM");
+        if (close(stream) != 0) return udp_fail("close stream probe");
     }
     errno = 0;
     if (socket(AF_INET, SOCK_DGRAM, 132) != -1 || errno != EPROTONOSUPPORT) {
@@ -357,11 +360,323 @@ static int udp_wire(const char *ip_text, const char *port_text) {
     return 0;
 }
 
+
+/* ---------------------------------------------------------------------------------------
+ * NET13b: the TCP and readiness subset — connect/listen/accept/send/recv/shutdown with
+ * partial I/O, dup/close lifetime, nonblocking and read/write timeouts, readiness through
+ * the session's existing WAIT object, and explicit refusals for everything outside it.
+ * --------------------------------------------------------------------------------------- */
+#define TCP_TOTAL 12000
+#define TCP_CHUNK 2048
+
+static unsigned char stream_byte(size_t index) {
+    return (unsigned char)((index * 31u + 7u) & 0xFFu);
+}
+
+static int tcp_fail(const char *what) {
+    say("relibc: tcp FAIL %s errno=%d\n", what, errno);
+    return 64;
+}
+
+static int tcp_set_nonblock(int fd, int on) {
+    const int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+}
+
+static void tcp_spin_ms(long ms) {
+    struct timespec start;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const long elapsed =
+            (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (elapsed >= ms) break;
+    }
+}
+
+static int tcp_loopback(void) {
+    static const struct in_addr loop_addr = {.s_addr = 0};
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(7803);
+    addr.sin_addr.s_addr = htonl(0x7f000001u);
+
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 3) return tcp_fail("listener socket");
+    if (bind(listener, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        return tcp_fail("listener bind");
+    }
+    if (listen(listener, 2) != 0) return tcp_fail("listen");
+
+    const int client = socket(AF_INET, SOCK_STREAM, 0);
+    if (client < 3) return tcp_fail("client socket");
+    if (connect(client, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        return tcp_fail("connect blocking");
+    }
+
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    const int server = accept(listener, (struct sockaddr *)&peer, &peer_len);
+    if (server < 3) return tcp_fail("accept");
+    if (peer_len != sizeof(peer) || peer.sin_family != AF_INET ||
+        peer.sin_addr.s_addr != htonl(0x7f000001u) || peer.sin_port == 0) {
+        return tcp_fail("accept peer sockaddr");
+    }
+    struct sockaddr_in local;
+    socklen_t local_len = sizeof(local);
+    if (getsockname(listener, (struct sockaddr *)&local, &local_len) != 0 ||
+        ntohs(local.sin_port) != 7803 || local.sin_addr.s_addr != htonl(0x7f000001u)) {
+        return tcp_fail("getsockname listener");
+    }
+    struct sockaddr_in conn_peer;
+    socklen_t conn_len = sizeof(conn_peer);
+    if (getpeername(client, (struct sockaddr *)&conn_peer, &conn_len) != 0 ||
+        ntohs(conn_peer.sin_port) != 7803) {
+        return tcp_fail("getpeername client");
+    }
+    (void)loop_addr;
+
+    /* One process drives both ends of a 12000-byte duplex stream: the client sends the
+     * generator, the server echoes every byte, SHUT_WR, then EOF both ways. Nonblocking
+     * sockets make the single-threaded pump possible and exercise fcntl for real. */
+    if (tcp_set_nonblock(client, 1) != 0 || tcp_set_nonblock(server, 1) != 0) {
+        return tcp_fail("fcntl nonblock");
+    }
+    static unsigned char out[TCP_CHUNK];
+    static unsigned char text[TCP_TOTAL];
+    for (size_t i = 0; i < TCP_TOTAL; ++i) text[i] = stream_byte(i);
+    size_t sent = 0;
+    size_t echoed = 0;
+    size_t echo_written = 0;
+    size_t got = 0;
+    int client_shut = 0, server_shut = 0, server_eof = 0, client_eof = 0;
+    int ok = 1;
+    for (int spin = 0; spin < 400000; ++spin) {
+        if (client_eof && server_eof && got == TCP_TOTAL) break;
+        int progress = 0;
+        if (sent < TCP_TOTAL) {
+            const size_t n = (TCP_TOTAL - sent) < TCP_CHUNK ? (TCP_TOTAL - sent) : TCP_CHUNK;
+            const ssize_t w = send(client, text + sent, n, 0);
+            if (w > 0) {
+                sent += (size_t)w;
+                progress = 1;
+            } else if (w < 0 && errno != EAGAIN) {
+                return tcp_fail("client send");
+            }
+        } else if (!client_shut) {
+            if (shutdown(client, SHUT_WR) != 0) return tcp_fail("client shutdown");
+            client_shut = 1;
+            progress = 1;
+        }
+        {
+            const ssize_t r = recv(server, out, sizeof(out), 0);
+            if (r > 0) {
+                echoed += (size_t)r;
+                progress = 1;
+            } else if (r == 0) {
+                server_eof = 1;
+            } else if (errno != EAGAIN) {
+                return tcp_fail("server recv");
+            }
+        }
+        while (echo_written < echoed) {
+            const size_t n =
+                (echoed - echo_written) < TCP_CHUNK ? (echoed - echo_written) : TCP_CHUNK;
+            const ssize_t w = send(server, text + echo_written, n, 0);
+            if (w > 0) {
+                echo_written += (size_t)w;
+                progress = 1;
+            } else if (w < 0 && errno != EAGAIN) {
+                return tcp_fail("server echo");
+            } else {
+                break;
+            }
+        }
+        if (server_eof && echo_written == echoed && !server_shut) {
+            if (shutdown(server, SHUT_WR) != 0) return tcp_fail("server shutdown");
+            server_shut = 1;
+            progress = 1;
+        }
+        {
+            const ssize_t r = recv(client, out, sizeof(out), 0);
+            if (r > 0) {
+                if (got + (size_t)r > TCP_TOTAL || memcmp(out, text + got, (size_t)r) != 0) {
+                    ok = 0;
+                    break;
+                }
+                got += (size_t)r;
+                progress = 1;
+            } else if (r == 0) {
+                client_eof = 1;
+            } else if (errno != EAGAIN) {
+                return tcp_fail("client recv");
+            }
+        }
+        if (!progress) tcp_spin_ms(1);
+    }
+    if (!ok || !client_shut || !server_eof || !client_eof || sent != TCP_TOTAL ||
+        got != TCP_TOTAL) {
+        say("relibc: tcp FAIL stream ok=%d sent=%zu echoed=%zu writ=%zu got=%zu eof=%d/%d\n",
+            ok, sent, echoed, echo_written, got, client_eof, server_eof);
+        return 64;
+    }
+    if (close(client) != 0 || close(server) != 0 || close(listener) != 0) {
+        return tcp_fail("close pair");
+    }
+    say("relibc: tcp loopback 12000 B both ways exact, SHUT_WR then EOF\n");
+    say("relibc: tcp loopback+readiness -> OK\n");
+    return 0;
+}
+
+static int tcp_edges(void) {
+    /* Flags and nonblocking through fcntl. */
+    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 3) return tcp_fail("socket nonblock");
+    const int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0 || (fl & O_NONBLOCK) == 0) return tcp_fail("fcntl get nonblock");
+    if (fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) != 0 ||
+        (fcntl(fd, F_GETFL, 0) & O_NONBLOCK) != 0) {
+        return tcp_fail("fcntl clear nonblock");
+    }
+    if (close(fd) != 0) return tcp_fail("close nonblock fd");
+
+    /* Unsupported families and options refuse by name. */
+    errno = 0;
+    if (socket(AF_INET6, SOCK_STREAM, 0) != -1 || errno != EAFNOSUPPORT) {
+        return tcp_fail("AF_INET6 stream");
+    }
+    errno = 0;
+    if (socket(AF_INET, SOCK_DGRAM, 132) != -1 || errno != EPROTONOSUPPORT) {
+        return tcp_fail("proto 132");
+    }
+    const int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe < 3) return tcp_fail("probe dgram");
+    int opt = 1;
+    errno = 0;
+    if (setsockopt(probe, SOL_SOCKET, SO_LINGER, &opt, sizeof(opt)) != -1 ||
+        errno != ENOPROTOOPT) {
+        return tcp_fail("setsockopt SO_LINGER");
+    }
+    socklen_t opt_len = sizeof(opt);
+    errno = 0;
+    if (getsockopt(probe, SOL_SOCKET, SO_LINGER, &opt, &opt_len) != -1 ||
+        errno != ENOPROTOOPT) {
+        return tcp_fail("getsockopt SO_LINGER");
+    }
+    errno = 0;
+    if (shutdown(probe, SHUT_WR) != -1 || errno != ENOTCONN) {
+        return tcp_fail("shutdown dgram");
+    }
+    if (close(probe) != 0) return tcp_fail("close probe");
+
+    /* A blocking connect to a closed loopback port refuses. */
+    struct sockaddr_in dead;
+    memset(&dead, 0, sizeof(dead));
+    dead.sin_family = AF_INET;
+    dead.sin_port = htons(7805);
+    dead.sin_addr.s_addr = htonl(0x7f000001u);
+    const int client = socket(AF_INET, SOCK_STREAM, 0);
+    if (client < 3) return tcp_fail("refused client socket");
+    errno = 0;
+    if (connect(client, (const struct sockaddr *)&dead, sizeof(dead)) != -1 ||
+        errno != ECONNREFUSED) {
+        return tcp_fail("connect refused");
+    }
+    if (close(client) != 0) return tcp_fail("close refused client");
+
+    /* A nonblocking connect answers EINPROGRESS, and SO_ERROR carries the refusal. */
+    struct sockaddr_in dead2;
+    memset(&dead2, 0, sizeof(dead2));
+    dead2.sin_family = AF_INET;
+    dead2.sin_port = htons(7807);
+    dead2.sin_addr.s_addr = htonl(0x7f000001u);
+    const int nb = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (nb < 3) return tcp_fail("nonblock connect socket");
+    errno = 0;
+    if (connect(nb, (const struct sockaddr *)&dead2, sizeof(dead2)) != -1 ||
+        errno != EINPROGRESS) {
+        return tcp_fail("nonblock connect EINPROGRESS");
+    }
+    int soerr = 0;
+    int refused = 0;
+    for (int spin = 0; spin < 400; ++spin) {
+        socklen_t sl = sizeof(soerr);
+        if (getsockopt(nb, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0) {
+            return tcp_fail("SO_ERROR get");
+        }
+        if (soerr == ECONNREFUSED) {
+            refused = 1;
+            break;
+        }
+        if (soerr != 0 && soerr != EINPROGRESS) break;
+        tcp_spin_ms(5);
+    }
+    if (!refused) {
+        say("relibc: tcp FAIL SO_ERROR refused soerr=%d\n", soerr);
+        return 64;
+    }
+    if (close(nb) != 0) return tcp_fail("close nonblock connect");
+
+    /* A read timeout answers EAGAIN instead of hanging. */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(7806);
+    addr.sin_addr.s_addr = htonl(0x7f000001u);
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 3) return tcp_fail("timeout listener");
+    if (bind(listener, (const struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(listener, 1) != 0) {
+        return tcp_fail("timeout listener setup");
+    }
+    const int conn = socket(AF_INET, SOCK_STREAM, 0);
+    if (conn < 3 || connect(conn, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        return tcp_fail("timeout connect");
+    }
+    const int peer = accept(listener, 0, 0);
+    if (peer < 3) return tcp_fail("timeout accept");
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 300000;
+    if (setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        return tcp_fail("SO_RCVTIMEO set");
+    }
+    struct timeval back;
+    socklen_t back_len = sizeof(back);
+    if (getsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &back, &back_len) != 0 ||
+        back.tv_sec != 0 || back.tv_usec != 300000) {
+        return tcp_fail("SO_RCVTIMEO get");
+    }
+    char small[8];
+    errno = 0;
+    if (recv(conn, small, sizeof(small), 0) != -1 || errno != EAGAIN) {
+        return tcp_fail("recv timeout");
+    }
+
+    /* dup2 lifetime: the session socket lives until the last alias closes. */
+    if (dup2(conn, 9) != 9) return tcp_fail("dup2");
+    if (close(conn) != 0) return tcp_fail("close alias one");
+    if (send(9, "alias", 5, 0) != 5) return tcp_fail("send through alias");
+    if (close(9) != 0) return tcp_fail("close alias last");
+    errno = 0;
+    if (send(9, "x", 1, 0) != -1 || errno != EBADF) return tcp_fail("send after last close");
+    if (close(peer) != 0 || close(listener) != 0) return tcp_fail("close edge pair");
+
+    say("relibc: tcp-edges fcntl/refusal/SO_ERROR/timeout/dup2 -> OK\n");
+    return 0;
+}
+
 int main(int argc, char **argv, char **envp) {
     if (argc > 1 && strcmp(argv[1], "screen") == 0) return screen_fixture();
     if (argc > 1 && strcmp(argv[1], "udp") == 0) return udp_loopback();
     if (argc > 1 && strcmp(argv[1], "udp-nogrant") == 0) return udp_nogrant();
     if (argc > 3 && strcmp(argv[1], "wire") == 0) return udp_wire(argv[2], argv[3]);
+    if (argc > 1 && strcmp(argv[1], "tcp") == 0) return tcp_loopback();
+    if (argc > 1 && strcmp(argv[1], "tcp-edges") == 0) return tcp_edges();
     enum { ALLOCATION_BYTES = 384 * 1024, PAGE_BYTES = 4096 };
 
     /* argv reached C through KUMO's argv VMO, not through an inherited POSIX stack. */

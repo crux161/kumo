@@ -1139,7 +1139,9 @@ fn build_autoexec() -> Vec<u8> {
       wc etc/autoexec\n\
       relibc i-a3\n\
       run relibc-smoke udp-nogrant\n\
-      net relibc-smoke udp\n"
+      net relibc-smoke udp\n\
+      net relibc-smoke tcp\n\
+      net relibc-smoke tcp-edges\n"
         .to_vec()
 }
 
