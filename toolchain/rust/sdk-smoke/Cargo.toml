@@ -1,0 +1,21 @@
+[package]
+name = "sdk-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately outside the kumo workspace: SH0's consumer builds against the prebuilt
+# sysroot (no -Z build-std) under scripts/kumo-rust-build.sh.
+[workspace]
+
+[[bin]]
+name = "sdk-smoke"
+path = "src/main.rs"
+
+[dependencies]
+kumo-abi = { path = "../../../lib/kumo-abi" }
+kumo-rt = { path = "../../../userland/kumo-rt" }
+sdk-smoke-lib = { path = "lib" }
+
+[profile.release]
+opt-level = 2

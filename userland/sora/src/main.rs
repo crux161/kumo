@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j825
 //j829
 //j837
 //j843
 //j856
+//j857
 
 extern crate alloc;
 
@@ -5874,11 +5874,36 @@ extern "C" fn sora_main(
     // manifest speaks the shell's own syntax. This is the X13s shell-vertical stopgap: commands
     // you add to the manifest run at boot and paint to the framebuffer with NO keyboard. Manifest
     // is small; a fixed buffer avoids the heap.
-    let mut manifest = [0u8; 256];
+    // The boot manifest grows with each proof program; 1 KiB stays far above any
+    // image. The old 256-byte cap silently dropped the tail (J857: the default
+    // autoexec reached 299 bytes and ruststd/run sdk-smoke never ran).
+    let mut manifest = [0u8; 1024];
     match find_initrd_file(initrd, AUTOEXEC_PATH.as_bytes()) {
         Some((off, len)) => {
+            if (len as usize) > manifest.len() {
+                log(b"autoexec: manifest exceeds the read buffer; truncated\n");
+            }
             let n = (len as usize).min(manifest.len());
-            if vmo_read(initrd, off, manifest.as_mut_ptr(), n) == 0 {
+            // VmoRead moves at most VMO_TRANSFER_MAX bytes per call; the ABI contract is
+            // that callers chunk. One large read left everything past 256 bytes zeroed,
+            // so the autoexec stopped mid-line and the tail never ran (J857).
+            let mut done = 0usize;
+            let mut read_ok = true;
+            while done < n {
+                let take = (n - done).min(kumo_abi::sys::VMO_TRANSFER_MAX);
+                if vmo_read(
+                    initrd,
+                    off + done as u64,
+                    manifest[done..done + take].as_mut_ptr(),
+                    take,
+                ) != 0
+                {
+                    read_ok = false;
+                    break;
+                }
+                done += take;
+            }
+            if read_ok {
                 for line in kumoza::autoexec_lines(&manifest[..n]) {
                     if let Ok(ls) = core::str::from_utf8(line) {
                         if let Some(stmt) = parse(ls) {

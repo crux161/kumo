@@ -1,8 +1,8 @@
-//j820
 //j822
 //j823
 //j824
 //j825
+//j857
 
 use std::env;
 use std::fmt;
@@ -23,8 +23,8 @@ use kumo_abi::initrd::{
     FATFS_PATH, GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, HELLO_PATH,
     INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX,
     INITRD_VERSION, KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH,
-    THREADS_PATH, TTYD_PATH, WC_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SDK_SMOKE_PATH, SORA_INIT_PATH, STD_SMOKE_PATH,
+    SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
@@ -152,6 +152,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "image" => image(&root, args.arch, hardware, args.pl011_console_base),
+        "sysroot" => run_tool(&root, "sh", &["scripts/rust-sysroot.sh"]),
         "product" => {
             let products = build_products(&root)?;
             println!("{}", products.host_stage.display());
@@ -951,6 +952,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let threads = build_threads_image(&workspace_root()?)?;
             let relibc_smoke = build_relibc_smoke_image(&workspace_root()?)?;
             let std_smoke = build_std_smoke_image(&workspace_root()?)?;
+            let sdk_smoke = build_sdk_smoke_image(&workspace_root()?)?;
             let kilo = build_kilo_image(&workspace_root()?)?;
             let autoexec = build_autoexec();
             let shadow = identity::shadow_file()?;
@@ -996,6 +998,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (THREADS_PATH, threads.as_slice()),
                 (RELIBC_SMOKE_PATH, relibc_smoke.as_slice()),
                 (STD_SMOKE_PATH, std_smoke.as_slice()),
+                (SDK_SMOKE_PATH, sdk_smoke.as_slice()),
                 (KILO_PATH, kilo.as_slice()),
                 (AUTOEXEC_PATH, autoexec.as_slice()),
                 (HOSTNAME_PATH, identity::HOSTNAME.as_bytes()),
@@ -1144,7 +1147,8 @@ fn build_autoexec() -> Vec<u8> {
       net relibc-smoke udp\n\
       net relibc-smoke tcp\n\
       net relibc-smoke tcp-edges\n\
-      ruststd\n"
+      ruststd\n\
+      run sdk-smoke\n"
         .to_vec()
 }
 
@@ -1446,6 +1450,22 @@ fn build_std_smoke_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as std-smoke ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_sdk_smoke_image(root: &Path) -> Result<Vec<u8>, String> {
+    // SH0 (PLAN/022): the consumer proof builds against the prebuilt sysroot with no
+    // -Z build-std. A clean checkout grows the sysroot first; the driver is idempotent.
+    let sysroot = root.join("build/sysroot/aarch64-unknown-kumo");
+    if !sysroot.join("manifest.json").is_file() {
+        run_tool(root, "sh", &["scripts/rust-sysroot.sh"])?;
+    }
+    run_tool(root, "sh", &["scripts/kumo-rust-build.sh"])?;
+    let source_path = root.join("target/sdk-smoke/aarch64-unknown-kumo/release/sdk-smoke");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as sdk-smoke ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 
@@ -3244,7 +3264,7 @@ x86_64 MUREX core online, first light reached; HALTING.\n";
 
 fn print_help() {
     println!(
-        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|x86-uefi-smoke|x86-initrd|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|rpi5|opi5plus|generic-uefi-x86_64] [--console-uart pl011@0x<base>]"
+        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|x86-uefi-smoke|x86-initrd|sysroot|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|rpi5|opi5plus|generic-uefi-x86_64] [--console-uart pl011@0x<base>]"
     );
     println!("       cargo xtask passwd <root|crux>: set a KUMO password at this terminal; only its argon2id hash is kept, in $KUMO_SHADOW or ~/.config/kumo/shadow");
     println!("default arch: aarch64; default hardware: thinkpad-x13s-gen1");

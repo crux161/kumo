@@ -1,5 +1,6 @@
 #!/bin/sh
 #j853
+#j857
 # Build KUMO's Rust std smoke from the pinned nightly's rust-src: stage the library tree,
 # alias the vendored libc to the linux surface for target_os = "kumo" (the same mechanical
 # admission relibc's kumo.patch makes in its headers), apply toolchain/rust/overlay, and
@@ -112,7 +113,7 @@ done
 
 # 5. Build std for the target against the staged tree.
 export __CARGO_TESTS_ONLY_SRC_ROOT="$stage/library"
-export CARGO_TARGET_DIR="$ROOT/target/rust-std-smoke"
+export CARGO_TARGET_DIR="${KUMO_RUST_STD_TARGET_DIR:-$ROOT/target/rust-std-smoke}"
 # An empty libunwind: rustc's std link line asks for it on unix, but panic=abort and the
 # gate program never unwind. Any genuinely referenced symbol surfaces below, in the shim.
 stublibs="$stage/stublibs"

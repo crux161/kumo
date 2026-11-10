@@ -1,8 +1,8 @@
-//j774
 //j798
 //j815
 //j824
 //j825
+//j857
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -101,6 +101,9 @@ pub const THREADS_PATH: &str = "bin/threads";
 pub const RELIBC_SMOKE_PATH: &str = "bin/relibc-smoke";
 /// The Rust std gate smoke (DESIGN/008 I-b).
 pub const STD_SMOKE_PATH: &str = "bin/std-smoke";
+/// SH0 (PLAN/022): the first program built against the prebuilt sysroot with no
+/// `-Z build-std`, from two crates and two source files (gate I-c consumer path).
+pub const SDK_SMOKE_PATH: &str = "bin/sdk-smoke";
 /// The first third-party C program ported to KUMO: antirez's `kilo` editor,
 /// byte-identical to upstream, built against KUMO's own C sysroot.
 pub const KILO_PATH: &str = "bin/kilo";
