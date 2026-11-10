@@ -1,0 +1,20 @@
+[package]
+name = "std-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately outside the kumo workspace: it builds with -Z build-std for the custom
+# target under scripts/rust-std-check.sh.
+[workspace]
+
+[[bin]]
+name = "std-smoke"
+path = "main.rs"
+
+[dependencies]
+kumo-abi = { path = "../../../lib/kumo-abi" }
+kumo-rt = { path = "../../../userland/kumo-rt" }
+
+[profile.release]
+opt-level = 2

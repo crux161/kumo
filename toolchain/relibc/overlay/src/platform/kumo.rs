@@ -998,6 +998,14 @@ unsafe fn build_startup_image(argv_vmo: u32) -> &'static Stack {
 /// KUMO's C startup entry. `_start` hands over the finite bootstrap channel and the
 /// address of `main`; everything after the SysV image is built — TLS activation, stdio,
 /// the init arrays, `main`, and exit — is upstream relibc's own start path. — TIMBERDOODLE
+/// The Rust `std` entry's startup intake: install the fd handles from the bootstrap
+/// stream exactly as the C start path does, and hand the argv VMO back to the caller,
+/// which owns its parse and close. std owns the rest of its runtime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __kumo_startup(bootstrap: u64) -> u32 {
+    take_bootstrap_capabilities(bootstrap as u32)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __relibc_kumo_start(
     bootstrap: u64,
@@ -1467,8 +1475,36 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// KUMO has no entropy object yet (recorded deviation): bytes are mixed from the
+    /// monotonic clock and an internal counter, and that is not cryptographic. HashMap
+    /// seeding is its consumer today; security-grade randomness is a later concern.
     fn getrandom(buf: &mut [u8], flags: c_uint) -> Result<usize> {
-        Err(unsupported())
+        use crate::header::errno::EINVAL;
+
+        const GRND_NONBLOCK: c_uint = 1;
+        const GRND_INSECURE: c_uint = 4;
+        if flags & !(GRND_NONBLOCK | GRND_INSECURE) != 0 {
+            return Err(Errno(EINVAL));
+        }
+        static STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let mut state = STATE.load(Ordering::Relaxed);
+        if state == 0 {
+            let nanos = syscall4(SYSCALL_CLOCK_GET, 0, 0, 0, 0);
+            state = nanos
+                ^ (&raw const STATE as usize as u64).rotate_left(17)
+                ^ 0x9e37_79b9_7f4a_7c15;
+            if state == 0 {
+                state = 0x9e37_79b9_7f4a_7c15;
+            }
+        }
+        for byte in buf.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        STATE.store(state, Ordering::Relaxed);
+        Ok(buf.len())
     }
 
     fn getresgid(
@@ -2050,8 +2086,17 @@ impl PalSignal for Sys {
         Err(unsupported())
     }
 
+    /// KUMO delivers no signals, so every disposition is vacuously honored: the query
+    /// reports SIG_DFL and the set succeeds. std's runtime asserts on `signal(SIGPIPE)`
+    /// during init, and an honest "no signals exist" answer is success, not an error.
     fn sigaction(sig: c_int, act: Option<&sigaction>, oact: Option<&mut sigaction>) -> Result<()> {
-        Err(unsupported())
+        let _ = (sig, act);
+        if let Some(old) = oact {
+            *old = unsafe { core::mem::zeroed() };
+            // The zeroed struct already carries SIG_DFL at the handler position.
+            old.sa_handler = None;
+        }
+        Ok(())
     }
 
     unsafe fn sigaltstack(ss: Option<&stack_t>, old_ss: Option<&mut stack_t>) -> Result<()> {

@@ -23,8 +23,8 @@ use kumo_abi::initrd::{
     FATFS_PATH, GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, HELLO_PATH,
     INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX,
     INITRD_VERSION, KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH,
-    TTYD_PATH, WC_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH,
+    THREADS_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
@@ -950,6 +950,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let lua_repl = build_lua_repl_image(&workspace_root()?)?;
             let threads = build_threads_image(&workspace_root()?)?;
             let relibc_smoke = build_relibc_smoke_image(&workspace_root()?)?;
+            let std_smoke = build_std_smoke_image(&workspace_root()?)?;
             let kilo = build_kilo_image(&workspace_root()?)?;
             let autoexec = build_autoexec();
             let shadow = identity::shadow_file()?;
@@ -994,6 +995,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (LUA_REPL_PATH, lua_repl.as_slice()),
                 (THREADS_PATH, threads.as_slice()),
                 (RELIBC_SMOKE_PATH, relibc_smoke.as_slice()),
+                (STD_SMOKE_PATH, std_smoke.as_slice()),
                 (KILO_PATH, kilo.as_slice()),
                 (AUTOEXEC_PATH, autoexec.as_slice()),
                 (HOSTNAME_PATH, identity::HOSTNAME.as_bytes()),
@@ -1141,7 +1143,8 @@ fn build_autoexec() -> Vec<u8> {
       run relibc-smoke udp-nogrant\n\
       net relibc-smoke udp\n\
       net relibc-smoke tcp\n\
-      net relibc-smoke tcp-edges\n"
+      net relibc-smoke tcp-edges\n\
+      ruststd\n"
         .to_vec()
 }
 
@@ -1430,6 +1433,19 @@ fn build_relibc_smoke_image(root: &Path) -> Result<Vec<u8>, String> {
             source_path.display()
         )
     })?;
+    Ok(bytes)
+}
+
+fn build_std_smoke_image(root: &Path) -> Result<Vec<u8>, String> {
+    // The Rust std gate (DESIGN/008 I-b): scripts/rust-std-check.sh stages the pinned
+    // nightly's library tree, admits kumo into the linux arms, and builds the smoke with
+    // -Z build-std against relibc's archive.
+    run_tool(root, "sh", &["scripts/rust-std-check.sh"])?;
+    let source_path = root.join("target/rust-std-smoke/aarch64-unknown-kumo/release/std-smoke");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as std-smoke ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 

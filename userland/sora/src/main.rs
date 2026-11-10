@@ -16,7 +16,8 @@ use kumo_abi::{
     BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
     GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GPU_LANE_PATH, GROUP_PATH,
     HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, NETSTACK_PATH, PASSWD_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH,
+    TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -7113,6 +7114,27 @@ fn eval_command(
         // source. Everything it needs was built by J509/J511-J514 for its own reasons; this
         // launcher only grants and gets out of the way. — TIMBERDOODLE
         start_kilo_session(initrd, cmd);
+        return true;
+    } else if cmd.name == "ruststd" {
+        // The Rust std gate (DESIGN/008 I-b): the same grants the C smoke gets, because
+        // std::fs goes through relibc's openat. — TIMBERDOODLE
+        debug_write(b"ruststd: Rust std smoke\n".as_ptr(), 24);
+        let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+        let count = command_argv_slots(cmd, &mut slots);
+        // A finite stdin keeps fd 0 open: std's unix init sanitizes the standard fds and
+        // would otherwise try to open /dev/null, which this image does not have.
+        run_with_startup_input(
+            initrd,
+            STD_SMOKE_PATH.as_bytes(),
+            b"std-smoke",
+            Some(&slots[..count]),
+            false,
+            FsGrant::Image,
+            false,
+            false,
+            StdinMode::Finite(b"\n"),
+            false,
+        );
         return true;
     } else if cmd.name == "relibc" {
         // I-a2: run the static C smoke with one finite stdout capability and its own argv

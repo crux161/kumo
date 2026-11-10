@@ -99,6 +99,8 @@ pub const THREADS_PATH: &str = "bin/threads";
 /// I-a1: statically linked C proof for relibc startup capability intake,
 /// fd 1/2 output, retained anonymous allocation growth, and process exit.
 pub const RELIBC_SMOKE_PATH: &str = "bin/relibc-smoke";
+/// The Rust std gate smoke (DESIGN/008 I-b).
+pub const STD_SMOKE_PATH: &str = "bin/std-smoke";
 /// The first third-party C program ported to KUMO: antirez's `kilo` editor,
 /// byte-identical to upstream, built against KUMO's own C sysroot.
 pub const KILO_PATH: &str = "bin/kilo";
