@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j537
 //j543
 //j545
 //j547
 //j548
+//j861
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -221,6 +221,22 @@ impl Bpb {
     pub const fn cluster_size_bytes(&self) -> u32 {
         self.bytes_per_sector as u32 * self.sectors_per_cluster as u32
     }
+}
+
+/// Build one 32-byte short directory entry (SH3's metadata writers share this).
+fn short_entry_bytes(
+    name: &[u8; 11],
+    attr: u8,
+    first_cluster: u32,
+    size: u32,
+) -> [u8; DIR_ENTRY_SIZE] {
+    let mut entry = [0u8; DIR_ENTRY_SIZE];
+    entry[..11].copy_from_slice(name);
+    entry[11] = attr;
+    entry[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+    entry[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+    entry[28..32].copy_from_slice(&size.to_le_bytes());
+    entry
 }
 
 /// A decoded short (8.3) directory entry.
@@ -1193,6 +1209,151 @@ impl FatVolume {
         }
     }
 
+    /// Resolve a path's parent directory cluster and final 8.3 name (SH3). The
+    /// parent must already exist; the final component need not.
+    fn parent_and_name<R: SectorReader>(
+        &self,
+        io: &mut R,
+        path: &[u8],
+    ) -> Result<(u32, [u8; 11]), FatWriteError> {
+        let mut components = path
+            .split(|&byte| byte == b'/')
+            .filter(|component| !component.is_empty())
+            .peekable();
+        let mut directory = self.bpb.root_cluster;
+        let name = loop {
+            let component = components.next().ok_or(FatWriteError::Invalid)?;
+            let name = name_to_83(component).ok_or(FatWriteError::Invalid)?;
+            if components.peek().is_none() {
+                break name;
+            }
+            let parent = self
+                .find_in_dir(io, directory, &name)
+                .ok_or(FatWriteError::Invalid)?;
+            if !parent.is_dir() {
+                return Err(FatWriteError::Invalid);
+            }
+            directory = parent.first_cluster;
+        };
+        Ok((directory, name))
+    }
+
+    /// Find a free (never-used or deleted) short-entry slot in a directory, walking
+    /// its cluster chain when needed. SH3's metadata operations share this walk.
+    fn free_dir_slot<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        dir_cluster: u32,
+    ) -> Result<DirLocation, FatWriteError> {
+        let mut cluster = dir_cluster;
+        loop {
+            let first = self.bpb.cluster_to_sector(cluster);
+            for sector_index in 0..self.bpb.sectors_per_cluster as u32 {
+                let lba = first + sector_index;
+                let mut sector = [0u8; SECTOR_SIZE];
+                if !io.read_sector(lba, &mut sector) {
+                    return Err(FatWriteError::Io);
+                }
+                for offset in (0..SECTOR_SIZE).step_by(DIR_ENTRY_SIZE) {
+                    if sector[offset] == 0 || sector[offset] == 0xE5 {
+                        return Ok(DirLocation {
+                            sector: lba,
+                            offset: offset as u16,
+                        });
+                    }
+                }
+            }
+            cluster = match self.next_link(io, cluster) {
+                Some(FatEntry::Next(next)) => next,
+                Some(FatEntry::End) => return Err(FatWriteError::NoSpace),
+                _ => return Err(FatWriteError::Io),
+            };
+        }
+    }
+
+    /// Retire one short entry by writing the deleted marker (SH3).
+    fn clear_entry<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        location: DirLocation,
+    ) -> Result<(), FatWriteError> {
+        let offset = location.offset as usize;
+        if offset + DIR_ENTRY_SIZE > SECTOR_SIZE {
+            return Err(FatWriteError::Invalid);
+        }
+        let mut sector = [0u8; SECTOR_SIZE];
+        if !io.read_sector(location.sector, &mut sector) {
+            return Err(FatWriteError::Io);
+        }
+        sector[offset] = 0xE5;
+        if !io.write_sector(location.sector, &sector) {
+            return Err(FatWriteError::Io);
+        }
+        Ok(())
+    }
+
+    /// Write one complete short entry at `location` (SH3).
+    fn write_entry_at<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        location: DirLocation,
+        name: &[u8; 11],
+        attr: u8,
+        first_cluster: u32,
+        size: u32,
+    ) -> Result<(), FatWriteError> {
+        let offset = location.offset as usize;
+        if offset + DIR_ENTRY_SIZE > SECTOR_SIZE {
+            return Err(FatWriteError::Invalid);
+        }
+        let mut sector = [0u8; SECTOR_SIZE];
+        if !io.read_sector(location.sector, &mut sector) {
+            return Err(FatWriteError::Io);
+        }
+        sector[offset..offset + DIR_ENTRY_SIZE].fill(0);
+        sector[offset..offset + 11].copy_from_slice(name);
+        sector[offset + 11] = attr;
+        sector[offset + 20..offset + 22]
+            .copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+        sector[offset + 26..offset + 28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+        sector[offset + 28..offset + 32].copy_from_slice(&size.to_le_bytes());
+        if !io.write_sector(location.sector, &sector) {
+            return Err(FatWriteError::Io);
+        }
+        Ok(())
+    }
+
+    /// Return every cluster of a chain to the free pool (SH3). A start below 2 is an
+    /// empty file and frees nothing; an already-free cluster stops the walk
+    /// conservatively rather than corrupting a shared chain.
+    fn free_chain<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        start: u32,
+    ) -> Result<(), FatWriteError> {
+        if start < 2 {
+            return Ok(());
+        }
+        let limit = self.cluster_limit();
+        let mut cluster = start;
+        let mut freed = 0u32;
+        while cluster >= 2 && cluster < limit && freed < limit.saturating_sub(2) {
+            let next = match self.next_link(io, cluster) {
+                Some(FatEntry::Next(next)) => Some(next),
+                Some(FatEntry::End) => None,
+                Some(FatEntry::Free) => break,
+                Some(FatEntry::Bad) | None => return Err(FatWriteError::Io),
+            };
+            self.write_fat_entry(io, cluster, 0)?;
+            freed += 1;
+            match next {
+                Some(next) => cluster = next,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
     /// Create one missing 8.3 regular file. Parent directories must already
     /// exist; a full directory returns [`FatWriteError::NoSpace`].
     pub fn create_file<R: SectorReader + SectorWriter>(
@@ -1321,6 +1482,158 @@ impl FatVolume {
             self.set_file_len(io, entry, end)?;
         }
         self.write_storage(io, entry, offset, data)
+    }
+
+    /// Create one missing 8.3 directory (SH3). Parent directories must already
+    /// exist; an existing target returns [`FatWriteError::Invalid`].
+    pub fn create_dir<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        path: &[u8],
+    ) -> Result<DirEntry, FatWriteError> {
+        let (parent, name) = self.parent_and_name(io, path)?;
+        if self.find_in_dir(io, parent, &name).is_some() {
+            return Err(FatWriteError::Invalid);
+        }
+        let slot = self.free_dir_slot(io, parent)?;
+        let cluster = self.find_free_cluster(io)?;
+        self.write_fat_entry(io, cluster, FAT32_EOF_MIN)?;
+        self.zero_cluster(io, cluster)?;
+        // A fresh directory opens with `.` (itself) and `..` (its parent; the root
+        // is addressed as cluster 0 by the FAT contract).
+        let parent_cluster = if parent == self.bpb.root_cluster {
+            0
+        } else {
+            parent
+        };
+        let mut first_sector = [0u8; SECTOR_SIZE];
+        let dot = short_entry_bytes(b".          ", attr::DIRECTORY, cluster, 0);
+        let dotdot = short_entry_bytes(b"..         ", attr::DIRECTORY, parent_cluster, 0);
+        first_sector[0..DIR_ENTRY_SIZE].copy_from_slice(&dot);
+        first_sector[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot);
+        let first = self.bpb.cluster_to_sector(cluster);
+        if !io.write_sector(first, &first_sector) {
+            return Err(FatWriteError::Io);
+        }
+        self.write_entry_at(io, slot, &name, attr::DIRECTORY, cluster, 0)?;
+        Ok(DirEntry {
+            name,
+            attr: attr::DIRECTORY,
+            first_cluster: cluster,
+            size: 0,
+            location: Some(slot),
+        })
+    }
+
+    /// Remove one regular file and free its cluster chain (SH3). Directories are
+    /// refused; use [`remove_dir`](Self::remove_dir).
+    pub fn remove_file<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        path: &[u8],
+    ) -> Result<(), FatWriteError> {
+        let entry = self.resolve_path(io, path).ok_or(FatWriteError::Invalid)?;
+        if entry.is_dir() {
+            return Err(FatWriteError::Invalid);
+        }
+        self.free_chain(io, entry.first_cluster)?;
+        let location = entry.location.ok_or(FatWriteError::Invalid)?;
+        self.clear_entry(io, location)
+    }
+
+    /// Remove one empty 8.3 directory (SH3). A directory holding anything but its
+    /// own `.`/`..` entries is refused with [`FatWriteError::Invalid`].
+    pub fn remove_dir<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        path: &[u8],
+    ) -> Result<(), FatWriteError> {
+        let entry = self.resolve_path(io, path).ok_or(FatWriteError::Invalid)?;
+        if !entry.is_dir() {
+            return Err(FatWriteError::Invalid);
+        }
+        let limit = self.cluster_limit();
+        let mut cluster = entry.first_cluster;
+        if cluster >= 2 {
+            let mut visited = 0u32;
+            'scan: loop {
+                let first = self.bpb.cluster_to_sector(cluster);
+                for sector_index in 0..self.bpb.sectors_per_cluster as u32 {
+                    let mut sector = [0u8; SECTOR_SIZE];
+                    if !io.read_sector(first + sector_index, &mut sector) {
+                        return Err(FatWriteError::Io);
+                    }
+                    for offset in (0..SECTOR_SIZE).step_by(DIR_ENTRY_SIZE) {
+                        let slot = &sector[offset..offset + DIR_ENTRY_SIZE];
+                        if slot[0] == 0 {
+                            // A never-used slot ends the valid directory area.
+                            break 'scan;
+                        }
+                        if slot[0] == 0xE5 {
+                            continue;
+                        }
+                        if &slot[..11] == b".          " || &slot[..11] == b"..         " {
+                            continue;
+                        }
+                        return Err(FatWriteError::Invalid);
+                    }
+                }
+                cluster = match self.next_link(io, cluster) {
+                    Some(FatEntry::Next(next)) => next,
+                    Some(FatEntry::End) => break,
+                    _ => return Err(FatWriteError::Io),
+                };
+                visited += 1;
+                if visited >= limit.saturating_sub(2) {
+                    return Err(FatWriteError::Invalid);
+                }
+            }
+        }
+        self.free_chain(io, entry.first_cluster)?;
+        let location = entry.location.ok_or(FatWriteError::Invalid)?;
+        self.clear_entry(io, location)
+    }
+
+    /// Rename one 8.3 file, replacing an existing target file (SH3). The new entry
+    /// is written before the old one is retired, so a mid-way failure leaves a
+    /// duplicate rather than a lost file. Directory renames are refused; FAT would
+    /// also require rewriting the directory's `..` entry.
+    pub fn rename<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<(), FatWriteError> {
+        let source = self.resolve_path(io, from).ok_or(FatWriteError::Invalid)?;
+        if source.is_dir() {
+            return Err(FatWriteError::Invalid);
+        }
+        let (parent_to, name_to) = self.parent_and_name(io, to)?;
+        let slot = match self.find_in_dir(io, parent_to, &name_to) {
+            Some(target) => {
+                if target.is_dir() {
+                    return Err(FatWriteError::Invalid);
+                }
+                let location = target.location.ok_or(FatWriteError::Invalid)?;
+                self.free_chain(io, target.first_cluster)?;
+                location
+            }
+            None => self.free_dir_slot(io, parent_to)?,
+        };
+        self.write_entry_at(
+            io,
+            slot,
+            &name_to,
+            source.attr,
+            source.first_cluster,
+            source.size,
+        )?;
+        if let Some(source_location) = source.location {
+            if source_location != slot {
+                self.clear_entry(io, source_location)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn flush<R: SectorWriter>(&self, writer: &mut R) -> Result<(), FatWriteError> {
@@ -2535,5 +2848,135 @@ mod tests {
         assert_eq!(fat.resolve_path(&mut disk, b"/hello.txt").unwrap().size, 6);
         assert_eq!(fat.resolve_path(&mut disk, b"/Love Spell"), None);
         assert_eq!(fat.resolve_path(&mut disk, b"/Boot Files/.."), None);
+    }
+
+    // The existing `WritableDisk` (above) serves these tests; this adds the FAT view.
+    impl WritableDisk {
+        fn fat_entry_raw(&self, cluster: u32) -> u32 {
+            let off = cluster as usize * 4;
+            u32::from_le_bytes(self.sectors[32][off..off + 4].try_into().unwrap())
+                & FAT32_ENTRY_MASK
+        }
+    }
+
+    #[test]
+    fn create_dir_writes_dot_entries_and_resolves() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        let entry = vol.create_dir(&mut disk, b"/WORK").expect("mkdir");
+        assert!(entry.is_dir());
+        assert!(entry.first_cluster >= 2);
+        let found = vol.resolve_path(&mut disk, b"/WORK").expect("resolve");
+        assert_eq!(found.first_cluster, entry.first_cluster);
+        assert!(found.is_dir());
+
+        // The new directory's first sector opens with `.` (itself) and `..` (root = 0).
+        let sector = disk.sectors[vol.bpb().cluster_to_sector(entry.first_cluster) as usize];
+        assert_eq!(&sector[..11], b".          ");
+        assert_eq!(sector[11], attr::DIRECTORY);
+        let dot_cluster = u32::from(u16::from_le_bytes([sector[26], sector[27]]))
+            | (u32::from(u16::from_le_bytes([sector[20], sector[21]])) << 16);
+        assert_eq!(dot_cluster, entry.first_cluster);
+        assert_eq!(&sector[32..43], b"..         ");
+        let dotdot_cluster = u32::from(u16::from_le_bytes([sector[58], sector[59]]))
+            | (u32::from(u16::from_le_bytes([sector[52], sector[53]])) << 16);
+        assert_eq!(dotdot_cluster, 0);
+    }
+
+    #[test]
+    fn create_dir_refuses_an_existing_target() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        vol.create_dir(&mut disk, b"/WORK").unwrap();
+        assert_eq!(
+            vol.create_dir(&mut disk, b"/WORK"),
+            Err(FatWriteError::Invalid)
+        );
+    }
+
+    #[test]
+    fn remove_file_frees_chain_and_directory_slot() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        // The fixture marks the chain's tail with an end-of-chain value
+        // (0x0FFF_FFFF), i.e. anything at or above FAT32_EOF_MIN.
+        assert!(disk.fat_entry_raw(3) >= FAT32_EOF_MIN);
+        vol.remove_file(&mut disk, b"/HELLO.TXT").expect("unlink");
+        assert!(vol.resolve_path(&mut disk, b"/HELLO.TXT").is_none());
+        assert_eq!(disk.fat_entry_raw(3), 0);
+        // The freed cluster is reusable: the next grown file lands on it.
+        let mut created = vol.create_file(&mut disk, b"/NEW.TXT").expect("create");
+        vol.set_file_len(&mut disk, &mut created, 1).unwrap();
+        let grown = vol.resolve_path(&mut disk, b"/NEW.TXT").unwrap();
+        assert_eq!(grown.first_cluster, 3);
+    }
+
+    #[test]
+    fn remove_dir_requires_an_empty_directory() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        vol.create_dir(&mut disk, b"/WORK").unwrap();
+        let file = vol.create_file(&mut disk, b"/WORK/A.TXT").unwrap();
+        let mut file = file;
+        vol.set_file_len(&mut disk, &mut file, 4).unwrap();
+        assert_eq!(
+            vol.remove_dir(&mut disk, b"/WORK"),
+            Err(FatWriteError::Invalid)
+        );
+        vol.remove_file(&mut disk, b"/WORK/A.TXT").unwrap();
+        vol.remove_dir(&mut disk, b"/WORK").expect("rmdir");
+        assert!(vol.resolve_path(&mut disk, b"/WORK").is_none());
+    }
+
+    #[test]
+    fn rename_replaces_a_file_and_moves_bytes() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        let mut temp = vol.create_file(&mut disk, b"/SAVE.TMP").unwrap();
+        vol.set_file_len(&mut disk, &mut temp, 3).unwrap();
+        vol.write_file_at(&mut disk, &mut temp, 0, b"new").unwrap();
+        let mut old = vol.create_file(&mut disk, b"/SAVE.TXT").unwrap();
+        vol.set_file_len(&mut disk, &mut old, 4).unwrap();
+        vol.write_file_at(&mut disk, &mut old, 0, b"old!").unwrap();
+        let old_cluster = old.first_cluster;
+
+        vol.rename(&mut disk, b"/SAVE.TMP", b"/SAVE.TXT")
+            .expect("rename");
+        assert!(vol.resolve_path(&mut disk, b"/SAVE.TMP").is_none());
+        let landed = vol.resolve_path(&mut disk, b"/SAVE.TXT").expect("target");
+        let mut out = [0u8; 8];
+        let n = vol.read_file(&mut disk, &landed, &mut out);
+        assert_eq!(&out[..n], b"new");
+        // The replaced file's chain was freed.
+        assert_eq!(disk.fat_entry_raw(old_cluster), 0);
+    }
+
+    #[test]
+    fn rename_moves_a_file_across_directories() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        vol.create_dir(&mut disk, b"/DONE").unwrap();
+        let mut file = vol.create_file(&mut disk, b"/A.TXT").unwrap();
+        vol.set_file_len(&mut disk, &mut file, 5).unwrap();
+        vol.write_file_at(&mut disk, &mut file, 0, b"moved")
+            .unwrap();
+        vol.rename(&mut disk, b"/A.TXT", b"/DONE/B.TXT")
+            .expect("rename");
+        assert!(vol.resolve_path(&mut disk, b"/A.TXT").is_none());
+        let landed = vol.resolve_path(&mut disk, b"/DONE/B.TXT").expect("target");
+        let mut out = [0u8; 8];
+        let n = vol.read_file(&mut disk, &landed, &mut out);
+        assert_eq!(&out[..n], b"moved");
+    }
+
+    #[test]
+    fn rename_refuses_a_directory() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        vol.create_dir(&mut disk, b"/WORK").unwrap();
+        assert_eq!(
+            vol.rename(&mut disk, b"/WORK", b"/OTHER"),
+            Err(FatWriteError::Invalid)
+        );
     }
 }
