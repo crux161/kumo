@@ -3,6 +3,7 @@
 //j844
 //j846
 //j848
+//j850
 
 extern crate std;
 
@@ -2610,4 +2611,515 @@ fn a_generation_change_discards_the_lease() {
     );
 
     // The new generation starts from Discovering, exactly like a cold attach.
+}
+
+// ---- NET12: the DNS resolver, host half against a fake isolated server ----
+
+const DNS_UDP_PORT: u16 = 6801;
+const DNS_TCP_PORT: u16 = 6802;
+/// The resolver's own local port (DNS_INTERNAL_PORT in the server).
+const DNS_CLIENT_PORT: u16 = 47653;
+const DNS_A_ADDR: [u8; 4] = [192, 168, 0, 77];
+const DNS_FLAGS_OK: u16 = 0x8180;
+const DNS_FLAG_TRUNCATED: u16 = 0x0200;
+const DNS_FLAG_NXDOMAIN: u16 = 0x0003;
+
+fn dns_grant(server: &mut Server, fallback: bool) {
+    server.set_resolver(ResolverConfig {
+        server: PEER_IP,
+        udp_port: DNS_UDP_PORT,
+        tcp_port: DNS_TCP_PORT,
+        fallback,
+    });
+}
+
+fn dns_run(server: &mut Server, ms: u64) {
+    for _ in 0..ms {
+        clock::advance(MS);
+        let mut out = Vec::new();
+        server.poll(clock::now(), &mut out);
+    }
+}
+
+/// Drain the wire, answer ARP, and return the first DNS query (transaction id, question
+/// bytes verbatim) the resolver emitted.
+fn dns_take_query(server: &mut Server) -> Option<(u16, Vec<u8>)> {
+    let mut frame = [0u8; FRAME_MAX];
+    while let Some(n) = server.take_wire_frame(&mut frame) {
+        let f = &frame[..n];
+        if f.len() >= 42 && f[12..14] == [0x08, 0x06] {
+            server
+                .push_wire_frame(&arp_reply_to(PEER_IP, WIRE_IP))
+                .expect("the ARP reply is admitted");
+            continue;
+        }
+        if f.len() < 42 || f[12..14] != [0x08, 0x00] || f[23] != 17 {
+            continue;
+        }
+        let ihl = usize::from(f[14] & 0x0F) * 4;
+        let udp = 14 + ihl;
+        if f.len() < udp + 8 {
+            continue;
+        }
+        let src = u16::from_be_bytes([f[udp], f[udp + 1]]);
+        let dst = u16::from_be_bytes([f[udp + 2], f[udp + 3]]);
+        if src != DNS_CLIENT_PORT || dst != DNS_UDP_PORT {
+            continue;
+        }
+        let payload = &f[udp + 8..n];
+        if payload.len() < 12 {
+            continue;
+        }
+        return Some((
+            u16::from_be_bytes([payload[0], payload[1]]),
+            payload[12..].to_vec(),
+        ));
+    }
+    None
+}
+
+fn dns_reply_wire(txid: u16, question: &[u8], flags: u16, ancount: u16, answers: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + question.len() + answers.len());
+    out.extend_from_slice(&txid.to_be_bytes());
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&ancount.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(question);
+    out.extend_from_slice(answers);
+    out
+}
+
+fn dns_a_answer(ttl: u32, addr: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&[0xC0, 0x0C]);
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&ttl.to_be_bytes());
+    out.extend_from_slice(&4u16.to_be_bytes());
+    out.extend_from_slice(&addr);
+    out
+}
+
+fn dns_push(server: &mut Server, payload: &[u8]) {
+    server
+        .push_wire_frame(&udp_frame_exact(
+            PEER_IP,
+            WIRE_IP,
+            DNS_UDP_PORT,
+            DNS_CLIENT_PORT,
+            payload,
+        ))
+        .expect("the reply is admitted");
+}
+
+fn resolve(c: &mut Client, server: &mut Server, name: &[u8]) -> Answer {
+    c.call(server, Op::Resolve, 0, 0, name)
+}
+
+/// Start a lookup and return its query as the fake server would answer it.
+fn dns_start(server: &mut Server, c: &mut Client, name: &[u8]) -> (u16, Vec<u8>) {
+    assert_eq!(resolve(c, server, name).status, Status::InProgress);
+    for _ in 0..200 {
+        if let Some(query) = dns_take_query(server) {
+            return query;
+        }
+        dns_run(server, 1);
+    }
+    panic!("no DNS query left the resolver");
+}
+
+#[test]
+fn a_dns_a_lookup_answers_and_caches() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    dns_grant(&mut server, false);
+    let mut c = Client::open(&mut server);
+
+    let (txid, question) = dns_start(&mut server, &mut c, b"kumo.test");
+    dns_push(
+        &mut server,
+        &dns_reply_wire(
+            txid,
+            &question,
+            DNS_FLAGS_OK,
+            1,
+            &dns_a_answer(3, DNS_A_ADDR),
+        ),
+    );
+    dns_run(&mut server, 5);
+    let answer = resolve(&mut c, &mut server, b"kumo.test");
+    assert_eq!(answer.status, Status::Ok);
+    assert_eq!((answer.result as u32).to_be_bytes(), DNS_A_ADDR);
+    match server.take_wire_event() {
+        Some(WireEvent::DnsQuerySent) => {}
+        other => panic!("expected the query event first, got {other:?}"),
+    }
+    match server.take_wire_event() {
+        Some(WireEvent::DnsAnswer { addr }) => assert_eq!(addr, DNS_A_ADDR),
+        other => panic!("expected the answer event, got {other:?}"),
+    }
+
+    // The cache answers the second lookup without a query on the wire.
+    assert_eq!(
+        resolve(&mut c, &mut server, b"kumo.test").status,
+        Status::Ok
+    );
+    dns_run(&mut server, 5);
+    assert!(
+        dns_take_query(&mut server).is_none(),
+        "a cache hit sends no query"
+    );
+}
+
+#[test]
+fn a_dns_cache_entry_expires_with_its_ttl() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    dns_grant(&mut server, false);
+    let mut c = Client::open(&mut server);
+    let (txid, question) = dns_start(&mut server, &mut c, b"kumo.test");
+    dns_push(
+        &mut server,
+        &dns_reply_wire(
+            txid,
+            &question,
+            DNS_FLAGS_OK,
+            1,
+            &dns_a_answer(3, DNS_A_ADDR),
+        ),
+    );
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"kumo.test").status,
+        Status::Ok
+    );
+
+    dns_run(&mut server, 3_200);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"kumo.test").status,
+        Status::InProgress,
+        "the expired entry starts a fresh lookup"
+    );
+    let mut requery = None;
+    for _ in 0..200 {
+        if let Some(query) = dns_take_query(&mut server) {
+            requery = Some(query);
+            break;
+        }
+        dns_run(&mut server, 1);
+    }
+    assert!(requery.is_some(), "the requery left the wire");
+}
+
+#[test]
+fn a_dns_nxdomain_is_negative_cached() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    dns_grant(&mut server, false);
+    let mut c = Client::open(&mut server);
+    let (txid, question) = dns_start(&mut server, &mut c, b"nope.test");
+    dns_push(
+        &mut server,
+        &dns_reply_wire(txid, &question, DNS_FLAGS_OK | DNS_FLAG_NXDOMAIN, 0, &[]),
+    );
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"nope.test").status,
+        Status::NotFound
+    );
+    assert!(matches!(
+        server.take_wire_event(),
+        Some(WireEvent::DnsQuerySent)
+    ));
+    assert!(matches!(
+        server.take_wire_event(),
+        Some(WireEvent::DnsNotFound)
+    ));
+    assert_eq!(
+        resolve(&mut c, &mut server, b"nope.test").status,
+        Status::NotFound
+    );
+    dns_run(&mut server, 5);
+    assert!(
+        dns_take_query(&mut server).is_none(),
+        "the negative entry answers without a query"
+    );
+
+    // Past the negative TTL a fresh lookup goes out.
+    dns_run(&mut server, 10_200);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"nope.test").status,
+        Status::InProgress
+    );
+    let mut requery = false;
+    for _ in 0..200 {
+        if dns_take_query(&mut server).is_some() {
+            requery = true;
+            break;
+        }
+        dns_run(&mut server, 1);
+    }
+    assert!(requery, "the negative entry expired and requeries");
+}
+
+#[test]
+fn a_dns_reply_is_validated_against_id_source_and_shape() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    dns_grant(&mut server, false);
+    let mut c = Client::open(&mut server);
+    let (txid, question) = dns_start(&mut server, &mut c, b"reject.test");
+    let good = dns_reply_wire(
+        txid,
+        &question,
+        DNS_FLAGS_OK,
+        1,
+        &dns_a_answer(30, DNS_A_ADDR),
+    );
+
+    // A wrong transaction id is rejected.
+    let mut bad_id = good.clone();
+    bad_id[0] ^= 0x01;
+    dns_push(&mut server, &bad_id);
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"reject.test").status,
+        Status::InProgress
+    );
+
+    // A reply from the wrong source port is rejected.
+    server
+        .push_wire_frame(&udp_frame_exact(
+            PEER_IP,
+            WIRE_IP,
+            9999,
+            DNS_CLIENT_PORT,
+            &good,
+        ))
+        .unwrap();
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"reject.test").status,
+        Status::InProgress
+    );
+
+    // A truncated header is malformed and ignored.
+    dns_push(&mut server, &good[..10]);
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"reject.test").status,
+        Status::InProgress
+    );
+
+    // A self-referential compression pointer in the question name is rejected.
+    let mut looped = dns_reply_wire(txid, &[], DNS_FLAGS_OK, 0, &[]);
+    looped.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+    dns_push(&mut server, &looped);
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"reject.test").status,
+        Status::InProgress
+    );
+
+    // The valid reply still lands.
+    dns_push(&mut server, &good);
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"reject.test").status,
+        Status::Ok
+    );
+
+    let (mut rejected, mut malformed) = (0u32, 0u32);
+    while let Some(event) = server.take_wire_event() {
+        match event {
+            WireEvent::DnsRejected => rejected += 1,
+            WireEvent::DnsMalformed => malformed += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        rejected >= 3,
+        "wrong id, wrong source, and the pointer loop are rejected"
+    );
+    assert!(malformed >= 1, "the truncated header is malformed");
+}
+
+#[test]
+fn a_dns_oversized_reply_is_refused_by_name() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    dns_grant(&mut server, false);
+    let mut c = Client::open(&mut server);
+    let (txid, question) = dns_start(&mut server, &mut c, b"big.test");
+    let mut big = dns_reply_wire(
+        txid,
+        &question,
+        DNS_FLAGS_OK,
+        1,
+        &dns_a_answer(30, DNS_A_ADDR),
+    );
+    big.extend(std::iter::repeat_n(0u8, 600 - big.len()));
+    dns_push(&mut server, &big);
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"big.test").status,
+        Status::MessageTooLarge
+    );
+    assert!(
+        dns_take_query(&mut server).is_none(),
+        "the refusal is cached; no immediate requery"
+    );
+}
+
+#[test]
+fn a_dns_truncation_without_fallback_is_refused() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    dns_grant(&mut server, false);
+    let mut c = Client::open(&mut server);
+    let (txid, question) = dns_start(&mut server, &mut c, b"trunc.test");
+    dns_push(
+        &mut server,
+        &dns_reply_wire(txid, &question, DNS_FLAGS_OK | DNS_FLAG_TRUNCATED, 0, &[]),
+    );
+    dns_run(&mut server, 5);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"trunc.test").status,
+        Status::MessageTooLarge
+    );
+}
+
+#[test]
+fn a_dns_truncated_udp_answer_falls_back_to_tcp() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    dns_grant(&mut server, true);
+    let mut peer = WirePeer::new(clock::now());
+    let listener = peer.tcp();
+    peer.sockets
+        .get_mut::<tcp::Socket>(listener)
+        .listen(DNS_TCP_PORT)
+        .expect("the fake DNS server listens");
+    let mut c = Client::open(&mut server);
+
+    // Capture the UDP query directly: run_wire would pump it into the peer stack first.
+    let (txid, question) = dns_start(&mut server, &mut c, b"kumo.test");
+    dns_push(
+        &mut server,
+        &dns_reply_wire(txid, &question, DNS_FLAGS_OK | DNS_FLAG_TRUNCATED, 0, &[]),
+    );
+
+    // Wait for the TCP connection and the length-prefixed query.
+    let mut framed = Vec::new();
+    for _ in 0..5_000 {
+        run_wire(&mut server, &mut peer, 1);
+        {
+            let socket = peer.sockets.get_mut::<tcp::Socket>(listener);
+            let mut buf = [0u8; 512];
+            while socket.can_recv() {
+                if let Ok(n) = socket.recv_slice(&mut buf) {
+                    framed.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
+        if framed.len() >= 2 {
+            let want = 2 + usize::from(u16::from_be_bytes([framed[0], framed[1]]));
+            if framed.len() >= want {
+                break;
+            }
+        }
+    }
+    assert!(framed.len() >= 2, "the framed query reached the TCP server");
+    assert_eq!(
+        u16::from_be_bytes([framed[0], framed[1]]),
+        (framed.len() - 2) as u16
+    );
+    assert_eq!(
+        u16::from_be_bytes([framed[2], framed[3]]),
+        txid,
+        "the TCP query id matches"
+    );
+
+    let reply = dns_reply_wire(
+        txid,
+        &question,
+        DNS_FLAGS_OK,
+        1,
+        &dns_a_answer(30, DNS_A_ADDR),
+    );
+    let mut framed_reply = Vec::with_capacity(2 + reply.len());
+    framed_reply.extend_from_slice(&(reply.len() as u16).to_be_bytes());
+    framed_reply.extend_from_slice(&reply);
+    peer.sockets
+        .get_mut::<tcp::Socket>(listener)
+        .send_slice(&framed_reply)
+        .expect("the framed reply is queued");
+
+    for _ in 0..2_000 {
+        run_wire(&mut server, &mut peer, 1);
+        let answer = resolve(&mut c, &mut server, b"kumo.test");
+        match answer.status {
+            Status::InProgress => {}
+            Status::Ok => {
+                assert_eq!((answer.result as u32).to_be_bytes(), DNS_A_ADDR);
+                return;
+            }
+            other => panic!("fallback lookup -> {other:?}"),
+        }
+    }
+    panic!("the fallback lookup never completed");
+}
+
+#[test]
+fn a_dns_timeout_is_bounded_and_cached() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    dns_grant(&mut server, false);
+    let mut c = Client::open(&mut server);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"slow.test").status,
+        Status::InProgress
+    );
+    let mut transmissions = 0u32;
+    for _ in 0..4_500 {
+        if dns_take_query(&mut server).is_some() {
+            transmissions += 1;
+        }
+        dns_run(&mut server, 1);
+    }
+    assert_eq!(transmissions, 3, "three transmissions then the deadline");
+    assert_eq!(
+        resolve(&mut c, &mut server, b"slow.test").status,
+        Status::TimedOut
+    );
+    let before = transmissions;
+    for _ in 0..1_000 {
+        if dns_take_query(&mut server).is_some() {
+            transmissions += 1;
+        }
+        dns_run(&mut server, 1);
+    }
+    assert_eq!(transmissions, before, "the timeout is cached; no requery");
+    assert_eq!(
+        resolve(&mut c, &mut server, b"slow.test").status,
+        Status::TimedOut
+    );
+}
+
+#[test]
+fn a_dns_lookup_without_a_grant_is_named() {
+    let mut server = Server::new(clock::now());
+    server.attach_wire(clock::now(), WIRE_MAC, WIRE_IP, 24);
+    let mut c = Client::open(&mut server);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"kumo.test").status,
+        Status::NotConfigured
+    );
+    dns_grant(&mut server, false);
+    assert_eq!(
+        resolve(&mut c, &mut server, b"a..b").status,
+        Status::InvalidArgument
+    );
 }

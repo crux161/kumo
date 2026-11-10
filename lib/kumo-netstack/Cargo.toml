@@ -23,6 +23,11 @@ smoltcp = { version = "=0.14.0", default-features = false, features = [
     # wire stack only (DESIGN/026 §8). No new crate enters the closure.
     "proto-dhcpv4",
     "socket-dhcpv4",
+    # NET12 (J850): the DNS wire parser only. socket-dns is deliberately NOT enabled: its
+    # port is hardcoded to 53 (an unprivileged isolated server cannot answer), it ignores
+    # TC (no TCP fallback), and it owns no cache/TTL; netstack implements the transport and
+    # policy over this parser (DESIGN/026 §8 deviation, J850).
+    "proto-dns",
 ] }
 
 [lib]

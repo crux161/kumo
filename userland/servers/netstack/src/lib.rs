@@ -176,6 +176,227 @@ pub enum IngressError {
 /// NET11: the DHCP client's receive packet buffer (a DHCP message is far under 576 B).
 const DHCP_PACKET_BUFFER: usize = 576;
 
+/// NET12 resolver policy. The UDP receive buffer is deliberately larger than the 512-byte
+/// policy cap, so an oversized answer is received and refused by name rather than dropped
+/// into a timeout.
+const DNS_UDP_BUFFER: usize = 640;
+const DNS_TCP_BUFFER: usize = 640;
+const DNS_POLICY_MAX: usize = 512;
+/// The resolver's own local port on the wire stack (both transports).
+const DNS_INTERNAL_PORT: u16 = 47653;
+const DNS_UDP_DEADLINE_NS: u64 = 4_000_000_000;
+const DNS_TCP_DEADLINE_NS: u64 = 8_000_000_000;
+const DNS_TTL_CAP_NS: u64 = 300_000_000_000;
+const DNS_NEGATIVE_TTL_NS: u64 = 10_000_000_000;
+const DNS_CACHE_MAX: usize = 8;
+const DNS_RETRANSMIT_NS: [u64; 3] = [0, 1_000_000_000, 3_000_000_000];
+
+/// NET12: the launcher-granted resolver. Configuration requires an explicit grant; until
+/// one arrives every lookup answers NotConfigured, never a guessed server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolverConfig {
+    pub server: [u8; 4],
+    pub udp_port: u16,
+    pub tcp_port: u16,
+    /// Whether a truncated UDP answer may fall back to one bounded TCP query.
+    pub fallback: bool,
+}
+
+/// One in-flight lookup (one at a time keeps the retry budget bounded and auditable).
+struct DnsQuery {
+    /// Dotted, lowercased name as granted by the client.
+    name: Vec<u8>,
+    /// Wire-format name (length-prefixed labels plus a zero terminator).
+    wire: Vec<u8>,
+    txid: u16,
+    started_ns: u64,
+    next_tx_ns: u64,
+    transmissions: u8,
+    tcp_attempted: bool,
+}
+
+/// The TCP fallback's small state machine.
+enum DnsTcp {
+    Connecting {
+        at_ns: u64,
+    },
+    Querying {
+        at_ns: u64,
+        framed: Vec<u8>,
+        sent: usize,
+        buf: Vec<u8>,
+    },
+}
+
+/// A cached lookup outcome; failures are cached too, so a polling client cannot drive
+/// unbounded retries within the negative TTL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedResult {
+    Found([u8; 4]),
+    NotFound,
+    Failed(Status),
+}
+
+struct DnsCacheEntry {
+    name: Vec<u8>,
+    result: CachedResult,
+    expires_ns: u64,
+}
+
+/// What one DNS response means to the resolver.
+enum DnsReply {
+    Answer([u8; 4], u32),
+    NotFound,
+    Truncated,
+    Oversized,
+    Malformed,
+    Rejected,
+}
+
+fn dns_query_repr<'a>(txid: u16, wire_name: &'a [u8]) -> kumo_netstack::smoltcp::wire::DnsRepr<'a> {
+    use kumo_netstack::smoltcp::wire::{DnsFlags, DnsOpcode, DnsQueryType, DnsQuestion, DnsRepr};
+    DnsRepr {
+        transaction_id: txid,
+        opcode: DnsOpcode::Query,
+        flags: DnsFlags::RECURSION_DESIRED,
+        question: DnsQuestion {
+            name: wire_name,
+            type_: DnsQueryType::A,
+        },
+    }
+}
+
+fn dns_packet(buffer: &mut [u8]) -> kumo_netstack::smoltcp::wire::DnsPacket<&mut [u8]> {
+    kumo_netstack::smoltcp::wire::DnsPacket::new_unchecked(buffer)
+}
+
+/// One response, validated for transaction id, shape, and question name, with answers
+/// compared compression-safely. A CNAME rewrites the expected name for the records after
+/// it, mirroring the crate's own client.
+fn dns_parse_response(data: &[u8], txid: u16, name_wire: &[u8]) -> DnsReply {
+    use kumo_netstack::smoltcp::wire::{
+        DnsFlags, DnsOpcode, DnsPacket, DnsQueryType, DnsQuestion, DnsRcode, DnsRecord,
+        DnsRecordData,
+    };
+    let Ok(packet) = DnsPacket::new_checked(data) else {
+        return DnsReply::Malformed;
+    };
+    if packet.transaction_id() != txid {
+        return DnsReply::Rejected;
+    }
+    if packet.opcode() != DnsOpcode::Query || !packet.flags().contains(DnsFlags::RESPONSE) {
+        return DnsReply::Malformed;
+    }
+    match packet.rcode() {
+        DnsRcode::NoError => {}
+        DnsRcode::NXDomain => return DnsReply::NotFound,
+        _ => return DnsReply::NotFound,
+    }
+    if packet.flags().contains(DnsFlags::TRUNCATED) {
+        return DnsReply::Truncated;
+    }
+    if packet.question_count() != 1 {
+        return DnsReply::Malformed;
+    }
+    let Ok((payload, question)) = DnsQuestion::parse(packet.payload()) else {
+        return DnsReply::Malformed;
+    };
+    if question.type_ != DnsQueryType::A || !dns_names_eq(&packet, question.name, name_wire) {
+        return DnsReply::Rejected;
+    }
+    let mut current = name_wire.to_vec();
+    let mut addr = None;
+    let mut ttl = u32::MAX;
+    let mut rest = payload;
+    for _ in 0..packet.answer_record_count() {
+        let Ok((next, record)) = DnsRecord::parse(rest) else {
+            return DnsReply::Malformed;
+        };
+        rest = next;
+        if !dns_names_eq(&packet, record.name, &current) {
+            continue;
+        }
+        match record.data {
+            DnsRecordData::A(a) => {
+                if addr.is_none() {
+                    addr = Some(a.octets());
+                }
+                ttl = ttl.min(record.ttl);
+            }
+            DnsRecordData::Cname(name) => match dns_wire_from(&packet, name) {
+                Some(wire) => current = wire,
+                None => return DnsReply::Malformed,
+            },
+            _ => {}
+        }
+    }
+    match addr {
+        Some(addr) => DnsReply::Answer(addr, ttl),
+        None => DnsReply::NotFound,
+    }
+}
+
+fn dns_names_eq(
+    packet: &kumo_netstack::smoltcp::wire::DnsPacket<&[u8]>,
+    a: &[u8],
+    b: &[u8],
+) -> bool {
+    let mut ia = packet.parse_name(a);
+    let mut ib = packet.parse_name(b);
+    loop {
+        match (ia.next(), ib.next()) {
+            (None, None) => return true,
+            (Some(Ok(x)), Some(Ok(y))) => {
+                if !x.eq_ignore_ascii_case(y) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn dns_wire_from(
+    packet: &kumo_netstack::smoltcp::wire::DnsPacket<&[u8]>,
+    name: &[u8],
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for label in packet.parse_name(name) {
+        let label = label.ok()?;
+        if label.is_empty() || label.len() > 63 || out.len() + label.len() + 2 > 255 {
+            return None;
+        }
+        out.push(label.len() as u8);
+        out.extend_from_slice(label);
+    }
+    out.push(0);
+    Some(out)
+}
+
+/// Validate a dotted name (labels 1..=63, wire form at most 255 bytes) and normalize it to
+/// its lowercased cache key.
+fn normalize_dns_name(name: &[u8]) -> Result<Vec<u8>, Status> {
+    if name.is_empty() || name.len() > 253 {
+        return Err(Status::InvalidArgument);
+    }
+    for label in name.split(|&c| c == b'.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(Status::InvalidArgument);
+        }
+    }
+    Ok(name.iter().map(|c| c.to_ascii_lowercase()).collect())
+}
+
+fn dotted_to_wire(dotted: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(dotted.len() + 2);
+    for label in dotted.split(|&c| c == b'.') {
+        out.push(label.len() as u8);
+        out.extend_from_slice(label);
+    }
+    out.push(0);
+    (out.len() <= 255).then_some(out)
+}
+
 /// NET11: how the wire interface is configured, chosen by the launcher's frame grant.
 #[derive(Clone, Copy)]
 pub enum WireConfig {
@@ -200,6 +421,17 @@ pub enum WireEvent {
     },
     DhcpExpired,
     DhcpDiscardedByGeneration,
+    DnsQuerySent,
+    DnsAnswer {
+        addr: [u8; 4],
+    },
+    DnsNotFound,
+    DnsMalformed,
+    DnsRejected,
+    DnsOversized,
+    DnsTruncated,
+    DnsFallback,
+    DnsTimedOut,
 }
 
 struct Wire {
@@ -213,6 +445,9 @@ struct Wire {
     prefix: u8,
     /// NET11: the DHCP socket in this generation's wire set (DHCP mode only).
     dhcp: Option<SocketHandle>,
+    /// NET12: the resolver's stack-internal sockets in this generation's wire set.
+    dns_udp: Option<SocketHandle>,
+    dns_tcp: Option<SocketHandle>,
     /// NET8's ingress refusals: frames the policy kept out of the stack, by kind.
     refusals: Refusals,
 }
@@ -220,6 +455,13 @@ struct Wire {
 pub struct Server {
     /// NET11 lease events awaiting the loop's NOTICE logging.
     wire_events: Vec<WireEvent>,
+    /// NET12 resolver state: the granted configuration, the one in-flight lookup, its TCP
+    /// fallback, and a small TTL-bounded cache.
+    resolver: Option<ResolverConfig>,
+    dns_query: Option<DnsQuery>,
+    dns_tcp_state: Option<DnsTcp>,
+    dns_cache: Vec<DnsCacheEntry>,
+    dns_tx_counter: u32,
     iface: Interface,
     /// Boxed: the 16-slot ring is ~24 KB, more than a native child's 16 KiB default stack.
     device: Box<Loopback>,
@@ -357,6 +599,11 @@ impl Server {
             sockets,
             wire: None,
             wire_events: Vec::new(),
+            resolver: None,
+            dns_query: None,
+            dns_tcp_state: None,
+            dns_cache: Vec::new(),
+            dns_tx_counter: 0,
             slots,
             sessions: (0..SESSIONS).map(|_| None).collect(),
             next_generation: 1,
@@ -428,6 +675,8 @@ impl Server {
     }
 
     pub fn attach_wire_config(&mut self, now_ns: u64, mac: [u8; 6], config: WireConfig) {
+        // No resolver state survives a different interface generation either (NET12).
+        self.dns_reset();
         // A lease never survives a different interface generation silently (NET11).
         if let Some(old) = self.wire.as_ref() {
             if matches!(old.config, WireConfig::Dhcp { .. }) && old.addr != [0; 4] {
@@ -452,7 +701,7 @@ impl Server {
         // twin sockets created on demand (NET10): a slot is one kind at a time, so one
         // on-demand socket per slot fits the reserve exactly. NET11 adds the DHCP socket.
         let storage: &'static mut [SocketStorage<'static>] = Box::leak(
-            (0..2 * SOCKETS_TOTAL + 1)
+            (0..2 * SOCKETS_TOTAL + 3)
                 .map(|_| SocketStorage::EMPTY)
                 .collect(),
         );
@@ -487,6 +736,30 @@ impl Server {
                 slot.wire_icmp = Some(sockets.add(wire_icmp_socket(slot.port)));
             }
         }
+        let dns_udp = {
+            let socket = udp::Socket::new(
+                udp::PacketBuffer::new(
+                    leak(udp::PacketMetadata::EMPTY, UDP_METADATA),
+                    leak(0u8, DNS_UDP_BUFFER),
+                ),
+                udp::PacketBuffer::new(
+                    leak(udp::PacketMetadata::EMPTY, UDP_METADATA),
+                    leak(0u8, DNS_UDP_BUFFER),
+                ),
+            );
+            let handle = sockets.add(socket);
+            let _ = sockets
+                .get_mut::<udp::Socket>(handle)
+                .bind(IpListenEndpoint {
+                    addr: None,
+                    port: DNS_INTERNAL_PORT,
+                });
+            Some(handle)
+        };
+        let dns_tcp = Some(sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(leak(0u8, DNS_TCP_BUFFER)),
+            tcp::SocketBuffer::new(leak(0u8, DNS_TCP_BUFFER)),
+        )));
         let dhcp = match config {
             WireConfig::Static { .. } => None,
             WireConfig::Dhcp {
@@ -512,6 +785,8 @@ impl Server {
             addr: lease_addr,
             prefix: lease_prefix,
             dhcp,
+            dns_udp,
+            dns_tcp,
             refusals: Refusals::default(),
         });
         // NET10: a listener is reachable from both stacks. Every armed backlog slot gains a
@@ -531,6 +806,19 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// NET12: the launcher's resolver grant. Until it arrives every lookup answers
+    /// NotConfigured; a new grant discards any in-flight lookup and the cache.
+    pub fn set_resolver(&mut self, config: ResolverConfig) {
+        self.resolver = Some(config);
+        self.dns_reset();
+    }
+
+    fn dns_reset(&mut self) {
+        self.dns_query = None;
+        self.dns_tcp_state = None;
+        self.dns_cache.clear();
     }
 
     /// NET11: drain one lease event for the server loop's NOTICE logging.
@@ -556,6 +844,7 @@ impl Server {
 
     /// The frame channel closed: the stack and every wire twin go with it.
     pub fn detach_wire(&mut self) {
+        self.dns_reset();
         if let Some(wire) = self.wire.as_ref() {
             if matches!(wire.config, WireConfig::Dhcp { .. }) && wire.addr != [0; 4] {
                 self.wire_events.push(WireEvent::DhcpDiscardedByGeneration);
@@ -1213,12 +1502,415 @@ impl Server {
             self.slots[index].owner = Some((session, id));
             return Ok(Answer::ok(id, id as u64));
         }
+        if let Body::Resolve(name) = request.body {
+            return self.dispatch_resolve(name, now_ns);
+        }
         let index = self.slot_of(session, socket)?;
         match self.slots[index].kind {
             SocketKind::Udp => self.dispatch_udp(session, index, request, now_ns),
             SocketKind::Tcp => self.dispatch_tcp(session, index, request, now_ns),
             SocketKind::Icmp => self.dispatch_icmp(session, index, request, now_ns),
         }
+    }
+
+    /// NET12: resolve a dotted name through the launcher-granted resolver. Every path is
+    /// bounded: three UDP transmissions over four seconds, at most one TCP fallback under
+    /// the policy, and failures are negative-cached so polling cannot retry without bound.
+    fn dispatch_resolve(&mut self, name: &[u8], now_ns: u64) -> Result<Answer, Status> {
+        let Some(config) = self.resolver else {
+            return Err(Status::NotConfigured);
+        };
+        if self.wire.is_none() {
+            return Err(Status::NetUnreachable);
+        }
+        let name = normalize_dns_name(name)?;
+        if let Some(cached) = self.dns_cache_lookup(&name, now_ns) {
+            return match cached {
+                CachedResult::Found(addr) => Ok(Answer::ok(0, u64::from(u32::from_be_bytes(addr)))),
+                CachedResult::NotFound => Err(Status::NotFound),
+                CachedResult::Failed(status) => Err(status),
+            };
+        }
+        if let Some(query) = self.dns_query.as_ref() {
+            return Err(if query.name == name {
+                Status::InProgress
+            } else {
+                Status::WouldBlock
+            });
+        }
+        let Some(wire_name) = dotted_to_wire(&name) else {
+            return Err(Status::InvalidArgument);
+        };
+        self.dns_tx_counter = self.dns_tx_counter.wrapping_add(1);
+        let txid = (self.dns_tx_counter.wrapping_mul(2_654_435_761) ^ (now_ns as u32)) as u16;
+        self.dns_query = Some(DnsQuery {
+            name,
+            wire: wire_name,
+            txid,
+            started_ns: now_ns,
+            next_tx_ns: now_ns,
+            transmissions: 0,
+            tcp_attempted: !config.fallback,
+        });
+        self.dns_transmit(now_ns)?;
+        self.wire_events.push(WireEvent::DnsQuerySent);
+        Err(Status::InProgress)
+    }
+
+    fn dns_transmit(&mut self, now_ns: u64) -> Result<(), Status> {
+        let Some(config) = self.resolver else {
+            return Err(Status::NotConfigured);
+        };
+        let Some(wire) = self.wire.as_mut() else {
+            return Err(Status::NetUnreachable);
+        };
+        let Some(handle) = wire.dns_udp else {
+            return Err(Status::NetUnreachable);
+        };
+        let Some(query) = self.dns_query.as_mut() else {
+            return Err(Status::WouldBlock);
+        };
+        let repr = dns_query_repr(query.txid, &query.wire);
+        let mut payload = [0u8; DNS_POLICY_MAX];
+        let len = repr.buffer_len();
+        if len > payload.len() {
+            return Err(Status::MessageTooLarge);
+        }
+        let mut packet = dns_packet(&mut payload[..len]);
+        repr.emit(&mut packet);
+        let endpoint = IpEndpoint::new(
+            IpAddress::Ipv4(Ipv4Address::from(config.server)),
+            config.udp_port,
+        );
+        wire.sockets
+            .get_mut::<udp::Socket>(handle)
+            .send_slice(&payload[..len], endpoint)
+            .map_err(|_| Status::NetUnreachable)?;
+        query.transmissions = query.transmissions.saturating_add(1);
+        // The schedule is absolute offsets from the query's start: 0, 1 s, 3 s.
+        let step = usize::from(query.transmissions.min(2));
+        query.next_tx_ns = query.started_ns.saturating_add(DNS_RETRANSMIT_NS[step]);
+        Ok(())
+    }
+
+    /// NET12: drive the in-flight lookup. Called once per stack turn.
+    fn dns_poll(&mut self, now_ns: u64) {
+        let Some(config) = self.resolver else {
+            return;
+        };
+        self.dns_purge_cache(now_ns);
+        loop {
+            let reply = {
+                let Some(wire) = self.wire.as_mut() else {
+                    return;
+                };
+                let Some(handle) = wire.dns_udp else {
+                    return;
+                };
+                match wire.sockets.get_mut::<udp::Socket>(handle).recv() {
+                    Ok((data, meta)) => Some((data.to_vec(), meta.endpoint)),
+                    Err(_) => None,
+                }
+            };
+            let Some((data, from)) = reply else {
+                break;
+            };
+            let expect = IpEndpoint::new(
+                IpAddress::Ipv4(Ipv4Address::from(config.server)),
+                config.udp_port,
+            );
+            if from != expect {
+                self.wire_events.push(WireEvent::DnsRejected);
+                continue;
+            }
+            let Some((txid, wire_name, name_key)) = self
+                .dns_query
+                .as_ref()
+                .map(|q| (q.txid, q.wire.clone(), q.name.clone()))
+            else {
+                continue;
+            };
+            let verdict = if data.len() > DNS_POLICY_MAX {
+                DnsReply::Oversized
+            } else {
+                dns_parse_response(&data, txid, &wire_name)
+            };
+            if self.dns_settle(verdict, now_ns, config, &name_key, true) {
+                continue;
+            }
+        }
+        if self.dns_query.is_none() {
+            return;
+        }
+        if self.dns_tcp_state.is_some() {
+            self.dns_poll_tcp(now_ns, config);
+            return;
+        }
+        let (started, attempts, next_tx) = {
+            let Some(query) = self.dns_query.as_ref() else {
+                return;
+            };
+            (query.started_ns, query.transmissions, query.next_tx_ns)
+        };
+        if now_ns >= started.saturating_add(DNS_UDP_DEADLINE_NS) {
+            self.dns_fail(now_ns, Status::TimedOut, WireEvent::DnsTimedOut);
+            return;
+        }
+        if attempts < 3 && now_ns >= next_tx {
+            let _ = self.dns_transmit(now_ns);
+        }
+    }
+
+    /// Apply a response verdict. Returns false when the query slot was freed, so the caller
+    /// stops draining stale replies for it.
+    fn dns_settle(
+        &mut self,
+        verdict: DnsReply,
+        now_ns: u64,
+        config: ResolverConfig,
+        name_key: &[u8],
+        udp: bool,
+    ) -> bool {
+        match verdict {
+            DnsReply::Answer(addr, ttl_s) => {
+                if ttl_s > 0 {
+                    let ttl = u64::from(ttl_s)
+                        .saturating_mul(1_000_000_000)
+                        .min(DNS_TTL_CAP_NS);
+                    self.dns_cache_insert(
+                        name_key.to_vec(),
+                        CachedResult::Found(addr),
+                        now_ns.saturating_add(ttl),
+                    );
+                }
+                self.dns_query = None;
+                self.dns_tcp_state = None;
+                self.wire_events.push(WireEvent::DnsAnswer { addr });
+                false
+            }
+            DnsReply::NotFound => {
+                self.dns_cache_insert(
+                    name_key.to_vec(),
+                    CachedResult::NotFound,
+                    now_ns.saturating_add(DNS_NEGATIVE_TTL_NS),
+                );
+                self.dns_query = None;
+                self.dns_tcp_state = None;
+                self.wire_events.push(WireEvent::DnsNotFound);
+                false
+            }
+            DnsReply::Truncated if udp && config.fallback => {
+                let attempted = self.dns_query.as_ref().is_some_and(|q| q.tcp_attempted);
+                if !attempted {
+                    if let Some(query) = self.dns_query.as_mut() {
+                        query.tcp_attempted = true;
+                    }
+                    if self.dns_start_tcp(now_ns, config) {
+                        self.wire_events.push(WireEvent::DnsFallback);
+                        return true;
+                    }
+                    self.dns_fail(now_ns, Status::TimedOut, WireEvent::DnsTimedOut);
+                    return false;
+                }
+                true
+            }
+            DnsReply::Truncated => {
+                self.dns_fail(now_ns, Status::MessageTooLarge, WireEvent::DnsTruncated);
+                false
+            }
+            DnsReply::Oversized => {
+                self.dns_fail(now_ns, Status::MessageTooLarge, WireEvent::DnsOversized);
+                false
+            }
+            DnsReply::Malformed => {
+                self.wire_events.push(WireEvent::DnsMalformed);
+                true
+            }
+            DnsReply::Rejected => {
+                self.wire_events.push(WireEvent::DnsRejected);
+                true
+            }
+        }
+    }
+
+    fn dns_fail(&mut self, now_ns: u64, status: Status, event: WireEvent) {
+        if let Some(query) = self.dns_query.take() {
+            self.dns_cache_insert(
+                query.name,
+                CachedResult::Failed(status),
+                now_ns.saturating_add(DNS_NEGATIVE_TTL_NS),
+            );
+        }
+        self.dns_tcp_state = None;
+        self.wire_events.push(event);
+    }
+
+    fn dns_start_tcp(&mut self, now_ns: u64, config: ResolverConfig) -> bool {
+        let Some(wire) = self.wire.as_mut() else {
+            return false;
+        };
+        let Some(handle) = wire.dns_tcp else {
+            return false;
+        };
+        let remote = IpEndpoint::new(
+            IpAddress::Ipv4(Ipv4Address::from(config.server)),
+            config.tcp_port,
+        );
+        if wire
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(wire.iface.context(), remote, DNS_INTERNAL_PORT)
+            .is_err()
+        {
+            return false;
+        }
+        self.dns_tcp_state = Some(DnsTcp::Connecting { at_ns: now_ns });
+        true
+    }
+
+    fn dns_poll_tcp(&mut self, now_ns: u64, config: ResolverConfig) {
+        let Some(state) = self.dns_tcp_state.take() else {
+            return;
+        };
+        match state {
+            DnsTcp::Connecting { at_ns } => {
+                let state_now = {
+                    let Some(wire) = self.wire.as_mut() else {
+                        return;
+                    };
+                    let Some(handle) = wire.dns_tcp else {
+                        return;
+                    };
+                    wire.sockets.get_mut::<tcp::Socket>(handle).state()
+                };
+                match state_now {
+                    tcp::State::Established => {
+                        let Some((txid, wire_name, _)) = self
+                            .dns_query
+                            .as_ref()
+                            .map(|q| (q.txid, q.wire.clone(), q.name.clone()))
+                        else {
+                            return;
+                        };
+                        let repr = dns_query_repr(txid, &wire_name);
+                        let mut body = alloc::vec![0u8; repr.buffer_len()];
+                        let mut packet = dns_packet(&mut body[..]);
+                        repr.emit(&mut packet);
+                        let mut framed = Vec::with_capacity(2 + body.len());
+                        framed.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                        framed.extend_from_slice(&body);
+                        let sent = {
+                            let Some(wire) = self.wire.as_mut() else {
+                                return;
+                            };
+                            let Some(handle) = wire.dns_tcp else {
+                                return;
+                            };
+                            wire.sockets
+                                .get_mut::<tcp::Socket>(handle)
+                                .send_slice(&framed)
+                                .unwrap_or(0)
+                        };
+                        self.dns_tcp_state = Some(DnsTcp::Querying {
+                            at_ns,
+                            framed,
+                            sent,
+                            buf: Vec::new(),
+                        });
+                    }
+                    tcp::State::Closed | tcp::State::TimeWait => {
+                        self.dns_fail(now_ns, Status::TimedOut, WireEvent::DnsTimedOut);
+                    }
+                    _ => {
+                        if now_ns >= at_ns.saturating_add(DNS_TCP_DEADLINE_NS) {
+                            self.dns_fail(now_ns, Status::TimedOut, WireEvent::DnsTimedOut);
+                        } else {
+                            self.dns_tcp_state = Some(DnsTcp::Connecting { at_ns });
+                        }
+                    }
+                }
+            }
+            DnsTcp::Querying {
+                at_ns,
+                mut framed,
+                mut sent,
+                mut buf,
+            } => {
+                {
+                    let Some(wire) = self.wire.as_mut() else {
+                        return;
+                    };
+                    let Some(handle) = wire.dns_tcp else {
+                        return;
+                    };
+                    let socket = wire.sockets.get_mut::<tcp::Socket>(handle);
+                    if sent < framed.len() && socket.can_send() {
+                        if let Ok(n) = socket.send_slice(&framed[sent..]) {
+                            sent += n;
+                        }
+                    }
+                    if socket.can_recv() {
+                        let mut chunk = [0u8; DNS_TCP_BUFFER];
+                        if let Ok(n) = socket.recv_slice(&mut chunk) {
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+                if buf.len() >= 2 {
+                    let want = 2 + usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+                    if buf.len() >= want {
+                        let Some((txid, wire_name, name_key)) = self
+                            .dns_query
+                            .as_ref()
+                            .map(|q| (q.txid, q.wire.clone(), q.name.clone()))
+                        else {
+                            return;
+                        };
+                        let verdict = if want - 2 > DNS_POLICY_MAX {
+                            DnsReply::Oversized
+                        } else {
+                            dns_parse_response(&buf[2..want], txid, &wire_name)
+                        };
+                        let _ = self.dns_settle(verdict, now_ns, config, &name_key, false);
+                        return;
+                    }
+                }
+                if now_ns >= at_ns.saturating_add(DNS_TCP_DEADLINE_NS) {
+                    self.dns_fail(now_ns, Status::TimedOut, WireEvent::DnsTimedOut);
+                } else {
+                    self.dns_tcp_state = Some(DnsTcp::Querying {
+                        at_ns,
+                        framed,
+                        sent,
+                        buf,
+                    });
+                }
+            }
+        }
+    }
+
+    fn dns_purge_cache(&mut self, now_ns: u64) {
+        self.dns_cache.retain(|e| e.expires_ns > now_ns);
+    }
+
+    fn dns_cache_lookup(&mut self, name: &[u8], now_ns: u64) -> Option<CachedResult> {
+        self.dns_purge_cache(now_ns);
+        self.dns_cache
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.result)
+    }
+
+    fn dns_cache_insert(&mut self, name: Vec<u8>, result: CachedResult, expires_ns: u64) {
+        self.dns_cache.retain(|e| e.name != name);
+        if self.dns_cache.len() >= DNS_CACHE_MAX {
+            self.dns_cache.remove(0);
+        }
+        self.dns_cache.push(DnsCacheEntry {
+            name,
+            result,
+            expires_ns,
+        });
     }
 
     /// NET8: ICMP echo on the wire. BIND's port is the echo identifier, SEND/SENDTO emit one
@@ -1793,6 +2485,8 @@ impl Server {
             }
         }
         self.wire_events.extend(lease_events);
+        // NET12: drive the in-flight DNS lookup (retransmissions, replies, fallback).
+        self.dns_poll(now_ns);
         // Sampling after the polls latches state windows (CloseWait, LastAck, TimeWait)
         // that a dispatch-only observe would miss.
         for index in 0..self.slots.len() {

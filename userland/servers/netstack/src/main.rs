@@ -29,7 +29,7 @@ use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid, port_bind,
     port_create, port_unbind, port_wait, timer_create,
 };
-use netstack::{After, IngressError, Output, Server, WireConfig, WireEvent};
+use netstack::{After, IngressError, Output, ResolverConfig, Server, WireConfig, WireEvent};
 
 kumo_rt::entry!(main);
 
@@ -39,6 +39,8 @@ const CONTROL_SESSION: u8 = b'S';
 const CONTROL_FRAME: u8 = b'F';
 /// NET11: a DHCP grant: tag, server port u16 LE, client port u16 LE.
 const CONTROL_DHCP: u8 = b'D';
+/// NET12: a resolver grant: tag, server IPv4 (4), UDP port u16 LE, TCP port u16 LE, flags.
+const CONTROL_RESOLVER: u8 = b'R';
 /// Timers shorter than this are rounded up, so a busy stack cannot spin the loop.
 const MIN_TIMER_NS: u64 = 1_000_000;
 
@@ -83,6 +85,37 @@ fn log_wire_events(server: &mut Server) {
             }
             WireEvent::DhcpDiscardedByGeneration => {
                 line.extend_from_slice(b"netstack: dhcp lease discarded by interface generation\n");
+            }
+            WireEvent::DnsQuerySent => {
+                line.extend_from_slice(b"netstack: dns query sent\n");
+            }
+            WireEvent::DnsAnswer { addr } => {
+                line.extend_from_slice(b"netstack: dns answer ");
+                push_ipv4(&mut line, addr);
+                line.push(b'\n');
+            }
+            WireEvent::DnsNotFound => {
+                line.extend_from_slice(b"netstack: dns not found\n");
+            }
+            WireEvent::DnsMalformed => {
+                line.extend_from_slice(b"netstack: dns reply rejected (malformed)\n");
+            }
+            WireEvent::DnsRejected => {
+                line.extend_from_slice(b"netstack: dns reply rejected (id/source)\n");
+            }
+            WireEvent::DnsOversized => {
+                line.extend_from_slice(b"netstack: dns reply refused (oversized)\n");
+            }
+            WireEvent::DnsTruncated => {
+                line.extend_from_slice(
+                    b"netstack: dns reply refused (truncated; no TCP fallback)\n",
+                );
+            }
+            WireEvent::DnsFallback => {
+                line.extend_from_slice(b"netstack: dns truncated; TCP fallback\n");
+            }
+            WireEvent::DnsTimedOut => {
+                line.extend_from_slice(b"netstack: dns lookup timed out\n");
             }
         }
         log(log_level::NOTICE, &line);
@@ -459,7 +492,7 @@ extern "C" fn main(
         let source = port_wait(port);
         let now = clock_get();
         if source == control_koid {
-            let mut grant = [0u8; 6];
+            let mut grant = [0u8; 12];
             let (n, raw) = channel_read_with_handle(control, grant.as_mut_ptr(), grant.len());
             if n == 0 {
                 // Sora is gone; serve the sessions that remain.
@@ -500,6 +533,26 @@ extern "C" fn main(
                         b"netstack: dhcp grant without a channel\n",
                     ),
                 }
+            } else if n == 10 && grant[0] == CONTROL_RESOLVER {
+                if let Some(extra) = valid(raw) {
+                    let _ = handle_close(extra);
+                }
+                let config = ResolverConfig {
+                    server: [grant[1], grant[2], grant[3], grant[4]],
+                    udp_port: u16::from_le_bytes([grant[5], grant[6]]),
+                    tcp_port: u16::from_le_bytes([grant[7], grant[8]]),
+                    fallback: grant[9] & 1 != 0,
+                };
+                server.set_resolver(config);
+                let mut line = Vec::with_capacity(96);
+                line.extend_from_slice(b"netstack: resolver granted udp=");
+                push_dec(&mut line, u64::from(config.udp_port));
+                line.extend_from_slice(b" tcp=");
+                push_dec(&mut line, u64::from(config.tcp_port));
+                line.extend_from_slice(b" fallback=");
+                push_dec(&mut line, u64::from(config.fallback as u64));
+                line.push(b'\n');
+                log(log_level::NOTICE, &line);
             } else if let Some(channel) = valid(raw) {
                 let koid = handle_koid(channel);
                 let admitted = (grant[0] == CONTROL_SESSION && koid != u64::MAX)

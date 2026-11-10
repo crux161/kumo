@@ -46,6 +46,8 @@ pub enum Op {
     Close = 12,
     Wait = 13,
     GetName = 14,
+    /// NET12: resolve a dotted name through the launcher-granted resolver.
+    Resolve = 15,
 }
 
 impl Op {
@@ -65,13 +67,14 @@ impl Op {
             12 => Self::Close,
             13 => Self::Wait,
             14 => Self::GetName,
+            15 => Self::Resolve,
             _ => return None,
         })
     }
 
     /// Ops addressed to the session, which carry socket id 0.
     pub const fn is_session_op(self) -> bool {
-        matches!(self, Self::Hello | Self::Socket)
+        matches!(self, Self::Hello | Self::Socket | Self::Resolve)
     }
 }
 
@@ -101,6 +104,10 @@ pub enum Status {
     ShutDown = 19,
     NetUnreachable = 20,
     ProtocolViolation = 21,
+    /// NET12: the name does not exist (NXDOMAIN or an empty answer), possibly cached.
+    NotFound = 22,
+    /// NET12: no resolver configuration has been granted by the launcher.
+    NotConfigured = 23,
 }
 
 impl Status {
@@ -128,6 +135,8 @@ impl Status {
             19 => Self::ShutDown,
             20 => Self::NetUnreachable,
             21 => Self::ProtocolViolation,
+            22 => Self::NotFound,
+            23 => Self::NotConfigured,
             _ => return None,
         })
     }
@@ -176,16 +185,30 @@ pub enum Body<'a> {
     Socket(SocketKind),
     Bind(Addr),
     Connect(Addr),
-    Listen { backlog: u8 },
+    Listen {
+        backlog: u8,
+    },
     Accept,
     Send(&'a [u8]),
     SendTo(Addr, &'a [u8]),
-    Recv { max: u16 },
-    RecvFrom { max: u16 },
-    Shutdown { read: bool, write: bool },
+    Recv {
+        max: u16,
+    },
+    RecvFrom {
+        max: u16,
+    },
+    Shutdown {
+        read: bool,
+        write: bool,
+    },
     Close,
-    Wait { interest: u8, timeout_ms: u32 },
+    Wait {
+        interest: u8,
+        timeout_ms: u32,
+    },
     GetName,
+    /// NET12: the dotted name to resolve (1..=255 bytes); session-addressed.
+    Resolve(&'a [u8]),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -393,6 +416,14 @@ pub fn decode_request(message: &[u8], handles: usize) -> Result<Request<'_>, Rej
                 Op::Close => Body::Close,
                 _ => Body::GetName,
             }
+        }
+        Op::Resolve => {
+            // A dotted name; the resolver validates the label syntax, not the codec.
+            if payload.is_empty() || payload.len() > 255 {
+                return Err(reject(Status::BadLength));
+            }
+            no_arg()?;
+            Body::Resolve(payload)
         }
     };
     Ok(Request {
@@ -616,6 +647,7 @@ pub const fn op_of(body: &Body<'_>) -> Op {
         Body::Close => Op::Close,
         Body::Wait { .. } => Op::Wait,
         Body::GetName => Op::GetName,
+        Body::Resolve(_) => Op::Resolve,
     }
 }
 
@@ -659,7 +691,7 @@ mod tests {
         sendto.extend_from_slice(b"datagram");
         let wait = WAIT_READABLE as u64 | (250u64 << 32);
         type Case<'a> = (Op, u32, u32, u64, &'a [u8], Body<'a>);
-        let cases: [Case<'_>; 15] = [
+        let cases: [Case<'_>; 16] = [
             (Op::Hello, 0, 0, 0, &[], Body::Hello),
             (Op::Socket, 0, 9, 2, &[], Body::Socket(SocketKind::Tcp)),
             (Op::Socket, 0, 9, 3, &[], Body::Socket(SocketKind::Icmp)),
@@ -702,6 +734,14 @@ mod tests {
                 },
             ),
             (Op::GetName, 1, 9, 0, &[], Body::GetName),
+            (
+                Op::Resolve,
+                0,
+                9,
+                0,
+                b"kumo.test",
+                Body::Resolve(b"kumo.test"),
+            ),
         ];
         let mut out = [0u8; 4096];
         for (op, socket, generation, arg, payload, body) in cases {
@@ -755,11 +795,11 @@ mod tests {
         version[4] = 2;
         assert_eq!(reply_status(&version), Reply(Status::BadVersion));
         let mut op = req(Op::Close, 1, 9, 0, &[]);
-        op[6] = 15;
+        op[6] = 16;
         let rejected = decode_request(&op, 0).unwrap_err();
         assert_eq!(
             (rejected.op, rejected.request_id),
-            (15, 5),
+            (16, 5),
             "reply can echo the bad op"
         );
         assert_eq!(rejected.disposition, Reply(Status::BadOp));
@@ -853,10 +893,10 @@ mod tests {
         let mut out = [0u8; 128];
         let len = encode_reply(&reply, &mut out).unwrap();
         assert_eq!(decode_reply(&out[..len], 0), Ok(reply));
-        for value in 0..=21u16 {
+        for value in 0..=23u16 {
             assert_eq!(Status::from_u16(value).map(|s| s as u16), Some(value));
         }
-        out[20..22].copy_from_slice(&22u16.to_le_bytes());
+        out[20..22].copy_from_slice(&24u16.to_le_bytes());
         assert_eq!(decode_reply(&out[..len], 0), Err(ReplyError::UnknownStatus));
         assert_eq!(decode_reply(&out[..len], 1), Err(ReplyError::Handles));
         assert_eq!(decode_reply(&out[..31], 0), Err(ReplyError::Short));

@@ -115,6 +115,8 @@ fn status_name(status: Status) -> &'static [u8] {
         Status::ConnRefused => b"ConnRefused",
         Status::ConnReset => b"ConnReset",
         Status::ShutDown => b"ShutDown",
+        Status::NotFound => b"NotFound",
+        Status::NotConfigured => b"NotConfigured",
         _ => b"(other)",
     }
 }
@@ -1333,6 +1335,121 @@ fn log_dhcp_addr(ip: [u8; 4]) {
     let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &buf[..at]);
 }
 
+/// NET12: the resolver campaign. Each phase is a name the isolated server answers a fixed
+/// way; the `tcp`/`notcp` argument selects what a truncated answer should do, matching the
+/// boot's resolver policy. Serial NOTICE lines carry every phase for the journal capture.
+fn dns_probe(client: &mut Client, mode: &[u8]) {
+    if mode != b"tcp" && mode != b"notcp" {
+        client.out.line(&[b"netprobe: dns needs tcp|notcp"]);
+        client.fail(&[b"dns mode"]);
+        return;
+    }
+    let fallback_ok = mode == b"tcp";
+    let pause = client.udp_socket();
+    client.bind_any(pause, 0);
+    let mut failures = 0u32;
+    let mut expect = |client: &mut Client, name: &[u8], want: Status, budget: u64| -> u64 {
+        let (status, result) = dns_resolve(client, pause, name, budget);
+        log_dns(
+            name,
+            status,
+            if status == Status::Ok {
+                Some(result as u32)
+            } else {
+                None
+            },
+        );
+        if status == want {
+            result
+        } else {
+            client.fail(&[b"dns ", name, b" -> ", status_name(status)]);
+            failures += 1;
+            0
+        }
+    };
+    // The first lookup may wait out the late service wave and the wire attach.
+    let addr = expect(client, b"kumo.test", Status::Ok, 240_000);
+    let _ = addr;
+    let _ = expect(client, b"kumo.test", Status::Ok, 10_000);
+    // The server's TTL is 3 s; the wait forces a second real query.
+    let _ = wait(client, pause, WAIT_READABLE, 3_500);
+    let _ = expect(client, b"kumo.test", Status::Ok, 60_000);
+    let _ = expect(client, b"nope.test", Status::NotFound, 60_000);
+    let _ = expect(client, b"nope.test", Status::NotFound, 10_000);
+    let _ = expect(client, b"slow.test", Status::TimedOut, 60_000);
+    let _ = expect(client, b"big.test", Status::MessageTooLarge, 60_000);
+    let _ = expect(client, b"reject.test", Status::Ok, 60_000);
+    let trunc_want = if fallback_ok {
+        Status::Ok
+    } else {
+        Status::MessageTooLarge
+    };
+    let _ = expect(client, b"trunc.test", trunc_want, 120_000);
+    client.out.line(&[
+        b"netprobe: dns phases failed=",
+        dec(u64::from(failures)).bytes(),
+    ]);
+    {
+        let mut line = [0u8; 64];
+        let head = b"netprobe: dns phases failed=";
+        line[..head.len()].copy_from_slice(head);
+        let d = dec(u64::from(failures));
+        let bytes = d.bytes();
+        let take = bytes.len().min(line.len() - head.len());
+        line[head.len()..head.len() + take].copy_from_slice(&bytes[..take]);
+        let mut at = head.len() + take;
+        line[at] = b'\n';
+        at += 1;
+        let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line[..at]);
+    }
+    if failures != 0 {
+        client.fail(&[b"dns campaign incomplete"]);
+    }
+}
+
+/// Poll one lookup until a terminal status. NetUnreachable (the wire is not up yet) is
+/// retried on the same budget as the boot.
+fn dns_resolve(client: &mut Client, pause: u32, name: &[u8], budget_ms: u64) -> (Status, u64) {
+    let steps = (budget_ms / 200).max(1);
+    for _ in 0..steps {
+        let reply = client.call(Op::Resolve, 0, 0, name);
+        match reply.status {
+            Status::InProgress | Status::NetUnreachable => {
+                let _ = wait(client, pause, WAIT_READABLE, 200);
+            }
+            other => return (other, reply.result),
+        }
+    }
+    (Status::TimedOut, 0)
+}
+
+fn log_dns(name: &[u8], status: Status, addr: Option<u32>) {
+    let mut line = [0u8; 128];
+    let mut at = 0usize;
+    let put = |line: &mut [u8; 128], at: &mut usize, part: &[u8]| {
+        let take = part.len().min(line.len() - *at);
+        line[*at..*at + take].copy_from_slice(&part[..take]);
+        *at += take;
+    };
+    put(&mut line, &mut at, b"netprobe: dns ");
+    put(&mut line, &mut at, name);
+    put(&mut line, &mut at, b" -> ");
+    put(&mut line, &mut at, status_name(status));
+    if let Some(a) = addr {
+        let octets = a.to_be_bytes();
+        put(&mut line, &mut at, b" ");
+        for (i, byte) in octets.iter().enumerate() {
+            if i > 0 {
+                put(&mut line, &mut at, b".");
+            }
+            let d = dec(u64::from(*byte));
+            put(&mut line, &mut at, d.bytes());
+        }
+    }
+    put(&mut line, &mut at, b"\n");
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line[..at]);
+}
+
 fn udp(client: &mut Client) {
     let a = client.udp_socket();
     let b = client.udp_socket();
@@ -2005,6 +2122,9 @@ extern "C" fn main(
         .is_some_and(|argv| vmo_read(argv, 0, argv_buf.as_mut_ptr(), argv_buf.len()) == 0);
     let mut args = unpack_argv(if read { &argv_buf[..] } else { &[] }).skip(1);
     let mode: &[u8] = args.next().unwrap_or(b"");
+    // `dns tcp|notcp`: the campaign's truncation expectation follows the boot's resolver
+    // policy, which only the launcher knows.
+    let dns_mode = if mode == b"dns" { args.next() } else { None };
     // `wire <ip> <port> [count]` and `ping <ip> [count]` take an address where the other
     // modes take a port; ping has no port, so its first number is the count.
     let wire_ip = if mode == b"wire"
@@ -2047,6 +2167,7 @@ extern "C" fn main(
         dec(hello.result & 0xFFFF).bytes(),
     ]);
     match mode {
+        b"dns" => dns_probe(&mut client, dns_mode.unwrap_or(b"")),
         b"udp" => udp(&mut client),
         b"hold" => {
             let s = client.udp_socket();
@@ -2110,7 +2231,7 @@ extern "C" fn main(
         b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries] | tcpwire <ip> <port> [retries] | dhcp <ip> <echo-port> [seconds]",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries] | tcpwire <ip> <port> [retries] | dhcp <ip> <echo-port> [seconds] | dns tcp|notcp",
             ]);
             process_exit(2);
         }

@@ -2032,6 +2032,19 @@ fn log(msg: &[u8]) {
 /// Kernel-log decimal append: prefix and digits in one NOTICE write, so a value cannot
 /// split across the console stream (debug_write) and the kernel-log ring (log_write).
 /// The NET11 grant line first printed as `server= client=` for exactly that reason.
+fn parse_ipv4(arg: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut n = 0;
+    for part in arg.split('.') {
+        if n == 4 {
+            return None;
+        }
+        out[n] = part.parse().ok()?;
+        n += 1;
+    }
+    (n == 4).then_some(out)
+}
+
 fn log_notice_dec(prefix: &[u8], mut value: u64) {
     let mut buf = [0u8; 64];
     let take = prefix.len().min(buf.len());
@@ -2493,10 +2506,18 @@ const FRAME_CHANNEL_TAG: u8 = b'F';
 /// instead of the fixed address; the port pair rides the grant (67/68 by default, the
 /// isolated test server's ports in the proof).
 const CONTROL_DHCP_TAG: u8 = b'D';
+/// NET12: the resolver grant: tag, server IPv4 (4), UDP port u16 LE, TCP port u16 LE,
+/// flags u8 (bit 0 = TCP fallback allowed).
+const CONTROL_RESOLVER_TAG: u8 = b'R';
 /// The NET11 policy: 0 keeps the static address; nonzero selects DHCP at the next grant.
 /// Set by the `netpolicy` shell word only — network configuration is a launcher decision.
 static NET_POLICY_DHCP: AtomicU32 = AtomicU32::new(0);
 static NET_POLICY_PORTS: AtomicU32 = AtomicU32::new((67 << 16) | 68);
+/// NET12 resolver policy: server address, then (udp_port << 16) | tcp_port, then flags
+/// (bit 0 = TCP fallback). All zero means no resolver was granted.
+static NET_DNS_SERVER: AtomicU32 = AtomicU32::new(0);
+static NET_DNS_PORTS: AtomicU32 = AtomicU32::new(0);
+static NET_DNS_FLAGS: AtomicU32 = AtomicU32::new(0);
 /// The static default, granted when the policy stays static (DESIGN/026 §3).
 const WIRE_ADDR: [u8; 4] = [192, 168, 0, 50];
 const WIRE_PREFIX: u8 = 24;
@@ -7269,6 +7290,36 @@ fn eval_command(
                 NET_POLICY_DHCP.store(0, Ordering::Relaxed);
                 log(b"netpolicy: static 192.168.0.50/24\n");
             }
+            Some("dns") if (4..=5).contains(&cmd.args.len()) => {
+                let Some(server) = parse_ipv4(&cmd.args[1]) else {
+                    usage(b"usage: netpolicy dns <server> <udp_port> <tcp_port> [on|off]\n");
+                    return true;
+                };
+                let udp: u16 = cmd.args[2].parse().unwrap_or(0);
+                let tcp: u16 = cmd.args[3].parse().unwrap_or(0);
+                let fallback = match cmd.args.get(4).map(|a| a.as_str()) {
+                    None | Some("off") => false,
+                    Some("on") => true,
+                    Some(_) => {
+                        usage(b"usage: netpolicy dns <server> <udp_port> <tcp_port> [on|off]\n");
+                        return true;
+                    }
+                };
+                if udp == 0 || tcp == 0 {
+                    usage(b"usage: netpolicy dns <server> <udp_port> <tcp_port> [on|off]\n");
+                } else {
+                    NET_DNS_SERVER.store(u32::from_be_bytes(server), Ordering::Relaxed);
+                    NET_DNS_PORTS.store((u32::from(udp) << 16) | u32::from(tcp), Ordering::Relaxed);
+                    NET_DNS_FLAGS.store(u32::from(fallback), Ordering::Relaxed);
+                    log(b"netpolicy: dns server granted, udp=");
+                    log_dec(u64::from(udp));
+                    log(b" tcp=");
+                    log_dec(u64::from(tcp));
+                    log(b" fallback=");
+                    log_dec(u64::from(fallback as u64));
+                    log(b"\n");
+                }
+            }
             Some("dhcp") if cmd.args.len() <= 3 => {
                 let server: u16 = cmd.args.get(1).and_then(|a| a.parse().ok()).unwrap_or(67);
                 let client: u16 = cmd.args.get(2).and_then(|a| a.parse().ok()).unwrap_or(68);
@@ -7887,6 +7938,34 @@ fn grant_frame_channel(control: Handle) {
     }
 }
 
+/// NET12: hand the resident netstack the launcher's resolver policy. No policy means no
+/// grant: the resolver then answers NotConfigured rather than guessing a server.
+fn grant_resolver(control: Handle) {
+    let server = NET_DNS_SERVER.load(Ordering::Relaxed);
+    let ports = NET_DNS_PORTS.load(Ordering::Relaxed);
+    if server == 0 || ports == 0 {
+        return;
+    }
+    let flags = NET_DNS_FLAGS.load(Ordering::Relaxed) as u8;
+    let mut grant = [0u8; 10];
+    grant[0] = CONTROL_RESOLVER_TAG;
+    grant[1..5].copy_from_slice(&server.to_be_bytes());
+    grant[5..7].copy_from_slice(&(((ports >> 16) & 0xFFFF) as u16).to_le_bytes());
+    grant[7..9].copy_from_slice(&((ports & 0xFFFF) as u16).to_le_bytes());
+    grant[9] = flags;
+    if channel_write(control, grant.as_ptr(), grant.len()) != 0 {
+        kumo_rt::log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"netstack: resolver grant refused; resolution stays NotConfigured\n",
+        );
+        return;
+    }
+    kumo_rt::log_write(
+        kumo_abi::sys::log_level::NOTICE,
+        b"netstack: resolver grant sent\n",
+    );
+}
+
 fn netstack_start() -> bool {
     let mut state = NET_SUPERVISOR.get();
     let Some(epoch) = state.epoch.checked_add(1) else {
@@ -7904,6 +7983,7 @@ fn netstack_start() -> bool {
     state.instance = Some(instance);
     NET_SUPERVISOR.set(state);
     grant_frame_channel(control);
+    grant_resolver(control);
     log(b"netstack: supervised instance ");
     log_dec(u64::from(epoch));
     log(b" ready\n");
