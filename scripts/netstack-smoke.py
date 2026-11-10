@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j821
+#j856
 """AXH: build, boot and check native NET2 loopback/recovery; restore the default image.
 
 No NIC, credentials or board access. Artifacts remain under build/verification. POST is
@@ -65,6 +66,24 @@ CASES = (
     ), ready=4),
     Case("idle", b"echo AXH idle begins\nnet netprobe udp\nnetstack-crash-proof idle\necho AXH idle ends\n", (
         "netprobe: udp PASS", "netstack-proof: idle kill armed", "netstack-proof: idle kill sent",
+    ), ready=2),
+    # NET15-c1 on the std path: one self-contained builtin spawns the arming std client,
+    # kills the supervised netstack, waits for the replacement, drains the old client and
+    # runs the fresh one. Nothing is asked of the autoexec after the kill. — TIMBERDOODLE
+    Case("stdrestart", b"echo AXH stdrestart begins\nnetstack-crash-proof std 7805\necho AXH stdrestart ends\n", (
+        "netstack-proof: std client armed",
+        "std: net recover-wait armed (live TCP, pending read)",
+        "netstack: terminated; old sessions invalidated",
+        "std: net recover-wait old session -> ECONNRESET ok",
+        "netstack-proof: std kill observed",
+        "netstack: restart delayed",
+        "netstack: supervised instance 2 ready",
+        "netstack-proof: std instance ready",
+        "netstack-proof: std old client exited",
+        "std: net recover-fresh bind on the old port -> OK",
+        "std: net recover-fresh exact exchange -> OK",
+        "std: net recovery -> OK",
+        "netstack-proof: std fresh client done",
     ), ready=2),
 )
 POST_NAMES = ("CONSOLE ROUTE", "BLOCK SERVE", "BLOCK FAT32", "BLOCK FILE", "NET LOOPBACK")

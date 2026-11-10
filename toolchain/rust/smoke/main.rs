@@ -1,4 +1,5 @@
 //j853
+//j856
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -20,6 +21,13 @@ unsafe extern "C" {
 /// runtime must install it before any std code touches a thread-local.
 const TLS_AREA_SIZE: usize = 16 * 1024;
 static mut TLS_AREA: [u8; TLS_AREA_SIZE + 16] = [0; TLS_AREA_SIZE + 16];
+/// relibc's GenericTcb header for kumo (a zero-sized OsSpecific): `{tls_end, tls_len,
+/// tcb_ptr, tcb_len}`. `[TPIDR_EL0]` must name this header (`GenericTcb::current_ptr`
+/// follows the stored pointer), and `tcb_ptr` must name a `Tcb` below. — TIMBERDOODLE
+static mut TCB_HEADER: [usize; 4] = [0; 4];
+/// Zeroed `Tcb` storage: `linker_ptr` (0x38) and every other field stay null — no
+/// dynamic linker, no TLS masters, no pthread state for this static image.
+static mut TCB_STORAGE: [u8; 256] = [0; 256];
 
 unsafe fn init_tls() {
     let tdata_start = core::ptr::addr_of!(__tdata_start) as usize;
@@ -33,9 +41,16 @@ unsafe fn init_tls() {
     let block = (tp - tls_size) as *mut u8;
     core::ptr::copy_nonoverlapping(tdata_start as *const u8, block, tdata_len);
     core::ptr::write_bytes(block.add(tdata_len), 0, tls_size - tdata_len);
-    // aarch64 tcbhead: dtv pointer then the self pointer at TP.
-    core::ptr::write_bytes(tp as *mut u8, 0, 16);
-    core::ptr::write((tp + 8) as *mut usize, tp);
+    // relibc's Variant-I ABI slot: the word at TP names the GenericTcb header, whose
+    // tcb_ptr names the Tcb. The glibc {dtv, self} pair this used to hold left
+    // Tcb::current() null and faulted ld_so::fini at exit (J856).
+    let header = core::ptr::addr_of_mut!(TCB_HEADER).cast::<usize>();
+    let tcb = core::ptr::addr_of_mut!(TCB_STORAGE).cast::<u8>() as usize;
+    core::ptr::write(header, tp);
+    core::ptr::write(header.add(1), tls_size);
+    core::ptr::write(header.add(2), tcb);
+    core::ptr::write(header.add(3), 256);
+    core::ptr::write(tp as *mut usize, header as usize);
     core::arch::asm!("msr tpidr_el0, {}", in(reg) tp, options(nostack, preserves_flags));
 }
 
@@ -117,6 +132,19 @@ pub extern "C" fn kumo_std_start(bootstrap: u64) -> KumoArgs {
         argc: argc as isize,
         argv: ptrs.cast::<*const u8>() as *const *const u8,
     }
+}
+
+/// `_start` calls this with lang_start's status once `main` returns: returning from
+/// `main` must terminate the process (C semantics). The old `b .` spin left every std
+/// program alive after its last record — the J856 exit defect. — TIMBERDOODLE
+unsafe extern "C" {
+    /// relibc's C `exit`: atexit handlers, fini arrays, stdio flush, then ProcessExit.
+    fn exit(status: i32) -> !;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kumo_std_exit(status: i32) -> ! {
+    unsafe { exit(status) }
 }
 
 fn main() {
@@ -570,6 +598,14 @@ fn recover_wait(args: &[String]) {
     };
     let _ = far.set_read_timeout(Some(Duration::from_secs(60)));
     netlog!("recover-wait armed (live TCP, pending read)");
+    // Sora's NET15-c1 proof gates the supervised kill on this stdout record; the ring
+    // record above stays the durable acceptance line. — TIMBERDOODLE
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"recover-wait armed\n");
+        let _ = out.flush();
+    }
     let mut buf = [0u8; 64];
     match far.read(&mut buf) {
         Err(ref e)
@@ -581,7 +617,14 @@ fn recover_wait(args: &[String]) {
         Err(e) => netlog!("recover-wait old session -> {:?} FAIL", e),
         Ok(n) => netlog!("recover-wait old session -> Ok({}) FAIL", n),
     }
-    let _ = client;
+    // J856 diagnostics: localize the dead-session teardown. The records bracket the
+    // socket drops and the return into std's exit path.
+    netlog!("recover-wait teardown");
+    drop(far);
+    drop(listener);
+    drop(client);
+    netlog!("recover-wait teardown done");
+    netlog!("recover-wait returning");
 }
 
 /// NET15-c1 half two: a fresh process (and therefore a fresh launcher grant to the

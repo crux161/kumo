@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j824
 //j825
 //j829
 //j837
 //j843
+//j856
 
 extern crate alloc;
 
@@ -6891,10 +6891,14 @@ fn eval_command(
     }
     #[cfg(feature = "netstack-restart-proof")]
     if cmd.name == "netstack-crash-proof" {
-        if cmd.args.first().is_some_and(|a| a == "idle") {
-            netstack_idle_crash_proof(initrd);
-        } else {
-            netstack_crash_proof(initrd, cmd.args.first().is_some_and(|a| a == "burst"));
+        match cmd.args.first().map(|a| a.as_str()) {
+            Some("idle") => netstack_idle_crash_proof(initrd),
+            Some("burst") => netstack_crash_proof(initrd, true),
+            Some("std") => match cmd.args.get(1).and_then(|p| p.parse::<u16>().ok()) {
+                Some(port) => netstack_std_restart_proof(initrd, port),
+                None => usage(b"usage: netstack-crash-proof std <port>\n"),
+            },
+            _ => netstack_crash_proof(initrd, false),
         }
         return true;
     }
@@ -8217,6 +8221,314 @@ fn netstack_crash_proof(initrd: Handle, burst: bool) {
         }
     }
     log(b"netstack-proof: kill observed\n");
+}
+
+/// NET15-c1, std path, both halves in one boot. A background std client (the metal
+/// campaign's launch policy) arms a live loopback TCP with a pending read; Sora kills
+/// the supervised netstack, waits for the replacement, and the client's pending read
+/// must fail explicitly. Then a fresh std process — a fresh launcher grant and the
+/// `ruststd` builtin's fd-0 policy — rebinds the old port and completes an exact
+/// exchange. Self-contained on purpose: the autoexec evaluator is not asked to run a
+/// line after the kill (the J855 drain stall). — TIMBERDOODLE
+#[cfg(feature = "netstack-restart-proof")]
+fn netstack_std_restart_proof(initrd: Handle, port: u16) {
+    let Some(instance) = netstack_ready(initrd) else {
+        log(b"netstack-proof: std FAIL no instance\n");
+        return;
+    };
+    let port_text = alloc::format!("{port}");
+    let wait_argv = [
+        b"std-smoke".as_slice(),
+        b"net",
+        b"recover-wait",
+        port_text.as_bytes(),
+    ];
+    let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+    slots[..wait_argv.len()].copy_from_slice(&wait_argv);
+    let Some(mut client) = run_with_startup_input(
+        initrd,
+        STD_SMOKE_PATH.as_bytes(),
+        b"std-smoke",
+        Some(&slots[..wait_argv.len()]),
+        false,
+        FsGrant::None,
+        false,
+        false,
+        StdinMode::Interactive,
+        true,
+    ) else {
+        log(b"netstack-proof: std FAIL client spawn\n");
+        return;
+    };
+    let _ = handle_close(client.stdin);
+    // Gate the kill on the client's own stdout record (bind, connect and accept have
+    // all completed), not on a sleep. A missing marker only loses pacing: the ring
+    // record it mirrors is a required transcript line.
+    if !proof_wait_stdout(client.stdout, b"recover-wait armed", 5_000_000_000) {
+        log(b"netstack-proof: std client marker missing; proceeding\n");
+    }
+    log(b"netstack-proof: std client armed\n");
+    if process_kill(instance.process) != 0 {
+        log(b"netstack-proof: std FAIL kill\n");
+        if let Some(process) = client.process {
+            let _ = process_kill(process);
+            let _ = handle_close(process);
+        }
+        let _ = handle_close(client.stdout);
+        return;
+    }
+    // Wait until the supervisor observes the death, exactly as the plain proof does;
+    // stale koids are ignored by the service dispatcher.
+    let Some(port_handle) = reply_port() else {
+        return;
+    };
+    let Some(deadline) = syscall_handle(timer_create(5_000_000_000)) else {
+        return;
+    };
+    let deadline_koid = handle_koid(deadline);
+    if deadline_koid == u64::MAX || port_bind(port_handle, deadline) != 0 {
+        let _ = handle_close(deadline);
+        return;
+    }
+    while NET_SUPERVISOR
+        .get()
+        .instance
+        .is_some_and(|s| s.koid == instance.koid)
+    {
+        let source = port_wait(port_handle);
+        if source == deadline_koid || source == u64::MAX {
+            break;
+        }
+        dispatch_service_event(source);
+    }
+    let _ = port_unbind(port_handle, deadline);
+    let _ = handle_close(deadline);
+    if NET_SUPERVISOR
+        .get()
+        .instance
+        .is_some_and(|s| s.koid == instance.koid)
+    {
+        log(b"netstack-proof: std FAIL termination watch\n");
+        return;
+    }
+    log(b"netstack-proof: std kill observed\n");
+    // Let the old client observe the session failure and exit untouched: this sleep
+    // parks on a private timer port with nothing else bound, so the client's exit
+    // cannot race a supervisor event (the J856 wedge: the replacement spawn's child
+    // pump landing on the client's exit). The restart timer's packet stays queued on
+    // the reply port while we are away from it.
+    proof_sleep(500_000_000);
+    // The client must now be gone: its stdout is closed and PEER_CLOSED is
+    // level-replayed on bind. A live client is a named FAIL, never a park.
+    let closed = proof_channel_closed(client.stdout, 1_000_000_000);
+    let _ = handle_close(client.stdout);
+    if let Some(process) = client.process.take() {
+        let _ = handle_close(process);
+    }
+    if !closed {
+        log(b"netstack-proof: std FAIL old client lingered\n");
+        return;
+    }
+    log(b"netstack-proof: std old client exited\n");
+    // Only now enter the supervisor's port: the queued restart fires with no client
+    // exiting beside it, the same ordering the plain restart proof proves.
+    if !proof_wait_replacement() {
+        log(b"netstack-proof: std FAIL no replacement\n");
+        return;
+    }
+    log(b"netstack-proof: std instance ready\n");
+    let fresh_argv = [
+        b"std-smoke".as_slice(),
+        b"net",
+        b"recover-fresh",
+        port_text.as_bytes(),
+    ];
+    let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+    slots[..fresh_argv.len()].copy_from_slice(&fresh_argv);
+    // Finite stdin keeps fd 0 open: std's unix init sanitizes the standard fds and this
+    // image has no /dev/null. No filesystem grant: the metal wire campaign ran the same
+    // program that way, and a per-launch fatfs child exits on the client's close — the
+    // J856 wedge trigger this proof must not ride.
+    run_with_startup_input(
+        initrd,
+        STD_SMOKE_PATH.as_bytes(),
+        b"std-smoke",
+        Some(&slots[..fresh_argv.len()]),
+        false,
+        FsGrant::None,
+        false,
+        false,
+        StdinMode::Finite(b"\n"),
+        true,
+    );
+    log(b"netstack-proof: std fresh client done\n");
+}
+
+/// Wait, under one deadline, for `marker` in `channel`'s next packet; service events
+/// (the netstack supervisor) stay answered on every wake. — TIMBERDOODLE
+#[cfg(feature = "netstack-restart-proof")]
+fn proof_wait_stdout(channel: Handle, marker: &[u8], deadline_ns: u64) -> bool {
+    let Some(port) = reply_port() else {
+        return false;
+    };
+    let Some(timer) = syscall_handle(timer_create(deadline_ns)) else {
+        return false;
+    };
+    let timer_koid = handle_koid(timer);
+    let channel_koid = handle_koid(channel);
+    if timer_koid == u64::MAX
+        || channel_koid == u64::MAX
+        || port_bind(port, timer) != 0
+        || port_bind(port, channel) != 0
+    {
+        let _ = port_unbind(port, channel);
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+        return false;
+    }
+    let mut buf = [0u8; 128];
+    let found = loop {
+        let source = port_wait(port);
+        if dispatch_service_event(source) {
+            continue;
+        }
+        if source == timer_koid || source == u64::MAX {
+            break false;
+        }
+        if source == channel_koid {
+            let n = channel_read(channel, buf.as_mut_ptr(), buf.len()) as usize;
+            if n == 0 || n > buf.len() {
+                break false;
+            }
+            break buf[..n].windows(marker.len()).any(|w| w == marker);
+        }
+    };
+    let _ = port_unbind(port, channel);
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    found
+}
+
+/// Park on a private one-shot timer port. Nothing else is bound there, so no other
+/// object's event can race this wait (J856: the replacement-spawn pump colliding with
+/// the old client's exit wedged the machine). — TIMBERDOODLE
+#[cfg(feature = "netstack-restart-proof")]
+fn proof_sleep(ns: u64) {
+    let Some(port) = syscall_handle(port_create()) else {
+        return;
+    };
+    let Some(timer) = syscall_handle(timer_create(ns)) else {
+        let _ = handle_close(port);
+        return;
+    };
+    if port_bind(port, timer) == 0 {
+        let _ = port_wait(port);
+    }
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    let _ = handle_close(port);
+}
+
+/// Whether `channel` is already closed, checked on a private port under one deadline.
+/// PEER_CLOSED is level-replayed at bind, so a closed channel answers at once; a live
+/// silent channel answers false at the deadline. — TIMBERDOODLE
+#[cfg(feature = "netstack-restart-proof")]
+fn proof_channel_closed(channel: Handle, deadline_ns: u64) -> bool {
+    let Some(port) = syscall_handle(port_create()) else {
+        return false;
+    };
+    let Some(timer) = syscall_handle(timer_create(deadline_ns)) else {
+        let _ = handle_close(port);
+        return false;
+    };
+    let timer_koid = handle_koid(timer);
+    let channel_koid = handle_koid(channel);
+    if timer_koid == u64::MAX
+        || channel_koid == u64::MAX
+        || port_bind(port, timer) != 0
+        || port_bind(port, channel) != 0
+    {
+        let _ = port_unbind(port, channel);
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+        let _ = handle_close(port);
+        return false;
+    }
+    let mut buf = [0u8; 128];
+    let closed = loop {
+        let source = port_wait(port);
+        if source == u64::MAX || source == timer_koid {
+            break false;
+        }
+        if source == channel_koid {
+            let n = channel_read(channel, buf.as_mut_ptr(), buf.len()) as usize;
+            break n == 0;
+        }
+    };
+    let _ = port_unbind(port, channel);
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    let _ = handle_close(port);
+    closed
+}
+
+/// Wait for the supervised replacement on the reply port, bounded and loud. The plain
+/// proof leans on the next console command to pump this event; a self-contained proof
+/// cannot, and must never spin silently on a port whose head packet it does not own.
+/// — TIMBERDOODLE
+#[cfg(feature = "netstack-restart-proof")]
+fn proof_wait_replacement() -> bool {
+    let Some(port) = reply_port() else {
+        log(b"netstack-proof: std wait FAIL no port\n");
+        return false;
+    };
+    let Some(deadline) = syscall_handle(timer_create(20_000_000_000)) else {
+        log(b"netstack-proof: std wait FAIL no deadline\n");
+        return false;
+    };
+    let deadline_koid = handle_koid(deadline);
+    if deadline_koid == u64::MAX || port_bind(port, deadline) != 0 {
+        let _ = handle_close(deadline);
+        log(b"netstack-proof: std wait FAIL deadline bind\n");
+        return false;
+    }
+    log(b"netstack-proof: std wait port=");
+    log_dec(u64::from(port.0));
+    log(b" timer=");
+    log_dec(NET_SUPERVISOR.get().timer.map_or(0, |t| t.1));
+    log(b"\n");
+    let mut unowned = 0u32;
+    let ready = loop {
+        let state = NET_SUPERVISOR.get();
+        if state.instance.is_some() {
+            break true;
+        }
+        if state.timer.is_none() {
+            log(b"netstack-proof: std wait FAIL no timer\n");
+            break false;
+        }
+        let source = port_wait(port);
+        if source == deadline_koid || source == u64::MAX {
+            log(b"netstack-proof: std wait FAIL deadline\n");
+            break false;
+        }
+        if dispatch_service_event(source) {
+            continue;
+        }
+        // An event this dispatcher does not own: name its source, tolerate a
+        // transient or two, then fail rather than wedge the machine.
+        log(b"netstack-proof: std wait: unowned wake ");
+        log_dec(source);
+        log(b"\n");
+        unowned += 1;
+        if unowned >= 4 {
+            log(b"netstack-proof: std wait FAIL unowned wake\n");
+            break false;
+        }
+    };
+    let _ = port_unbind(port, deadline);
+    let _ = handle_close(deadline);
+    ready
 }
 
 // AX0 is opt-in. An autoexec request runs only after the ordinary login services settle.

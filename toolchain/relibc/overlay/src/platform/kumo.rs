@@ -1,8 +1,8 @@
-//j513
 //j514
 //j535
 //j557
 //j759
+//j856
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -1015,7 +1015,18 @@ unsafe fn build_startup_image(argv_vmo: u32) -> &'static Stack {
 /// which owns its parse and close. std owns the rest of its runtime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __kumo_startup(bootstrap: u64) -> u32 {
-    take_bootstrap_capabilities(bootstrap as u32)
+    let argv_vmo = take_bootstrap_capabilities(bootstrap as u32);
+    // The std entry bypasses relibc_start_v1, which is what normally initializes stdio
+    // and the main thread's Pthread record. Without this, exit's flush_io_streams walks
+    // a null FILE and faults, and pthread_self has no record (J856). Mirror start.rs's
+    // order: stdio first, then pthread; both are idempotent per-process.
+    unsafe {
+        crate::header::stdio::stdin = crate::header::stdio::default_stdin().get();
+        crate::header::stdio::stdout = crate::header::stdio::default_stdout().get();
+        crate::header::stdio::stderr = crate::header::stdio::default_stderr().get();
+        crate::pthread::init();
+    }
+    argv_vmo
 }
 
 #[unsafe(no_mangle)]
