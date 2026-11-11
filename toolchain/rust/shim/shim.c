@@ -1,4 +1,5 @@
 // j853
+// j871
 // The KUMO std shim: the few C symbols std references that relibc does not provide.
 // Freestanding C, no headers. Everything outside the surface below refuses by name
 // (ENOSYS) rather than pretending.
@@ -151,6 +152,28 @@ long splice(int fd_in, long *off_in, int fd_out, long *off_out, unsigned long le
     (void)flags;
     *__errno_location() = ENOSYS;
     return -1;
+}
+
+// std's Command wait path pulls PidFd::waitid in as a hard symbol; relibc exports
+// waitpid only. ENOSYS through errno makes std report the pidfd path unsupported and
+// fall back to its waitpid loop (SH4).
+int waitid(int idtype, unsigned int id, void *infop, int options) {
+    (void)idtype;
+    (void)id;
+    (void)infop;
+    (void)options;
+    *__errno_location() = ENOSYS;
+    return -1;
+}
+
+// std references the glibc-only posix_spawn_file_actions_addchdir_np extension as a hard
+// symbol; relibc exports the POSIX addchdir. Forward, so a Command::current_dir request
+// records the action (the overlay's spawn refuses Chdir explicitly) instead of failing in
+// the shim (SH4).
+extern int posix_spawn_file_actions_addchdir(void *actions, const char *path);
+
+int posix_spawn_file_actions_addchdir_np(void *actions, const char *path) {
+    return posix_spawn_file_actions_addchdir(actions, path);
 }
 
 extern char *strerror(int errnum);

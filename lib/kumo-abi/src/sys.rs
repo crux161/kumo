@@ -1,8 +1,8 @@
-//j743
 //j790
 //j797
 //j824
 //j825
+//j871
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +65,11 @@ pub enum Syscall {
     ProcessRun = 32,
     PortBind = 33,
     HandleKoid = 34,
+    /// Block until the async children drain: x0 = status (Ok when all are reaped,
+    /// ShouldWait while resident children remain), and since SH4 one reaped child OF THE
+    /// CALLER per call reports x1 = its process koid (0 when none) and x2 = its exit code.
+    /// A resident child calling it gets no scheduler pump: it reaps its own children and
+    /// blocks, if it must, on a port bound to the child process (`TERMINATED`).
     ProcessWait = 35,
     ResourceCreateChild = 36,
     PortUnbind = 37,
@@ -314,6 +319,11 @@ pub const fn interrupt_authority_key(irq: u32) -> u32 {
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessRunFlags(pub u64);
+
+/// `ChannelRead` x3 flag (SH4): do not park when the inbox is empty; x0 answers
+/// `Errno::ShouldWait` instead. Honoured on the resident-child read path (relibc's
+/// nonblocking pipes); Sora's multiplexed reads keep their park-once contract.
+pub const CHANNEL_READ_NONBLOCK: u64 = 1 << 0;
 
 impl ProcessRunFlags {
     /// Admit the child without blocking the caller.

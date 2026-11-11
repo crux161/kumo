@@ -1,8 +1,8 @@
-//j822
 //j823
 //j824
 //j825
 //j857
+//j871
 
 use std::env;
 use std::fmt;
@@ -801,6 +801,8 @@ const FAT_SPC: u8 = 1;
 const FAT_SPF: u32 = 32; // sectors per FAT
 const FAT_TOTAL_SECS: u32 = 4096;
 const ROOT_CLUSTER: u32 = 2;
+/// First data cluster of the std-smoke copy packed as SMOKE.ELF (SH4 spawn preview).
+const SMOKE_FIRST_CLUSTER: u32 = 7;
 const DATA_START: u64 = FAT_RESERVED as u64 + (FAT_NUM_FATS as u64 * FAT_SPF as u64);
 
 /// Byte offset of the first sector of `cluster` within the FAT image.
@@ -818,7 +820,7 @@ fn put_dir_entry(dir: &mut [u8], off: usize, name: &[u8; 11], attr: u8, cluster:
     e[28..32].copy_from_slice(&size.to_le_bytes());
 }
 
-fn build_fat32_image() -> Vec<u8> {
+fn build_fat32_image(smoke: &[u8]) -> Vec<u8> {
     let total = FAT_TOTAL_SECS as usize * FAT_SEC_SIZE as usize;
     let mut img = vec![0u8; total];
 
@@ -862,6 +864,24 @@ fn build_fat32_image() -> Vec<u8> {
         fat1[16..20].copy_from_slice(&eof); // cluster 4 = EFI/ dir = EOF
         fat1[20..24].copy_from_slice(&eof); // cluster 5 = EFI/BOOT/ dir = EOF
         fat1[24..28].copy_from_slice(&eof); // cluster 6 = BOOTAA64.EFI = EOF
+
+        // SMOKE.ELF: the std-smoke copy the spawn proof executes (SH4), one chain from
+        // cluster 7.
+        // An empty payload (the host fixture test) leaves the entry at size 0, cluster 0.
+        let smoke_clusters = smoke.len().div_ceil(512);
+        assert!(
+            SMOKE_FIRST_CLUSTER as usize + smoke_clusters < 4096,
+            "SMOKE.ELF too large for the fixture FAT"
+        );
+        for index in 0..smoke_clusters {
+            let cluster = SMOKE_FIRST_CLUSTER as usize + index;
+            let next = if index + 1 == smoke_clusters {
+                eof
+            } else {
+                ((cluster + 1) as u32).to_le_bytes()
+            };
+            fat1[cluster * 4..cluster * 4 + 4].copy_from_slice(&next);
+        }
     }
 
     // ---- FAT #2 at sector 64 (copy of FAT #1) ----
@@ -871,6 +891,12 @@ fn build_fat32_image() -> Vec<u8> {
     // ---- cluster 3 (sector 97): HELLO.TXT payload ----
     img[fat_cluster_off(3)..fat_cluster_off(3) + 6].copy_from_slice(b"hello!");
 
+    // ---- SMOKE.ELF payload from cluster 7 ----
+    for (index, chunk) in smoke.chunks(512).enumerate() {
+        let at = fat_cluster_off(SMOKE_FIRST_CLUSTER + index as u32);
+        img[at..at + chunk.len()].copy_from_slice(chunk);
+    }
+
     // ---- root directory at cluster 2 (sector 96) ----
     {
         let dir = &mut img[fat_cluster_off(2)..fat_cluster_off(2) + 512];
@@ -878,7 +904,19 @@ fn build_fat32_image() -> Vec<u8> {
         put_dir_entry(dir, 32, b"README  TXT", 0x20, 0, 128);
         put_dir_entry(dir, 64, b"HELLO   TXT", 0x20, 3, 6); // cluster 3, 6 bytes
         put_dir_entry(dir, 96, b"EFI        ", 0x10, 4, 0); // subdirectory, cluster 4
-        dir[128] = 0x00; // end of directory
+        put_dir_entry(
+            dir,
+            128,
+            b"SMOKE   ELF",
+            0x20,
+            if smoke.is_empty() {
+                0
+            } else {
+                SMOKE_FIRST_CLUSTER
+            },
+            smoke.len() as u32,
+        ); // the spawn proof's child (SH4)
+        dir[160] = 0x00; // end of directory
     }
 
     // ---- EFI/ directory at cluster 4 (sector 98) ----
@@ -932,7 +970,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let asidpair = build_native_bin(&workspace_root()?, "asidpair")?;
             let actorcall = build_native_bin(&workspace_root()?, "actorcall")?;
             let ax4idle = build_native_bin(&workspace_root()?, "ax4idle")?;
-            let fat32_img = build_fat32_image();
+            // computed just below, once the smoke binary is in hand
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
             let gfx_client = build_graphics_client_image(&workspace_root()?, "gfx-client")?;
@@ -956,6 +994,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let kilo = build_kilo_image(&workspace_root()?)?;
             let autoexec = build_autoexec();
             let shadow = identity::shadow_file()?;
+            let fat32_img = build_fat32_image(std_smoke.as_slice());
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
@@ -3117,7 +3156,7 @@ mod fat32_image_tests {
 
     #[test]
     fn generated_image_resolves_root_and_esp_paths() {
-        let mut disk = ImageDisk(build_fat32_image());
+        let mut disk = ImageDisk(build_fat32_image(&[]));
         let vol = FatVolume::mount(&mut disk).expect("mount generated fat32.img");
 
         // The existing root file still resolves (regression guard).

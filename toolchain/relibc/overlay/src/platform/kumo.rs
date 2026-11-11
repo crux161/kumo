@@ -1,8 +1,8 @@
-//j859
 //j866
 //j867
 //j868
 //j869
+//j871
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -56,6 +56,49 @@ const SYSCALL_PROCESS_EXIT: u64 = 21;
 const SYSCALL_CLOCK_GET: u64 = 26;
 const SYSCALL_FUTEX_WAIT: u64 = 28;
 const SYSCALL_FUTEX_WAKE: u64 = 29;
+const SYSCALL_HANDLE_DUPLICATE: u64 = 1;
+const SYSCALL_CHANNEL_CREATE: u64 = 3;
+const SYSCALL_PORT_CREATE: u64 = 7;
+const SYSCALL_PORT_WAIT: u64 = 8;
+const SYSCALL_TIMER_CREATE: u64 = 27;
+const SYSCALL_PORT_BIND: u64 = 33;
+const SYSCALL_PORT_UNBIND: u64 = 37;
+const SYSCALL_VMO_WRITE: u64 = 14;
+const SYSCALL_PROCESS_CREATE: u64 = 18;
+const SYSCALL_ADDRESS_SPACE_CREATE: u64 = 31;
+const SYSCALL_PROCESS_RUN: u64 = 32;
+const SYSCALL_HANDLE_KOID: u64 = 34;
+const SYSCALL_PROCESS_WAIT: u64 = 35;
+const SYSCALL_PROCESS_KILL: u64 = 46;
+
+// SH4 spawn constants. The VMAR bits mirror `kumo_abi::VmarFlags`; a child's segments are
+// user pages. Rights::ALL for the duplicated standard handles.
+const VMAR_EXECUTE: u64 = 1 << 2;
+const VMAR_USER: u64 = 1 << 3;
+/// Rights for a duplicated standard handle: enough to use the channel end and transfer it
+/// into the child, and no more — a duplicate may only narrow its source (the kernel
+/// refuses amplification), and Sora's transfers use exactly this subset.
+const RIGHTS_CHANNEL: u64 = 0x2 | 0x4 | 0x8; // TRANSFER | READ | WRITE
+const PROCESS_RUN_ASYNC: u64 = 1 << 0;
+const PROCESS_RUN_TRANSFER_ARG: u64 = 1 << 1;
+/// The child address-space reservation ProcessCreate is given, as Sora gives its children.
+const CHILD_VMAR_SIZE: u64 = 0x2000_0000;
+/// The child stack arena top, as Sora's loader fixes it.
+const CHILD_STACK_TOP: u64 = 0x1001_0000;
+const DEFAULT_CHILD_STACK: u64 = 0x4000;
+const MAX_CHILD_STACK: u64 = 8 * 1024 * 1024;
+const MAX_CHILDREN: usize = 8;
+/// Child pids are table slots offset by 100, clear of the standard descriptors.
+const CHILD_PID_BASE: c_int = 100;
+const PT_LOAD: u32 = 1;
+const PT_GNU_STACK: u32 = 0x6474_E551;
+/// `ChannelRead` x3: answer `ShouldWait` on an empty inbox instead of parking (SH4; mirrors
+/// `kumo_abi::sys::CHANNEL_READ_NONBLOCK`).
+const CHANNEL_READ_NONBLOCK: u64 = 1 << 0;
+/// Epoll sets this process may hold open at once, and the descriptors each may watch.
+/// relibc's `poll` makes one transient set per call; std's piped-output loop watches two.
+const EPOLL_SETS: usize = 4;
+const EPOLL_ENTRIES: usize = 8;
 
 /// KUMO statuses this backend distinguishes. The whole error space is negative, which is
 /// what lets `FutexWake` return a woken count in the same register.
@@ -278,7 +321,36 @@ enum FdSlot {
         rcv_timeo_ms: u16,
         snd_timeo_ms: u16,
     },
+    /// An epoll instance (SH4): a kernel port the watched channels are bound to. relibc's
+    /// `poll` is built on it, which is what std's piped-stdio reader needs.
+    Epoll {
+        set: u8,
+    },
 }
+
+/// One watched descriptor of an epoll set: the channel it names (bound to the set's port
+/// when readable interest was registered) and the koid `PortWait` reports for it.
+#[derive(Clone, Copy)]
+struct EpollEntry {
+    fd: c_int,
+    events: u32,
+    data: u64,
+    handle: u32,
+    koid: u64,
+    bound: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EpollSet {
+    port: u32,
+    entries: [Option<EpollEntry>; EPOLL_ENTRIES],
+}
+
+static mut EPOLL_TABLE: [Option<EpollSet>; EPOLL_SETS] = [None; EPOLL_SETS];
+
+/// O_NONBLOCK for channel descriptors (SH4), indexed like `FD_TABLE`. Per descriptor, not
+/// per open file description: a dup does not share it (recorded deviation).
+static mut FD_NONBLOCK: [bool; FD_SLOTS] = [false; FD_SLOTS];
 
 /// Descriptors this backend can hold. POSIX programs expect 0/1/2 to be stdio, so the table
 /// is indexed directly by the descriptor number.
@@ -362,6 +434,431 @@ fn vmar_map_anywhere(vmo: u32, len: usize) -> (u64, u64) {
     (status, address)
 }
 
+/// A successful syscall's handle/status word. Kernel errors arrive zero-extended — a
+/// negative i32 in the low word — so `u64::MAX`-only screens let refusals masquerade as
+/// handles; every raw handle helper goes through here.
+fn syscall_ok(value: u64) -> Option<u32> {
+    if value == 0 || (value as u32 as i32) < 0 {
+        return None;
+    }
+    Some(value as u32)
+}
+
+fn channel_pair() -> Option<(u32, u32)> {
+    let first: u64;
+    let second: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_CHANNEL_CREATE,
+            lateout("x0") first,
+            lateout("x1") second,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    Some((syscall_ok(first)?, syscall_ok(second)?))
+}
+
+fn vmo_create_raw(len: u64) -> Option<u32> {
+    syscall_ok(syscall4(SYSCALL_VMO_CREATE, len, 0, 0, 0))
+}
+
+fn vmo_write(vmo: u32, offset: u64, src: *const u8, len: usize) -> u64 {
+    syscall4(SYSCALL_VMO_WRITE, u64::from(vmo), offset, src as u64, len as u64)
+}
+
+/// One startup tag plus one transferred handle, the wire the child's intake loop reads.
+fn channel_write_tag(channel: u32, tag: u8, handle: u32) -> u64 {
+    syscall4(
+        SYSCALL_CHANNEL_WRITE,
+        u64::from(channel),
+        (&raw const tag) as u64,
+        1,
+        u64::from(handle),
+    )
+}
+
+fn handle_duplicate_raw(handle: u32) -> Option<u32> {
+    syscall_ok(syscall4(
+        SYSCALL_HANDLE_DUPLICATE,
+        u64::from(handle),
+        RIGHTS_CHANNEL,
+        0,
+        0,
+    ))
+}
+
+fn handle_koid_raw(handle: u32) -> Option<u64> {
+    let koid = syscall4(SYSCALL_HANDLE_KOID, u64::from(handle), 0, 0, 0);
+    if koid == 0 || (koid as u32 as i32) < 0 {
+        return None;
+    }
+    Some(koid)
+}
+
+fn process_create_raw(vmar_base: u64, vmar_size: u64) -> Option<u32> {
+    syscall_ok(syscall4(SYSCALL_PROCESS_CREATE, vmar_base, vmar_size, 0, 0))
+}
+
+fn process_run_raw(process: u32, entry: u64, sp: u64, arg: u64, arg2: u64, flags: u64) -> u64 {
+    let status: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_PROCESS_RUN,
+            in("x0") u64::from(process),
+            in("x1") entry,
+            in("x2") sp,
+            in("x3") arg,
+            in("x4") arg2,
+            in("x5") flags,
+            lateout("x0") status,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    status
+}
+
+fn process_wait_pair() -> (u64, u64, u64) {
+    let status: u64;
+    let koid: u64;
+    let code: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_PROCESS_WAIT,
+            lateout("x0") status,
+            lateout("x1") koid,
+            lateout("x2") code,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status, koid, code)
+}
+
+fn process_kill_raw(process: u32) -> u64 {
+    syscall4(SYSCALL_PROCESS_KILL, u64::from(process), 0, 0, 0)
+}
+
+fn address_space_create(process: u32, stack_top: u64, stack_size: u64) -> u64 {
+    syscall4(
+        SYSCALL_ADDRESS_SPACE_CREATE,
+        u64::from(process),
+        stack_top,
+        stack_size,
+        0,
+    )
+}
+
+/// Map a child's segment: vmar_map_anywhere's shape, but the child names the address space
+/// and the virtual address is explicit.
+fn vmar_map_child(
+    process: u32,
+    vmo: u32,
+    vmo_offset: u64,
+    virt: u64,
+    len: u64,
+    flags: u64,
+) -> u64 {
+    let status: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_VMAR_MAP,
+            in("x0") u64::from(process),
+            in("x1") u64::from(vmo),
+            in("x2") vmo_offset,
+            in("x3") virt,
+            in("x4") len,
+            in("x5") flags,
+            lateout("x0") status,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    status
+}
+
+/// Build one startup VMO in the argv/env wire format: `[count u32][item\0 ...]`.
+fn startup_image(items: &[&[u8]]) -> Option<u32> {
+    let mut wire = [0u8; 1024];
+    wire[0..4].copy_from_slice(&(items.len() as u32).to_le_bytes());
+    let mut at = 4usize;
+    for item in items {
+        let end = at + item.len() + 1;
+        if end > wire.len() {
+            return None;
+        }
+        wire[at..at + item.len()].copy_from_slice(item);
+        wire[at + item.len()] = 0;
+        at = end;
+    }
+    let vmo = vmo_create_raw(at as u64)?;
+    if vmo_write(vmo, 0, wire.as_ptr(), at) != 0 {
+        close_handle(vmo);
+        return None;
+    }
+    Some(vmo)
+}
+
+// The loader's page arithmetic lives at module scope: the scaffold gate counts
+// four-space `fn` lines as Pal methods, and nested helpers would inflate the trait count.
+fn align_up4k(value: u64) -> Option<u64> {
+    value.checked_add(0xFFF).map(|value| value & !0xFFF)
+}
+
+fn align_down4k(value: u64) -> u64 {
+    value & !0xFFF
+}
+
+fn page_flags(elf: u32) -> u64 {
+    let mut flags = VMAR_USER;
+    if elf & 4 != 0 {
+        flags |= 1; // PF_R
+    }
+    if elf & 2 != 0 {
+        flags |= 2; // PF_W
+    }
+    if elf & 1 != 0 {
+        flags |= VMAR_EXECUTE; // PF_X
+    }
+    flags
+}
+
+/// The kernel spawn pipeline, ported from Sora's loader (SH4): the ELF is read through
+/// THIS process's filesystem grant, staged into a child VMO, mapped into a fresh process,
+/// given a stack, and run asynchronously with one transferred bootstrap channel carrying
+/// exactly the tagged grants built here. Nothing is ambient: the child receives what was
+/// enqueued and no more. — TIMBERDOODLE
+fn spawn_elf(
+    program: CStr,
+    args: &[&[u8]],
+    envs: &[&[u8]],
+    stdio: &[Option<(u8, u32)>; 3],
+) -> Result<pid_t> {
+    use crate::header::{
+        errno::{E2BIG, EAGAIN, EINVAL, EIO, ENOMEM},
+        fcntl::{AT_FDCWD, O_RDONLY},
+    };
+
+    #[derive(Clone, Copy)]
+    struct Segment {
+        file_offset: u64,
+        virt_addr: u64,
+        file_size: u64,
+        mem_size: u64,
+        flags: u64,
+    }
+
+    let fd = Sys::openat(AT_FDCWD, program, O_RDONLY, 0)?;
+
+    let mut vmo = 0u32;
+    let mut process = 0u32;
+    let mut child_end = 0u32;
+    let mut sender = 0u32;
+    let result = (|| -> Result<pid_t> {
+        let mut header = [0u8; 64];
+        let n = Sys::pread(fd, &mut header, 0)?;
+        if n != 64
+            || header[0..4] != [0x7F, b'E', b'L', b'F']
+            || header[4] != 2
+            || header[5] != 1
+        {
+            return Err(Errno(EINVAL));
+        }
+        let entry = u64::from_le_bytes(header[0x18..0x20].try_into().unwrap());
+        let phoff = u64::from_le_bytes(header[0x20..0x28].try_into().unwrap());
+        let phentsize = usize::from(u16::from_le_bytes([header[0x36], header[0x37]]));
+        let phnum = u16::from_le_bytes([header[0x38], header[0x39]]);
+        if phentsize < 56 || phnum == 0 || phnum > 8 {
+            return Err(Errno(EINVAL));
+        }
+
+        let empty = Segment {
+            file_offset: 0,
+            virt_addr: 0,
+            file_size: 0,
+            mem_size: 0,
+            flags: 0,
+        };
+        let mut segments = [empty; 8];
+        let mut segment_count = 0usize;
+        let mut vmo_len = 0u64;
+        let mut stack_request = 0u64;
+        for index in 0..u64::from(phnum) {
+            let mut ph = [0u8; 56];
+            let off = phoff + index * phentsize as u64;
+            if Sys::pread(fd, &mut ph, off as off_t)? != 56 {
+                return Err(Errno(EIO));
+            }
+            let kind = u32::from_le_bytes(ph[0..4].try_into().unwrap());
+            let elf_flags = u32::from_le_bytes(ph[4..8].try_into().unwrap());
+            let file_offset = u64::from_le_bytes(ph[8..16].try_into().unwrap());
+            let virt_addr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
+            let file_size = u64::from_le_bytes(ph[32..40].try_into().unwrap());
+            let mem_size = u64::from_le_bytes(ph[40..48].try_into().unwrap());
+            if kind == PT_GNU_STACK {
+                stack_request = mem_size;
+            } else if kind == PT_LOAD && mem_size != 0 {
+                segments[segment_count] = Segment {
+                    file_offset,
+                    virt_addr,
+                    file_size,
+                    mem_size,
+                    flags: page_flags(elf_flags),
+                };
+                segment_count += 1;
+                // The VMO must cover the mapping's full memory extent, not just the file
+                // bytes: a segment's BSS zero-fill rides the same aligned window, so
+                // size from align_down(file_offset) through align_up(page delta +
+                // mem_size). Sora's loader sizes identically.
+                let vmo_offset = align_down4k(file_offset);
+                let delta = virt_addr & 0xFFF;
+                let span = delta
+                    .checked_add(mem_size)
+                    .and_then(align_up4k)
+                    .ok_or(Errno(EINVAL))?;
+                vmo_len = vmo_len.max(
+                    vmo_offset.checked_add(span).ok_or(Errno(EINVAL))?,
+                );
+            }
+        }
+        if segment_count == 0 {
+            return Err(Errno(EINVAL));
+        }
+
+        let len = align_up4k(vmo_len.max(1)).ok_or(Errno(EINVAL))?;
+        vmo = vmo_create_raw(len).ok_or(Errno(ENOMEM))?;
+        let mut chunk = [0u8; 256];
+        for segment in &segments[..segment_count] {
+            let mut copied = 0u64;
+            while copied < segment.file_size {
+                let take = ((segment.file_size - copied) as usize).min(chunk.len());
+                let got = Sys::pread(
+                    fd,
+                    &mut chunk[..take],
+                    (segment.file_offset + copied) as off_t,
+                )?;
+                if got != take
+                    || vmo_write(
+                        vmo,
+                        segment.file_offset + copied,
+                        chunk.as_ptr(),
+                        take,
+                    ) != 0
+                {
+                    return Err(Errno(EIO));
+                }
+                copied += take as u64;
+            }
+        }
+
+        process = process_create_raw(0, CHILD_VMAR_SIZE).ok_or(Errno(ENOMEM))?;
+        for segment in &segments[..segment_count] {
+            let delta = segment.virt_addr & 0xFFF;
+            let virt = align_down4k(segment.virt_addr);
+            let map_len = align_up4k(delta + segment.mem_size).ok_or(Errno(EINVAL))?;
+            let vmo_offset = align_down4k(segment.file_offset);
+            let map_status = vmar_map_child(process, vmo, vmo_offset, virt, map_len, segment.flags);
+            if map_status != 0 {
+                return Err(Errno(ENOMEM));
+            }
+        }
+
+        let stack_size = match stack_request {
+            0 => DEFAULT_CHILD_STACK,
+            size if size <= MAX_CHILD_STACK => size.max(DEFAULT_CHILD_STACK),
+            _ => return Err(Errno(EINVAL)),
+        };
+        // Sora's loader convention: this call reports failure as u64::MAX; any other
+        // value (a mapped address) is success.
+        let as_value = address_space_create(process, CHILD_STACK_TOP, stack_size);
+        if as_value == u64::MAX {
+            return Err(Errno(ENOMEM));
+        }
+
+        let Some((first, second)) = channel_pair() else {
+            return Err(Errno(ENOMEM));
+        };
+        child_end = first;
+        sender = second;
+        for entry in stdio.iter().flatten() {
+            let (tag, handle) = *entry;
+            if channel_write_tag(sender, tag, handle) != 0 {
+                close_handle(handle);
+                return Err(Errno(EIO));
+            }
+        }
+        let Some(argv_vmo) = startup_image(args) else {
+            return Err(Errno(E2BIG));
+        };
+        if channel_write_tag(sender, STARTUP_TAG_ARGV, argv_vmo) != 0 {
+            close_handle(argv_vmo);
+            return Err(Errno(EIO));
+        }
+        if !envs.is_empty() {
+            let Some(env_vmo) = startup_image(envs) else {
+                return Err(Errno(E2BIG));
+            };
+            if channel_write_tag(sender, STARTUP_TAG_ENV, env_vmo) != 0 {
+                close_handle(env_vmo);
+                return Err(Errno(EIO));
+            }
+        }
+        // The child's intake reads until EOF: the sender must close after the queue.
+        close_handle(sender);
+        sender = 0;
+
+        let koid = handle_koid_raw(process).ok_or(Errno(EINVAL))?;
+        let status = process_run_raw(
+            process,
+            entry,
+            CHILD_STACK_TOP - 0x10,
+            u64::from(child_end),
+            0,
+            PROCESS_RUN_ASYNC | PROCESS_RUN_TRANSFER_ARG,
+        ) as u32 as i32;
+        if status != 0 {
+            return Err(Errno(-status));
+        }
+        // The bootstrap child end was transferred; the VMO mapping kept ours.
+        child_end = 0;
+        close_handle(vmo);
+        vmo = 0;
+
+        let Some(pid) = child_alloc(process, koid) else {
+            let _ = process_kill_raw(process);
+            return Err(Errno(EAGAIN));
+        };
+        process = 0;
+        Ok(pid)
+    })();
+
+    if result.is_err() {
+        if sender != 0 {
+            close_handle(sender);
+        }
+        if child_end != 0 {
+            close_handle(child_end);
+        }
+        if process != 0 {
+            let _ = process_kill_raw(process);
+            close_handle(process);
+        }
+        if vmo != 0 {
+            close_handle(vmo);
+        }
+        for entry in stdio.iter().flatten() {
+            close_handle(entry.1);
+        }
+    }
+    let _ = Sys::close(fd);
+    result
+}
+
 fn vmo_read(vmo: u32, offset: u64, dest: *mut u8, len: usize) -> u64 {
     syscall4(
         SYSCALL_VMO_READ,
@@ -389,6 +886,18 @@ fn channel_read_bytes(channel: u32, buf: &mut [u8]) -> u64 {
         buf.as_mut_ptr() as u64,
         buf.len() as u64,
         0,
+    )
+}
+
+/// `channel_read_bytes` that answers `KUMO_SHOULD_WAIT` (zero-extended in the count word)
+/// on an empty inbox instead of parking.
+fn channel_read_bytes_nonblock(channel: u32, buf: &mut [u8]) -> u64 {
+    syscall4(
+        SYSCALL_CHANNEL_READ,
+        u64::from(channel),
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        CHANNEL_READ_NONBLOCK,
     )
 }
 
@@ -700,6 +1209,102 @@ fn fd_slot(fildes: c_int) -> Option<&'static mut FdSlot> {
 }
 
 /// Claim the lowest free descriptor at or above 3, as POSIX requires of `open`.
+fn fd_nonblock(fildes: c_int) -> bool {
+    usize::try_from(fildes)
+        .ok()
+        .filter(|&index| index < FD_SLOTS)
+        .is_some_and(|index| unsafe { *(&raw const FD_NONBLOCK).cast::<bool>().add(index) })
+}
+
+fn set_fd_nonblock(fildes: c_int, nonblock: bool) {
+    if let Some(index) = usize::try_from(fildes).ok().filter(|&index| index < FD_SLOTS) {
+        unsafe { *(&raw mut FD_NONBLOCK).cast::<bool>().add(index) = nonblock };
+    }
+}
+
+fn epoll_set(set: u8) -> Option<&'static mut EpollSet> {
+    let index = usize::from(set);
+    if index >= EPOLL_SETS {
+        return None;
+    }
+    unsafe {
+        (&raw mut EPOLL_TABLE)
+            .cast::<Option<EpollSet>>()
+            .add(index)
+            .as_mut()?
+            .as_mut()
+    }
+}
+
+fn epoll_set_entry(set: u8) -> Option<&'static mut Option<EpollSet>> {
+    let index = usize::from(set);
+    if index >= EPOLL_SETS {
+        return None;
+    }
+    unsafe {
+        (&raw mut EPOLL_TABLE)
+            .cast::<Option<EpollSet>>()
+            .add(index)
+            .as_mut()
+    }
+}
+
+/// Release an epoll set: unbind every watched channel, close the port, free the slot.
+fn epoll_release(set: u8) {
+    let Some(entry) = epoll_set_entry(set) else {
+        return;
+    };
+    if let Some(instance) = entry.take() {
+        for watched in instance.entries.iter().flatten() {
+            if watched.bound {
+                let _ = port_unbind_raw(instance.port, watched.handle);
+            }
+        }
+        close_handle(instance.port);
+    }
+}
+
+fn port_create_raw() -> Option<u32> {
+    syscall_ok(syscall4(SYSCALL_PORT_CREATE, 0, 0, 0, 0))
+}
+
+fn port_bind_raw(port: u32, object: u32) -> u64 {
+    syscall4(SYSCALL_PORT_BIND, u64::from(port), u64::from(object), 0, 0)
+}
+
+fn port_unbind_raw(port: u32, object: u32) -> u64 {
+    syscall4(SYSCALL_PORT_UNBIND, u64::from(port), u64::from(object), 0, 0)
+}
+
+/// Block until a bound object signals; the answer is that object's koid (0 on failure).
+fn port_wait_raw(port: u32) -> u64 {
+    syscall4(SYSCALL_PORT_WAIT, u64::from(port), 0, 0, 0)
+}
+
+fn timer_create_raw(delay_ns: u64) -> Option<u32> {
+    syscall_ok(syscall4(SYSCALL_TIMER_CREATE, delay_ns, 0, 0, 0))
+}
+
+/// Park until the process behind `process` terminates (SH4 waitpid): a private port bound
+/// to the process object, which the kernel signals `TERMINATED` — replayed at bind time
+/// when the child already ended. Any wake releases the caller; it re-reaps and re-checks.
+fn wait_process_terminated(process: u32) -> Result<()> {
+    use crate::header::errno::EIO;
+
+    let port = port_create_raw().ok_or(Errno(EIO))?;
+    let bound = port_bind_raw(port, process) == 0;
+    let woke = bound && port_wait_raw(port) != 0;
+    if bound {
+        let _ = port_unbind_raw(port, process);
+    }
+    close_handle(port);
+    if woke {
+        Ok(())
+    } else {
+        Err(Errno(EIO))
+    }
+}
+
 fn fd_alloc() -> Option<c_int> {
     for index in 3..FD_SLOTS {
         if let Some(FdSlot::Closed) = fd_slot(index as c_int) {
@@ -718,6 +1323,85 @@ fn fd_alloc_from(min: c_int) -> Option<c_int> {
         }
     }
     None
+}
+
+/// A spawned child (SH4): the retained process handle and the process koid `ProcessWait`
+/// reports for it, or the collected exit code once reaped.
+#[derive(Clone, Copy)]
+enum ChildState {
+    Live,
+    Exited(u64),
+}
+
+#[derive(Clone, Copy)]
+struct ChildSlot {
+    state: ChildState,
+    process: u32,
+    koid: u64,
+}
+
+static mut CHILD_TABLE: [Option<ChildSlot>; MAX_CHILDREN] = [None; MAX_CHILDREN];
+
+fn child_slot(pid: c_int) -> Option<&'static mut ChildSlot> {
+    let index = usize::try_from(pid.checked_sub(CHILD_PID_BASE)?).ok()?;
+    if index >= MAX_CHILDREN {
+        return None;
+    }
+    unsafe {
+        (&raw mut CHILD_TABLE)
+            .cast::<Option<ChildSlot>>()
+            .add(index)
+            .as_mut()?
+            .as_mut()
+    }
+}
+
+fn child_by_koid(koid: u64) -> Option<&'static mut ChildSlot> {
+    for index in 0..MAX_CHILDREN {
+        let slot = unsafe {
+            (&raw mut CHILD_TABLE)
+                .cast::<Option<ChildSlot>>()
+                .add(index)
+                .as_mut()?
+        };
+        if slot.as_ref().is_some_and(|child| child.koid == koid) {
+            return slot.as_mut();
+        }
+    }
+    None
+}
+
+fn child_alloc(process: u32, koid: u64) -> Option<c_int> {
+    for index in 0..MAX_CHILDREN {
+        let slot = unsafe {
+            (&raw mut CHILD_TABLE)
+                .cast::<Option<ChildSlot>>()
+                .add(index)
+                .as_mut()?
+        };
+        if slot.is_none() {
+            *slot = Some(ChildSlot {
+                state: ChildState::Live,
+                process,
+                koid,
+            });
+            return Some(CHILD_PID_BASE + index as c_int);
+        }
+    }
+    None
+}
+
+fn child_entry(pid: c_int) -> Option<&'static mut Option<ChildSlot>> {
+    let index = usize::try_from(pid.checked_sub(CHILD_PID_BASE)?).ok()?;
+    if index >= MAX_CHILDREN {
+        return None;
+    }
+    unsafe {
+        (&raw mut CHILD_TABLE)
+            .cast::<Option<ChildSlot>>()
+            .add(index)
+            .as_mut()
+    }
 }
 
 fn close_handle(handle: u32) {
@@ -928,6 +1612,30 @@ fn socket_info(fildes: c_int) -> Result<(u32, u8, u8, u16, u16)> {
 }
 
 /// How many descriptors other than `skip` name the same session socket.
+/// Descriptors other than `skip` that name the same channel handle (SH4): `dup2` copies a
+/// channel slot by handle, so the kernel handle is released only with its last alias —
+/// otherwise a pipe writer's `close` would never let the reader see PEER_CLOSED.
+fn channel_alias_count(handle: u32, skip: c_int) -> usize {
+    let mut count = 0;
+    for index in 0..FD_SLOTS {
+        if index as c_int == skip {
+            continue;
+        }
+        match fd_slot(index as c_int) {
+            Some(FdSlot::Input(other)) | Some(FdSlot::Output(other)) if *other == handle => {
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
+/// True unless `source` itself names `handle` (dup2 onto an alias of the source).
+fn handle_matches_no_source(handle: u32, source: FdSlot) -> bool {
+    !matches!(source, FdSlot::Input(other) | FdSlot::Output(other) if other == handle)
+}
+
 fn socket_alias_count(id: u32, skip: c_int) -> usize {
     let mut count = 0;
     for index in 0..FD_SLOTS {
@@ -1466,6 +2174,11 @@ impl Sys {
                     *flags = if value != 0 { FD_SOCK_NONBLOCK } else { 0 };
                     Ok(0)
                 }
+                // A pipe or tty end (SH4): std's piped-output reader flips both pipes.
+                FdSlot::Input(_) | FdSlot::Output(_) => {
+                    set_fd_nonblock(fd, value != 0);
+                    Ok(0)
+                }
                 FdSlot::Closed => Err(Errno(EBADF)),
                 _ => Err(Errno(ENOTTY)),
             };
@@ -1473,7 +2186,10 @@ impl Sys {
 
         match fd_slot(fd).map(|slot| *slot) {
             None | Some(FdSlot::Closed) => return Err(Errno(EBADF)),
-            Some(FdSlot::File { .. }) | Some(FdSlot::Socket { .. }) | Some(FdSlot::Dir { .. }) => {
+            Some(FdSlot::File { .. })
+            | Some(FdSlot::Socket { .. })
+            | Some(FdSlot::Dir { .. })
+            | Some(FdSlot::Epoll { .. }) => {
                 return Err(Errno(ENOTTY));
             }
             Some(FdSlot::Input(_)) | Some(FdSlot::Output(_)) => {}
@@ -1633,8 +2349,21 @@ impl Pal for Sys {
         use crate::header::errno::EBADF;
 
         let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
+        set_fd_nonblock(fildes, false);
         match core::mem::replace(slot, FdSlot::Closed) {
             FdSlot::Closed => Err(Errno(EBADF)),
+            FdSlot::Epoll { set } => {
+                epoll_release(set);
+                Ok(())
+            }
+            FdSlot::Input(handle) | FdSlot::Output(handle) => {
+                // Release the channel end with its last alias (SH4): a pipe peer must see
+                // PEER_CLOSED when this process is done writing or reading.
+                if channel_alias_count(handle, fildes) == 0 {
+                    close_handle(handle);
+                }
+                Ok(())
+            }
             FdSlot::Socket { id, .. } => {
                 // Release the session's socket when this was its last descriptor; a
                 // dup2 alias keeps it alive, and a dead session cannot fail the close.
@@ -1674,12 +2403,23 @@ impl Pal for Sys {
             return Ok(fildes2);
         }
         let target = *fd_slot(fildes2).ok_or(Errno(EBADF))?;
-        if let FdSlot::Socket { id, .. } = target {
-            *fd_slot(fildes2).ok_or(Errno(EBADF))? = FdSlot::Closed;
-            if socket_alias_count(id, fildes2) == 0 {
-                let _ = net_call(KNS1_OP_CLOSE, id, 0, 0, &[]);
+        match target {
+            FdSlot::Socket { id, .. } => {
+                *fd_slot(fildes2).ok_or(Errno(EBADF))? = FdSlot::Closed;
+                if socket_alias_count(id, fildes2) == 0 {
+                    let _ = net_call(KNS1_OP_CLOSE, id, 0, 0, &[]);
+                }
             }
+            FdSlot::Input(handle) | FdSlot::Output(handle) => {
+                // The replaced channel end is released with its last alias (SH4).
+                *fd_slot(fildes2).ok_or(Errno(EBADF))? = FdSlot::Closed;
+                if channel_alias_count(handle, fildes2) == 0 && handle_matches_no_source(handle, source) {
+                    close_handle(handle);
+                }
+            }
+            _ => {}
         }
+        set_fd_nonblock(fildes2, fd_nonblock(fildes));
         *fd_slot(fildes2).ok_or(Errno(EBADF))? = source;
         Ok(fildes2)
     }
@@ -1800,6 +2540,11 @@ impl Pal for Sys {
                     fill_stat(buf, 0o140000, 0o666, 1, 0); // S_IFSOCK
                     return Ok(());
                 }
+                FdSlot::Epoll { .. } => {
+                    // An epoll instance is an anonymous inode, as on Linux.
+                    fill_stat(buf, 0o020000, 0o600, 1, 0); // S_IFCHR
+                    return Ok(());
+                }
                 FdSlot::Dir { .. } => {
                     // The same synthetic directory shape the path branch reports
                     // (SH3-d2c): fdopendir's S_IFDIR gate and stat's nlink ride on it.
@@ -1861,9 +2606,18 @@ impl Pal for Sys {
                 } else {
                     0
                 }),
+                FdSlot::Input(_) | FdSlot::Output(_) => Ok(if fd_nonblock(fildes) {
+                    O_NONBLOCK
+                } else {
+                    0
+                }),
                 _ => Ok(0),
             },
             F_SETFL => match slot {
+                FdSlot::Input(_) | FdSlot::Output(_) => {
+                    set_fd_nonblock(fildes, (arg as c_int) & O_NONBLOCK != 0);
+                    Ok(0)
+                }
                 FdSlot::Socket { flags, .. } => {
                     *flags = if (arg as c_int) & O_NONBLOCK != 0 {
                         FD_SOCK_NONBLOCK
@@ -2227,7 +2981,7 @@ impl Pal for Sys {
             FdSlot::Input(_) | FdSlot::Output(_) | FdSlot::Socket { .. } => {
                 return Err(Errno(ESPIPE));
             }
-            FdSlot::Dir { .. } => return Err(Errno(EINVAL)),
+            FdSlot::Dir { .. } | FdSlot::Epoll { .. } => return Err(Errno(EINVAL)),
             FdSlot::File { offset, size, .. } => (offset, size),
         };
         let base = match whence {
@@ -2470,8 +3224,40 @@ impl Pal for Sys {
         Ok(fildes)
     }
 
-    fn pipe2(fildes: Out<[c_int; 2]>, flags: c_int) -> Result<()> {
-        Err(unsupported())
+    /// A pipe over one channel pair (SH4): the read end in fildes[0], the write end in
+    /// fildes[1], the two ends of the same channel.
+    fn pipe2(mut fildes: Out<[c_int; 2]>, flags: c_int) -> Result<()> {
+        use crate::header::errno::EMFILE;
+
+        let _ = flags;
+        let Some((first, second)) = channel_pair() else {
+            return Err(Errno(EMFILE));
+        };
+        // Install each end before allocating the next: `fd_alloc` reports the lowest
+        // CLOSED slot, so allocating both first returned the SAME descriptor twice and the
+        // second install overwrote the first (SH4: the parent's pipe read landed on its own
+        // write slot and answered EBADF).
+        let Some(read_fd) = fd_alloc() else {
+            close_handle(first);
+            close_handle(second);
+            return Err(Errno(EMFILE));
+        };
+        if let Some(slot) = fd_slot(read_fd) {
+            *slot = FdSlot::Input(first);
+        }
+        let Some(write_fd) = fd_alloc() else {
+            if let Some(slot) = fd_slot(read_fd) {
+                *slot = FdSlot::Closed;
+            }
+            close_handle(first);
+            close_handle(second);
+            return Err(Errno(EMFILE));
+        };
+        if let Some(slot) = fd_slot(write_fd) {
+            *slot = FdSlot::Output(second);
+        }
+        unsafe { *fildes.as_mut_ptr() = [read_fd, write_fd] };
+        Ok(())
     }
 
     fn posix_fallocate(fd: c_int, offset: u64, length: NonZeroU64) -> Result<()> {
@@ -2526,7 +3312,7 @@ impl Pal for Sys {
     /// [`VFS_READ_MAX`] bytes per exchange — so callers loop, which is what stdio does.
     /// End of input is a zero-length read, not an error.
     fn read(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
-        use crate::header::errno::{EBADF, ENOTCONN};
+        use crate::header::errno::{EAGAIN, EBADF, ENOTCONN};
 
         if buf.is_empty() {
             return Ok(0);
@@ -2536,9 +3322,16 @@ impl Pal for Sys {
             // A channel read parks until a message arrives, and answers 0 once the writer
             // is gone — which is exactly POSIX end-of-file, so it needs no translation.
             FdSlot::Input(handle) => {
-                let n = channel_read_bytes(handle, buf);
+                let n = if fd_nonblock(fildes) {
+                    channel_read_bytes_nonblock(handle, buf)
+                } else {
+                    channel_read_bytes(handle, buf)
+                };
                 return if n == u64::MAX {
                     Err(Errno(EBADF))
+                } else if n as u32 as i32 == KUMO_SHOULD_WAIT {
+                    // SH4: O_NONBLOCK and nothing queued yet (the peer is still open).
+                    Err(Errno(EAGAIN))
                 } else {
                     Ok((n as usize).min(buf.len()))
                 };
@@ -2682,6 +3475,11 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// posix_spawn over the kernel spawn pipeline (SH4). The child is loaded from THIS
+    /// process's filesystem grant and receives exactly the tagged grants built here —
+    /// stdio (inherited ends duplicated, or the file-action overrides), argv and env as
+    /// VMOs — nothing ambient. File actions support Dup2 and Close on fds 0-2, the shape
+    /// std's piped stdio uses; anything else is EOPNOTSUPP. — TIMBERDOODLE
     unsafe fn spawn(
         program: CStr,
         fac: Option<&crate::header::spawn::posix_spawn_file_actions_t>,
@@ -2689,7 +3487,79 @@ impl Pal for Sys {
         argv: NulTerminated<*mut c_char>,
         envp: Option<NulTerminated<*mut c_char>>,
     ) -> Result<pid_t> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{E2BIG, EINVAL, EMFILE, EOPNOTSUPP},
+            spawn::Action,
+        };
+
+        let _ = fat;
+        let tags = [STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_STDERR];
+        let mut args: [&[u8]; 16] = [b""; 16];
+        let mut argn = 0usize;
+        for arg in argv {
+            if argn == args.len() {
+                return Err(Errno(E2BIG));
+            }
+            args[argn] = unsafe { CStr::from_ptr(*arg) }.to_bytes();
+            argn += 1;
+        }
+        if argn == 0 {
+            return Err(Errno(EINVAL));
+        }
+        let mut envs: [&[u8]; 16] = [b""; 16];
+        let mut envn = 0usize;
+        if let Some(envp) = envp {
+            for env in envp {
+                if envn == envs.len() {
+                    return Err(Errno(E2BIG));
+                }
+                envs[envn] = unsafe { CStr::from_ptr(*env) }.to_bytes();
+                envn += 1;
+            }
+        }
+
+        let mut stdio: [Option<(u8, u32)>; 3] = [None; 3];
+        for fd in 0..3usize {
+            let handle = match fd_slot(fd as c_int).map(|slot| *slot) {
+                Some(FdSlot::Input(handle)) | Some(FdSlot::Output(handle)) if handle != 0 => handle,
+                _ => continue,
+            };
+            let Some(duplicate) = handle_duplicate_raw(handle) else {
+                continue;
+            };
+            stdio[fd] = Some((tags[fd], duplicate));
+        }
+        if let Some(fac) = fac {
+            for action in fac {
+                match action {
+                    Action::Dup2(from, to) if (0..3).contains(&to) => {
+                        let handle = match fd_slot(from).map(|slot| *slot) {
+                            Some(FdSlot::Input(handle)) | Some(FdSlot::Output(handle))
+                                if handle != 0 =>
+                            {
+                                handle
+                            }
+                            _ => return Err(Errno(EOPNOTSUPP)),
+                        };
+                        let Some(duplicate) = handle_duplicate_raw(handle) else {
+                            return Err(Errno(EMFILE));
+                        };
+                        if let Some((_, previous)) = stdio[to as usize].take() {
+                            close_handle(previous);
+                        }
+                        stdio[to as usize] = Some((tags[to as usize], duplicate));
+                    }
+                    Action::Close(fd) if (0..3).contains(&fd) => {
+                        if let Some((_, previous)) = stdio[fd as usize].take() {
+                            close_handle(previous);
+                        }
+                    }
+                    _ => return Err(Errno(EOPNOTSUPP)),
+                }
+            }
+        }
+
+        spawn_elf(program, &args[..argn], &envs[..envn], &stdio)
     }
 
     fn symlinkat(path1: CStr, fd: c_int, path2: CStr) -> Result<()> {
@@ -2745,8 +3615,50 @@ impl Pal for Sys {
         vfs_path_status(op, path)
     }
 
+    /// Ownership is the wait (SH4): pids name table slots for processes this process
+    /// retained from posix_spawn. Each ProcessWait pump reports one reaped child of this
+    /// process (koid and exit code); the POSIX status word is the exited encoding
+    /// `(code & 0xFF) << 8` (a killed child carries the kernel's 137), and a reported
+    /// child's pid is released. WNOHANG checks without blocking; otherwise the caller parks
+    /// on a port bound to the child process until it terminates. Only a specific pid is
+    /// supported — `-1`/group waits answer ECHILD (recorded deviation). — TEAL
     fn waitpid(pid: pid_t, stat_loc: Option<Out<c_int>>, options: c_int) -> Result<pid_t> {
-        Err(unsupported())
+        use crate::header::errno::ECHILD;
+
+        const WNOHANG: c_int = 1;
+        loop {
+            // Drain everything the kernel has reaped for this process, ours or a sibling's.
+            loop {
+                let (_, koid, code) = process_wait_pair();
+                if koid == 0 {
+                    break;
+                }
+                if let Some(target) = child_by_koid(koid) {
+                    if matches!(target.state, ChildState::Live) {
+                        target.state = ChildState::Exited(code);
+                    }
+                }
+            }
+            let Some(entry) = child_entry(pid) else {
+                return Err(Errno(ECHILD));
+            };
+            let Some(slot) = entry.as_ref() else {
+                return Err(Errno(ECHILD));
+            };
+            match slot.state {
+                ChildState::Exited(code) => {
+                    let raw = ((code as c_int & 0xFF) << 8) as c_int;
+                    if let Some(mut out) = stat_loc {
+                        unsafe { *out.as_mut_ptr() = raw };
+                    }
+                    close_handle(slot.process);
+                    *entry = None;
+                    return Ok(pid);
+                }
+                ChildState::Live if options & WNOHANG != 0 => return Ok(0),
+                ChildState::Live => wait_process_terminated(slot.process)?,
+            }
+        }
     }
 
     /// Write through the channel or file capability this descriptor names. File writes are
@@ -2912,13 +3824,118 @@ impl Pal for Sys {
     }
 }
 
+/// Epoll over one kernel port (SH4). Readable interest in a channel descriptor binds the
+/// channel to the set's port; the kernel queues READABLE/PEER_CLOSED packets for it (level
+/// state replayed at bind time), and `PortWait` names the channel that signalled. Writable
+/// interest in a channel is answered at once — a channel write never parks. A timeout is a
+/// one-shot timer bound to the same port. Files, directories and sockets refuse (EPERM), as
+/// Linux refuses regular files. — TEAL
 impl PalEpoll for Sys {
     fn epoll_create1(flags: c_int) -> Result<c_int> {
-        Err(unsupported())
+        use crate::header::errno::EMFILE;
+
+        let _ = flags;
+        let Some(set) = (0..EPOLL_SETS as u8).find(|&set| epoll_set(set).is_none()) else {
+            return Err(Errno(EMFILE));
+        };
+        let port = port_create_raw().ok_or(Errno(EMFILE))?;
+        let Some(fd) = fd_alloc() else {
+            close_handle(port);
+            return Err(Errno(EMFILE));
+        };
+        if let Some(entry) = epoll_set_entry(set) {
+            *entry = Some(EpollSet {
+                port,
+                entries: [None; EPOLL_ENTRIES],
+            });
+        }
+        if let Some(slot) = fd_slot(fd) {
+            *slot = FdSlot::Epoll { set };
+        }
+        Ok(fd)
     }
 
     unsafe fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> Result<()> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{EBADF, EEXIST, EINVAL, ENOENT, ENOSPC, EPERM},
+            sys_epoll::{EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLIN},
+        };
+
+        let set = match fd_slot(epfd).map(|slot| *slot) {
+            Some(FdSlot::Epoll { set }) => set,
+            Some(FdSlot::Closed) | None => return Err(Errno(EBADF)),
+            _ => return Err(Errno(EINVAL)),
+        };
+        let handle = match fd_slot(fd).map(|slot| *slot) {
+            Some(FdSlot::Input(handle)) | Some(FdSlot::Output(handle)) => handle,
+            Some(FdSlot::Closed) | None => return Err(Errno(EBADF)),
+            _ => return Err(Errno(EPERM)),
+        };
+        let readable_end = matches!(fd_slot(fd).map(|slot| *slot), Some(FdSlot::Input(_)));
+        let instance = epoll_set(set).ok_or(Errno(EBADF))?;
+        let port = instance.port;
+        let (events, data) = if event.is_null() {
+            (0, 0)
+        } else {
+            let event = unsafe { core::ptr::read_unaligned(event) };
+            (event.events, unsafe { event.data.u64 })
+        };
+        let existing = instance
+            .entries
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.fd == fd));
+        match op {
+            EPOLL_CTL_ADD => {
+                if existing.is_some() {
+                    return Err(Errno(EEXIST));
+                }
+                let Some(index) = instance.entries.iter().position(Option::is_none) else {
+                    return Err(Errno(ENOSPC));
+                };
+                let koid = handle_koid_raw(handle).ok_or(Errno(EBADF))?;
+                let bound = readable_end && events & EPOLLIN != 0;
+                if bound && port_bind_raw(port, handle) != 0 {
+                    return Err(Errno(EBADF));
+                }
+                instance.entries[index] = Some(EpollEntry {
+                    fd,
+                    events,
+                    data,
+                    handle,
+                    koid,
+                    bound,
+                });
+                Ok(())
+            }
+            EPOLL_CTL_DEL => {
+                let index = existing.ok_or(Errno(ENOENT))?;
+                if let Some(entry) = instance.entries[index].take() {
+                    if entry.bound {
+                        let _ = port_unbind_raw(port, entry.handle);
+                    }
+                }
+                Ok(())
+            }
+            EPOLL_CTL_MOD => {
+                let index = existing.ok_or(Errno(ENOENT))?;
+                let Some(entry) = instance.entries[index].as_mut() else {
+                    return Err(Errno(ENOENT));
+                };
+                let want_bound = readable_end && events & EPOLLIN != 0;
+                if want_bound && !entry.bound {
+                    if port_bind_raw(port, entry.handle) != 0 {
+                        return Err(Errno(EBADF));
+                    }
+                } else if !want_bound && entry.bound {
+                    let _ = port_unbind_raw(port, entry.handle);
+                }
+                entry.events = events;
+                entry.data = data;
+                entry.bound = want_bound;
+                Ok(())
+            }
+            _ => Err(Errno(EINVAL)),
+        }
     }
 
     unsafe fn epoll_pwait(
@@ -2928,7 +3945,82 @@ impl PalEpoll for Sys {
         timeout: c_int,
         sigmask: *const sigset_t,
     ) -> Result<usize> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{EBADF, EFAULT, EINVAL, EIO},
+            sys_epoll::{epoll_data, EPOLLIN, EPOLLOUT},
+        };
+
+        let _ = sigmask;
+        let set = match fd_slot(epfd).map(|slot| *slot) {
+            Some(FdSlot::Epoll { set }) => set,
+            Some(FdSlot::Closed) | None => return Err(Errno(EBADF)),
+            _ => return Err(Errno(EINVAL)),
+        };
+        if events.is_null() || maxevents <= 0 {
+            return Err(Errno(EFAULT));
+        }
+        let max = maxevents as usize;
+        let instance = *epoll_set(set).ok_or(Errno(EBADF))?;
+        let mut count = 0usize;
+        let emit = |count: &mut usize, ready: u32, data: u64| {
+            if *count < max {
+                let record = epoll_event {
+                    events: ready,
+                    data: epoll_data { u64: data },
+                };
+                unsafe { core::ptr::write_unaligned(events.add(*count), record) };
+                *count += 1;
+            }
+        };
+
+        // Writable interest is satisfied without waiting: a channel write never parks.
+        for entry in instance.entries.iter().flatten() {
+            if entry.events & EPOLLOUT != 0 && !entry.bound {
+                emit(&mut count, EPOLLOUT, entry.data);
+            }
+        }
+        if count > 0 {
+            return Ok(count);
+        }
+        if !instance.entries.iter().flatten().any(|entry| entry.bound) || timeout == 0 {
+            return Ok(0);
+        }
+
+        let mut timer: Option<(u32, u64)> = None;
+        if timeout > 0 {
+            let handle = timer_create_raw(timeout as u64 * 1_000_000).ok_or(Errno(EIO))?;
+            let koid = handle_koid_raw(handle).unwrap_or(0);
+            if port_bind_raw(instance.port, handle) != 0 {
+                close_handle(handle);
+                return Err(Errno(EIO));
+            }
+            timer = Some((handle, koid));
+        }
+        let result = loop {
+            let source = port_wait_raw(instance.port);
+            if source == 0 {
+                break Err(Errno(EIO));
+            }
+            if timer.is_some_and(|(_, koid)| koid == source) {
+                break Ok(0);
+            }
+            if let Some(entry) = instance
+                .entries
+                .iter()
+                .flatten()
+                .find(|entry| entry.bound && entry.koid == source)
+            {
+                // READABLE or PEER_CLOSED alike: the read will not park (data or EOF).
+                emit(&mut count, EPOLLIN, entry.data);
+                break Ok(count);
+            }
+            // A packet for a channel no longer watched: wait again.
+        };
+        if let Some((handle, _)) = timer {
+            let _ = port_unbind_raw(instance.port, handle);
+            close_handle(handle);
+        }
+        result
     }
 }
 
@@ -2948,8 +4040,24 @@ impl PalSignal for Sys {
         Err(unsupported())
     }
 
+    /// Kill a spawned child by pid (SH4). Every signal terminates for now — SH6 refines
+    /// delivery; the kernel's ProcessKill takes the process off every wait and closes its
+    /// handles, and the reap reports the killed status.
     fn kill(pid: pid_t, sig: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::ESRCH;
+
+        let _ = sig;
+        let Some(slot) = child_slot(pid) else {
+            return Err(Errno(ESRCH));
+        };
+        if matches!(slot.state, ChildState::Exited(_)) {
+            return Err(Errno(ESRCH));
+        }
+        let status = process_kill_raw(slot.process) as u32 as i32;
+        if status != 0 {
+            return Err(Errno(-status));
+        }
+        Ok(())
     }
 
     fn sigqueue(pid: pid_t, sig: c_int, val: sigval) -> Result<()> {

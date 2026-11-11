@@ -1,8 +1,8 @@
-//j748
 //j790
 //j823
 //j824
 //j825
+//j871
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -838,10 +838,26 @@ fn run_sora_child_without_borrow(
     flags: u64,
 ) -> i32 {
     let run_flags = ProcessRunFlags(flags);
+    // SH4: the handle table that owns `process_handle` and stages the transferred args is
+    // the CALLER's, not Sora's — an ordinary process spawns its own children. Resolve it
+    // by caller koid exactly as ProcessKill does.
+    let caller_koid = match crate::user_thread::current_process_koid() {
+        Some(koid) => koid,
+        None => return Errno::Internal.status(),
+    };
     if run_flags.contains(ProcessRunFlags::ASYNC) {
         return with_sora_mut(|sora| {
+            let caller_ptr: *mut Process = if caller_koid == sora.process.koid() {
+                &raw mut sora.process
+            } else {
+                match sora.engine.process_by_koid_mut(caller_koid) {
+                    Some(process) => process as *mut Process,
+                    None => return Errno::BadHandle.status(),
+                }
+            };
+            let caller = unsafe { &mut *caller_ptr };
             match sora.engine.dispatch(
-                &mut sora.process,
+                caller,
                 KernelCall::ProcessRun {
                     process_handle,
                     entry,
@@ -858,9 +874,17 @@ fn run_sora_child_without_borrow(
     }
 
     let prepared = with_sora_mut(|sora| {
+        let caller_ptr: *mut Process = if caller_koid == sora.process.koid() {
+            &raw mut sora.process
+        } else {
+            match sora.engine.process_by_koid_mut(caller_koid) {
+                Some(process) => process as *mut Process,
+                None => return Err(Errno::BadHandle.status()),
+            }
+        };
+        let caller = unsafe { &mut *caller_ptr };
         let proc_koid =
-            match sora
-                .process
+            match caller
                 .handles()
                 .require(process_handle, ObjectKind::Process, Rights::WRITE)
             {
@@ -907,7 +931,7 @@ fn run_sora_child_without_borrow(
         let (child_arg, child_arg2, grants) = unsafe {
             let child_handles = (*target_ptr).handles_mut();
             let (child_arg, first) = match stage_process_arg(
-                sora.process.handles(),
+                caller.handles(),
                 child_handles,
                 arg,
                 run_flags.contains(ProcessRunFlags::TRANSFER_ARG),
@@ -916,7 +940,7 @@ fn run_sora_child_without_borrow(
                 Err(error) => return Err(crate::syscall::errno_from_object(error).status()),
             };
             let (child_arg2, second) = match stage_process_arg(
-                sora.process.handles(),
+                caller.handles(),
                 child_handles,
                 arg2,
                 run_flags.contains(ProcessRunFlags::TRANSFER_ARG2),
@@ -945,7 +969,7 @@ fn run_sora_child_without_borrow(
                 return Err(Errno::NoMemory.status());
             }
         };
-        if commit_process_grants(sora.process.handles_mut(), &grants).is_err() {
+        if commit_process_grants(caller.handles_mut(), &grants).is_err() {
             let child_handles = unsafe { (*target_ptr).handles_mut() };
             let _ = rollback_process_grants(child_handles, &grants);
             return Err(Errno::Internal.status());
@@ -1089,11 +1113,14 @@ fn write_channel_message(
     }
 }
 
+/// `nonblock` (SH4, `CHANNEL_READ_NONBLOCK`): an empty inbox answers `Errno::ShouldWait`
+/// in x0 instead of parking — relibc's nonblocking pipe reads map it to EAGAIN. — TEAL
 fn read_child_channel_without_borrow(
     process_koid: KoId,
     channel: Handle,
     user_buf: u64,
     cap: usize,
+    nonblock: bool,
 ) -> (u64, u64, Option<CallDelivery>) {
     loop {
         let outcome = with_sora_mut(|sora| {
@@ -1154,6 +1181,9 @@ fn read_child_channel_without_borrow(
 
         match outcome {
             ChildReadOutcome::Message { len, handle, call } => return (len, handle, call),
+            ChildReadOutcome::ShouldWait(_) if nonblock => {
+                return (Errno::ShouldWait.status() as u32 as u64, 0, None);
+            }
             ChildReadOutcome::ShouldWait(wait_koid) => {
                 crate::user_thread::park_current_child_on_channel(wait_koid);
             }
@@ -1568,6 +1598,15 @@ fn teardown_process_and_signal(koid: KoId) {
             drained.push((kind, koid));
         }
         for (kind, koid) in drained {
+            //j871
+            // SH4: an endpoint a duplicate still owns elsewhere (a pipe end the parent
+            // kept, or one passed on to a grandchild) outlives this process: no close,
+            // no call completion, and its port watches stay. — TEAL
+            if kind == kumo_abi::ObjectKind::Channel
+                && sora.engine.ipc_mut().endpoint_still_owned(koid)
+            {
+                continue;
+            }
             match kind {
                 kumo_abi::ObjectKind::Channel => {
                     if let Ok(peer_koids) = sora.engine.ipc_mut().close_by_koid(koid) {
@@ -1778,6 +1817,12 @@ const EL0_FAULT_EXIT_CODE: u64 = 0xFA17;
 /// returns so the normal teardown/restart path proceeds.
 fn raise_tower_on_abend(exit_code: u64) {
     if exit_code == 0 {
+        return;
+    }
+    //j871
+    // SH4: a spawned child's status is its live parent's to collect (waitpid); `exit(7)`
+    // under a waiting parent is a result, not a microservice that gave up. — TEAL
+    if crate::user_thread::current_exit_is_collected_by_parent() {
         return;
     }
     let victim = crate::user_thread::current_process_koid();
@@ -2530,7 +2575,22 @@ extern "C" fn svc_hook(regs: *mut u64) {
     }
 
     if num == Syscall::ProcessWait as u64 {
-        r[0] = crate::user_thread::process_wait() as u32 as u64;
+        // SH4: a resident child waits for its own children without Sora's scheduler pump
+        // (it blocks on a port bound to the child process instead); Sora keeps the pump.
+        let caller = crate::user_thread::current_process_koid();
+        let sora_koid = with_sora(|sora| sora.process.koid());
+        r[0] = match caller {
+            Some(koid) if koid != sora_koid => crate::user_thread::process_wait_for(koid),
+            _ => crate::user_thread::process_wait(),
+        } as u32 as u64;
+        // One reaped child OF THE CALLER per call: its process koid and exit code ride
+        // x1/x2 so a parent can collect exit statuses (waitpid). 0/0 when none this call.
+        let (koid, code) = caller
+            .and_then(crate::user_thread::take_reaped)
+            .map(|(koid, code)| (koid.0 as u64, code))
+            .unwrap_or((0, 0));
+        r[1] = koid;
+        r[2] = code;
         crate::user_thread::reschedule_if_pending_after_svc();
         return;
     }
@@ -2560,8 +2620,10 @@ extern "C" fn svc_hook(regs: *mut u64) {
         if let Some(cp_koid) = crate::user_thread::current_process_koid() {
             let sora_koid = with_sora(|sora| sora.process.koid());
             if cp_koid != sora_koid {
+                // SH4: x3 carries `CHANNEL_READ_NONBLOCK` for relibc's nonblocking pipes.
+                let nonblock = r[3] & kumo_abi::sys::CHANNEL_READ_NONBLOCK != 0;
                 let (n, handle, call) =
-                    read_child_channel_without_borrow(cp_koid, channel, user_buf, cap);
+                    read_child_channel_without_borrow(cp_koid, channel, user_buf, cap, nonblock);
                 r[0] = n;
                 r[1] = handle;
                 //j824
@@ -2759,7 +2821,23 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 // target-agnostic syscall routes through the shared `dispatch_object_syscall`
                 // below (against the CHILD's table), so a resident driver now gets the full
                 // pure-syscall set Sora has — no more per-arm drift between the two chains.
-                if num == Syscall::DebugWrite as u64 {
+                if num == Syscall::ProcessCreate as u64 {
+                    // SH4: a resident child creates its own children, and the handle lands
+                    // in the CHILD's table — the scaffold's own routing principle. The new
+                    // process sits under the root job (the policy scope every Sora launch
+                    // shares), as in the top-level arm.
+                    match sora.engine.dispatch(
+                        child,
+                        KernelCall::ProcessCreate {
+                            parent_job: sora.root_job,
+                            vmar_base: r[0],
+                            vmar_size: r[1],
+                        },
+                    ) {
+                        KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                        _ => r[0] = u64::MAX,
+                    }
+                } else if num == Syscall::DebugWrite as u64 {
                     let user_ptr = r[0];
                     let len = (r[1] as usize).min(256);
                     if !user_range_ok(child, user_ptr, len as u64) {
@@ -2902,14 +2980,37 @@ extern "C" fn svc_hook(regs: *mut u64) {
         } else if num == Syscall::ProcessCreate as u64 {
             let vmar_base = r[0];
             let vmar_size = r[1];
-            let result = sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::ProcessCreate {
-                    parent_job: sora.root_job,
-                    vmar_base,
-                    vmar_size,
-                },
-            );
+            // SH4: the new process handle lands in the CALLER's table, exactly as
+            // ProcessRun's grants resolve there — an ordinary process spawns its own
+            // children. The new process sits under the root job, the policy scope every
+            // Sora launch shares (a caller-job-true tree is a later refinement).
+            let caller_koid = crate::user_thread::current_process_koid();
+            let result = match caller_koid {
+                Some(caller_koid) => {
+                    let caller_ptr: *mut Process = if caller_koid == sora.process.koid() {
+                        &raw mut sora.process
+                    } else {
+                        match sora.engine.process_by_koid_mut(caller_koid) {
+                            Some(process) => process as *mut Process,
+                            None => {
+                                r[0] = u64::MAX;
+                                crate::user_thread::reschedule_if_pending_after_svc();
+                                return;
+                            }
+                        }
+                    };
+                    let caller = unsafe { &mut *caller_ptr };
+                    sora.engine.dispatch(
+                        caller,
+                        KernelCall::ProcessCreate {
+                            parent_job: sora.root_job,
+                            vmar_base,
+                            vmar_size,
+                        },
+                    )
+                }
+                None => KernelCallResult::Status(Errno::Internal.status()),
+            };
             match result {
                 KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                 _ => r[0] = u64::MAX,

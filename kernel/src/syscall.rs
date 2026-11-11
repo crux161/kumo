@@ -1,8 +1,8 @@
-//j790
 //j798
 //j823
 //j824
 //j825
+//j871
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -4008,7 +4008,14 @@ impl SyscallEngine {
                             // record can never outlive the endpoints it names; the wakes
                             // are paid after this match, outside the engine borrows that
                             // `close_by_koid` takes. — TIMBERDOODLE
-                            let call_wakes = self.complete_calls_on_endpoint_closed(koid);
+                            //j871
+                            // SH4: only the endpoint's last owner closes it; a surviving
+                            // duplicate keeps its calls pending too. — TEAL
+                            let call_wakes = if self.ipc.endpoint_still_owned(koid) {
+                                Vec::new()
+                            } else {
+                                self.complete_calls_on_endpoint_closed(koid)
+                            };
                             if let Ok(peer_koids) = self.ipc.close_by_koid(koid) {
                                 for peer_koid in peer_koids {
                                     self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);

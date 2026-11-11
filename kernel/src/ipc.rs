@@ -1,8 +1,8 @@
-//j708
 //j719
 //j731
 //j824
 //j825
+//j871
 
 use alloc::vec::Vec;
 
@@ -496,6 +496,23 @@ impl IpcRegistry {
         Err(IpcError::BadHandle)
     }
 
+    //j871
+    /// True while some handle other than the one just released — a duplicate in any
+    /// table, a staged grant or a queued transfer — still owns the endpoint `koid`
+    /// (SH4). Unknown koids and observer-less endpoints answer false. — TEAL
+    pub fn endpoint_still_owned(&mut self, koid: KoId) -> bool {
+        let Ok(end) = self.channel_end_for(koid) else {
+            return false;
+        };
+        self.channel_mut_by_koid(koid).is_ok_and(|channel| {
+            channel
+                .endpoint(end)
+                .references
+                .as_ref()
+                .is_some_and(|references| references.is_referenced())
+        })
+    }
+
     //j719
     /// Close the endpoint named by `koid` and, only when this close removed its last
     /// owning handle, reap what it still holds: its inbox — messages no surviving owner
@@ -509,6 +526,16 @@ impl IpcRegistry {
         let end = self.channel_end_for(koid)?;
         let mut signals = Vec::new();
         let mut carried = Vec::new();
+        //j871
+        // SH4: a duplicated endpoint closes with its LAST owner. Before this, any one
+        // handle's close marked the endpoint closed and signalled the peer while a
+        // duplicate still lived elsewhere — a spawned child's pipe ends died the moment
+        // the parent dropped its own copies. An endpoint without an observer (a root
+        // channel's kernel-retained end) cannot prove ownership and closes as before.
+        // — TEAL
+        if self.endpoint_still_owned(koid) {
+            return Ok(Vec::new());
+        }
         {
             let channel = self.channel_mut_by_koid(koid)?;
             channel.close(end);
@@ -936,11 +963,22 @@ mod tests {
         // Closing one handle is not the end of the endpoint: the survivor still reads.
         let right_koid = process.handles().get(right).unwrap().koid;
         process.handles_mut().remove(right).unwrap();
+        //j871
+        // SH4: nor does the peer hear PEER_CLOSED while the survivor lives, and it can
+        // still write to it; the survivor's own close is the one that signals. — TEAL
         let signals = ipc.close_by_koid(right_koid).unwrap();
-        assert_eq!(signals.len(), 1);
+        assert!(signals.is_empty());
         let received = ipc.channel_read(&mut process, survivor).unwrap();
         assert_eq!(received.bytes(), b"config");
         assert_eq!(received.handles().len(), 1);
+        ipc.channel_write(&mut process, left, Message::new(1, b"more", &[]).unwrap())
+            .unwrap();
+        process.handles_mut().remove(survivor).unwrap();
+        assert_eq!(ipc.close_by_koid(right_koid).unwrap().len(), 1);
+        assert_eq!(
+            ipc.channel_write(&mut process, left, Message::new(1, b"late", &[]).unwrap()),
+            Err(IpcError::PeerClosed)
+        );
     }
 
     //j719
@@ -1106,6 +1144,8 @@ mod tests {
             Err(IpcError::ShouldWait)
         );
         let right_koid = process.handles().get(right).unwrap().koid;
+        // j871: the endpoint closes with its last owner, so release the handle first.
+        process.handles_mut().remove(right).unwrap();
         ipc.close_by_koid(right_koid).unwrap();
         assert_eq!(
             ipc.channel_write(

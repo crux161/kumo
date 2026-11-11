@@ -1,8 +1,8 @@
-//j866
 //j867
 //j868
 //j869
 //j870
+//j871
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -168,6 +168,38 @@ fn main() {
             let args: Vec<String> = std::env::args().collect();
             lock_try(&args);
             return;
+        }
+        // SH4: the std::process::Command proof (scripts/spawn-smoke.py drives spawnparent;
+        // the other three are the children it spawns from the image's SMOKE.ELF copy).
+        Some("spawnparent") => {
+            spawn_parent();
+            return;
+        }
+        Some("spawnchild") => {
+            use std::io::{Read as _, Write as _};
+            let mut fed = String::new();
+            let _ = std::io::stdin().read_to_string(&mut fed);
+            print!("child says hi: {}", fed.to_uppercase());
+            eprint!("child stderr\n");
+            std::io::stdout().flush().ok();
+            std::io::stderr().flush().ok();
+            std::process::exit(7);
+        }
+        Some("spawnspin") => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {}
+            std::process::exit(0);
+        }
+        Some("spawnnogrant") => {
+            use std::io::Write as _;
+            // No filesystem grant travels with a spawn: the file this child was loaded
+            // from is not openable by the child.
+            match std::fs::File::open("/SMOKE.ELF") {
+                Err(_) => print!("nogrant: open refused\n"),
+                Ok(_) => print!("nogrant: open succeeded\n"),
+            }
+            std::io::stdout().flush().ok();
+            std::process::exit(0);
         }
         Some("net") => {
             let args: Vec<String> = std::env::args().collect();
@@ -1086,6 +1118,99 @@ fn lock_try(args: &[String]) {
             Err(_) => sh3log!("lock try -> FAIL"),
         },
         Err(_) => sh3log!("lock try -> FAIL"),
+    }
+}
+
+/// SH4: std::process::Command over the kernel spawn pipeline. Four records, each one
+/// `-> OK` line the harness asserts (or the failure spelled out): a child fed through its
+/// stdin pipe whose exact stdout, stderr and exit status come back through
+/// wait_with_output (std's poll-driven two-pipe reader); a spinning child killed and
+/// reaped with the kernel's killed status; and the no-grant proof — the child cannot open
+/// the file it was loaded from, because no filesystem grant travels with a spawn. — TEAL
+#[inline(never)]
+fn spawn_parent() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    match Command::new("/SMOKE.ELF")
+        .arg("spawnchild")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let fed = child
+                .stdin
+                .take()
+                .map(|mut stdin| stdin.write_all(b"ping from parent\n").is_ok())
+                .unwrap_or(false);
+            match child.wait_with_output() {
+                Ok(output) => {
+                    if fed && output.stdout == b"child says hi: PING FROM PARENT\n" {
+                        sh3log!("spawn output -> OK");
+                    } else {
+                        sh3log!(
+                            "spawn output FAIL fed={} {:?}",
+                            fed,
+                            String::from_utf8_lossy(&output.stdout)
+                        );
+                    }
+                    if output.stderr == b"child stderr\n" {
+                        sh3log!("spawn stderr -> OK");
+                    } else {
+                        sh3log!(
+                            "spawn stderr FAIL {:?}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    if output.status.code() == Some(7) {
+                        sh3log!("spawn status -> OK");
+                    } else {
+                        sh3log!("spawn status FAIL {:?}", output.status);
+                    }
+                }
+                Err(e) => sh3log!("spawn output FAIL wait {:?} {:?}", e.kind(), e.raw_os_error()),
+            }
+        }
+        Err(e) => sh3log!("spawn output FAIL spawn {:?} {:?}", e.kind(), e.raw_os_error()),
+    }
+
+    match Command::new("/SMOKE.ELF")
+        .arg("spawnspin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let killed = child.kill().is_ok();
+            match child.wait() {
+                Ok(status) if killed && !status.success() && status.code() == Some(137) => {
+                    sh3log!("spawn kill -> OK");
+                }
+                Ok(status) => sh3log!("spawn kill FAIL killed={} {:?}", killed, status),
+                Err(e) => sh3log!("spawn kill FAIL wait {:?}", e.kind()),
+            }
+        }
+        Err(e) => sh3log!("spawn kill FAIL spawn {:?} {:?}", e.kind(), e.raw_os_error()),
+    }
+
+    match Command::new("/SMOKE.ELF")
+        .arg("spawnnogrant")
+        .stdin(Stdio::piped())
+        .output()
+    {
+        Ok(output)
+            if output.stdout == b"nogrant: open refused\n" && output.status.code() == Some(0) =>
+        {
+            sh3log!("spawn nogrant -> OK");
+        }
+        Ok(output) => sh3log!(
+            "spawn nogrant FAIL {:?} {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            output.status
+        ),
+        Err(e) => sh3log!("spawn nogrant FAIL {:?} {:?}", e.kind(), e.raw_os_error()),
     }
 }
 

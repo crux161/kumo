@@ -1,8 +1,8 @@
-//j790
 //j815
 //j824
 //j825
 //j859
+//j871
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -1011,6 +1011,32 @@ pub fn process_kill(_process: Handle) -> u64 {
 #[cfg(target_arch = "aarch64")]
 pub fn process_wait() -> u64 {
     syscall(Syscall::ProcessWait, 0, 0, 0, 0)
+}
+
+/// [`process_wait`] plus one reaped child's status: `(status, process_koid, exit_code)`.
+/// The kernel reports at most one reaped child per call (SH4); 0/0 means none this time.
+#[cfg(target_arch = "aarch64")]
+pub fn process_wait_reaped() -> (u64, u64, u64) {
+    let status: u64;
+    let koid: u64;
+    let code: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::ProcessWait as u64,
+            lateout("x0") status,
+            lateout("x1") koid,
+            lateout("x2") code,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status, koid, code)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn process_wait_reaped() -> (u64, u64, u64) {
+    (u64::MAX, 0, 0)
 }
 
 #[cfg(not(target_arch = "aarch64"))]

@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j556
 //j724
 //j730
 //j824
 //j825
+//j871
 
 use core::cell::UnsafeCell;
 
@@ -225,6 +225,10 @@ struct ResidentChild {
     ttbr0: u64,
     /// The child process koid.
     process: KoId,
+    /// The process that admitted this child (SH4). `ProcessWait` reports a reaped child's
+    /// status to its parent only, so a launcher's pumps never drain a sibling parent's
+    /// statuses; Sora's own launches carry Sora. — TEAL
+    parent: KoId,
     /// The child exit code (valid once `done`).
     exit_code: u64,
     /// True once the child thread has terminated.
@@ -285,6 +289,12 @@ pub struct UserSched {
     /// resident children count against this value; it is the authoritative live gate because
     /// the scheduler owns the resident set. Always in `1..=MAX_RESIDENT_CHILDREN`.
     resident_limit: u32,
+    /// Exit statuses of children reaped at the wait boundaries, oldest first (SH4): the
+    /// parent koid, the process koid and the exit code, drained one per `ProcessWait` by
+    /// the parent they belong to, so a parent can collect every child's status, killed
+    /// ones included. A small fixed ring — the oldest entry falls off if nobody asks.
+    reaped: [(KoId, KoId, u64); 8],
+    reaped_len: usize,
 }
 
 struct UserSchedCell(UnsafeCell<Option<UserSched>>);
@@ -295,6 +305,58 @@ static USER_SCHED: UserSchedCell = UserSchedCell(UnsafeCell::new(None));
 pub fn exit_code() -> u64 {
     let p = sched_ptr();
     unsafe { (&*p).exit_code }
+}
+
+/// Pop the oldest reaped child of `parent` as (process koid, exit code), for
+/// `ProcessWait`'s x1/x2. Entries of other parents stay queued for their own pumps.
+pub fn take_reaped(parent: KoId) -> Option<(KoId, u64)> {
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        let at = (0..s.reaped_len).find(|&at| s.reaped[at].0 == parent)?;
+        let (_, process, code) = s.reaped[at];
+        s.reaped.copy_within(at + 1..s.reaped_len, at);
+        s.reaped_len -= 1;
+        Some((process, code))
+    }
+}
+
+/// `ProcessWait` for a resident child acting as a parent (SH4): reap, then report whether
+/// any of the caller's own children are still live. No scheduler pump — a child blocks on
+/// its own port (bound to the child process, which signals `TERMINATED`) and pumps here
+/// only to collect; Sora's pump path (`process_wait`) stays the launcher's alone. — TEAL
+pub fn process_wait_for(parent: KoId) -> Status {
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        reap_done(s);
+        if s.children.iter().any(|c| c.parent == parent && !c.done) {
+            Errno::ShouldWait.status()
+        } else {
+            Errno::Ok.status()
+        }
+    }
+}
+
+/// True when the current thread belongs to a child that a live resident process (not
+/// Sora) admitted (SH4). Such a child's exit status is data its parent collects through
+/// `ProcessWait`, so a non-zero exit is not a silent failure and raises no TOWER; once the
+/// parent is gone nobody will collect it and the abend report stands. — TEAL
+pub fn current_exit_is_collected_by_parent() -> bool {
+    let p = sched_ptr();
+    unsafe {
+        let s = &*p;
+        let Some(current) = s.dispatcher.current() else {
+            return false;
+        };
+        let Some(child) = s.children.iter().find(|c| c.thread.koid() == current) else {
+            return false;
+        };
+        child.parent != s.user_thread.process()
+            && s.children
+                .iter()
+                .any(|c| c.process == child.parent && !c.done)
+    }
 }
 
 /// Whether the user thread has terminated.
@@ -565,6 +627,8 @@ pub fn init(
             done: false,
             sora_current_call: None,
             resident_limit: job.resident_limit(),
+            reaped: [(KoId(0), KoId(0), 0); 8],
+            reaped_len: 0,
         });
     }
     kumo_hal::active::set_tower_context_hook(tower_context);
@@ -816,11 +880,22 @@ fn install_child(
     arg: u64,
     arg2: u64,
 ) -> KoId {
+    // The admitting process is whoever is executing this SVC: a resident child spawning
+    // its own child, or Sora (also the fallback before any thread runs, as on the host).
+    let parent = match s.dispatcher.current() {
+        Some(current) if current != s.user_thread.koid() => s
+            .children
+            .iter()
+            .find(|c| c.thread.koid() == current)
+            .map_or(s.user_thread.process(), |c| c.process),
+        _ => s.user_thread.process(),
+    };
     let mut child = alloc::boxed::Box::new(ResidentChild {
         thread: new_child,
         fresh: true,
         ttbr0,
         process: proc_koid,
+        parent,
         exit_code: 0,
         done: false,
         current_call: None,
@@ -863,6 +938,20 @@ fn reap_done(s: &mut UserSched) {
     while i < s.children.len() {
         if s.children[i].done {
             let koid = s.children[i].thread.koid();
+            // SH4: the exit status must survive the record — the parent's next ProcessWait
+            // collects it from x1/x2.
+            let entry = (
+                s.children[i].parent,
+                s.children[i].process,
+                s.children[i].exit_code,
+            );
+            if s.reaped_len == s.reaped.len() {
+                s.reaped.copy_within(1.., 0);
+                s.reaped[s.reaped.len() - 1] = entry;
+            } else {
+                s.reaped[s.reaped_len] = entry;
+                s.reaped_len += 1;
+            }
             s.wait_queue.remove_thread(koid);
             s.children.remove(i);
         } else {
@@ -957,6 +1046,17 @@ pub fn run_prepared_child(
             .find(|c| c.thread.koid() == koid)
             .map_or(0, |c| c.exit_code);
         reap_done(s);
+        // The sync runner consumed this child's status as its return; drop the queue copy
+        // so a later ProcessWait does not report it twice (SH4).
+        let mut at = 0;
+        while at < s.reaped_len {
+            if s.reaped[at].1 == proc_koid {
+                s.reaped.copy_within(at + 1..s.reaped_len, at);
+                s.reaped_len -= 1;
+                break;
+            }
+            at += 1;
+        }
         code
     };
     if exit_code == 0 {
@@ -2302,5 +2402,52 @@ mod ax4_capacity_tests {
         assert_eq!(process_wait(), Errno::Ok.status());
         assert!(sched().children.is_empty());
         assert_eq!(resident_live(), 0);
+    }
+
+    //j871
+    /// SH4: a reaped child's status reaches its own parent's `ProcessWait` and no other
+    /// pump — Sora's launches and a resident parent's spawns share one ring but never
+    /// each other's entries. — TEAL
+    #[test]
+    fn reaped_statuses_are_reported_to_their_parent_only() {
+        let _guard = AX4_LOCK.lock().unwrap();
+        let mut objects = ObjectManager::new();
+        let vmar = Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).unwrap();
+        init(&mut objects, KoId(7), vmar, 0).unwrap();
+        let sora = sched().user_thread.process();
+
+        // Three children: two admitted by resident parent 500, one by Sora (the host has no
+        // running SVC context, so install_child records Sora; re-parent two by hand).
+        for proc_koid in [600, 601, 602] {
+            assert_eq!(spawn_actor(&mut objects, proc_koid), Errno::Ok.status());
+        }
+        assert!(sched().children.iter().all(|c| c.parent == sora));
+        sched_mut().children[0].parent = KoId(500);
+        sched_mut().children[1].parent = KoId(500);
+
+        // Nothing reaped yet: both parents still have live children.
+        assert_eq!(process_wait_for(KoId(500)), Errno::ShouldWait.status());
+        assert_eq!(take_reaped(KoId(500)), None);
+        assert_eq!(take_reaped(sora), None);
+
+        // Kill 600 and Sora's 602. The resident parent sees exactly its own child; Sora's
+        // pump sees exactly its own, in either order of asking.
+        assert_eq!(kill_process_threads(KoId(600)).killed, 1);
+        assert_eq!(kill_process_threads(KoId(602)).killed, 1);
+        assert_eq!(process_wait_for(KoId(500)), Errno::ShouldWait.status());
+        assert_eq!(take_reaped(KoId(999)), None);
+        assert_eq!(take_reaped(sora), Some((KoId(602), KILLED_EXIT_CODE)));
+        assert_eq!(take_reaped(sora), None);
+        assert_eq!(take_reaped(KoId(500)), Some((KoId(600), KILLED_EXIT_CODE)));
+        assert_eq!(take_reaped(KoId(500)), None);
+
+        // The last child of 500 ends: its wait reports Ok and the entry is still delivered.
+        assert_eq!(kill_process_threads(KoId(601)).killed, 1);
+        assert_eq!(process_wait_for(KoId(500)), Errno::Ok.status());
+        assert_eq!(take_reaped(KoId(500)), Some((KoId(601), KILLED_EXIT_CODE)));
+        assert_eq!(take_reaped(KoId(500)), None);
+        assert_eq!(sched().reaped_len, 0);
+        assert_eq!(process_wait(), Errno::Ok.status());
+        assert!(sched().children.is_empty());
     }
 }
