@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j549
 //j862
 //j863
 //j865
 //j866
+//j869
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -90,6 +90,13 @@ impl OpenTable {
     pub fn get(&self, handle: u32) -> Option<OpenFile> {
         let index = usize::try_from(handle).ok()?.checked_sub(1)?;
         self.slots.get(index).copied().flatten()
+    }
+
+    /// Free the slot `handle` names (SH3-d2d). The per-launch lock flag lives in the
+    /// removed entry and dies with it.
+    pub fn remove(&mut self, handle: u32) -> Option<OpenFile> {
+        let index = usize::try_from(handle).ok()?.checked_sub(1)?;
+        self.slots.get_mut(index)?.take()
     }
 
     pub fn get_mut(&mut self, handle: u32) -> Option<&mut OpenFile> {
@@ -477,6 +484,7 @@ pub fn dispatch_shared<R: SectorReader + SectorWriter>(
         Some(Request::Lock { handle, operation }) => {
             lock_session(server, session, handle, operation, reply)
         }
+        Some(Request::Close { handle }) => close_shared(server, session, handle, reply),
         Some(Request::Chmod { path, mode }) => {
             chmod_shared(volume, io, &mut server.modes, path, mode, reply)
         }
@@ -518,6 +526,22 @@ fn lock_session(
     }
 }
 
+/// Release an open handle in one session (SH3-d2d). The session's advisory lock row for
+/// the file releases with it: the registry is per (location, session), so closing one
+/// handle releases the session's lock even when a sibling handle remains open
+/// (recorded in JOURNAL/869; per-description release needs per-handle registry rows).
+fn close_shared(server: &mut SharedServer, session: usize, handle: u32, reply: &mut [u8]) -> usize {
+    match server.sessions[session].remove(handle) {
+        Some(file) => {
+            if let Some(location) = file.entry.location {
+                server.locks.clear(location, session);
+            }
+            write_status(reply, VFS_OK)
+        }
+        None => write_status(reply, VFS_BAD_HANDLE),
+    }
+}
+
 /// Handle one vfs request frame, writing the reply into `reply` and returning
 /// the number of reply bytes. Malformed frames and too-small reply buffers return
 /// a one-byte [`VFS_BAD_REQUEST`] status when possible.
@@ -554,6 +578,7 @@ pub fn dispatch<R: SectorReader + SectorWriter>(
         Some(Request::Rename { from, to }) => rename(volume, reader, from, to, reply),
         Some(Request::Stat { path }) => stat(volume, reader, path, reply),
         Some(Request::Lock { handle, operation }) => lock(open_files, handle, operation, reply),
+        Some(Request::Close { handle }) => close(open_files, handle, reply),
         // The per-launch image server records no modes (SH3-d scope): the mount-scoped
         // server does. Documented, not silent.
         Some(Request::Chmod { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
@@ -769,6 +794,20 @@ fn mkdir<R: SectorReader + SectorWriter>(
     if volume.resolve_path(io, path).is_some() {
         return write_status(reply, VFS_EXISTS);
     }
+    // A missing parent is ENOENT, not a malformed request: create_dir_all's recursion
+    // depends on telling them apart (SH3-d2d). The root is a valid parent even though
+    // resolve_path has no entry for it.
+    let Some(at) = path.iter().rposition(|&b| b == b'/') else {
+        return write_status(reply, VFS_BAD_REQUEST);
+    };
+    let parent = &path[..at];
+    if !parent.iter().all(|&b| b == b'/') {
+        match volume.resolve_path(io, parent) {
+            None => return write_status(reply, VFS_NOT_FOUND),
+            Some(entry) if !entry.is_dir() => return write_status(reply, VFS_NOT_DIR),
+            Some(_) => {}
+        }
+    }
     match volume.create_dir(io, path).and_then(|_| volume.flush(io)) {
         Ok(()) => write_status(reply, VFS_OK),
         Err(error) => write_status(reply, mutation_status(error)),
@@ -955,6 +994,14 @@ fn lock(open_files: &mut OpenTable, handle: u32, operation: u8, reply: &mut [u8]
             write_status(reply, VFS_OK)
         }
         _ => write_status(reply, VFS_BAD_REQUEST),
+    }
+}
+
+/// Release an open handle (SH3-d2d).
+fn close(open_files: &mut OpenTable, handle: u32, reply: &mut [u8]) -> usize {
+    match open_files.remove(handle) {
+        Some(_) => write_status(reply, VFS_OK),
+        None => write_status(reply, VFS_BAD_HANDLE),
     }
 }
 
@@ -2292,6 +2339,39 @@ mod tests {
             ),
             alloc::vec![VFS_ACCESS_DENIED]
         );
+    }
+
+    #[test]
+    fn mkdir_missing_parent_is_not_found() {
+        let (volume, mut disk) = writable();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let request = encode_request(Request::mkdir(b"/NOPE/DIR"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_NOT_FOUND]);
+        let request = encode_request(Request::mkdir(b"/NEWDIR"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_OK]);
+    }
+
+    #[test]
+    fn close_releases_an_open_handle() {
+        let (volume, mut disk) = writable();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let request = encode_request(Request::open(b"/HELLO.TXT"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(reply[0], VFS_OK);
+        let handle = u32::from_le_bytes(reply[1..5].try_into().unwrap());
+        let request = encode_request(Request::Close { handle });
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_OK]);
+        let request = encode_request(Request::read(handle, 0, 4));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_BAD_HANDLE]);
+        let request = encode_request(Request::Close { handle });
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_BAD_HANDLE]);
     }
 
     #[test]

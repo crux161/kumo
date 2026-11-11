@@ -1,8 +1,8 @@
-//j857
 //j859
 //j866
 //j867
 //j868
+//j869
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -1055,6 +1055,103 @@ fn sh3_probe() {
         Err(_) => sh3log!("read dir empty -> FAIL"),
     }
     check!(fs::remove_dir("/SH3DIR/SUB").is_ok(), "rmdir sub");
+
+    // SH3-d2d: the rest of std::fs — seek and at-io over the positional wire, O_APPEND,
+    // set_len, try_clone, the directory-tree helpers, and copy (whose set_permissions
+    // chain rides the fd-chmod no-op).
+    {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+
+        let c = "/SH3DIR/C.TXT";
+        let e = "/SH3DIR/E.TXT";
+        check!(fs::write(c, b"abcdef").is_ok(), "d2d write");
+        match fs::OpenOptions::new().read(true).write(true).open(c) {
+            Ok(mut f) => {
+                check!(
+                    f.seek(SeekFrom::Start(1)).map(|p| p == 1).unwrap_or(false),
+                    "seek"
+                );
+                let mut two = [0u8; 2];
+                check!(f.read_exact(&mut two).is_ok() && &two == b"bc", "seek read");
+                check!(
+                    f.seek(SeekFrom::End(0)).map(|p| p == 6).unwrap_or(false),
+                    "seek end"
+                );
+                let mut at = [0u8; 2];
+                check!(
+                    f.read_at(&mut at, 4).map(|n| n == 2).unwrap_or(false) && &at == b"ef",
+                    "at read"
+                );
+                check!(
+                    f.write_at(b"XY", 0).map(|n| n == 2).unwrap_or(false),
+                    "at write"
+                );
+            }
+            Err(_) => sh3log!("seek -> FAIL"),
+        }
+        check!(
+            fs::read(c).map(|d| d == b"XYcdef").unwrap_or(false),
+            "at write readback"
+        );
+        match fs::OpenOptions::new().append(true).open(c) {
+            Ok(mut f) => check!(f.write_all(b"!").is_ok(), "append"),
+            Err(_) => sh3log!("append -> FAIL"),
+        }
+        check!(
+            fs::read(c).map(|d| d == b"XYcdef!").unwrap_or(false),
+            "append readback"
+        );
+        match fs::OpenOptions::new().write(true).open(c) {
+            Ok(f) => {
+                check!(f.set_len(3).is_ok(), "set len");
+                check!(
+                    f.metadata().map(|m| m.len() == 3).unwrap_or(false),
+                    "set len stat"
+                );
+                check!(
+                    f.set_permissions(fs::Permissions::from_mode(0o600))
+                        .is_ok(),
+                    "fchmod fd"
+                );
+            }
+            Err(e) => sh3log!("set len -> FAIL ({:?} {:?})", e.kind(), e.raw_os_error()),
+        }
+        match (fs::File::open(c), fs::File::open(c)) {
+            (Ok(f1), Ok(mut f2)) => match f1.try_clone() {
+                Ok(mut c1) => {
+                    let mut a = [0u8; 1];
+                    let mut b1 = [0u8; 1];
+                    let ok = c1.read_exact(&mut a).is_ok()
+                        && a == *b"X"
+                        && f2.read_exact(&mut b1).is_ok()
+                        && b1 == *b"X";
+                    check!(ok, "clone");
+                }
+                Err(e) => sh3log!("clone -> FAIL ({:?} {:?})", e.kind(), e.raw_os_error()),
+            },
+            _ => sh3log!("clone -> FAIL (open)"),
+        }
+        check!(fs::create_dir_all("/SH3DIR/D1/D2").is_ok(), "mkdir all");
+        check!(
+            fs::metadata("/SH3DIR/D1/D2").map(|m| m.is_dir()).unwrap_or(false),
+            "mkdir all stat"
+        );
+        sh3log!("d2d copy begins");
+        check!(fs::copy(c, e).map(|n| n == 3).unwrap_or(false), "copy");
+        check!(fs::read(e).map(|d| d == b"XYc").unwrap_or(false), "copy readback");
+        sh3log!("d2d remove all begins");
+        match fs::remove_dir_all("/SH3DIR/D1") {
+            Ok(()) => sh3log!("remove all -> OK"),
+            Err(e) => sh3log!("remove all -> FAIL ({:?} {:?})", e.kind(), e.raw_os_error()),
+        }
+        check!(
+            fs::metadata("/SH3DIR/D1").map(|_| false).unwrap_or(true),
+            "remove all gone"
+        );
+        check!(fs::remove_file(c).is_ok(), "d2d cleanup c");
+        check!(fs::remove_file(e).is_ok(), "d2d cleanup e");
+    }
     check!(
         fs::metadata(a)
             .map(|_| false)

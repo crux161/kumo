@@ -48,6 +48,8 @@ static unsigned long rng_next(void) {
     return s;
 }
 
+extern int *__errno_location(void);
+
 long syscall(long n, ...) {
     __builtin_va_list ap;
     __builtin_va_start(ap, n);
@@ -87,6 +89,14 @@ long syscall(long n, ...) {
         result = (long)len;
     }
     __builtin_va_end(ap);
+    if (result == -ENOSYS) {
+        // Unknown syscall numbers answer musl-style: errno set, -1 returned. std's
+        // copy_file_range/statx-style probes read the error through errno; a raw
+        // -ENOSYS return reads as a successful negative result and a stale errno can
+        // drive an infinite retry (JOURNAL/869).
+        *__errno_location() = ENOSYS;
+        return -1;
+    }
     return result;
 }
 
@@ -113,6 +123,34 @@ extern int accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
 int accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
     (void)flags;
     return accept(fd, addr, addrlen);
+}
+
+// std's fs::copy probes sendfile/splice before its generic copy loop, and reads
+// ENOSYS (or EPERM/EINVAL) as the signal to fall back permanently
+// (std/sys/io/kernel_copy/linux.rs). KUMO has neither facility, so both answer ENOSYS
+// through relibc's errno and io::copy degrades to the userspace read/write loop
+// (JOURNAL/869).
+extern int *__errno_location(void);
+
+long sendfile(int out_fd, int in_fd, long *offset, unsigned long count) {
+    (void)out_fd;
+    (void)in_fd;
+    (void)offset;
+    (void)count;
+    *__errno_location() = ENOSYS;
+    return -1;
+}
+
+long splice(int fd_in, long *off_in, int fd_out, long *off_out, unsigned long len,
+            unsigned int flags) {
+    (void)fd_in;
+    (void)off_in;
+    (void)fd_out;
+    (void)off_out;
+    (void)len;
+    (void)flags;
+    *__errno_location() = ENOSYS;
+    return -1;
 }
 
 extern char *strerror(int errnum);

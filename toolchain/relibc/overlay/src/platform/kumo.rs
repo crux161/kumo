@@ -1,8 +1,8 @@
-//j856
 //j859
 //j866
 //j867
 //j868
+//j869
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -103,6 +103,9 @@ const VFS_OP_STAT: u8 = 0x0b;
 const VFS_OP_LINK: u8 = 0x0c;
 const VFS_OP_LOCK: u8 = 0x0d;
 const VFS_OP_CHMOD: u8 = 0x0e;
+const VFS_OP_CLOSE: u8 = 0x0f;
+/// Wire length of a close request: `op(1) + handle(4)`.
+const CLOSE_REQUEST_LEN: usize = 5;
 const VFS_OPEN_READ: u8 = 1 << 0;
 const VFS_OPEN_WRITE: u8 = 1 << 1;
 const VFS_OPEN_CREATE: u8 = 1 << 2;
@@ -252,6 +255,9 @@ enum FdSlot {
         handle: u32,
         offset: u64,
         size: u64,
+        /// Bit 0: O_APPEND (SH3-d2d) — writes start at the recorded end. Carried by
+        /// dup and try_clone with the rest of the slot.
+        flags: u8,
     },
     /// A directory opened with O_DIRECTORY (SH3-d2c): the resolved path this launch's
     /// server lists, plus the entry-index cursor posix_getdents resumes from. getdents
@@ -480,22 +486,53 @@ fn vfs_errno(status: u8) -> Errno {
     }
 }
 
-/// Resolve an `…at` call's path against this process's filesystem root. `AT_FDCWD` is the
-/// only base that exists so far — a process's cwd is the capability's root — and a
-/// directory-descriptor base arrives with SH3-d2c's `Dir` slots. — TIMBERDOODLE
+/// Resolve an `…at` call's path. `AT_FDCWD` bases on this process's filesystem root —
+/// a process's cwd is the capability's root — and a directory descriptor bases on its
+/// recorded path, which is what remove_dir_all's unlinkat(dirfd, name, ...) walk needs
+/// (SH3-d2d). Absolute names ignore the base, as POSIX says. — TIMBERDOODLE
 fn at_path<'a>(dirfd: c_int, path: &'a [u8], buf: &'a mut [u8; VFS_MAX_PATH]) -> Result<&'a [u8]> {
     use crate::header::{
-        errno::{EINVAL, ENAMETOOLONG},
+        errno::{EINVAL, EISDIR, ENAMETOOLONG},
         fcntl::AT_FDCWD,
     };
 
-    if dirfd != AT_FDCWD {
-        return Err(Errno(EINVAL));
+    if dirfd == AT_FDCWD {
+        if path.is_empty() {
+            return Err(Errno(ENAMETOOLONG));
+        }
+        return vfs_path(path, buf);
     }
+    let Some(FdSlot::Dir {
+        path: dir_path,
+        path_len,
+        ..
+    }) = fd_slot(dirfd).map(|slot| *slot)
+    else {
+        return Err(Errno(EINVAL));
+    };
     if path.is_empty() {
         return Err(Errno(ENAMETOOLONG));
     }
-    vfs_path(path, buf)
+    if path[0] == b'/' {
+        return vfs_path(path, buf);
+    }
+    let mut rest = path;
+    while let Some(tail) = rest.strip_prefix(b"./") {
+        rest = tail;
+    }
+    if rest.is_empty() || rest == b"." {
+        return Err(Errno(EISDIR));
+    }
+    let dir = &dir_path[..usize::from(path_len)];
+    let dir = if dir == b"/" { &dir[..0] } else { dir };
+    let len = dir.len() + 1 + rest.len();
+    if len > VFS_MAX_PATH {
+        return Err(Errno(ENAMETOOLONG));
+    }
+    buf[..dir.len()].copy_from_slice(dir);
+    buf[dir.len()] = b'/';
+    buf[dir.len() + 1..len].copy_from_slice(rest);
+    Ok(&buf[..len])
 }
 
 /// One status-only `kumo-vfs` exchange. The SH3 namespace ops answer exactly one status
@@ -869,6 +906,8 @@ fn net_call(
 
 
 const FD_SOCK_NONBLOCK: u8 = 1;
+/// Bit 0 of FdSlot::File::flags: O_APPEND (SH3-d2d).
+const FD_FILE_APPEND: u8 = 1 << 0;
 const SOCKET_KIND_UDP: u8 = 1;
 const SOCKET_KIND_TCP: u8 = 2;
 
@@ -1604,6 +1643,17 @@ impl Pal for Sys {
                 }
                 Ok(())
             }
+            FdSlot::File { handle, .. } => {
+                // Release the server-side slot (SH3-d2d): a vfs handle is a server-table
+                // index with no lifetime of its own, so client close is what frees it.
+                // Best-effort — a close never surfaces server failure.
+                let mut request = [0u8; CLOSE_REQUEST_LEN];
+                request[0] = VFS_OP_CLOSE;
+                request[1..5].copy_from_slice(&handle.to_le_bytes());
+                let mut reply = [0u8; 1];
+                let _ = vfs_call(&request, &mut reply);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1664,15 +1714,23 @@ impl Pal for Sys {
     fn fchmodat(dirfd: c_int, path: Option<CStr>, mode: mode_t, flags: c_int) -> Result<()> {
         use crate::header::{
             errno::{EINVAL, EOPNOTSUPP},
-            fcntl::AT_SYMLINK_NOFOLLOW,
+            fcntl::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW},
         };
 
-        if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
             return Err(Errno(EINVAL));
         }
+        let _ = mode;
         let Some(path) = path.map(|p| p.to_bytes()).filter(|p| !p.is_empty()) else {
-            // fchmod on an open descriptor: the synthetic table is keyed by path and this
-            // backend keeps no fd→path record yet, so be explicit instead of lying.
+            // fchmod on an open descriptor. FAT records no modes and the synthetic table
+            // is path-keyed, so the fd form succeeds as a documented no-op on an open
+            // file — std::fs::copy's set_permissions chain depends on that succeeding
+            // (JOURNAL/869). A non-file descriptor stays explicit.
+            if flags & AT_EMPTY_PATH != 0
+                && matches!(fd_slot(dirfd).map(|slot| *slot), Some(FdSlot::File { .. }))
+            {
+                return Ok(());
+            }
             return Err(Errno(EOPNOTSUPP));
         };
         let mut resolved = [0u8; VFS_MAX_PATH];
@@ -1782,7 +1840,7 @@ impl Pal for Sys {
 
     /// F_GETFL / F_SETFL with O_NONBLOCK: the only descriptor flag this backend owns.
     fn fcntl(fildes: c_int, cmd: c_int, arg: c_ulonglong) -> Result<c_int> {
-        use crate::header::bits_open_flags::O_NONBLOCK;
+        use crate::header::bits_open_flags::{O_APPEND, O_NONBLOCK};
         use crate::header::errno::{EBADF, EINVAL, EMFILE};
         use crate::header::fcntl::{
             F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_RDLCK, F_SETFD, F_SETFL,
@@ -1798,12 +1856,25 @@ impl Pal for Sys {
                 } else {
                     0
                 }),
+                FdSlot::File { flags, .. } => Ok(if flags & FD_FILE_APPEND != 0 {
+                    O_APPEND
+                } else {
+                    0
+                }),
                 _ => Ok(0),
             },
             F_SETFL => match slot {
                 FdSlot::Socket { flags, .. } => {
                     *flags = if (arg as c_int) & O_NONBLOCK != 0 {
                         FD_SOCK_NONBLOCK
+                    } else {
+                        0
+                    };
+                    Ok(0)
+                }
+                FdSlot::File { flags, .. } => {
+                    *flags = if (arg as c_int) & O_APPEND != 0 {
+                        FD_FILE_APPEND
                     } else {
                         0
                     };
@@ -2137,8 +2208,45 @@ impl Pal for Sys {
         vfs_two_path_status(VFS_OP_LINK, oldpath, newpath)
     }
 
+    /// Cursor movement over the descriptor table (SH3-d2d). The wire is positional —
+    /// READ and WRITE carry explicit offsets — so a seek is pure client state: SEEK_SET,
+    /// SEEK_CUR and SEEK_END over the slot's cursor and its recorded size. Channels and
+    /// sockets are not seekable (ESPIPE); directories have no byte cursor (EINVAL).
+    /// — TIMBERDOODLE
     fn lseek(fildes: c_int, offset: off_t, whence: c_int) -> Result<off_t> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{EBADF, EINVAL, ESPIPE},
+            unistd::{SEEK_CUR, SEEK_END, SEEK_SET},
+        };
+
+        let Some(slot) = fd_slot(fildes) else {
+            return Err(Errno(EBADF));
+        };
+        let (cursor, size) = match *slot {
+            FdSlot::Closed => return Err(Errno(EBADF)),
+            FdSlot::Input(_) | FdSlot::Output(_) | FdSlot::Socket { .. } => {
+                return Err(Errno(ESPIPE));
+            }
+            FdSlot::Dir { .. } => return Err(Errno(EINVAL)),
+            FdSlot::File { offset, size, .. } => (offset, size),
+        };
+        let base = match whence {
+            SEEK_SET => 0,
+            SEEK_CUR => i64::try_from(cursor).map_err(|_| Errno(EINVAL))?,
+            SEEK_END => i64::try_from(size).map_err(|_| Errno(EINVAL))?,
+            _ => return Err(Errno(EINVAL)),
+        };
+        let Some(next) = base.checked_add(offset) else {
+            return Err(Errno(EINVAL));
+        };
+        if next < 0 {
+            return Err(Errno(EINVAL));
+        }
+        let next = next as u64;
+        if let FdSlot::File { offset, .. } = slot {
+            *offset = next;
+        }
+        Ok(next as off_t)
     }
 
     fn mkdirat(fildes: c_int, path: CStr, mode: mode_t) -> Result<()> {
@@ -2257,13 +2365,10 @@ impl Pal for Sys {
         use crate::header::{
             errno::{EINVAL, EIO, EMFILE, ENAMETOOLONG, ENOTDIR},
             fcntl::{
-                AT_FDCWD, O_ACCMODE, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+                O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
             },
         };
 
-        if dirfd != AT_FDCWD {
-            return Err(Errno(EINVAL));
-        }
         let access = match oflag & O_ACCMODE {
             O_RDONLY => VFS_OPEN_READ,
             O_WRONLY => VFS_OPEN_WRITE,
@@ -2284,11 +2389,16 @@ impl Pal for Sys {
             return Err(Errno(ENAMETOOLONG));
         }
         let mut resolved = [0u8; VFS_MAX_PATH];
-        let path = vfs_path(path, &mut resolved)?;
+        let path = at_path(dirfd, path, &mut resolved)?;
         // O_DIRECTORY (SH3-d2c): directories are opened as path records, not server
         // handles. One OP_STAT gates existence and kind, so opendir fails like POSIX
-        // (ENOENT / ENOTDIR) instead of at the first listing.
-        if oflag & O_DIRECTORY != 0 {
+        // (ENOENT / ENOTDIR) instead of at the first listing. The bit carries two
+        // numbers: relibc's headers (linux-forked) say 0x1_0000 while the Rust libc
+        // crate's musl aarch64 table — what std compiled against, and what its
+        // remove_dir_all passes — says 0x4000, so both are honored; 0x4000 is O_DIRECT
+        // in relibc's numbering, which this volume cannot honor anyway (SH3-d2d).
+        const O_DIRECTORY_COMPAT: c_int = 0x4000;
+        if oflag & (O_DIRECTORY | O_DIRECTORY_COMPAT) != 0 {
             if options != VFS_OPEN_READ {
                 return Err(Errno(EINVAL));
             }
@@ -2342,6 +2452,11 @@ impl Pal for Sys {
                 handle,
                 offset: 0,
                 size,
+                flags: if oflag & O_APPEND != 0 {
+                    FD_FILE_APPEND
+                } else {
+                    0
+                },
             };
         }
         if oflag & O_TRUNC != 0 {
@@ -2432,6 +2547,7 @@ impl Pal for Sys {
                 handle,
                 offset,
                 size,
+                ..
             } => (handle, offset, size),
             FdSlot::Socket { kind, .. } => {
                 if kind != SOCKET_KIND_TCP {
@@ -2478,8 +2594,38 @@ impl Pal for Sys {
         Ok(got)
     }
 
+    /// Positional read: the wire read already carries an offset, so this is read()'s
+    /// frame without the cursor update (SH3-d2d). O_APPEND does not affect reads.
     fn pread(fildes: c_int, buf: &mut [u8], offset: off_t) -> Result<usize> {
-        Err(unsupported())
+        use crate::header::errno::{EBADF, EINVAL};
+
+        if offset < 0 {
+            return Err(Errno(EINVAL));
+        }
+        let offset = offset as u64;
+        let Some(FdSlot::File { handle, size, .. }) = fd_slot(fildes).map(|slot| *slot) else {
+            return Err(Errno(EBADF));
+        };
+        if buf.is_empty() || offset >= size {
+            return Ok(0);
+        }
+        let want = buf
+            .len()
+            .min(VFS_READ_MAX)
+            .min((size - offset).try_into().unwrap_or(usize::MAX));
+        let mut request = [0u8; VFS_READ_REQUEST_LEN];
+        request[0] = VFS_OP_READ;
+        request[1..5].copy_from_slice(&handle.to_le_bytes());
+        request[5..13].copy_from_slice(&offset.to_le_bytes());
+        request[13..17].copy_from_slice(&(want as u32).to_le_bytes());
+        let mut reply = [0u8; 1 + VFS_READ_MAX];
+        let n = vfs_call(&request, &mut reply)?;
+        if reply[0] != VFS_OK {
+            return Err(vfs_errno(reply[0]));
+        }
+        let got = (n - 1).min(want);
+        buf[..got].copy_from_slice(&reply[1..1 + got]);
+        Ok(got)
     }
 
     fn readlinkat(dirfd: c_int, pathname: CStr, out: &mut [u8]) -> Result<usize> {
@@ -2630,9 +2776,15 @@ impl Pal for Sys {
                 handle,
                 mut offset,
                 mut size,
+                flags,
             }) => {
                 let mut total = 0usize;
                 while total < buf.len() {
+                    // O_APPEND (SH3-d2d): every chunk starts at the recorded end, so a
+                    // growing file is never overwritten from a stale cursor.
+                    if flags & FD_FILE_APPEND != 0 {
+                        offset = size;
+                    }
                     let take = (buf.len() - total).min(VFS_READ_MAX);
                     let mut request = [0u8; VFS_WRITE_HEADER_LEN + VFS_READ_MAX];
                     request[0] = VFS_OP_WRITE;
@@ -2681,6 +2833,7 @@ impl Pal for Sys {
                         handle,
                         offset,
                         size,
+                        flags,
                     };
                 }
                 Ok(total)
@@ -2694,8 +2847,64 @@ impl Pal for Sys {
         }
     }
 
+    /// Positional write: write()'s frame loop with an explicit offset, no O_APPEND
+    /// (POSIX semantics), no cursor movement; the recorded size still grows so later
+    /// bound checks see the extension (SH3-d2d).
     fn pwrite(fildes: c_int, buf: &[u8], offset: off_t) -> Result<usize> {
-        Err(unsupported())
+        use crate::header::errno::{EBADF, EINVAL, EIO};
+
+        if offset < 0 {
+            return Err(Errno(EINVAL));
+        }
+        let mut offset = offset as u64;
+        let Some(FdSlot::File { handle, mut size, .. }) = fd_slot(fildes).map(|slot| *slot) else {
+            return Err(Errno(EBADF));
+        };
+        let mut total = 0usize;
+        while total < buf.len() {
+            let take = (buf.len() - total).min(VFS_READ_MAX);
+            let mut request = [0u8; VFS_WRITE_HEADER_LEN + VFS_READ_MAX];
+            request[0] = VFS_OP_WRITE;
+            request[1..5].copy_from_slice(&handle.to_le_bytes());
+            request[5..13].copy_from_slice(&offset.to_le_bytes());
+            request[13..15].copy_from_slice(&(take as u16).to_le_bytes());
+            request[VFS_WRITE_HEADER_LEN..VFS_WRITE_HEADER_LEN + take]
+                .copy_from_slice(&buf[total..total + take]);
+            let mut reply = [0u8; VFS_WRITE_REPLY_LEN];
+            let result = vfs_call(&request[..VFS_WRITE_HEADER_LEN + take], &mut reply);
+            let n = match result {
+                Ok(n) => n,
+                Err(error) if total == 0 => return Err(error),
+                Err(_) => break,
+            };
+            if n != VFS_WRITE_REPLY_LEN || reply[0] != VFS_OK {
+                if total == 0 {
+                    return Err(if n == 0 {
+                        Errno(EIO)
+                    } else {
+                        vfs_errno(reply[0])
+                    });
+                }
+                break;
+            }
+            let written = u32::from_le_bytes(reply[1..5].try_into().unwrap()) as usize;
+            if written == 0 || written > take {
+                if total == 0 {
+                    return Err(Errno(EIO));
+                }
+                break;
+            }
+            total += written;
+            offset += written as u64;
+            size = size.max(offset);
+            if written < take {
+                break;
+            }
+        }
+        if let Some(FdSlot::File { size: slot_size, .. }) = fd_slot(fildes) {
+            *slot_size = size;
+        }
+        Ok(total)
     }
 
     fn verify() -> bool {

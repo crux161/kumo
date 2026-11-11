@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j821
 #j856
 #j866
 #j867
 #j868
+#j869
 """AXH: build, boot and check native NET2 loopback/recovery; restore the default image.
 
 No NIC, credentials or board access. Artifacts remain under build/verification. POST is
@@ -117,6 +117,27 @@ CASES = (
         "std: sh3 read dir root -> OK",
         "std: sh3 read dir empty -> OK",
         "std: sh3 rmdir sub -> OK",
+        "std: sh3 d2d write -> OK",
+        "std: sh3 seek -> OK",
+        "std: sh3 seek read -> OK",
+        "std: sh3 seek end -> OK",
+        "std: sh3 at read -> OK",
+        "std: sh3 at write -> OK",
+        "std: sh3 at write readback -> OK",
+        "std: sh3 append -> OK",
+        "std: sh3 append readback -> OK",
+        "std: sh3 set len -> OK",
+        "std: sh3 set len stat -> OK",
+        "std: sh3 fchmod fd -> OK",
+        "std: sh3 clone -> OK",
+        "std: sh3 mkdir all -> OK",
+        "std: sh3 mkdir all stat -> OK",
+        "std: sh3 copy -> OK",
+        "std: sh3 copy readback -> OK",
+        "std: sh3 remove all -> OK",
+        "std: sh3 remove all gone -> OK",
+        "std: sh3 d2d cleanup c -> OK",
+        "std: sh3 d2d cleanup e -> OK",
         "std: sh3 old name gone -> OK",
         "std: sh3 unlink -> OK",
         "std: sh3 rmdir -> OK",

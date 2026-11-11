@@ -3,6 +3,7 @@
 //j547
 //j860
 //j865
+//j869
 
 //! `kumo-vfs` — the wire protocol for KUMO's filesystem servers.
 //!
@@ -60,6 +61,10 @@ pub const OP_LOCK: u8 = 0x0d;
 /// Op code: record a synthetic permission mode for `path` (SH3-d). FAT stores no
 /// modes; a server keeps the recorded value in soft state and reports it from stat.
 pub const OP_CHMOD: u8 = 0x0e;
+/// Op code: release the open file `handle` (SH3-d2d). Reply: one status byte. Handles
+/// are server-table indexes with no lifetime of their own, so this is what keeps the
+/// table from exhausting under a client's open/close churn.
+pub const OP_CLOSE: u8 = 0x0f;
 
 /// Open option: the returned handle may read.
 pub const OPEN_READ: u8 = 1 << 0;
@@ -133,6 +138,8 @@ pub const WRITE_HEADER_LEN: usize = 15;
 pub const SET_LEN_REQUEST_LEN: usize = 13;
 /// Wire length of a [`Request::Flush`] frame.
 pub const FLUSH_REQUEST_LEN: usize = 5;
+/// Wire length of a [`Request::Close`] frame: `op(1) + handle(4)`.
+pub const CLOSE_REQUEST_LEN: usize = 5;
 
 /// Wire length of a successful `Open` reply: `status(1) + handle(4) + size(8)`.
 pub const OPEN_REPLY_LEN: usize = 13;
@@ -177,6 +184,8 @@ pub enum Request<'a> {
     Lock { handle: u32, operation: u8 },
     /// Record a synthetic permission mode for `path` (SH3-d).
     Chmod { path: &'a [u8], mode: u16 },
+    /// Release the open file `handle` (SH3-d2d).
+    Close { handle: u32 },
 }
 
 impl<'a> Request<'a> {
@@ -383,6 +392,12 @@ impl<'a> Request<'a> {
                 out[5] = operation;
                 Some(LOCK_REQUEST_LEN)
             }
+            Request::Close { handle } => {
+                let out = buf.get_mut(..CLOSE_REQUEST_LEN)?;
+                out[0] = OP_CLOSE;
+                out[1..5].copy_from_slice(&handle.to_le_bytes());
+                Some(CLOSE_REQUEST_LEN)
+            }
             Request::Chmod { path, mode } => {
                 if path.len() > MAX_PATH {
                     return None;
@@ -501,6 +516,10 @@ impl<'a> Request<'a> {
                     handle: u32::from_le_bytes(b[1..5].try_into().ok()?),
                     operation,
                 })
+            }
+            OP_CLOSE => {
+                let handle = u32::from_le_bytes(raw.get(1..5)?.try_into().ok()?);
+                Some(Request::Close { handle })
             }
             OP_CHMOD => {
                 let mode = u16::from_le_bytes(raw.get(1..3)?.try_into().ok()?);
@@ -735,6 +754,19 @@ pub fn parse_stat_reply(resp: &[u8]) -> Result<StatReply, VfsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_request_round_trips() {
+        let mut buf = [0u8; CLOSE_REQUEST_LEN];
+        let n = Request::Close { handle: 7 }.encode_into(&mut buf).unwrap();
+        assert_eq!(n, CLOSE_REQUEST_LEN);
+        assert_eq!(buf, [OP_CLOSE, 7, 0, 0, 0]);
+        assert!(matches!(
+            Request::decode(&buf[..n]),
+            Some(Request::Close { handle: 7 })
+        ));
+        assert!(Request::decode(&[OP_CLOSE, 1, 2]).is_none());
+    }
 
     #[test]
     fn open_request_round_trips() {
