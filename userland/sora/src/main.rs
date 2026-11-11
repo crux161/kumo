@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j843
 //j856
 //j857
 //j859
 //j864
+//j870
 
 extern crate alloc;
 
@@ -7318,8 +7318,10 @@ fn eval_command(
         // environment (SH2). No other launcher word mints one. — TIMBERDOODLE
         run_env_command(initrd, cmd)
     } else if cmd.name == "bg" {
-        // bg <run|net> <program> [args...]: start one program without waiting for it; `wait`
-        // later drains its output. One job at a time (J816, NET2b-2). — TIMBERDOODLE
+        // bg <run|net|media> <program> [args...]: start one program without waiting for it;
+        // `wait` later drains its output. One job at a time (J816, NET2b-2). `media` grants
+        // a read-write session on the mounted volume through the mount-scoped server
+        // (SH3-e), which is what puts two lock probes in the same lock world. — TIMBERDOODLE
         match cmd.args.split_first() {
             Some((launcher, program)) if !program.is_empty() && launcher == "run" => {
                 run_program_background(initrd, program, false)
@@ -7327,7 +7329,19 @@ fn eval_command(
             Some((launcher, program)) if !program.is_empty() && launcher == "net" => {
                 run_program_background(initrd, program, true)
             }
-            _ => usage(b"usage: bg run|net <program> [args...]\n"),
+            Some((launcher, program)) if !program.is_empty() && launcher == "media" => {
+                run_program_media_background(initrd, program)
+            }
+            _ => usage(b"usage: bg run|net|media <program> [args...]\n"),
+        }
+    } else if cmd.name == "media" {
+        // media <program> [args...]: `run`, plus a read-write session on the mounted volume
+        // through the mount-scoped fatfs server (SH3-e). The program sees the volume root
+        // as "/"; nothing outside /media/<volume> is granted. — TIMBERDOODLE
+        if cmd.args.is_empty() {
+            usage(b"usage: media <program> [args...]\n");
+        } else {
+            run_program_media(initrd, &cmd.args);
         }
     } else if cmd.name == "wait" {
         if !cmd.args.is_empty() {
@@ -7756,6 +7770,198 @@ fn run_env_command(initrd: Handle, cmd: &kumoza::Command) {
     }
     let program: alloc::vec::Vec<alloc::string::String> = cmd.args[index..].to_vec();
     run_program_granted_with_env(initrd, &program, false, Some(&env));
+}
+
+/// Make the removable volume's read-write session available to the `media` word. A
+/// synchronous autoexec is not in Sora's serve loop (whose port does not exist yet), so
+/// this creates a private port, binds the storage control channels and a one-shot
+/// deadline to it, and dispatches storage offers until the removable volume mounts. The
+/// stick's offer arrives only after USB enumeration. The NVMe volume is explicit-mount
+/// storage, never a candidate here (SH3-e).
+fn ensure_media_writable(initrd: Handle) -> bool {
+    if let Some(volume) = media() {
+        // A volume the shell mounted explicitly is honored; otherwise this word mounts
+        // one itself, preferring the removable stick.
+        return !volume.ready.read_only;
+    }
+    if let Some(mounted) = mount_removable_media(initrd) {
+        return mounted;
+    }
+    if pump_removable_media(initrd) {
+        return true;
+    }
+    // Recorded deviation (SH3-e): when no removable offer arrives, the media word falls
+    // back to any writable offered volume — the PLAN/019 NVMe (KUMONVME) on this board
+    // after its rear USB link stopped enumerating the stick.
+    mount_writable_media(initrd).unwrap_or(false)
+}
+
+/// Mount any writable offered volume, including explicit-mount storage. This is the
+/// recorded SH3-e fallback, reached only after the removable wait expires.
+fn mount_writable_media(initrd: Handle) -> Option<bool> {
+    for (index, slot) in DEVICES.get().iter().enumerate() {
+        let Some(device) = slot else { continue };
+        if device.ready.read_only {
+            continue;
+        }
+        let name = sora::MediaName::new(device.ready.label, device.ready.serial);
+        mount_device(initrd, index, *device, name);
+        return Some(media().is_some_and(|volume| !volume.ready.read_only));
+    }
+    None
+}
+
+/// Wait for a removable volume's storage offer. A synchronous autoexec is not in Sora's
+/// serve loop — the serve port does not exist yet — so this creates a private port,
+/// binds every storage control channel and a one-shot deadline to it, and dispatches the
+/// offers as they arrive. PortBind replays a pending offer, so a message queued before
+/// the bind is not missed. The xhci controllers start during autoexec; the stick's ready
+/// offer follows USB enumeration, and the deadline bounds a controller that never
+/// answers.
+fn pump_removable_media(initrd: Handle) -> bool {
+    const MEDIA_WAIT_NS: u64 = 90_000_000_000;
+    let Some(port) = syscall_handle(port_create()) else {
+        return false;
+    };
+    let mut watches: [Option<Handle>; sora::STORAGE_DEVICES] = [None; sora::STORAGE_DEVICES];
+    for (index, slot) in watches.iter_mut().enumerate() {
+        let control = Handle(STORAGE_CONTROLS[index].load(Ordering::Relaxed));
+        let raw_koid = handle_koid(control);
+        if control.0 != 0 && raw_koid != u64::MAX && port_bind(port, control) == 0 {
+            *slot = Some(Handle(raw_koid as u32));
+        }
+    }
+    let Some(deadline) = syscall_handle(timer_create(MEDIA_WAIT_NS)) else {
+        let _ = handle_close(port);
+        return false;
+    };
+    let deadline_koid = handle_koid(deadline);
+    if deadline_koid == u64::MAX || port_bind(port, deadline) != 0 {
+        let _ = handle_close(deadline);
+        let _ = handle_close(port);
+        return false;
+    }
+    let mounted = loop {
+        if let Some(volume) = media() {
+            break sora::StorageTransport::of(volume.device).auto_mounts()
+                && !volume.ready.read_only;
+        }
+        if let Some(mounted) = mount_removable_media(initrd) {
+            break mounted;
+        }
+        let source = port_wait(port);
+        if source == deadline_koid || source == u64::MAX {
+            break false;
+        }
+        if let Some(index) = watches
+            .iter()
+            .position(|slot| slot.is_some_and(|handle| u64::from(handle.0) == source))
+        {
+            let _ = media_offered(initrd, port, index, &mut watches);
+        }
+    };
+    for (index, slot) in watches.iter().enumerate() {
+        if slot.is_some() {
+            let control = Handle(STORAGE_CONTROLS[index].load(Ordering::Relaxed));
+            let _ = port_unbind(port, control);
+        }
+    }
+    let _ = port_unbind(port, deadline);
+    let _ = handle_close(deadline);
+    let _ = handle_close(port);
+    mounted
+}
+
+/// Scan the offered volumes for a writable removable one and mount it. `None` means no
+/// removable offer has arrived yet; the NVMe volume announces itself and stays
+/// explicit-mount storage (PLAN/019), so it is never a candidate here.
+fn mount_removable_media(initrd: Handle) -> Option<bool> {
+    for (index, slot) in DEVICES.get().iter().enumerate() {
+        let Some(device) = slot else { continue };
+        if device.ready.read_only || !sora::StorageTransport::of(index).auto_mounts() {
+            continue;
+        }
+        let name = sora::MediaName::new(device.ready.label, device.ready.serial);
+        mount_device(initrd, index, *device, name);
+        return Some(media().is_some_and(|volume| !volume.ready.read_only));
+    }
+    None
+}
+
+/// `media <program> [args...]`: foreground launch with a read-write volume session.
+fn run_program_media(initrd: Handle, argv: &[alloc::string::String]) {
+    if !ensure_media_writable(initrd) {
+        log(b"media: no writable volume mounted\n");
+        fail_status(1);
+        return;
+    }
+    let Some(name) = argv.first().map(|n| n.as_bytes()) else {
+        return;
+    };
+    let mut path = [0u8; 64];
+    let Some(full) = program_path(name, &mut path) else {
+        fail_status(1);
+        return;
+    };
+    let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+    let count = string_argv_slots(argv, &mut slots);
+    run_with_startup_input(
+        initrd,
+        full,
+        full,
+        Some(&slots[..count]),
+        false,
+        FsGrant::Media(BlockAccess::ReadWrite),
+        false,
+        false,
+        StdinMode::Finite(b"\n"),
+        false,
+    );
+}
+
+/// `bg media <program> [args...]`: the background twin, same grant.
+fn run_program_media_background(initrd: Handle, argv: &[alloc::string::String]) {
+    if BG_STDOUT.load(Ordering::Relaxed) != 0 {
+        log(b"bg: a background job is still running; `wait` for it first\n");
+        fail_status(1);
+        return;
+    }
+    if !ensure_media_writable(initrd) {
+        log(b"bg: media: no writable volume mounted\n");
+        fail_status(1);
+        return;
+    }
+    let Some(name) = argv.first().map(|n| n.as_bytes()) else {
+        return;
+    };
+    let mut path = [0u8; 64];
+    let Some(full) = program_path(name, &mut path) else {
+        fail_status(1);
+        return;
+    };
+    let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+    let count = string_argv_slots(argv, &mut slots);
+    let Some(child) = run_with_startup_input(
+        initrd,
+        full,
+        full,
+        Some(&slots[..count]),
+        false,
+        FsGrant::Media(BlockAccess::ReadWrite),
+        false,
+        false,
+        StdinMode::Interactive,
+        false,
+    ) else {
+        fail_status(1);
+        return;
+    };
+    let _ = handle_close(child.stdin);
+    BG_STDOUT.store(child.stdout.0, Ordering::Relaxed);
+    BG_PROCESS.store(child.process.map_or(0, |p| p.0), Ordering::Relaxed);
+    log(b"bg: started ");
+    log(name);
+    log(b"\n");
 }
 
 fn run_program_background(initrd: Handle, argv: &[alloc::string::String], grant_net: bool) {

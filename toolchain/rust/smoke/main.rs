@@ -1,8 +1,8 @@
-//j859
 //j866
 //j867
 //j868
 //j869
+//j870
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -149,6 +149,24 @@ fn main() {
         }
         Some("fsmeta") => {
             sh3_probe();
+            return;
+        }
+        Some("mediasuite") => {
+            media_suite();
+            return;
+        }
+        Some("mediacheck") => {
+            media_check();
+            return;
+        }
+        Some("lockhold") => {
+            let args: Vec<String> = std::env::args().collect();
+            lock_hold(&args);
+            return;
+        }
+        Some("locktry") => {
+            let args: Vec<String> = std::env::args().collect();
+            lock_try(&args);
             return;
         }
         Some("net") => {
@@ -924,6 +942,150 @@ fn net_campaign() {
     netlog!("campaign failed={}", failures);
     if failures == 0 {
         netlog!("loopback -> OK");
+    }
+}
+
+/// SH3-e: the cargo-shaped basics on the granted volume, whose root this process sees
+/// as "/". Leaves the tree in place for the reboot read-back.
+#[inline(never)]
+fn media_suite() {
+    use std::fs;
+    macro_rules! check {
+        ($cond:expr, $msg:literal) => {
+            if $cond {
+                sh3log!("{} -> OK", $msg);
+            } else {
+                sh3log!("{} -> FAIL", $msg);
+            }
+        };
+    }
+
+    // A rerun must not trip on a tree an earlier attempt left behind — including an
+    // attempt whose proof lines the console level hid. The suite owns /SH3E and
+    // starts from a clean slate.
+    let _ = fs::remove_dir_all("/SH3E");
+    check!(fs::create_dir("/SH3E").is_ok(), "e1 mkdir");
+    check!(fs::create_dir("/SH3E/SRC").is_ok(), "e1 mkdir tree");
+    check!(fs::write("/SH3E/TMP.TXT", b"kumo-metal").is_ok(), "e1 write");
+    check!(
+        fs::rename("/SH3E/TMP.TXT", "/SH3E/FINAL.TXT").is_ok(),
+        "e1 rename"
+    );
+    check!(
+        fs::metadata("/SH3E/FINAL.TXT")
+            .map(|m| m.len() == 10 && m.is_file())
+            .unwrap_or(false),
+        "e1 stat"
+    );
+    check!(
+        fs::read("/SH3E/FINAL.TXT")
+            .map(|d| d == b"kumo-metal")
+            .unwrap_or(false),
+        "e1 read"
+    );
+    match fs::read_dir("/SH3E") {
+        Ok(entries) => {
+            let mut have_final = false;
+            let mut have_src = false;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if name == "FINAL.TXT" && !is_dir {
+                    have_final = true;
+                }
+                if name == "SRC" && is_dir {
+                    have_src = true;
+                }
+            }
+            check!(have_final && have_src, "e1 readdir");
+        }
+        Err(_) => sh3log!("e1 readdir -> FAIL"),
+    }
+}
+
+/// SH3-e: the reboot read-back — the tree survives a power cycle on real media, then the
+/// suite cleans up after itself.
+#[inline(never)]
+fn media_check() {
+    use std::fs;
+    macro_rules! check {
+        ($cond:expr, $msg:literal) => {
+            if $cond {
+                sh3log!("{} -> OK", $msg);
+            } else {
+                sh3log!("{} -> FAIL", $msg);
+            }
+        };
+    }
+
+    check!(
+        fs::read("/SH3E/FINAL.TXT")
+            .map(|d| d == b"kumo-metal")
+            .unwrap_or(false),
+        "e3 persisted"
+    );
+    check!(fs::remove_dir_all("/SH3E").is_ok(), "e3 cleanup");
+    check!(
+        fs::metadata("/SH3E").map(|_| false).unwrap_or(true),
+        "e3 cleaned"
+    );
+}
+
+/// SH3-e: hold an exclusive lock for a bounded window. No sleep primitive exists in the
+/// ABI, so the hold is a clock-bounded spin; preemption keeps the machine responsive and
+/// the window is small.
+#[inline(never)]
+fn lock_hold(args: &[String]) {
+    use std::fs;
+    use std::time::{Duration, Instant};
+
+    let path = args.get(2).map(String::as_str).unwrap_or("/SH3E/LOCK");
+    let ms: u64 = args
+        .get(3)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3000);
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+    {
+        Ok(file) => match file.lock() {
+            Ok(()) => {
+                sh3log!("lock held");
+                let deadline = Instant::now() + Duration::from_millis(ms);
+                while Instant::now() < deadline {}
+                let _ = file.unlock();
+                sh3log!("lock released");
+            }
+            Err(_) => sh3log!("lock hold -> FAIL"),
+        },
+        Err(_) => sh3log!("lock hold -> FAIL"),
+    }
+}
+
+/// SH3-e: the contender — a held exclusive lock answers WouldBlock, and after the holder
+/// releases, the same probe acquires.
+#[inline(never)]
+fn lock_try(args: &[String]) {
+    use std::fs;
+
+    let path = args.get(2).map(String::as_str).unwrap_or("/SH3E/LOCK");
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+    {
+        Ok(file) => match file.try_lock() {
+            Ok(()) => {
+                sh3log!("lock acquired");
+                let _ = file.unlock();
+            }
+            Err(fs::TryLockError::WouldBlock) => sh3log!("lock wouldblock"),
+            Err(_) => sh3log!("lock try -> FAIL"),
+        },
+        Err(_) => sh3log!("lock try -> FAIL"),
     }
 }
 

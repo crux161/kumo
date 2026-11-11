@@ -1,8 +1,8 @@
-/* j512 */
 /* j513 */
 /* j514 */
 /* j535 */
 /* j557 */
+/* j870 */
 /*
  * Every declaration below now comes from KUMO's own installed headers, generated from
  * relibc by the vendored cbindgen and installed into `target/kumo-sysroot`. Until J511
@@ -22,6 +22,9 @@
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <dirent.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <termios.h>
@@ -670,7 +673,69 @@ static int tcp_edges(void) {
     return 0;
 }
 
+/* SH3-e: the C leg of the metal suite — mkdir, write, rename, stat, readdir, lockf and
+ * removal on the granted volume, whose root this process sees as "/". */
+static int media_suite(void) {
+    if (mkdir("/SH3C", 0755) != 0) {
+        printf("c-media: mkdir -> FAIL\n");
+        return 60;
+    }
+    printf("c-media: mkdir -> OK\n");
+    FILE *stream = fopen("/SH3C/A.TXT", "w");
+    if (!stream) {
+        printf("c-media: write -> FAIL\n");
+        return 61;
+    }
+    if (fwrite("kumo", 1, 4, stream) != 4) return 62;
+    fclose(stream);
+    if (rename("/SH3C/A.TXT", "/SH3C/B.TXT") != 0) {
+        printf("c-media: rename -> FAIL\n");
+        return 63;
+    }
+    printf("c-media: rename -> OK\n");
+    struct stat info;
+    if (stat("/SH3C/B.TXT", &info) != 0 || info.st_size != 4) {
+        printf("c-media: stat -> FAIL\n");
+        return 64;
+    }
+    printf("c-media: stat -> OK\n");
+    DIR *dir = opendir("/SH3C");
+    if (!dir) {
+        printf("c-media: readdir -> FAIL\n");
+        return 65;
+    }
+    int entries = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        entries++;
+    }
+    closedir(dir);
+    if (entries != 1) {
+        printf("c-media: readdir -> FAIL\n");
+        return 66;
+    }
+    printf("c-media: readdir -> OK\n");
+    int fd = open("/SH3C/B.TXT", O_RDWR);
+    if (fd < 0) return 67;
+    if (lockf(fd, F_TLOCK, 0) != 0) {
+        printf("c-media: lockf -> FAIL\n");
+        return 68;
+    }
+    if (lockf(fd, F_ULOCK, 0) != 0) {
+        printf("c-media: unlockf -> FAIL\n");
+        return 69;
+    }
+    close(fd);
+    printf("c-media: lockf -> OK\n");
+    if (unlink("/SH3C/B.TXT") != 0) return 70;
+    if (rmdir("/SH3C") != 0) return 71;
+    printf("c-media: all -> OK\n");
+    return 0;
+}
+
 int main(int argc, char **argv, char **envp) {
+    if (argc > 1 && strcmp(argv[1], "media") == 0) return media_suite();
     if (argc > 1 && strcmp(argv[1], "screen") == 0) return screen_fixture();
     if (argc > 1 && strcmp(argv[1], "udp") == 0) return udp_loopback();
     if (argc > 1 && strcmp(argv[1], "udp-nogrant") == 0) return udp_nogrant();

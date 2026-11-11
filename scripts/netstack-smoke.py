@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j856
 #j866
 #j867
 #j868
 #j869
+#j870
 """AXH: build, boot and check native NET2 loopback/recovery; restore the default image.
 
 No NIC, credentials or board access. Artifacts remain under build/verification. POST is
@@ -177,7 +177,9 @@ def unpack(data):
 def stage(initrd, case):
     original = initrd.read_bytes()
     files = unpack(original)
-    require(len(case.script) <= 256, f"{case.name}: autoexec exceeds Sora's 256-byte read")
+    # j856 made Sora read the autoexec manifest in chunks against a 1 KiB buffer; the
+    # old 256-byte single-read cap is gone.
+    require(len(case.script) <= 1024, f"{case.name}: autoexec exceeds Sora's 1 KiB manifest")
     require("etc/autoexec" in files, "autoexec missing")
     files["etc/autoexec"] = case.script
     out = bytearray(original[:16 + len(files) * 80])
