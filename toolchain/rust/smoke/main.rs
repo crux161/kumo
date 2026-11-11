@@ -1,8 +1,8 @@
-//j868
 //j869
 //j870
 //j871
 //j873
+//j875
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -116,6 +116,20 @@ macro_rules! sh5log {
     ($($arg:tt)*) => { sh5_line(format_args!($($arg)*)) };
 }
 
+/// SH6: the signals proof's ring record, one formatted entry under "std: sh6".
+fn sh6_line(args: core::fmt::Arguments<'_>) {
+    let text = format!("std: sh6 {}\n", args);
+    let bytes = text.as_bytes();
+    let _ = kumo_rt::log_write(
+        kumo_abi::sys::log_level::NOTICE,
+        &bytes[..bytes.len().min(200)],
+    );
+}
+
+macro_rules! sh6log {
+    ($($arg:tt)*) => { sh6_line(format_args!($($arg)*)) };
+}
+
 
 
 fn main() {
@@ -210,6 +224,14 @@ fn main() {
             threads_suite();
             return;
         }
+        // SH6: the signals proof (scripts/signal-smoke.py drives `signals`; the other two
+        // are the children it spawns from SMOKE.ELF).
+        Some("signals") => {
+            signals_suite();
+            return;
+        }
+        Some("stackoverflow") => sh6_stack_overflow_child(),
+        Some("sigpipedefault") => sh6_sigpipe_default_child(),
         Some("threadexit") => {
             let worker = std::thread::spawn(|| {
                 std::process::exit(5);
@@ -1240,6 +1262,341 @@ fn spawn_parent() {
         ),
         Err(e) => sh3log!("spawn nogrant FAIL {:?} {:?}", e.kind(), e.raw_os_error()),
     }
+}
+
+/// SH6: the C signal ABI as kumo.patch lays it out — `struct sigaction` in the linux-musl
+/// layout the Rust libc crate uses (handler, 128-byte mask, int flags at 136, restorer),
+/// and `stack_t` (base, int flags, size).
+mod sh6 {
+    #[repr(C)]
+    pub struct SigAction {
+        pub handler: usize,
+        pub mask: [u64; 16],
+        pub flags: i32,
+        pub restorer: usize,
+    }
+
+    #[repr(C)]
+    pub struct StackT {
+        pub sp: usize,
+        pub flags: i32,
+        pub size: usize,
+    }
+
+    pub const SIG_DFL: usize = 0;
+    pub const SIG_IGN: usize = 1;
+    pub const SIGKILL: i32 = 9;
+    pub const SIGUSR1: i32 = 10;
+    pub const SIGSEGV: i32 = 11;
+    pub const SIGUSR2: i32 = 12;
+    pub const SIGPIPE: i32 = 13;
+    pub const SA_SIGINFO: i32 = 4;
+    pub const SA_ONSTACK: i32 = 0x0800_0000;
+    pub const SA_NODEFER: i32 = 0x4000_0000;
+    pub const SA_RESETHAND: i32 = 0x8000_0000_u32 as i32;
+    pub const SIG_BLOCK: i32 = 0;
+    pub const SIG_SETMASK: i32 = 2;
+    pub const EPIPE: i32 = 32;
+    pub const ENOMEM: i32 = 12;
+
+    unsafe extern "C" {
+        pub fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+        pub fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
+        pub fn sigprocmask(how: i32, set: *const u64, old: *mut u64) -> i32;
+        pub fn sigpending(set: *mut u64) -> i32;
+        pub fn raise(sig: i32) -> i32;
+        pub fn signal(sig: i32, handler: usize) -> usize;
+        pub fn pipe(fds: *mut i32) -> i32;
+        pub fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+        pub fn close(fd: i32) -> i32;
+    }
+
+    pub fn errno() -> i32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+
+    pub fn query(sig: i32) -> Option<SigAction> {
+        let mut old: SigAction = unsafe { core::mem::zeroed() };
+        (unsafe { sigaction(sig, core::ptr::null(), &mut old) } == 0).then_some(old)
+    }
+
+    pub fn install(sig: i32, handler: usize, flags: i32) -> bool {
+        let act = SigAction {
+            handler,
+            mask: [0; 16],
+            flags,
+            restorer: 0,
+        };
+        unsafe { sigaction(sig, &act, core::ptr::null_mut()) == 0 }
+    }
+
+    /// A no-allocation line writer for handler context.
+    pub struct Line {
+        pub buf: [u8; 192],
+        pub len: usize,
+    }
+
+    impl core::fmt::Write for Line {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let take = text.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
+            self.len += take;
+            Ok(())
+        }
+    }
+}
+
+static SH6_USR1_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn sh6_on_usr1(sig: i32) {
+    if sig == sh6::SIGUSR1 {
+        SH6_USR1_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// SH6-a: the signal state surface and the synchronous-fault path. The parent proves
+/// sigaction/raise/sigprocmask/sigaltstack round-trips and std's SIGPIPE-ignore (EPIPE) in
+/// process, then spawns two children: one overflows its stack into the guard page under a
+/// rustc-style SA_ONSTACK|SA_SIGINFO handler (reported through the handler, then re-raised
+/// with SIG_DFL, so the parent sees WTERMSIG 11, not a TOWER), and one writes to a closed
+/// pipe with SIGPIPE at SIG_DFL (WTERMSIG 13). — TEAL
+fn signals_suite() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::Ordering;
+
+    let mut fails = Vec::new();
+    let mut check = |ok: bool, what: &'static str| {
+        if !ok {
+            fails.push(what);
+        }
+    };
+
+    // 1. Dispositions: a fresh SIGUSR1 is SIG_DFL; a handler installs, reads back, and runs
+    // synchronously under raise(); SIG_IGN swallows; SIGKILL cannot be caught.
+    check(sh6::query(sh6::SIGUSR1).is_some_and(|old| old.handler == sh6::SIG_DFL), "dfl");
+    check(sh6::install(sh6::SIGUSR1, sh6_on_usr1 as usize, 0), "install");
+    check(
+        sh6::query(sh6::SIGUSR1).is_some_and(|old| old.handler == sh6_on_usr1 as usize),
+        "readback",
+    );
+    check(unsafe { sh6::raise(sh6::SIGUSR1) } == 0, "raise");
+    check(SH6_USR1_HITS.load(Ordering::SeqCst) == 1, "handler ran");
+    check(sh6::install(sh6::SIGUSR2, sh6::SIG_IGN, 0), "ignore");
+    check(unsafe { sh6::raise(sh6::SIGUSR2) } == 0, "raise ignored");
+    check(!sh6::install(sh6::SIGKILL, sh6::SIG_IGN, 0), "sigkill refused");
+    // std's own stack-overflow handler, installed at startup through the Rust libc crate's
+    // struct: its flags must read back exactly (the kumo.patch musl-layout ABI).
+    check(
+        sh6::query(sh6::SIGSEGV).is_some_and(|old| {
+            old.handler > sh6::SIG_IGN && old.flags == sh6::SA_SIGINFO | sh6::SA_ONSTACK
+        }),
+        "std segv handler abi",
+    );
+    // 2. The mask records and reports; nothing is pending.
+    let mut old = u64::MAX;
+    let usr1 = 1u64 << (sh6::SIGUSR1 - 1);
+    check(unsafe { sh6::sigprocmask(sh6::SIG_BLOCK, &usr1, &mut old) } == 0, "block");
+    let mut now = 0u64;
+    check(
+        unsafe { sh6::sigprocmask(sh6::SIG_SETMASK, &old, &mut now) } == 0 && now & usr1 != 0,
+        "mask readback",
+    );
+    let mut pending = u64::MAX;
+    check(unsafe { sh6::sigpending(&mut pending) } == 0 && pending == 0, "pending");
+    // 3. The alternate stack: std's own (its stack-overflow reporter installs one per
+    // thread at startup; 12 KiB on this target), ENOMEM below MINSIGSTKSZ, then ours set
+    // and read back.
+    let mut query: sh6::StackT = unsafe { core::mem::zeroed() };
+    let std_stack = unsafe { sh6::sigaltstack(core::ptr::null(), &mut query) } == 0
+        && query.flags == 0
+        && query.sp != 0
+        && query.size >= 5120;
+    if !std_stack {
+        sh6log!(
+            "altstack std was sp={:#x} flags={} size={:#x}",
+            query.sp,
+            query.flags,
+            query.size
+        );
+    }
+    check(std_stack, "altstack std");
+    let area: &'static mut [u8] = Box::leak(vec![0u8; 64 * 1024].into_boxed_slice());
+    let small = sh6::StackT {
+        sp: area.as_ptr() as usize,
+        flags: 0,
+        size: 1024,
+    };
+    check(
+        unsafe { sh6::sigaltstack(&small, core::ptr::null_mut()) } == -1
+            && sh6::errno() == sh6::ENOMEM,
+        "altstack small",
+    );
+    let full = sh6::StackT {
+        sp: area.as_ptr() as usize,
+        flags: 0,
+        size: area.len(),
+    };
+    check(unsafe { sh6::sigaltstack(&full, core::ptr::null_mut()) } == 0, "altstack set");
+    check(
+        unsafe { sh6::sigaltstack(core::ptr::null(), &mut query) } == 0
+            && query.sp == full.sp
+            && query.size == full.size
+            && query.flags == 0,
+        "altstack readback",
+    );
+    if fails.is_empty() {
+        sh6log!("state -> OK");
+    } else {
+        sh6log!("state FAIL {:?}", fails);
+    }
+
+    // 4. SIGPIPE: std set it to SIG_IGN at startup, so a write to a pipe whose reader is
+    // gone answers EPIPE.
+    let ignored = sh6::query(sh6::SIGPIPE).is_some_and(|old| old.handler == sh6::SIG_IGN);
+    let mut fds = [0i32; 2];
+    let epipe = unsafe { sh6::pipe(fds.as_mut_ptr()) } == 0 && {
+        unsafe { sh6::close(fds[0]) };
+        let n = unsafe { sh6::write(fds[1], b"x".as_ptr(), 1) };
+        let errno = sh6::errno();
+        unsafe { sh6::close(fds[1]) };
+        n == -1 && errno == sh6::EPIPE
+    };
+    if ignored && epipe {
+        sh6log!("epipe -> OK");
+    } else {
+        sh6log!("epipe FAIL ignored={} epipe={}", ignored, epipe);
+    }
+
+    // 5. The guard-page overflow, through the handler, in a child.
+    match Command::new("/SMOKE.ELF")
+        .arg("stackoverflow")
+        .stdin(Stdio::piped())
+        .output()
+    {
+        Ok(output) => {
+            let report = String::from_utf8_lossy(&output.stderr);
+            if report.contains("sh6 handler: SIGSEGV")
+                && report.contains("guard=yes")
+                && report.contains("altstack=yes")
+                && report.contains("code=1")
+            {
+                sh6log!("overflow handler -> OK");
+            } else {
+                sh6log!("overflow handler FAIL {:?}", report.trim());
+            }
+            if output.status.signal() == Some(sh6::SIGSEGV) && output.status.code().is_none() {
+                sh6log!("overflow signaled -> OK (WTERMSIG 11)");
+            } else {
+                sh6log!("overflow signaled FAIL {:?}", output.status);
+            }
+        }
+        Err(error) => sh6log!("overflow spawn FAIL {:?}", error),
+    }
+
+    // 6. SIGPIPE at SIG_DFL kills the writer.
+    match Command::new("/SMOKE.ELF")
+        .arg("sigpipedefault")
+        .stdin(Stdio::piped())
+        .status()
+    {
+        Ok(status) if status.signal() == Some(sh6::SIGPIPE) => {
+            sh6log!("sigpipe default -> OK (WTERMSIG 13)")
+        }
+        Ok(status) => sh6log!("sigpipe default FAIL {:?}", status),
+        Err(error) => sh6log!("sigpipe default spawn FAIL {:?}", error),
+    }
+}
+
+static SH6_DEEPEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static SH6_ALT: [std::sync::atomic::AtomicUsize; 2] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// rustc's shape (rustc_driver's signal handler): report on the alternate stack, restore
+/// the default, and re-raise so the process ends as killed by the signal. Allocation-free.
+extern "C" fn sh6_on_segv(sig: i32, info: *mut u8, _context: *mut u8) {
+    use core::fmt::Write as _;
+    use std::sync::atomic::Ordering;
+
+    let (addr, code) = unsafe {
+        (
+            core::ptr::read(info.add(16).cast::<usize>()),
+            core::ptr::read(info.add(8).cast::<i32>()),
+        )
+    };
+    let marker = 0u8;
+    let here = core::ptr::addr_of!(marker) as usize;
+    let alt = here >= SH6_ALT[0].load(Ordering::SeqCst) && here < SH6_ALT[1].load(Ordering::SeqCst);
+    let deepest = SH6_DEEPEST.load(Ordering::SeqCst);
+    let guard = addr < deepest && deepest - addr <= 8192;
+    let mut line = sh6::Line {
+        buf: [0; 192],
+        len: 0,
+    };
+    let _ = write!(
+        line,
+        "sh6 handler: SIGSEGV code={} guard={} altstack={} addr={:#x} deepest={:#x}\n",
+        code,
+        if guard { "yes" } else { "no" },
+        if alt { "yes" } else { "no" },
+        addr,
+        deepest
+    );
+    unsafe { sh6::write(2, line.buf.as_ptr(), line.len) };
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line.buf[..line.len]);
+    unsafe {
+        sh6::signal(sig, sh6::SIG_DFL);
+        sh6::raise(sig);
+    }
+}
+
+#[inline(never)]
+fn sh6_recurse(depth: u64) -> u64 {
+    let mut pad = [0u8; 512];
+    std::hint::black_box(&mut pad);
+    SH6_DEEPEST.fetch_min(pad.as_ptr() as usize, std::sync::atomic::Ordering::SeqCst);
+    pad[0] = depth as u8;
+    sh6_recurse(depth + 1).wrapping_add(std::hint::black_box(pad[1]) as u64)
+}
+
+fn sh6_stack_overflow_child() -> ! {
+    use std::sync::atomic::Ordering;
+
+    let area: &'static mut [u8] = Box::leak(vec![0u8; 64 * 1024].into_boxed_slice());
+    SH6_ALT[0].store(area.as_ptr() as usize, Ordering::SeqCst);
+    SH6_ALT[1].store(area.as_ptr() as usize + area.len(), Ordering::SeqCst);
+    let stack = sh6::StackT {
+        sp: area.as_ptr() as usize,
+        flags: 0,
+        size: area.len(),
+    };
+    let installed = unsafe { sh6::sigaltstack(&stack, core::ptr::null_mut()) } == 0
+        && sh6::install(
+            sh6::SIGSEGV,
+            sh6_on_segv as usize,
+            sh6::SA_SIGINFO | sh6::SA_ONSTACK | sh6::SA_NODEFER | sh6::SA_RESETHAND,
+        );
+    if !installed {
+        eprintln!("sh6 child: handler install failed");
+        std::process::exit(2);
+    }
+    let _ = std::hint::black_box(sh6_recurse(0));
+    std::process::exit(3);
+}
+
+fn sh6_sigpipe_default_child() -> ! {
+    let mut fds = [0i32; 2];
+    unsafe {
+        sh6::signal(sh6::SIGPIPE, sh6::SIG_DFL);
+        if sh6::pipe(fds.as_mut_ptr()) != 0 {
+            std::process::exit(2);
+        }
+        sh6::close(fds[0]);
+        sh6::write(fds[1], b"x".as_ptr(), 1);
+    }
+    std::process::exit(3);
 }
 
 /// Spin (no sleep primitive exists yet) until this process's live thread count drops to

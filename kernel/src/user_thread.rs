@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j730
 //j824
 //j825
 //j871
 //j873
+//j875
 
 use core::cell::UnsafeCell;
 
@@ -241,6 +241,11 @@ struct ResidentChild {
     /// It survives a re-park without a reply and is overwritten only by the next delivered
     /// call (the abandoned caller then resolves at its deadline). — TIMBERDOODLE
     current_call: Option<usize>,
+    /// SH6 synchronous-fault entry (`FaultHandlerSet`): the EL0 trampoline this thread's
+    /// next fault is redirected to, or 0. One-shot: delivery clears it. — TEAL
+    fault_entry: u64,
+    /// The alternate stack top the trampoline starts on, or 0 for "below the faulting SP".
+    fault_stack_top: u64,
 }
 
 /// The scheduler-integrated user-thread harness. Owns the dispatcher, the boot-flow
@@ -904,6 +909,8 @@ fn install_child(
         reports: true,
         done: false,
         current_call: None,
+        fault_entry: 0,
+        fault_stack_top: 0,
     });
     child.thread.user_state = Some(UserState {
         x: {
@@ -1109,15 +1116,15 @@ pub fn spawn_thread(
     arg: u64,
 ) -> Result<KoId, Status> {
     let p = sched_ptr();
-    let creator_parent = unsafe {
+    let creator = unsafe {
         let s = &*p;
         let current = s.dispatcher.current();
         s.children
             .iter()
             .find(|c| Some(c.thread.koid()) == current && c.process == proc_koid)
-            .map(|c| c.parent)
+            .map(|c| (c.parent, c.fault_entry))
     };
-    let Some(parent) = creator_parent else {
+    let Some((parent, fault_entry)) = creator else {
         return Err(Errno::NotSupported.status());
     };
     let koid = admit_resident(objects, proc_koid, root_vmar, ttbr0, entry, sp, arg, 0)?;
@@ -1126,9 +1133,59 @@ pub fn spawn_thread(
         if let Some(record) = s.children.iter_mut().find(|c| c.thread.koid() == koid) {
             record.parent = parent;
             record.reports = false;
+            // SH6: handlers are per process, alternate stacks per thread (POSIX).
+            record.fault_entry = fault_entry;
+            record.fault_stack_top = 0;
         }
     }
     Ok(koid)
+}
+
+/// SH6 `FaultHandlerSet` for the record `thread`: `entry` 0 clears. False when no
+/// resident record is that thread (the supervisor has none).
+fn set_fault_entry_for(s: &mut UserSched, thread: KoId, entry: u64, stack_top: u64) -> bool {
+    let Some(record) = s.children.iter_mut().find(|c| c.thread.koid() == thread) else {
+        return false;
+    };
+    record.fault_entry = entry;
+    record.fault_stack_top = if entry == 0 { 0 } else { stack_top };
+    true
+}
+
+/// SH6: take, and clear, `thread`'s fault entry for one delivery.
+fn take_fault_entry_for(s: &mut UserSched, thread: KoId) -> Option<(u64, u64)> {
+    let record = s.children.iter_mut().find(|c| c.thread.koid() == thread)?;
+    if record.fault_entry == 0 {
+        return None;
+    }
+    let taken = (record.fault_entry, record.fault_stack_top);
+    record.fault_entry = 0;
+    record.fault_stack_top = 0;
+    Some(taken)
+}
+
+/// SH6 `FaultHandlerSet` for the CURRENT thread. — TEAL
+pub fn set_current_fault_entry(entry: u64, stack_top: u64) -> bool {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return false;
+    }
+    let s = unsafe { &mut *sched_ptr() };
+    let Some(current) = s.dispatcher.current() else {
+        return false;
+    };
+    set_fault_entry_for(s, current, entry, stack_top)
+}
+
+/// SH6: the CURRENT thread's fault entry, taken for one delivery (see `FaultHandlerSet`).
+pub fn take_current_fault_entry() -> Option<(u64, u64)> {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return None;
+    }
+    let s = unsafe { &mut *sched_ptr() };
+    let current = s.dispatcher.current()?;
+    take_fault_entry_for(s, current)
 }
 
 /// Live (not yet exited) threads of `process` among the resident records (SH5).
@@ -2673,6 +2730,41 @@ mod ax4_capacity_tests {
                 Some((KoId(702), KILLED_EXIT_CODE)),
             ]
         );
+        assert!(sched().children.is_empty());
+    }
+
+    /// SH6: a fault registration is per thread, one-shot, and cleared by entry 0; the
+    /// supervisor (no resident record) cannot register. — TEAL
+    #[test]
+    fn fault_entry_is_per_thread_and_one_shot() {
+        let _guard = AX4_LOCK.lock().unwrap();
+        let mut objects = ObjectManager::new();
+        let vmar = Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).unwrap();
+        init(&mut objects, KoId(7), vmar, 0).unwrap();
+        assert_eq!(spawn_actor(&mut objects, 710), Errno::Ok.status());
+        assert_eq!(spawn_actor(&mut objects, 711), Errno::Ok.status());
+        let a = sched().children[0].thread.koid();
+        let b = sched().children[1].thread.koid();
+        let sora_thread = sched().user_thread.koid();
+
+        assert!(!set_fault_entry_for(sched_mut(), sora_thread, 0x40_1000, 0));
+        assert!(set_fault_entry_for(sched_mut(), a, 0x40_1000, 0x7000_0000));
+        assert_eq!(take_fault_entry_for(sched_mut(), b), None);
+        assert_eq!(
+            take_fault_entry_for(sched_mut(), a),
+            Some((0x40_1000, 0x7000_0000))
+        );
+        // One-shot: the delivery consumed it.
+        assert_eq!(take_fault_entry_for(sched_mut(), a), None);
+        // Entry 0 clears, stack and all.
+        assert!(set_fault_entry_for(sched_mut(), b, 0x40_2000, 0x7100_0000));
+        assert!(set_fault_entry_for(sched_mut(), b, 0, 0x7100_0000));
+        assert_eq!(take_fault_entry_for(sched_mut(), b), None);
+
+        assert_eq!(kill_process_threads(KoId(710)).killed, 1);
+        assert_eq!(kill_process_threads(KoId(711)).killed, 1);
+        assert_eq!(process_wait(), Errno::Ok.status());
+        while take_reaped(sched().user_thread.process()).is_some() {}
         assert!(sched().children.is_empty());
     }
 }

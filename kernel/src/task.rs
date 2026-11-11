@@ -2,6 +2,7 @@
 //j660
 //j743
 //j825
+//j875
 use alloc::vec::Vec;
 
 use kumo_abi::{KoId, ObjectKind, Signals};
@@ -168,6 +169,66 @@ impl Process {
             .iter()
             .position(|(mapping, _)| mapping.virt == virt && mapping.len == len)?;
         Some(self.mappings.remove(index))
+    }
+
+    /// Every record wholly inside `[virt, virt + len)` (SH6 `VmarUnmap`): `None` when a
+    /// record straddles either edge (a partial unmap is never made) or none lies inside.
+    /// An exact single record is the J660 case; a range spanning a guard hole made by
+    /// `VmarProtect` is the SH6 one. — TEAL
+    pub fn mappings_within(&self, virt: u64, len: u64) -> Option<Vec<(Mapping, KoId)>> {
+        let end = virt.checked_add(len)?;
+        let mut inside = Vec::new();
+        for &(mapping, koid) in &self.mappings {
+            let m_end = mapping.virt.saturating_add(mapping.len);
+            if m_end <= virt || mapping.virt >= end {
+                continue;
+            }
+            if mapping.virt < virt || m_end > end {
+                return None;
+            }
+            inside.push((mapping, koid));
+        }
+        (!inside.is_empty()).then_some(inside)
+    }
+
+    /// Trim `[virt, virt + len)` off one end of the record that holds it (SH6
+    /// `VmarProtect` PROT_NONE). The range must be a strict prefix or suffix of exactly one
+    /// record; that record shrinks (a prefix also advances its VMO offset), and the removed
+    /// span comes back so the caller can clear its leaves. A middle range would split the
+    /// record in two and is refused (`None`). — TEAL
+    pub fn trim_mapping(&mut self, virt: u64, len: u64) -> Option<Mapping> {
+        let end = virt.checked_add(len)?;
+        let (record, _) = self.mappings.iter_mut().find(|(mapping, _)| {
+            mapping.virt <= virt && end <= mapping.virt.saturating_add(mapping.len)
+        })?;
+        let m_end = record.virt + record.len;
+        if len == 0 || len >= record.len {
+            return None;
+        }
+        let removed = if virt == record.virt {
+            let removed = Mapping {
+                virt,
+                len,
+                vmo_offset: record.vmo_offset,
+                flags: record.flags,
+            };
+            record.virt += len;
+            record.vmo_offset += len;
+            record.len -= len;
+            removed
+        } else if end == m_end {
+            let removed = Mapping {
+                virt,
+                len,
+                vmo_offset: record.vmo_offset + (virt - record.virt),
+                flags: record.flags,
+            };
+            record.len -= len;
+            removed
+        } else {
+            return None;
+        };
+        Some(removed)
     }
 
     /// Whether `[start, start + len)` is unused by both VMO mappings and the user stack.

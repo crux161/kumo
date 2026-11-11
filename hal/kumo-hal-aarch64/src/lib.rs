@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j792
 //j793
 //j794
 //j797
 //j823
+//j875
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -2604,6 +2604,18 @@ pub mod el0 {
         FAULT_HOOK.store(hook as usize, Ordering::Release);
     }
 
+    /// SH6: the kernel's synchronous-fault redirect, consulted BEFORE [`FAULT_HOOK`]. It
+    /// receives `(esr, far, frame)` and either rewrites the trap frame's registers (x0..x30,
+    /// ELR at index 31, SP_EL0 at index 33) and returns non-zero, so the vector restores the
+    /// frame and `eret`s to the faulting thread's registered handler, or returns 0 and the
+    /// fault takes the ordinary contained-teardown path. — TEAL
+    static FAULT_RESUME_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Register the kernel's synchronous-fault redirect (see [`FAULT_RESUME_HOOK`]).
+    pub fn set_fault_resume_hook(hook: extern "C" fn(u64, u64, *mut u64) -> u64) {
+        FAULT_RESUME_HOOK.store(hook as usize, Ordering::Release);
+    }
+
     /// Outcome of the EL0 round-trip, for the boot report.
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct El0Report {
@@ -2915,6 +2927,7 @@ pub mod el0 {
         // switch does not carry DAIF). From here to the `eret` an IRQ would overwrite
         // elr_el1/spsr_el1 after they are restored, so mask first; the `eret` restores EL0's
         // own mask from SPSR. Linux's `kernel_exit` does the same. — TIMBERDOODLE
+        "7:", // SH6: a redirected fault resumes here with its rewritten frame
         "  msr  daifset, #0xf",
         "  ldp  x0,  x1,  [sp, #248]", // restore EL0 return state (x0/x1 scratch)
         "  msr  elr_el1, x0",
@@ -2968,6 +2981,7 @@ pub mod el0 {
         "  ldr  x4, [sp, #264]", // EL0 SP (saved sp_el0): a wild value flags stack corruption
         "  mov  x5, sp",         // trap frame base: x0..x30 at [sp+0..]; lets the hook dump GPRs
         "  bl   kumo_el0_fault",
+        "  cbnz x0, 7b", // SH6: redirected to a registered handler; restore and eret
         // Unhandled (no hook): the Tower, with EL0's own LR/SP/FP from the saved frame.
         "  ldr  x4, [sp, #240]",
         "  ldr  x5, [sp, #264]",
@@ -3028,7 +3042,18 @@ pub mod el0 {
         lr: u64,
         sp: u64,
         frame: *const u64,
-    ) {
+    ) -> u64 {
+        let resume = FAULT_RESUME_HOOK.load(Ordering::Acquire);
+        if resume != 0 {
+            // SAFETY: FAULT_RESUME_HOOK only ever holds an
+            // `extern "C" fn(u64, u64, *mut u64) -> u64` set by `set_fault_resume_hook`;
+            // `frame` is this exception's live trap frame on the kernel stack.
+            let resume: extern "C" fn(u64, u64, *mut u64) -> u64 =
+                unsafe { core::mem::transmute(resume) };
+            if resume(esr, far, frame as *mut u64) != 0 {
+                return 1;
+            }
+        }
         let hook = FAULT_HOOK.load(Ordering::Acquire);
         if hook != 0 {
             // SAFETY: FAULT_HOOK only ever holds an
@@ -3038,6 +3063,7 @@ pub mod el0 {
             hook(esr, elr, far, lr, sp, frame);
         }
         // No hook installed: return to the vector, which branches to the Tower.
+        0
     }
 
     fn align_down_4k(value: u64) -> u64 {
@@ -3321,9 +3347,9 @@ pub mod el0 {
 
 #[cfg(target_os = "none")]
 pub use el0::{
-    build_user_tables, el0_exit, run_el0_image, run_el0_smoke, set_fault_hook, set_svc_hook,
-    syscall_count, user_entry_context, El0Report, UserImage, UserImageError, UserLoadSegment,
-    UserMapping, UserState,
+    build_user_tables, el0_exit, run_el0_image, run_el0_smoke, set_fault_hook,
+    set_fault_resume_hook, set_svc_hook, syscall_count, user_entry_context, El0Report, UserImage,
+    UserImageError, UserLoadSegment, UserMapping, UserState,
 };
 
 /// Host/x86 builds have no EL0 path yet; report "not entered" so the shared kernel can
@@ -3388,6 +3414,9 @@ pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
 
 #[cfg(not(target_os = "none"))]
 pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_fault_resume_hook(_hook: extern "C" fn(u64, u64, *mut u64) -> u64) {}
 
 #[cfg(not(target_os = "none"))]
 pub fn el0_exit(_code: u64) -> ! {

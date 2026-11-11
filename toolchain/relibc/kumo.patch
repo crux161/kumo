@@ -256,8 +256,31 @@ index 6d7b21f..a94868d 100644
  const SEPARATOR: char = ':';
  
  /// cbindgen:ignore
+diff --git a/src/header/signal/cbindgen.toml b/src/header/signal/cbindgen.toml
+index 15e483c..d29ee10 100644
+--- a/src/header/signal/cbindgen.toml
++++ b/src/header/signal/cbindgen.toml
+@@ -38,14 +38,17 @@ typedef struct ucontext ucontext_t;
+ typedef struct mcontext mcontext_t;
+ typedef long sig_atomic_t;
+ 
++// KUMO: musl's layout (the Rust libc crate's), so C and std/rustc agree: the mask
++// follows the handler, padded to musl's 128-byte sigset_t; flags sit at offset 136.
+ struct sigaction {
+   union {
+     void (*sa_handler)(int);
+     void (*sa_sigaction)(int, siginfo_t *, void *);
+   };
++  sigset_t sa_mask;
++  unsigned long long __sa_mask_pad[15];
+   int sa_flags;
+   void (*sa_restorer)(void);
+-  sigset_t sa_mask;
+ };
+ """
+ language = "C"
 diff --git a/src/header/signal/mod.rs b/src/header/signal/mod.rs
-index 660fadc..e0a8afd 100644
+index 660fadc..4316b4b 100644
 --- a/src/header/signal/mod.rs
 +++ b/src/header/signal/mod.rs
 @@ -26,7 +26,7 @@ use super::{
@@ -269,7 +292,29 @@ index 660fadc..e0a8afd 100644
  #[path = "linux.rs"]
  pub mod sys;
  
-@@ -108,7 +108,7 @@ pub struct sigaltstack {
+@@ -81,6 +81,13 @@ pub struct sigaction {
+     /// Pointer to a signal-catching function or one of the `SIG_IGN` or
+     /// `SIG_DFL`.
+     pub sa_handler: Option<extern "C" fn(c_int)>,
++    /// KUMO: the mask follows the handler, padded to musl's 128-byte `sigset_t`, so this
++    /// struct is the Rust libc crate's linux-musl `sigaction` (flags at 136) — the layout
++    /// std and rustc pass — as `struct stat` already is.
++    #[cfg(target_os = "kumo")]
++    pub sa_mask: sigset_t,
++    #[cfg(target_os = "kumo")]
++    pub __sa_mask_pad: [c_ulonglong; 15],
+     /// Special flags.
+     pub sa_flags: c_int,
+     /// Non-POSIX, see <https://www.man7.org/linux/man-pages/man2/sigaction.2.html>.
+@@ -91,6 +98,7 @@ pub struct sigaction {
+     pub sa_restorer: Option<unsafe extern "C" fn()>,
+     /// Set of signals to be blocked during execution of the signal handling
+     /// function.
++    #[cfg(not(target_os = "kumo"))]
+     pub sa_mask: sigset_t,
+ }
+ 
+@@ -108,7 +116,7 @@ pub struct sigaltstack {
  /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/signal.h.html>.
  #[repr(C)]
  #[derive(Clone)]
@@ -278,7 +323,7 @@ index 660fadc..e0a8afd 100644
  pub struct sigevent {
      /// Signal value.
      pub sigev_value: sigval,
-@@ -129,7 +129,7 @@ pub struct sigevent {
+@@ -129,7 +137,7 @@ pub struct sigevent {
  /// See <https://docs.rs/libc/0.2.186/src/libc/unix/linux_like/mod.rs.html#300-322>.
  #[repr(C)]
  #[derive(Clone)]
@@ -287,6 +332,24 @@ index 660fadc..e0a8afd 100644
  pub struct sigevent {
      /// Signal value.
      pub sigev_value: sigval,
+@@ -543,6 +551,8 @@ pub extern "C" fn signal(
+         sa_flags: SA_RESTART as _,
+         sa_restorer: None, // set by platform if applicable
+         sa_mask: sigset_t::default(),
++        #[cfg(target_os = "kumo")]
++        __sa_mask_pad: [0; 15],
+     };
+     let mut old_sa = mem::MaybeUninit::uninit();
+     if unsafe { sigaction(sig, &raw const sa, old_sa.as_mut_ptr()) } < 0 {
+@@ -715,6 +725,8 @@ pub unsafe extern "C" fn sigset(
+                 sa_flags: c_int::from(0),
+                 sa_restorer: None, // set by platform if applicable
+                 sa_mask: sigset_t::default(),
++                #[cfg(target_os = "kumo")]
++                __sa_mask_pad: [0; 15],
+             };
+             unsafe { sigemptyset(&raw mut sa.sa_mask) };
+             if unsafe { sigaction(sig, &raw const sa, old_sa.as_mut_ptr()) } < 0
 diff --git a/src/header/stdio/constants.rs b/src/header/stdio/constants.rs
 index 834c18c..d48c08f 100644
 --- a/src/header/stdio/constants.rs

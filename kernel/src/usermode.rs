@@ -1,8 +1,8 @@
-//j823
 //j824
 //j825
 //j871
 //j873
+//j875
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -1800,6 +1800,116 @@ fn unmap_own_mapping_without_borrow(caller: KoId, virt: u64, len: u64) -> kumo_a
     })
 }
 
+/// SH6 `FaultHandlerSet`: record the calling thread's synchronous-fault entry and its
+/// alternate stack. Only the range's place inside the caller's own address space is
+/// checked here; an entry or stack that is not mapped faults again on delivery, and the
+/// registration is one-shot, so that second fault takes the ordinary contained path. — TEAL
+fn set_fault_handler_without_borrow(
+    entry: u64,
+    stack_base: u64,
+    stack_size: u64,
+) -> kumo_abi::Status {
+    let Some(caller) = crate::user_thread::current_process_koid() else {
+        return Errno::Internal.status();
+    };
+    let stack_top = if entry == 0 {
+        0
+    } else if stack_size == 0 {
+        if stack_base != 0 {
+            return Errno::InvalidArgs.status();
+        }
+        0
+    } else {
+        let Some(top) = stack_base.checked_add(stack_size) else {
+            return Errno::InvalidArgs.status();
+        };
+        let in_range = with_sora(|sora| {
+            if caller == sora.process.koid() {
+                return None;
+            }
+            sora.engine
+                .process_by_koid(caller)
+                .map(|process| user_range_ok(process, stack_base, stack_size))
+        });
+        match in_range {
+            None => return Errno::NotSupported.status(),
+            Some(false) => return Errno::InvalidArgs.status(),
+            Some(true) => top & !15,
+        }
+    };
+    if crate::user_thread::set_current_fault_entry(entry, stack_top) {
+        Errno::Ok.status()
+    } else {
+        Errno::NotSupported.status()
+    }
+}
+
+/// SH6 synchronous-fault redirect (HAL `set_fault_resume_hook`, consulted before
+/// [`fault_hook`]). A resident thread that registered a `FaultHandlerSet` entry and took a
+/// data/instruction abort (SIGSEGV), an alignment fault (SIGBUS) or an undefined
+/// instruction (SIGILL) resumes at that entry. Only its saved registers change: the kernel
+/// writes no user memory and builds no frame on a user stack; the relibc trampoline builds
+/// `siginfo_t` itself. The registration is consumed, so a fault inside the handler is not
+/// redirected again. This is the narrow exception to PROPOSAL/004 §1 ratified for SH6:
+/// the thread was already stopped by its own fault. Asynchronous signals stay messages.
+/// Every other exception class (BRK, SVC from AArch32, ...) and every unregistered thread
+/// returns 0: the ordinary TOWER-and-teardown path. — TEAL
+#[cfg(feature = "arch_aarch64")]
+extern "C" fn fault_resume_hook(esr: u64, far: u64, frame: *mut u64) -> u64 {
+    const SIGILL: u64 = 4;
+    const SIGBUS: u64 = 7;
+    const SIGSEGV: u64 = 11;
+    // Trap-frame word indices (`kumo_svc_common`): x0..x30, then ELR, SPSR, SP_EL0.
+    const X30: usize = 30;
+    const ELR: usize = 31;
+    const SP_EL0: usize = 33;
+    if frame.is_null() || !crate::user_thread::is_started() {
+        return 0;
+    }
+    let signo = match (esr >> 26) & 0x3f {
+        0x20 | 0x24 => SIGSEGV,
+        0x22 | 0x26 => SIGBUS,
+        0x00 | 0x0e => SIGILL,
+        _ => return 0,
+    };
+    let Some((entry, stack_top)) = crate::user_thread::take_current_fault_entry() else {
+        return 0;
+    };
+    // SAFETY: `frame` is the faulting exception's live 34-word trap frame on this
+    // thread's kernel stack (`kumo_svc_common`); the vector restores it right after.
+    let (fault_pc, fault_sp) = unsafe {
+        let fault_pc = *frame.add(ELR);
+        let fault_sp = *frame.add(SP_EL0);
+        let sp = if stack_top != 0 {
+            stack_top & !15
+        } else {
+            fault_sp.wrapping_sub(256) & !15
+        };
+        *frame.add(0) = signo;
+        *frame.add(1) = far;
+        *frame.add(2) = esr;
+        *frame.add(3) = fault_pc;
+        *frame.add(4) = fault_sp;
+        *frame.add(X30) = 0;
+        *frame.add(ELR) = entry;
+        *frame.add(SP_EL0) = sp;
+        (fault_pc, fault_sp)
+    };
+    let process = crate::user_thread::current_process_koid().map_or(0, |koid| koid.0);
+    let thread = crate::user_thread::current_thread_koid().map_or(0, |koid| koid.0);
+    crate::klog_at!(
+        crate::kmsg::NOTICE,
+        "signal: process {:#x} thread {:#x} sig {} addr {:#x} pc {:#x} sp {:#x} -> handler\n",
+        process,
+        thread,
+        signo,
+        far,
+        fault_pc,
+        fault_sp
+    );
+    1
+}
+
 /// `ProcessKill` (J556). Resolve and check the target under the borrow, then stop its threads
 /// and close its handles outside it, in the order an exit uses: the threads first, so no wake the
 /// teardown causes can re-admit one. The report says what the process was doing, which is the
@@ -2316,6 +2426,21 @@ fn dispatch_object_syscall(
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::VmarProtect as u64 {
+        // SH6: PROT_NONE guard pages at one end of the caller's own mapping (std's
+        // alternate signal stack). — TEAL
+        match engine.dispatch(
+            target,
+            KernelCall::VmarProtect {
+                process_handle: Handle(r[0] as u32),
+                virt: r[1],
+                len: r[2],
+                prot: r[3],
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
     } else if num == Syscall::VmarUnmap as u64 {
         let process_handle = Handle(r[0] as u32);
         let virt = r[1];
@@ -2654,6 +2779,11 @@ extern "C" fn svc_hook(regs: *mut u64) {
             }
         }
         r[0] = Errno::NotSupported.status() as u32 as u64;
+        return;
+    }
+
+    if num == Syscall::FaultHandlerSet as u64 {
+        r[0] = set_fault_handler_without_borrow(r[0], r[1], r[2]) as u32 as u64;
         return;
     }
 
@@ -3730,6 +3860,8 @@ fn attempt_sora(
 
     kumo_hal::active::set_svc_hook(svc_hook);
     kumo_hal::active::set_fault_hook(fault_hook);
+    #[cfg(feature = "arch_aarch64")]
+    kumo_hal::active::set_fault_resume_hook(fault_resume_hook);
     #[cfg(target_os = "none")]
     crate::user_thread::install_preemption_hook();
     // Returns when Sora *parks* on the (drained) console channel — Sora stays alive as

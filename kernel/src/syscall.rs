@@ -1,8 +1,8 @@
-//j798
 //j823
 //j824
 //j825
 //j871
+//j875
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -125,6 +125,13 @@ pub enum KernelCall<'a> {
         process_handle: Handle,
         virt: u64,
         len: u64,
+    },
+    /// SH6: make a page-aligned prefix or suffix of one recorded mapping inaccessible.
+    VmarProtect {
+        process_handle: Handle,
+        virt: u64,
+        len: u64,
+        prot: u64,
     },
     ThreadCreate {
         process_handle: Handle,
@@ -3309,6 +3316,27 @@ impl SyscallEngine {
     /// in bits [63:48]: the HAL masks it for the walk and invalidates that ASID after clearing
     /// (an untagged root falls back to `tlbi vmalle1`). A root switch no longer flushes now
     /// that ASIDs separate the spaces. — TIMBERDOODLE
+    /// Clear `mapping`'s leaves from `process`'s live tree, if it has one (the `VmarUnmap`
+    /// and `VmarProtect` path; a tree-less process has nothing to clear).
+    fn clear_mapping_leaves(&self, process: &Process, mapping: Mapping) -> Result<(), Errno> {
+        let Some(ttbr0) = process.ttbr0 else {
+            return Ok(());
+        };
+        #[cfg(target_os = "none")]
+        {
+            let saved = kumo_hal::active::read_user_aspace_root();
+            unsafe { kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0()) };
+            let result = self.clear_from_live_tree(ttbr0, mapping);
+            unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+            result
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = self.clear_from_live_tree(ttbr0, mapping);
+            Ok(())
+        }
+    }
+
     fn clear_from_live_tree(&self, ttbr0: u64, mapping: Mapping) -> Result<(), Errno> {
         // SAFETY: caller switched TTBR0 to the kernel identity map; `ttbr0` is the user tree
         // root and the range was validated against the process's own mapping record.
@@ -4559,31 +4587,45 @@ impl SyscallEngine {
                 if process_handle != kumo_abi::INVALID_HANDLE {
                     return KernelCallResult::Status(Errno::NotSupported.status());
                 }
-                let Some(mapping) = process.mapping_exact(virt, len).map(|(mapping, _)| mapping)
-                else {
+                // SH6: every record wholly inside the range goes (J660's exact record is
+                // the one-record case); a record straddling either edge refuses the call.
+                let Some(records) = process.mappings_within(virt, len) else {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 };
-                if let Some(ttbr0) = process.ttbr0 {
-                    #[cfg(target_os = "none")]
-                    {
-                        let saved = kumo_hal::active::read_user_aspace_root();
-                        unsafe {
-                            kumo_hal::active::set_user_aspace_root(
-                                crate::user_thread::kernel_ttbr0(),
-                            )
-                        };
-                        let result = self.clear_from_live_tree(ttbr0, mapping);
-                        unsafe { kumo_hal::active::set_user_aspace_root(saved) };
-                        if let Err(errno) = result {
-                            return KernelCallResult::Status(errno.status());
-                        }
+                for (mapping, _) in records {
+                    if let Err(errno) = self.clear_mapping_leaves(process, mapping) {
+                        return KernelCallResult::Status(errno.status());
                     }
-                    #[cfg(not(target_os = "none"))]
-                    {
-                        let _ = self.clear_from_live_tree(ttbr0, mapping);
-                    }
+                    let _ = process.remove_mapping_exact(mapping.virt, mapping.len);
                 }
-                let _ = process.remove_mapping_exact(virt, len);
+                KernelCallResult::Status(Errno::Ok.status())
+            }
+            KernelCall::VmarProtect {
+                process_handle,
+                virt,
+                len,
+                prot,
+            } => {
+                // SH6: the one protection change std's stack-overflow machinery makes — a
+                // PROT_NONE guard at one end of its own fresh mapping. Self only; any other
+                // protection is not supported yet, and a middle range (which would split a
+                // record in two) is refused. The trimmed pages stay owned by the VMO until
+                // its last record goes. — TEAL
+                if process_handle != kumo_abi::INVALID_HANDLE {
+                    return KernelCallResult::Status(Errno::NotSupported.status());
+                }
+                if prot != 0 {
+                    return KernelCallResult::Status(Errno::NotSupported.status());
+                }
+                if len == 0 || virt % crate::mm::PAGE_SIZE != 0 || len % crate::mm::PAGE_SIZE != 0 {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                let Some(removed) = process.trim_mapping(virt, len) else {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                };
+                if let Err(errno) = self.clear_mapping_leaves(process, removed) {
+                    return KernelCallResult::Status(errno.status());
+                }
                 KernelCallResult::Status(Errno::Ok.status())
             }
             KernelCall::ThreadCreate { process_handle } => {
@@ -8622,6 +8664,89 @@ mod tests {
             engine.dispatch(&mut parent, KernelCall::PortWait { port: late }),
             KernelCallResult::Status(Errno::ShouldWait.status())
         );
+    }
+
+    //j875
+    /// SH6: std's alternate-stack shape — map three pages, PROT_NONE the first, then
+    /// munmap the ORIGINAL whole range across the guard hole. A middle page, a non-zero
+    /// protection and a whole-record protect are refused; a straddling unmap still is.
+    /// — TEAL
+    #[test]
+    fn vmar_protect_trims_a_guard_and_unmap_spans_the_hole() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let page = crate::mm::PAGE_SIZE;
+        let vmo = create_physical_vmo(&mut engine, &mut process, 0x9400_0000, page * 3);
+        let base = 0xffff_0000_0000_0000;
+        let result = engine.dispatch(
+            &mut process,
+            KernelCall::VmarMap {
+                process_handle: kumo_abi::INVALID_HANDLE,
+                vmo_handle: vmo,
+                vmo_offset: 0,
+                virt: base,
+                len: page * 3,
+                flags: PageFlags::READ,
+            },
+        );
+        assert!(mapped(result.clone()), "{result:?}");
+        let protect = |engine: &mut SyscallEngine, process: &mut Process, virt, len, prot| {
+            engine.dispatch(
+                process,
+                KernelCall::VmarProtect {
+                    process_handle: kumo_abi::INVALID_HANDLE,
+                    virt,
+                    len,
+                    prot,
+                },
+            )
+        };
+        let invalid = KernelCallResult::Status(Errno::InvalidArgs.status());
+        let ok = KernelCallResult::Status(Errno::Ok.status());
+        assert_eq!(
+            protect(&mut engine, &mut process, base, page, 3),
+            KernelCallResult::Status(Errno::NotSupported.status())
+        );
+        assert_eq!(
+            protect(&mut engine, &mut process, base + page, page, 0),
+            invalid
+        );
+        assert_eq!(
+            protect(&mut engine, &mut process, base, page * 3, 0),
+            invalid
+        );
+        assert_eq!(protect(&mut engine, &mut process, base, page, 0), ok);
+        assert_eq!(process.mappings().len(), 1);
+        let (rest, _) = process.mappings()[0];
+        assert_eq!(
+            (rest.virt, rest.len, rest.vmo_offset),
+            (base + page, page * 2, page)
+        );
+        // The guard page is free VA now; a suffix trim works too.
+        assert_eq!(
+            protect(&mut engine, &mut process, base + page * 2, page, 0),
+            ok
+        );
+        assert_eq!(process.mappings()[0].0.len, page);
+        let unmap = |engine: &mut SyscallEngine, process: &mut Process, virt, len| {
+            engine.dispatch(
+                process,
+                KernelCall::VmarUnmap {
+                    process_handle: kumo_abi::INVALID_HANDLE,
+                    virt,
+                    len,
+                },
+            )
+        };
+        // Straddling the surviving record is still refused.
+        assert_eq!(
+            unmap(&mut engine, &mut process, base, page + page / 2),
+            invalid
+        );
+        // The original whole range spans the holes and takes the survivor.
+        assert_eq!(unmap(&mut engine, &mut process, base, page * 3), ok);
+        assert!(process.mappings().is_empty());
+        assert_eq!(unmap(&mut engine, &mut process, base, page * 3), invalid);
     }
 
     #[test]

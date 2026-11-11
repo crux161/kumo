@@ -1,8 +1,8 @@
-//j797
 //j824
 //j825
 //j871
 //j873
+//j875
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,11 +38,19 @@ pub enum Syscall {
     VmoRead = 13,
     VmoWrite = 14,
     VmarMap = 15,
+    /// Make a page-aligned prefix or suffix of one of the caller's own recorded mappings
+    /// inaccessible: `(process, virt, len, prot)` with `process` = `INVALID_HANDLE` (self)
+    /// and `prot` = 0 (PROT_NONE) only (SH6). The record shrinks and the range's leaves are
+    /// cleared; an access there faults. A middle range, a whole record and any other
+    /// protection are refused. `VmarUnmap` of the original whole range still releases the
+    /// rest, across the hole.
     VmarProtect = 16,
-    /// Remove an exact, page-aligned mapping from the calling process's address space:
+    /// Remove page-aligned mappings from the calling process's address space:
     /// `(process, virt, len)`. `process` must be `INVALID_HANDLE` (self) in this slice; a
-    /// real process handle is refused. The range must match one recorded mapping exactly,
-    /// and the live user page tables are cleared before the record is removed. (J660)
+    /// real process handle is refused. Every recorded mapping wholly inside the range goes
+    /// (J660's exact single record, or SH6's range across a `VmarProtect` guard hole); a
+    /// mapping straddling either edge refuses the whole call. The live user page tables
+    /// are cleared before each record is removed.
     VmarUnmap = 17,
     ProcessCreate = 18,
     ThreadCreate = 19,
@@ -164,6 +172,17 @@ pub enum Syscall {
     /// threads of the caller's process (the caller included), and `x2` = the caller's
     /// recorded mappings. Names nothing outside the caller's own process.
     ThreadSelf = 60,
+    /// Register the CALLING thread's synchronous-fault entry (SH6): `(entry, stack_base,
+    /// stack_size)`. When this thread later takes a data or instruction abort (SIGSEGV), an
+    /// alignment fault (SIGBUS) or an undefined instruction (SIGILL), the kernel rewrites
+    /// only its saved registers: PC = `entry`, SP = the top of `[stack_base, +stack_size)`
+    /// (or 256 bytes below the faulting SP when `stack_size` is 0), `x0` = signal number,
+    /// `x1` = fault address, `x2` = ESR, `x3` = faulting PC, `x4` = faulting SP, `x30` = 0.
+    /// It writes no user memory. One-shot: a delivery clears the registration, so a fault
+    /// inside the handler ends the process by the ordinary contained path. `entry` 0
+    /// clears. A thread made by `ThreadSpawn` inherits its creator's entry without a stack.
+    /// The supervisor is refused with [`Errno::NotSupported`].
+    FaultHandlerSet = 61,
 }
 
 /// Stable indices for the RK3588 display unit's checked D0/D1 write table (DESIGN/022).
@@ -510,6 +529,12 @@ mod tests {
         assert_eq!(Syscall::ThreadSpawn as usize, 58);
         assert_eq!(Syscall::ThreadExit as usize, 59);
         assert_eq!(Syscall::ThreadSelf as usize, 60);
+    }
+
+    #[test]
+    fn fault_handler_takes_the_next_free_slot() {
+        // SH6: relibc's signal runtime calls this by number.
+        assert_eq!(Syscall::FaultHandlerSet as usize, 61);
     }
 }
 

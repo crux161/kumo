@@ -1,8 +1,8 @@
-//j867
 //j868
 //j869
 //j871
 //j873
+//j875
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -71,9 +71,11 @@ const SYSCALL_HANDLE_KOID: u64 = 34;
 const SYSCALL_PROCESS_WAIT: u64 = 35;
 const SYSCALL_PROCESS_KILL: u64 = 46;
 const SYSCALL_VMAR_UNMAP: u64 = 17;
+const SYSCALL_VMAR_PROTECT: u64 = 16;
 const SYSCALL_THREAD_SPAWN: u64 = 58;
 const SYSCALL_THREAD_EXIT: u64 = 59;
 const SYSCALL_THREAD_SELF: u64 = 60;
+const SYSCALL_FAULT_HANDLER_SET: u64 = 61;
 
 // SH4 spawn constants. The VMAR bits mirror `kumo_abi::VmarFlags`; a child's segments are
 // user pages. Rights::ALL for the duplicated standard handles.
@@ -452,6 +454,210 @@ fn thread_entry_address() -> u64 {
         );
     }
     address
+}
+
+// ---- SH6-a signals: dispositions, the alternate stack, and synchronous faults ----------
+//
+// Per the SH6 ruling (2026-11-11): a thread's OWN synchronous fault (SIGSEGV/SIGBUS/SIGILL)
+// is redirected by the kernel to `__relibc_kumo_signal_entry` on the registered alternate
+// stack (`FaultHandlerSet`); asynchronous signals stay PROPOSAL/004 messages (SH6-b). No
+// asynchronous delivery exists yet, so nothing is ever pending and the mask only records.
+// — TEAL
+
+const SIG_COUNT: usize = 65;
+const SIGILL_NO: usize = 4;
+const SIGBUS_NO: usize = 7;
+const SIGKILL_NO: usize = 9;
+const SIGSEGV_NO: usize = 11;
+const SIGPIPE_NO: usize = 13;
+const SIGSTOP_NO: usize = 19;
+const SA_SIGINFO_FLAG: usize = 4;
+const SS_ONSTACK_FLAG: c_int = 1;
+const SS_DISABLE_FLAG: c_int = 2;
+/// Linux aarch64's MINSIGSTKSZ.
+const MIN_SIGNAL_STACK: usize = 5120;
+/// A process that ended by a signal exits with this bit plus the signal number; `waitpid`
+/// reports it as WIFSIGNALED/WTERMSIG. The kernel carries the code untouched.
+const SIGNALED_EXIT: u64 = 0x100;
+const STATUS_PEER_CLOSED: i32 = -6;
+
+/// Process-wide dispositions: 0 = SIG_DFL, 1 = SIG_IGN, otherwise the handler address.
+static SIG_HANDLER: [core::sync::atomic::AtomicUsize; SIG_COUNT] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; SIG_COUNT];
+static SIG_FLAGS: [core::sync::atomic::AtomicUsize; SIG_COUNT] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; SIG_COUNT];
+static SIG_MASK: [core::sync::atomic::AtomicU64; SIG_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SIG_COUNT];
+
+/// This thread's alternate signal stack (`sigaltstack`), or a zero base when none.
+#[thread_local]
+static ALT_STACK_BASE: core::cell::Cell<usize> = core::cell::Cell::new(0);
+#[thread_local]
+static ALT_STACK_SIZE: core::cell::Cell<usize> = core::cell::Cell::new(0);
+/// This thread's blocked-signal mask (`sigprocmask`), bit `sig - 1`.
+#[thread_local]
+static SIGNAL_MASK: core::cell::Cell<u64> = core::cell::Cell::new(0);
+
+core::arch::global_asm!(
+    ".text",
+    ".global __relibc_kumo_signal_entry",
+    ".type __relibc_kumo_signal_entry, %function",
+    "__relibc_kumo_signal_entry:",
+    // The kernel left x0..x4 = (signo, fault address, ESR, fault PC, fault SP) and SP on
+    // the alternate stack. Terminate the frame chain for any unwinder, then deliver.
+    "  mov x29, #0",
+    "  mov x30, #0",
+    "  bl __relibc_kumo_signal_deliver",
+    "  brk #0x6b",
+);
+
+fn signal_entry_address() -> u64 {
+    let address: u64;
+    unsafe {
+        core::arch::asm!(
+            "adrp {0}, __relibc_kumo_signal_entry",
+            "add {0}, {0}, :lo12:__relibc_kumo_signal_entry",
+            out(reg) address,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    address
+}
+
+fn current_stack_pointer() -> usize {
+    let sp: usize;
+    unsafe {
+        core::arch::asm!("mov {0}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    sp
+}
+
+fn on_alt_stack() -> bool {
+    let base = ALT_STACK_BASE.get();
+    let sp = current_stack_pointer();
+    base != 0 && sp >= base && sp < base + ALT_STACK_SIZE.get()
+}
+
+/// Re-arm the CALLING thread's kernel registration from the current dispositions and its
+/// alternate stack: an entry only while a synchronous signal has a real handler.
+fn refresh_fault_registration() {
+    let caught = [SIGSEGV_NO, SIGBUS_NO, SIGILL_NO]
+        .iter()
+        .any(|&sig| SIG_HANDLER[sig].load(Ordering::Acquire) > 1);
+    let entry = if caught { signal_entry_address() } else { 0 };
+    let base = ALT_STACK_BASE.get();
+    let (base, size) = if entry != 0 && base != 0 {
+        (base as u64, ALT_STACK_SIZE.get() as u64)
+    } else {
+        (0, 0)
+    };
+    let _ = syscall4(SYSCALL_FAULT_HANDLER_SET, entry, base, size, 0);
+}
+
+/// End the process as killed by `sig` (no stdio flush, as a signal death has none).
+fn exit_signaled(sig: usize) -> ! {
+    let _ = syscall4(
+        SYSCALL_PROCESS_EXIT,
+        SIGNALED_EXIT | (sig as u64 & 0x7f),
+        0,
+        0,
+        0,
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Signals whose default action is to do nothing. With no job control on KUMO the stop
+/// signals are ignored too (recorded deviation).
+fn ignored_by_default(sig: usize) -> bool {
+    matches!(sig, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28)
+}
+
+/// Run `sig`'s disposition synchronously on this thread (`raise`, SIGPIPE).
+fn run_disposition(sig: usize) {
+    match SIG_HANDLER[sig].load(Ordering::Acquire) {
+        0 if ignored_by_default(sig) => {}
+        0 => exit_signaled(sig),
+        1 => {}
+        handler => {
+            if SIG_FLAGS[sig].load(Ordering::Acquire) & SA_SIGINFO_FLAG != 0 {
+                let mut info = [0u64; 16];
+                info[0] = sig as u64; // si_signo; si_errno 0; si_code SI_USER (0)
+                let handler: extern "C" fn(c_int, *mut c_void, *mut c_void) =
+                    unsafe { core::mem::transmute(handler) };
+                handler(sig as c_int, info.as_mut_ptr().cast(), core::ptr::null_mut());
+            } else {
+                let handler: extern "C" fn(c_int) = unsafe { core::mem::transmute(handler) };
+                handler(sig as c_int);
+            }
+        }
+    }
+}
+
+/// The write side of a closed pipe or channel: SIGPIPE's disposition, then EPIPE.
+fn broken_pipe() -> Errno {
+    use crate::header::errno::EPIPE;
+
+    run_disposition(SIGPIPE_NO);
+    Errno(EPIPE)
+}
+
+/// Where the kernel's fault redirect lands (via `__relibc_kumo_signal_entry`), on the
+/// alternate stack when one is registered. Builds `siginfo_t` and a minimal `ucontext_t`
+/// here, never in the kernel. `si_addr` is written at offset 16, where Linux and the Rust
+/// libc crate read it, and at offset 24, where relibc's own `siginfo` places it. A
+/// synchronous fault never resumes: a handler that returns, an ignored or a default
+/// disposition all end the process as killed by the signal (recorded deviation; on
+/// Linux the re-executed instruction faults again to the same end). — TEAL
+#[unsafe(no_mangle)]
+unsafe extern "C" fn __relibc_kumo_signal_deliver(
+    signo: u64,
+    far: u64,
+    esr: u64,
+    pc: u64,
+    sp: u64,
+) -> ! {
+    let sig = (signo as usize).min(SIG_COUNT - 1);
+    let handler = SIG_HANDLER[sig].load(Ordering::Acquire);
+    if handler > 1 {
+        let code: u64 = match sig {
+            SIGSEGV_NO => match esr & 0x3c {
+                0x08 | 0x0c => 2, // access flag / permission fault: SEGV_ACCERR
+                _ => 1,           // translation and the rest: SEGV_MAPERR
+            },
+            _ => 1, // BUS_ADRALN, ILL_ILLOPC
+        };
+        let mut info = [0u64; 16];
+        info[0] = signo; // si_signo (low half), si_errno 0 (high half)
+        info[1] = code; // si_code (low half)
+        info[2] = far; // si_addr: Linux / libc-crate offset
+        info[3] = far; // si_addr: relibc offset
+        // ucontext: uc_flags, uc_link, uc_stack {ss_sp, ss_flags, ss_size}; the rest zero.
+        let mut context = [0u64; 160];
+        context[2] = ALT_STACK_BASE.get() as u64;
+        context[3] = if ALT_STACK_BASE.get() != 0 {
+            SS_ONSTACK_FLAG as u64
+        } else {
+            SS_DISABLE_FLAG as u64
+        };
+        context[4] = ALT_STACK_SIZE.get() as u64;
+        let _ = (pc, sp);
+        if SIG_FLAGS[sig].load(Ordering::Acquire) & SA_SIGINFO_FLAG != 0 {
+            let handler: extern "C" fn(c_int, *mut c_void, *mut c_void) =
+                unsafe { core::mem::transmute(handler) };
+            handler(
+                sig as c_int,
+                info.as_mut_ptr().cast(),
+                context.as_mut_ptr().cast(),
+            );
+        } else {
+            let handler: extern "C" fn(c_int) = unsafe { core::mem::transmute(handler) };
+            handler(sig as c_int);
+        }
+    }
+    SIG_HANDLER[sig].store(0, Ordering::Release);
+    exit_signaled(sig)
 }
 
 fn channel_read_with_handle(channel: u32, tag: &mut u8) -> (u64, u64) {
@@ -952,6 +1158,112 @@ fn channel_read_bytes(channel: u32, buf: &mut [u8]) -> u64 {
 
 /// `channel_read_bytes` that answers `KUMO_SHOULD_WAIT` (zero-extended in the count word)
 /// on an empty inbox instead of parking.
+// SH6-a: the unread rest of a channel message. ChannelRead is a datagram read: a message
+// larger than the caller's buffer is consumed whole and its tail dropped. A POSIX pipe
+// keeps that tail for the next read (std's read_to_end opens with a 32-byte probe, which
+// cut a child's stderr line at 32 bytes), so a short read takes the message into a
+// full-size buffer and parks the rest here, keyed by the channel handle (dup aliases
+// share it, as they share a file description). — TEAL
+const CHANNEL_MESSAGE_MAX: usize = 4096;
+const PIPE_STASH_SLOTS: usize = 8;
+
+struct PipeStash {
+    handle: u32,
+    start: usize,
+    end: usize,
+    bytes: [u8; CHANNEL_MESSAGE_MAX],
+}
+
+static PIPE_STASH_LOCK: AtomicU32 = AtomicU32::new(0);
+static mut PIPE_STASH: [PipeStash; PIPE_STASH_SLOTS] = [const {
+    PipeStash {
+        handle: 0,
+        start: 0,
+        end: 0,
+        bytes: [0; CHANNEL_MESSAGE_MAX],
+    }
+}; PIPE_STASH_SLOTS];
+
+fn with_pipe_stash<R>(f: impl FnOnce(&mut [PipeStash; PIPE_STASH_SLOTS]) -> R) -> R {
+    while PIPE_STASH_LOCK
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let result = f(unsafe { &mut *core::ptr::addr_of_mut!(PIPE_STASH) });
+    PIPE_STASH_LOCK.store(0, Ordering::Release);
+    result
+}
+
+/// Copy a parked remainder for `handle` into `buf`, if one exists.
+fn pipe_stash_take(handle: u32, buf: &mut [u8]) -> Option<usize> {
+    with_pipe_stash(|stash| {
+        let slot = stash
+            .iter_mut()
+            .find(|slot| slot.handle == handle && slot.start < slot.end)?;
+        let take = buf.len().min(slot.end - slot.start);
+        buf[..take].copy_from_slice(&slot.bytes[slot.start..slot.start + take]);
+        slot.start += take;
+        if slot.start == slot.end {
+            slot.handle = 0;
+        }
+        Some(take)
+    })
+}
+
+/// Forget `handle`'s remainder (its last descriptor closed).
+fn pipe_stash_drop(handle: u32) {
+    with_pipe_stash(|stash| {
+        for slot in stash.iter_mut().filter(|slot| slot.handle == handle) {
+            slot.handle = 0;
+            slot.start = 0;
+            slot.end = 0;
+        }
+    });
+}
+
+/// One POSIX read from a channel: a parked remainder first, then a fresh message whose
+/// tail, if `buf` is short, is parked. Returns the raw ChannelRead status on failure.
+fn channel_read_posix(handle: u32, buf: &mut [u8], nonblock: bool) -> u64 {
+    if let Some(n) = pipe_stash_take(handle, buf) {
+        return n as u64;
+    }
+    let read = |into: &mut [u8]| {
+        if nonblock {
+            channel_read_bytes_nonblock(handle, into)
+        } else {
+            channel_read_bytes(handle, into)
+        }
+    };
+    if buf.len() >= CHANNEL_MESSAGE_MAX {
+        return read(buf);
+    }
+    let mut message = [0u8; CHANNEL_MESSAGE_MAX];
+    let n = read(&mut message);
+    if n == u64::MAX || n as u32 as i32 == KUMO_SHOULD_WAIT {
+        return n;
+    }
+    let n = (n as usize).min(CHANNEL_MESSAGE_MAX);
+    let take = n.min(buf.len());
+    buf[..take].copy_from_slice(&message[..take]);
+    if n > take {
+        let parked = with_pipe_stash(|stash| {
+            let Some(slot) = stash.iter_mut().find(|slot| slot.handle == 0) else {
+                return false;
+            };
+            slot.handle = handle;
+            slot.bytes[..n - take].copy_from_slice(&message[take..n]);
+            slot.start = 0;
+            slot.end = n - take;
+            true
+        });
+        // With every slot busy the tail is lost, as before this fix (recorded limit).
+        let _ = parked;
+    }
+    take as u64
+}
+
 fn channel_read_bytes_nonblock(channel: u32, buf: &mut [u8]) -> u64 {
     syscall4(
         SYSCALL_CHANNEL_READ,
@@ -2421,6 +2733,7 @@ impl Pal for Sys {
                 // Release the channel end with its last alias (SH4): a pipe peer must see
                 // PEER_CLOSED when this process is done writing or reading.
                 if channel_alias_count(handle, fildes) == 0 {
+                    pipe_stash_drop(handle);
                     close_handle(handle);
                 }
                 Ok(())
@@ -3113,14 +3426,16 @@ impl Pal for Sys {
     ) -> Result<*mut c_void> {
         use crate::header::{
             errno::{EINVAL, ENOMEM},
-            sys_mman::{MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE},
+            sys_mman::{MAP_ANON, MAP_PRIVATE, MAP_STACK, PROT_READ, PROT_WRITE},
         };
 
+        // SH6: MAP_STACK is a placement hint (std's linux alternate signal stack asks for
+        // it); every anonymous mapping here is already stack-suitable. — TEAL
         let valid = addr.is_null()
             && len != 0
             && fildes == -1
             && off == 0
-            && flags == MAP_ANON | MAP_PRIVATE
+            && flags & !MAP_STACK == MAP_ANON | MAP_PRIVATE
             && prot & !(PROT_READ | PROT_WRITE) == 0;
         if !valid {
             return Err(Errno(EINVAL));
@@ -3154,8 +3469,29 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// SH6: PROT_NONE at one end of a mapping made by [`Self::mmap`] — the guard page std's
+    /// stack-overflow machinery puts under each alternate signal stack. Other protections
+    /// and middle ranges are not supported yet (the kernel answers which). — TEAL
     unsafe fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::{errno::EINVAL, sys_mman::PROT_NONE};
+
+        if prot != PROT_NONE {
+            return Err(unsupported());
+        }
+        let Some(len) = len
+            .checked_add(PAGE_SIZE - 1)
+            .map(|len| len & !(PAGE_SIZE - 1))
+        else {
+            return Err(Errno(EINVAL));
+        };
+        if addr.is_null() || len == 0 || addr as usize % PAGE_SIZE != 0 {
+            return Err(Errno(EINVAL));
+        }
+        match syscall4(SYSCALL_VMAR_PROTECT, 0, addr as u64, len as u64, 0) {
+            0 => Ok(()),
+            status if status as u32 as i32 == -8 => Err(unsupported()),
+            _ => Err(Errno(EINVAL)),
+        }
     }
 
     unsafe fn msync(addr: *mut c_void, len: usize, flags: c_int) -> Result<()> {
@@ -3174,10 +3510,12 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
-    /// SH5: release a whole mapping made by [`Self::mmap`] (exact base and length, rounded up
-    /// to the page as `mmap` rounded it). A sub-range is refused with EINVAL rather than
-    /// splitting the mapping; relibc's allocator never releases part of a segment on KUMO
-    /// (`can_release_part`). The frames return to the kernel once nothing maps them. — TEAL
+    /// SH5: release whole mappings made by [`Self::mmap`] (rounded up to the page as `mmap`
+    /// rounded it). SH6: every mapping wholly inside the range goes, so the original range
+    /// of a mapping with an `mprotect` guard hole releases the rest. A range that would
+    /// split a mapping is refused with EINVAL; relibc's allocator never releases part of a
+    /// segment on KUMO (`can_release_part`). The frames return to the kernel once nothing
+    /// maps them. — TEAL
     unsafe fn munmap(addr: *mut c_void, len: usize) -> Result<()> {
         use crate::header::errno::EINVAL;
 
@@ -3426,11 +3764,7 @@ impl Pal for Sys {
             // A channel read parks until a message arrives, and answers 0 once the writer
             // is gone — which is exactly POSIX end-of-file, so it needs no translation.
             FdSlot::Input(handle) => {
-                let n = if fd_nonblock(fildes) {
-                    channel_read_bytes_nonblock(handle, buf)
-                } else {
-                    channel_read_bytes(handle, buf)
-                };
+                let n = channel_read_posix(handle, buf, fd_nonblock(fildes));
                 return if n == u64::MAX {
                     Err(Errno(EBADF))
                 } else if n as u32 as i32 == KUMO_SHOULD_WAIT {
@@ -3751,7 +4085,12 @@ impl Pal for Sys {
             };
             match slot.state {
                 ChildState::Exited(code) => {
-                    let raw = ((code as c_int & 0xFF) << 8) as c_int;
+                    // SH6-a: a signal death carries SIGNALED_EXIT | signo (WIFSIGNALED).
+                    let raw = if code & !0x7f == SIGNALED_EXIT {
+                        (code & 0x7f) as c_int
+                    } else {
+                        ((code as c_int & 0xFF) << 8) as c_int
+                    };
                     if let Some(mut out) = stat_loc {
                         unsafe { *out.as_mut_ptr() = raw };
                     }
@@ -3781,7 +4120,12 @@ impl Pal for Sys {
                 // POSIX buffer; report only committed progress. — KESTREL
                 let mut written = 0;
                 for chunk in buf.chunks(4096) {
-                    if channel_write_bytes(handle, chunk) != 0 {
+                    let status = channel_write_bytes(handle, chunk);
+                    if status != 0 {
+                        // SH6-a: the reader is gone — SIGPIPE's disposition, then EPIPE.
+                        if written == 0 && status as u32 as i32 == STATUS_PEER_CLOSED {
+                            return Err(broken_pipe());
+                        }
                         return if written == 0 { Err(Errno(EIO)) } else { Ok(written) };
                     }
                     written += chunk.len();
@@ -4172,37 +4516,131 @@ impl PalSignal for Sys {
         Err(unsupported())
     }
 
+    /// SH6-a: run `sig`'s disposition on this thread now — a handler is called, SIG_IGN
+    /// and default-ignored signals return, and a default terminating action ends the
+    /// process as killed by `sig` (rustc's `signal(sig, SIG_DFL); raise(sig)`). — TEAL
     fn raise(sig: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::EINVAL;
+
+        if sig == 0 {
+            return Ok(());
+        }
+        if sig < 0 || sig as usize >= SIG_COUNT {
+            return Err(Errno(EINVAL));
+        }
+        run_disposition(sig as usize);
+        Ok(())
     }
 
     fn setitimer(which: c_int, new: &itimerval, old: Option<&mut itimerval>) -> Result<()> {
         Err(unsupported())
     }
 
-    /// KUMO delivers no signals, so every disposition is vacuously honored: the query
-    /// reports SIG_DFL and the set succeeds. std's runtime asserts on `signal(SIGPIPE)`
-    /// during init, and an honest "no signals exist" answer is success, not an error.
+    /// SH6-a: a real process-wide disposition table. Installing or removing a handler for
+    /// SIGSEGV, SIGBUS or SIGILL re-arms the calling thread's kernel fault registration;
+    /// other threads keep the registration they inherited at spawn (recorded deviation:
+    /// re-arm per thread). SIGKILL and SIGSTOP cannot be caught or ignored. — TEAL
     fn sigaction(sig: c_int, act: Option<&sigaction>, oact: Option<&mut sigaction>) -> Result<()> {
-        let _ = (sig, act);
+        use crate::header::errno::EINVAL;
+
+        if sig <= 0 || sig as usize >= SIG_COUNT {
+            return Err(Errno(EINVAL));
+        }
+        let sig = sig as usize;
+        if act.is_some() && (sig == SIGKILL_NO || sig == SIGSTOP_NO) {
+            return Err(Errno(EINVAL));
+        }
         if let Some(old) = oact {
             *old = unsafe { core::mem::zeroed() };
-            // The zeroed struct already carries SIG_DFL at the handler position.
-            old.sa_handler = None;
+            old.sa_handler =
+                unsafe { core::mem::transmute(SIG_HANDLER[sig].load(Ordering::Acquire)) };
+            old.sa_flags = SIG_FLAGS[sig].load(Ordering::Acquire) as c_int;
+            old.sa_mask = SIG_MASK[sig].load(Ordering::Acquire) as sigset_t;
+        }
+        if let Some(new) = act {
+            let handler = new.sa_handler.map_or(0, |handler| handler as usize);
+            SIG_FLAGS[sig].store(new.sa_flags as u32 as usize, Ordering::Release);
+            SIG_MASK[sig].store(new.sa_mask as u64, Ordering::Release);
+            SIG_HANDLER[sig].store(handler, Ordering::Release);
+            if matches!(sig, SIGSEGV_NO | SIGBUS_NO | SIGILL_NO) {
+                refresh_fault_registration();
+            }
         }
         Ok(())
     }
 
+    /// SH6-a: this thread's alternate signal stack, handed to the kernel with the fault
+    /// registration. EPERM while running on it; ENOMEM below MINSIGSTKSZ. — TEAL
     unsafe fn sigaltstack(ss: Option<&stack_t>, old_ss: Option<&mut stack_t>) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::{EINVAL, ENOMEM, EPERM};
+
+        let (base, size, on) = (ALT_STACK_BASE.get(), ALT_STACK_SIZE.get(), on_alt_stack());
+        if let Some(new) = ss {
+            if on {
+                return Err(Errno(EPERM));
+            }
+            if new.ss_flags & !(SS_DISABLE_FLAG | SS_ONSTACK_FLAG) != 0 {
+                return Err(Errno(EINVAL));
+            }
+            if new.ss_flags & SS_DISABLE_FLAG == 0 && new.ss_size < MIN_SIGNAL_STACK {
+                return Err(Errno(ENOMEM));
+            }
+        }
+        if let Some(old) = old_ss {
+            old.ss_sp = base as *mut c_void;
+            old.ss_size = size;
+            old.ss_flags = if base == 0 {
+                SS_DISABLE_FLAG
+            } else if on {
+                SS_ONSTACK_FLAG
+            } else {
+                0
+            };
+        }
+        if let Some(new) = ss {
+            if new.ss_flags & SS_DISABLE_FLAG != 0 {
+                ALT_STACK_BASE.set(0);
+                ALT_STACK_SIZE.set(0);
+            } else {
+                ALT_STACK_BASE.set(new.ss_sp as usize);
+                ALT_STACK_SIZE.set(new.ss_size);
+            }
+            refresh_fault_registration();
+        }
+        Ok(())
     }
 
+    /// SH6-a: nothing is ever pending — no asynchronous delivery exists before SH6-b.
     fn sigpending(set: &mut sigset_t) -> Result<()> {
-        Err(unsupported())
+        *set = 0;
+        Ok(())
     }
 
+    /// SH6-a: the per-thread mask is recorded and reported; with no asynchronous delivery
+    /// yet it gates nothing, and synchronous faults ignore it as Linux does. — TEAL
     fn sigprocmask(how: c_int, set: Option<&sigset_t>, oset: Option<&mut sigset_t>) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::EINVAL;
+
+        const SIG_BLOCK: c_int = 0;
+        const SIG_UNBLOCK: c_int = 1;
+        const SIG_SETMASK: c_int = 2;
+        // SIGKILL and SIGSTOP cannot be blocked.
+        const UNBLOCKABLE: u64 = (1 << (SIGKILL_NO - 1)) | (1 << (SIGSTOP_NO - 1));
+        let old = SIGNAL_MASK.get();
+        if let Some(&set) = set {
+            let set = set as u64;
+            let new = match how {
+                SIG_BLOCK => old | set,
+                SIG_UNBLOCK => old & !set,
+                SIG_SETMASK => set,
+                _ => return Err(Errno(EINVAL)),
+            };
+            SIGNAL_MASK.set(new & !UNBLOCKABLE);
+        }
+        if let Some(oset) = oset {
+            *oset = old as sigset_t;
+        }
+        Ok(())
     }
 
     fn sigsuspend(mask: &sigset_t) -> Errno {
