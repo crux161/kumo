@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j870
+#j872
 """SH3-e: the cargo-shaped metal suite on the Orange Pi 5 Plus, two PXE boots.
 
 Boot 1 (std::fs and C on the mounted volume, cross-process locks):
@@ -87,6 +88,20 @@ def load_harness():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def stage_tree(tftp):
+    """A private TFTP root from the built image. The firmware's NBP is the top-level
+    `bootaa64.efi` (PXEHOST_ARM64_BOOTFILE); `xtask image` emits the loader only as
+    EFI/BOOT/BOOTAA64.EFI, so stage that copy too. J870 passed only because the main
+    checkout's image directory carried a hand-staged stray bootaa64.efi (found j872)."""
+    if tftp.exists():
+        shutil.rmtree(tftp)
+    shutil.copytree(SOURCE_IMAGE, tftp)
+    loader = tftp / "EFI/BOOT/BOOTAA64.EFI"
+    if not loader.is_file():
+        raise RuntimeError(f"missing {loader}; rebuild the orange-pi-5-plus image")
+    shutil.copyfile(loader, tftp / "bootaa64.efi")
 
 
 def stage_boot(tftp, script):
@@ -237,6 +252,58 @@ def classify(text):
     return "unknown"
 
 
+FRONT_PAGE = (
+    "Boot Maintenance Manager", "Select Language", "Device Manager", "Boot Manager",
+    "Continue", "Reset",
+)
+RESET_SEEN = ("DDR ", "U-Boot SPL", "BL31:")
+
+
+def raw_text_since(log_path, offset):
+    raw = log_path.with_suffix(log_path.suffix + ".raw")
+    data = raw.read_bytes()[offset:] if raw.exists() else b""
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", " ", data.decode(errors="replace"))
+    text = re.sub(r"\[\d\d:\d\d:\d\d\.\d+\]", " ", text)
+    return re.sub(r"\s+", " ", text)
+
+
+def raw_size(log_path):
+    raw = log_path.with_suffix(log_path.suffix + ".raw")
+    return raw.stat().st_size if raw.exists() else 0
+
+
+def front_page_reset(log_path):
+    """Steer the UEFI front page onto Reset by reading the highlight, never by count.
+
+    Each arrow redraws the old entry, then `<Enter>=Select Entry`, then the newly
+    highlighted entry's label and help text. The highlight does NOT reliably start on
+    Select Language (j872 found it on Device Manager), and the list wraps, so a blind
+    five-downs-then-Enter can open the language popup instead. A pending popup is closed
+    with Esc first. The board has also been seen to reset by itself once Reset is
+    highlighted (J741/J747); Enter is sent only if it has not.
+    """
+    if "Esc=Exit Entry" in raw_text_since(log_path, max(0, raw_size(log_path) - 600)):
+        send_raw(b"\x1b")
+        time.sleep(1.0)
+    for _ in range(len(FRONT_PAGE) + 2):
+        mark = raw_size(log_path)
+        send_raw(b"\x1b[B")
+        time.sleep(1.2)
+        fresh = raw_text_since(log_path, mark)
+        if any(marker in fresh for marker in RESET_SEEN):
+            return
+        _, _, after = fresh.rpartition("Select Entry")
+        after = re.sub(r"^\s*(<[^>]*>\s*)?>?\s*", "", after)
+        highlighted = next((name for name in FRONT_PAGE if after.startswith(name)), None)
+        if highlighted == "Reset":
+            mark = raw_size(log_path)
+            time.sleep(2.0)
+            if not any(marker in raw_text_since(log_path, mark) for marker in RESET_SEEN):
+                send_raw(b"\r")
+            return
+    raise RuntimeError(f"could not steer the UEFI front page onto Reset; see {log_path}.raw")
+
+
 def wake_board(log_path):
     """Reset the board into a fresh PXE boot by the safest method for its current state.
 
@@ -277,15 +344,7 @@ def wake_board(log_path):
     elif state == "running":
         return
     elif state == "firmware-menu":
-        # The front page does not reliably time out into the default boot order, and a
-        # bare poke only redraws it. Select Language is the top entry and the default
-        # highlight (its help text is what classify saw), so five downs land on Reset
-        # and Enter selects it — the documented front-page reset.
-        for _ in range(5):
-            send_raw(b"\x1b[B")
-            time.sleep(0.4)
-        send_raw(b"\r")
-        time.sleep(0.5)
+        front_page_reset(log_path)
     elif state == "firmware-net":
         # Enter starts the highlighted network boot; if that entry has no link the
         # firmware falls through to the cabled port on its own.
@@ -348,9 +407,7 @@ def main():
     work = args.work
     work.mkdir(parents=True, exist_ok=True)
     tftp = work / "tftp"
-    if tftp.exists():
-        shutil.rmtree(tftp)
-    shutil.copytree(SOURCE_IMAGE, tftp)
+    stage_tree(tftp)
 
     manifest = {"boots": {}, "pxehost": str(PXEHOST)}
     # One pxehost+tio lifetime spans both boots: the escape hatch needs the serial socket
