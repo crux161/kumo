@@ -1,8 +1,8 @@
-//j815
 //j824
 //j825
 //j859
 //j871
+//j873
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -1042,6 +1042,32 @@ pub fn process_wait_reaped() -> (u64, u64, u64) {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn process_wait() -> u64 {
     u64::MAX
+}
+
+/// SH5 self-census: `(thread_koid, live_threads, mappings)` of the CALLER's own process
+/// (`ThreadSelf`). Names nothing outside the caller.
+#[cfg(target_arch = "aarch64")]
+pub fn thread_self() -> (u64, u64, u64) {
+    let thread: u64;
+    let threads: u64;
+    let mappings: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::ThreadSelf as u64,
+            lateout("x0") thread,
+            lateout("x1") threads,
+            lateout("x2") mappings,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (thread, threads, mappings)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn thread_self() -> (u64, u64, u64) {
+    (0, 0, 0)
 }
 
 /// Set the root Job's resident-actor bound (PLAN/021 AX4).

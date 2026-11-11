@@ -848,3 +848,79 @@ index 649b3aa..90a9373 100644
  /// The `blksize_t` type provided in [`sys/types.h`](crate::header::sys_types).
  pub type blksize_t = c_long;
  /// The `blkcnt_t` type provided in [`sys/types.h`](crate::header::sys_types).
+diff --git a/src/pthread/mod.rs b/src/pthread/mod.rs
+index 81f2389..092e2d7 100644
+--- a/src/pthread/mod.rs
++++ b/src/pthread/mod.rs
+@@ -66,6 +66,9 @@ pub unsafe fn terminate_from_main_thread() {
+ bitflags::bitflags! {
+     pub struct PthreadFlags: usize {
+         const DETACHED = 1;
++        /// KUMO: the stack was mapped by `create` and is the thread's to release on exit;
++        /// a caller-provided `pthread_attr_setstack` stack is never unmapped.
++        const OWNED_STACK = 2;
+     }
+ }
+ 
+@@ -90,6 +93,9 @@ pub struct OsTid {
+     pub thread_fd: usize,
+     #[cfg(target_os = "linux")]
+     pub thread_id: usize,
++    /// KUMO: the thread's kernel koid.
++    #[cfg(target_os = "kumo")]
++    pub thread_id: usize,
+ }
+ 
+ unsafe impl Send for Pthread {}
+@@ -157,6 +163,9 @@ pub(crate) unsafe fn create(
+ 
+         other => unreachable!("unknown detachstate {}", other),
+     }
++    if attrs.stack == 0 {
++        flags |= PthreadFlags::OWNED_STACK;
++    }
+ 
+     let stack_raii = MmapGuard {
+         page_start: stack_base,
+@@ -306,6 +315,7 @@ pub unsafe fn exit_current_thread(retval: Retval) -> ! {
+     let this = current_thread().expect("failed to obtain current thread when exiting");
+     let stack_base = this.stack_base;
+     let stack_size = this.stack_size;
++    let flags = this.flags.load(Ordering::Acquire);
+ 
+     // dealloc_thread() or waitval.post() might unmaps the tcb so extract the thread_fd now
+     #[cfg(target_os = "redox")]
+@@ -328,6 +338,13 @@ pub unsafe fn exit_current_thread(retval: Retval) -> ! {
+     unsafe {
+         redox_rt::thread::exit_this_thread_inner(stack_base.cast(), stack_size, status_fd)
+     }
++    // KUMO: only a stack `create` mapped is released by the exiting thread.
++    #[cfg(target_os = "kumo")]
++    let stack_size = if flags & PthreadFlags::OWNED_STACK.bits() != 0 {
++        stack_size
++    } else {
++        0
++    };
+     unsafe { Sys::exit_thread(stack_base.cast(), stack_size) }
+ }
+ 
+@@ -336,6 +353,19 @@ unsafe fn dealloc_thread(thread: &Pthread) {
+     unsafe {
+         OS_TID_TO_PTHREAD.lock().remove(&thread.os_tid.get().read());
+     }
++    // KUMO: the Tcb is one mapping — ABI page, TLS block, TCB page — made by `Tcb::new`;
++    // release it whole. Never the main thread's: only created threads are deallocated.
++    #[cfg(target_os = "kumo")]
++    unsafe {
++        let tcb = thread.tcb_selfref.get().read();
++        if !tcb.is_null() {
++            let page = Sys::getpagesize();
++            let generic = &(*tcb).generic;
++            let base = (tcb as usize) - generic.tls_len - page;
++            let len = page + generic.tls_len + generic.tcb_len;
++            let _ = Sys::munmap(base as *mut c_void, len);
++        }
++    }
+     #[cfg(target_os = "redox")]
+     unsafe {
+         let tcb = thread.tcb_selfref.get().read();

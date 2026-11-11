@@ -1,5 +1,6 @@
 // j853
 // j871
+// j873
 // The KUMO std shim: the few C symbols std references that relibc does not provide.
 // Freestanding C, no headers. Everything outside the surface below refuses by name
 // (ENOSYS) rather than pretending.
@@ -174,6 +175,15 @@ extern int posix_spawn_file_actions_addchdir(void *actions, const char *path);
 
 int posix_spawn_file_actions_addchdir_np(void *actions, const char *path) {
     return posix_spawn_file_actions_addchdir(actions, path);
+}
+
+// std names every spawned thread through the glibc pthread_setname_np, a hard symbol
+// relibc does not export. KUMO threads carry no name yet: refuse by name (the pthread
+// convention returns the error number), which std ignores (SH5).
+int pthread_setname_np(unsigned long thread, const char *name) {
+    (void)thread;
+    (void)name;
+    return ENOSYS;
 }
 
 extern char *strerror(int errnum);

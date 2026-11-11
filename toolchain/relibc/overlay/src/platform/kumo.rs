@@ -1,8 +1,8 @@
-//j866
 //j867
 //j868
 //j869
 //j871
+//j873
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -70,6 +70,10 @@ const SYSCALL_PROCESS_RUN: u64 = 32;
 const SYSCALL_HANDLE_KOID: u64 = 34;
 const SYSCALL_PROCESS_WAIT: u64 = 35;
 const SYSCALL_PROCESS_KILL: u64 = 46;
+const SYSCALL_VMAR_UNMAP: u64 = 17;
+const SYSCALL_THREAD_SPAWN: u64 = 58;
+const SYSCALL_THREAD_EXIT: u64 = 59;
+const SYSCALL_THREAD_SELF: u64 = 60;
 
 // SH4 spawn constants. The VMAR bits mirror `kumo_abi::VmarFlags`; a child's segments are
 // user pages. Rights::ALL for the duplicated standard handles.
@@ -391,6 +395,63 @@ fn syscall4(number: u64, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
         );
     }
     result
+}
+
+/// SH5 `ThreadSpawn`: a sibling thread entering `entry` with `sp`; returns (status, koid).
+fn thread_spawn(entry: u64, sp: u64) -> (u64, u64) {
+    let status;
+    let koid;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_THREAD_SPAWN,
+            in("x0") entry,
+            in("x1") sp,
+            in("x2") 0_u64,
+            lateout("x0") status,
+            lateout("x1") koid,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status, koid)
+}
+
+/// SH5 `ThreadSelf`: the calling thread's koid (its OS thread id).
+fn thread_self_koid() -> u64 {
+    syscall4(SYSCALL_THREAD_SELF, 0, 0, 0, 0)
+}
+
+// SH5: where a thread made by `rlct_clone` enters EL0. relibc's `pthread::create` pushed,
+// from the stack pointer upward: new_thread_shim, start_routine, arg, the new Tcb, the
+// synchronization mutex, then three padding words (64 bytes in all, so the stack end is
+// reached again and stays 16-byte aligned). The shim takes the next four as its arguments
+// and never returns. — TEAL
+core::arch::global_asm!(
+    ".text",
+    ".global __relibc_kumo_thread_entry",
+    ".type __relibc_kumo_thread_entry, %function",
+    "__relibc_kumo_thread_entry:",
+    "  ldp x9, x0, [sp]",
+    "  ldp x1, x2, [sp, #16]",
+    "  ldr x3, [sp, #32]",
+    "  add sp, sp, #64",
+    "  br x9",
+);
+
+/// The trampoline's address, PC-relative (no extern declaration: the backend's method
+/// census counts indented `fn` lines).
+fn thread_entry_address() -> u64 {
+    let address: u64;
+    unsafe {
+        core::arch::asm!(
+            "adrp {0}, __relibc_kumo_thread_entry",
+            "add {0}, {0}, :lo12:__relibc_kumo_thread_entry",
+            out(reg) address,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    address
 }
 
 fn channel_read_with_handle(channel: u32, tag: &mut u8) -> (u64, u64) {
@@ -2443,8 +2504,20 @@ impl Pal for Sys {
         }
     }
 
-    unsafe fn exit_thread(_stack_base: *mut (), _stack_size: usize) -> ! {
-        panic!("relibc KUMO stub called: exit_thread")
+    /// SH5: end this thread only. The kernel unmaps the thread's own stack once it can no
+    /// longer touch it (relibc passes a zero size for a caller-provided stack), and the
+    /// process's last thread ending this way ends the process with status 0. — TEAL
+    unsafe fn exit_thread(stack_base: *mut (), stack_size: usize) -> ! {
+        let _ = syscall4(
+            SYSCALL_THREAD_EXIT,
+            stack_base as u64,
+            stack_size as u64,
+            0,
+            0,
+        );
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     fn fchdir(fildes: c_int) -> Result<()> {
@@ -2936,7 +3009,7 @@ impl Pal for Sys {
     }
 
     fn gettid() -> pid_t {
-        0
+        thread_self_koid() as pid_t
     }
 
     fn gettimeofday(tp: Out<timeval>, tzp: Option<Out<timezone>>) -> Result<()> {
@@ -3101,8 +3174,26 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// SH5: release a whole mapping made by [`Self::mmap`] (exact base and length, rounded up
+    /// to the page as `mmap` rounded it). A sub-range is refused with EINVAL rather than
+    /// splitting the mapping; relibc's allocator never releases part of a segment on KUMO
+    /// (`can_release_part`). The frames return to the kernel once nothing maps them. — TEAL
     unsafe fn munmap(addr: *mut c_void, len: usize) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::EINVAL;
+
+        let Some(len) = len
+            .checked_add(PAGE_SIZE - 1)
+            .map(|len| len & !(PAGE_SIZE - 1))
+        else {
+            return Err(Errno(EINVAL));
+        };
+        if addr.is_null() || len == 0 || addr as usize % PAGE_SIZE != 0 {
+            return Err(Errno(EINVAL));
+        }
+        match syscall4(SYSCALL_VMAR_UNMAP, 0, addr as u64, len as u64, 0) {
+            0 => Ok(()),
+            _ => Err(Errno(EINVAL)),
+        }
     }
 
     unsafe fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> Result<()> {
@@ -3292,11 +3383,22 @@ impl Pal for Sys {
         Ok(n)
     }
 
+    /// SH5: a sibling thread over `ThreadSpawn`, entering `__relibc_kumo_thread_entry` on
+    /// the stack `pthread::create` prepared. The kernel's refusals (resident bound, kernel
+    /// memory) are the "insufficient resources" EAGAIN. — TEAL
     unsafe fn rlct_clone(
         stack: *mut usize,
-        os_specific: &mut OsSpecific,
+        _os_specific: &mut OsSpecific,
     ) -> Result<pthread::OsTid, Errno> {
-        Err(unsupported())
+        use crate::header::errno::EAGAIN;
+
+        let (status, koid) = thread_spawn(thread_entry_address(), stack as u64);
+        if status != 0 || koid == 0 {
+            return Err(Errno(EAGAIN));
+        }
+        Ok(pthread::OsTid {
+            thread_id: koid as usize,
+        })
     }
 
     unsafe fn rlct_kill(os_tid: pthread::OsTid, signal: usize) -> Result<()> {
@@ -3304,7 +3406,9 @@ impl Pal for Sys {
     }
 
     fn current_os_tid() -> pthread::OsTid {
-        pthread::OsTid::default()
+        pthread::OsTid {
+            thread_id: thread_self_koid() as usize,
+        }
     }
 
     /// Read from an input channel or an open file. Short reads are normal on both — the

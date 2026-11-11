@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j724
 //j730
 //j824
 //j825
 //j871
+//j873
 
 use core::cell::UnsafeCell;
 
@@ -231,6 +231,10 @@ struct ResidentChild {
     parent: KoId,
     /// The child exit code (valid once `done`).
     exit_code: u64,
+    /// Whether this record's exit is the PROCESS's status (SH5). A process's first thread
+    /// reports; a sibling admitted by `ThreadSpawn` does not, and a group exit or kill moves
+    /// the report onto exactly one record, so `ProcessWait` sees one status per process.
+    reports: bool,
     /// True once the child thread has terminated.
     done: bool,
     /// AX2 reply routing: the call record this child last consumed when serving a call.
@@ -897,6 +901,7 @@ fn install_child(
         process: proc_koid,
         parent,
         exit_code: 0,
+        reports: true,
         done: false,
         current_call: None,
     });
@@ -936,7 +941,12 @@ fn install_child(
 fn reap_done(s: &mut UserSched) {
     let mut i = 0;
     while i < s.children.len() {
-        if s.children[i].done {
+        if s.children[i].done && !s.children[i].reports {
+            // SH5: a sibling thread's end is not a process status.
+            let koid = s.children[i].thread.koid();
+            s.wait_queue.remove_thread(koid);
+            s.children.remove(i);
+        } else if s.children[i].done {
             let koid = s.children[i].thread.koid();
             // SH4: the exit status must survive the record — the parent's next ProcessWait
             // collects it from x1/x2.
@@ -1079,6 +1089,123 @@ pub fn spawn_child_async(
     arg: u64,
     arg2: u64,
 ) -> Status {
+    match admit_resident(objects, proc_koid, root_vmar, ttbr0, entry, sp, arg, arg2) {
+        Ok(_) => Errno::Ok.status(),
+        Err(status) => status,
+    }
+}
+
+/// SH5 `ThreadSpawn`: admit a sibling thread into the CALLER's own process. It shares the
+/// caller's address space (`ttbr0`) and futex domain, inherits the caller's parent (so a
+/// group exit reports to the right `ProcessWait` and a collected status still raises no
+/// TOWER), and never reports a status of its own. Returns the new thread's koid. — TEAL
+pub fn spawn_thread(
+    objects: &mut ObjectManager,
+    proc_koid: KoId,
+    root_vmar: crate::mm::Vmar,
+    ttbr0: u64,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+) -> Result<KoId, Status> {
+    let p = sched_ptr();
+    let creator_parent = unsafe {
+        let s = &*p;
+        let current = s.dispatcher.current();
+        s.children
+            .iter()
+            .find(|c| Some(c.thread.koid()) == current && c.process == proc_koid)
+            .map(|c| c.parent)
+    };
+    let Some(parent) = creator_parent else {
+        return Err(Errno::NotSupported.status());
+    };
+    let koid = admit_resident(objects, proc_koid, root_vmar, ttbr0, entry, sp, arg, 0)?;
+    unsafe {
+        let s = &mut *p;
+        if let Some(record) = s.children.iter_mut().find(|c| c.thread.koid() == koid) {
+            record.parent = parent;
+            record.reports = false;
+        }
+    }
+    Ok(koid)
+}
+
+/// Live (not yet exited) threads of `process` among the resident records (SH5).
+pub fn process_live_threads(process: KoId) -> usize {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return 0;
+    }
+    let p = sched_ptr();
+    unsafe {
+        (&*p)
+            .children
+            .iter()
+            .filter(|c| c.process == process && !c.done)
+            .count()
+    }
+}
+
+/// SH5 group exit: before the current thread's process is torn down, end every sibling
+/// thread exactly as `ProcessKill` would, and make the current record the one that reports
+/// the process's status. Returns how many siblings were ended. A no-op for the supervisor.
+pub fn end_sibling_threads_for_exit() -> u32 {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return 0;
+    }
+    let p = sched_ptr();
+    let process = unsafe {
+        let s = &*p;
+        let current = s.dispatcher.current();
+        s.children
+            .iter()
+            .find(|c| Some(c.thread.koid()) == current)
+            .map(|c| c.process)
+    };
+    let Some(process) = process else {
+        return 0;
+    };
+    let report = kill_process_threads(process);
+    unsafe {
+        let s = &mut *p;
+        let current = s.dispatcher.current();
+        for child in s.children.iter_mut().filter(|c| c.process == process) {
+            child.reports = Some(child.thread.koid()) == current;
+        }
+    }
+    report.killed
+}
+
+/// SH5 `ThreadExit` of a thread that is not its process's last: this record's end is not a
+/// process status. The caller then ends the thread through [`exit_current_user`].
+pub fn silence_current_thread() {
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        let current = s.dispatcher.current();
+        if let Some(child) = s
+            .children
+            .iter_mut()
+            .find(|c| Some(c.thread.koid()) == current)
+        {
+            child.reports = false;
+        }
+    }
+}
+
+/// The resident-admission core shared by `ProcessRun` ASYNC and `ThreadSpawn` (SH5).
+fn admit_resident(
+    objects: &mut ObjectManager,
+    proc_koid: KoId,
+    root_vmar: crate::mm::Vmar,
+    ttbr0: u64,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+    arg2: u64,
+) -> Result<KoId, Status> {
     let p = sched_ptr();
     //j825
     // AX4: reap and gate BEFORE allocating the 16 KiB kernel stack. The old order built the
@@ -1095,30 +1222,31 @@ pub fn spawn_child_async(
         // `BadState` rather than the old slot-pressure `ShouldWait`. Refusal precedes
         // install and admission, so no child, wait entry or dispatcher slot is created.
         if s.children.len() >= s.resident_limit as usize {
-            return Errno::BadState.status();
+            return Err(Errno::BadState.status());
         }
     }
     if !spawn_heap_ready() {
-        return Errno::NoMemory.status();
+        return Err(Errno::NoMemory.status());
     }
 
     let temp_process = Process::from_parts(proc_koid, root_vmar);
     let new_child = match Thread::new(objects, &temp_process, 0, 0, DEFAULT_KERNEL_STACK_SIZE) {
         Ok(thread) => thread,
-        Err(_) => return Errno::NoMemory.status(),
+        Err(_) => return Err(Errno::NoMemory.status()),
     };
 
-    unsafe {
+    let koid = unsafe {
         let s = &mut *p;
         if s.children.len() >= s.resident_limit as usize {
-            return Errno::BadState.status();
+            return Err(Errno::BadState.status());
         }
 
         let koid = install_child(s, new_child, proc_koid, ttbr0, entry, sp, arg, arg2);
         // Admit at CHILD_ASYNC_PRIORITY (63) but do NOT reschedule — Sora continues.
         s.dispatcher.admit(koid, CHILD_ASYNC_PRIORITY);
-    }
-    Errno::Ok.status()
+        koid
+    };
+    Ok(koid)
 }
 
 /// Install the live Sora/resident-child scheduler tick.
@@ -1433,6 +1561,17 @@ pub fn kill_process_threads(process: KoId) -> KillReport {
             child.done = true;
             child.thread.terminate();
             report.killed += 1;
+        }
+        // SH5: the process's status rides exactly one record. If its reporting thread had
+        // already ended on its own (`ThreadExit`), the first killed sibling carries the kill.
+        if report.killed > 0 && !s.children.iter().any(|c| c.process == process && c.reports) {
+            if let Some(first) = s
+                .children
+                .iter_mut()
+                .find(|c| c.process == process && c.done && c.exit_code == KILLED_EXIT_CODE)
+            {
+                first.reports = true;
+            }
         }
     }
     report
@@ -2448,6 +2587,92 @@ mod ax4_capacity_tests {
         assert_eq!(take_reaped(KoId(500)), None);
         assert_eq!(sched().reaped_len, 0);
         assert_eq!(process_wait(), Errno::Ok.status());
+        assert!(sched().children.is_empty());
+    }
+    //j873
+    /// SH5: sibling threads share their process's status. A kill of a two-thread process
+    /// reports once; a sibling's own exit reports nothing; and when the reporting thread
+    /// ended first (`pthread_exit` on the main thread), a later kill still reports exactly
+    /// once. `spawn_thread` itself needs a running creator, so the host models its result:
+    /// a second record of the same process, silenced and carrying the creator's parent.
+    /// — TEAL
+    #[test]
+    fn sibling_threads_report_one_status_per_process() {
+        let _guard = AX4_LOCK.lock().unwrap();
+        let mut objects = ObjectManager::new();
+        let vmar = Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).unwrap();
+        init(&mut objects, KoId(7), vmar, 0).unwrap();
+        let sora = sched().user_thread.process();
+        let add_thread = |objects: &mut ObjectManager, proc_koid: u64| {
+            assert_eq!(spawn_actor(objects, proc_koid), Errno::Ok.status());
+            let record = sched_mut().children.last_mut().unwrap();
+            record.reports = false;
+        };
+
+        // Two threads of 700: one kill, one status, both records gone after the reap.
+        assert_eq!(spawn_actor(&mut objects, 700), Errno::Ok.status());
+        add_thread(&mut objects, 700);
+        assert_eq!(process_live_threads(KoId(700)), 2);
+        assert_eq!(kill_process_threads(KoId(700)).killed, 2);
+        assert_eq!(process_live_threads(KoId(700)), 0);
+        assert_eq!(process_wait(), Errno::Ok.status());
+        assert_eq!(take_reaped(sora), Some((KoId(700), KILLED_EXIT_CODE)));
+        assert_eq!(take_reaped(sora), None);
+        assert!(sched().children.is_empty());
+
+        // A sibling of 701 exits on its own: its record is reaped with no status, and the
+        // process is still live with one thread.
+        assert_eq!(spawn_actor(&mut objects, 701), Errno::Ok.status());
+        add_thread(&mut objects, 701);
+        {
+            let sibling = &mut sched_mut().children[1];
+            let koid = sibling.thread.koid();
+            assert!(sched_mut()
+                .dispatcher
+                .remove_ready_rt(koid, super::CHILD_PRIORITY));
+            let sibling = &mut sched_mut().children[1];
+            sibling.done = true;
+            sibling.thread.terminate();
+        }
+        assert_eq!(process_live_threads(KoId(701)), 1);
+        // Reap without a scheduler pump: on the host a pump would make 701 current.
+        assert_eq!(process_wait_for(sora), Errno::ShouldWait.status());
+        assert_eq!(sched().children.len(), 1);
+        assert_eq!(take_reaped(sora), None);
+
+        // 702's reporting (first) thread ends silently first, as pthread_exit does; the kill
+        // of the survivor still yields exactly one status.
+        assert_eq!(spawn_actor(&mut objects, 702), Errno::Ok.status());
+        add_thread(&mut objects, 702);
+        {
+            let first = sched()
+                .children
+                .iter()
+                .position(|c| c.process == KoId(702) && c.reports)
+                .unwrap();
+            let koid = sched().children[first].thread.koid();
+            assert!(sched_mut()
+                .dispatcher
+                .remove_ready_rt(koid, super::CHILD_PRIORITY));
+            let record = &mut sched_mut().children[first];
+            record.reports = false;
+            record.done = true;
+            record.thread.terminate();
+        }
+        assert_eq!(process_live_threads(KoId(702)), 1);
+        assert_eq!(kill_process_threads(KoId(702)).killed, 1);
+        assert_eq!(kill_process_threads(KoId(701)).killed, 1);
+        assert_eq!(process_wait(), Errno::Ok.status());
+        let mut statuses = [take_reaped(sora), take_reaped(sora), take_reaped(sora)];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [
+                None,
+                Some((KoId(701), KILLED_EXIT_CODE)),
+                Some((KoId(702), KILLED_EXIT_CODE)),
+            ]
+        );
         assert!(sched().children.is_empty());
     }
 }

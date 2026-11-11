@@ -1,8 +1,8 @@
-//j867
 //j868
 //j869
 //j870
 //j871
+//j873
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -102,6 +102,20 @@ macro_rules! sh3log {
     ($($arg:tt)*) => { sh3_line(format_args!($($arg)*)) };
 }
 
+/// SH5: the threads proof's ring record, one formatted entry under "std: sh5".
+fn sh5_line(args: core::fmt::Arguments<'_>) {
+    let text = format!("std: sh5 {}\n", args);
+    let bytes = text.as_bytes();
+    let _ = kumo_rt::log_write(
+        kumo_abi::sys::log_level::NOTICE,
+        &bytes[..bytes.len().min(200)],
+    );
+}
+
+macro_rules! sh5log {
+    ($($arg:tt)*) => { sh5_line(format_args!($($arg)*)) };
+}
+
 
 
 fn main() {
@@ -189,6 +203,20 @@ fn main() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while std::time::Instant::now() < deadline {}
             std::process::exit(0);
+        }
+        // SH5: the std::thread proof (scripts/thread-smoke.py drives `threads`; `threadexit`
+        // is the child it spawns from SMOKE.ELF to prove exit() from a thread is a group exit).
+        Some("threads") => {
+            threads_suite();
+            return;
+        }
+        Some("threadexit") => {
+            let worker = std::thread::spawn(|| {
+                std::process::exit(5);
+            });
+            // The main thread parks in join; the worker's exit ends both.
+            let _ = worker.join();
+            std::process::exit(9);
         }
         Some("spawnnogrant") => {
             use std::io::Write as _;
@@ -1211,6 +1239,150 @@ fn spawn_parent() {
             output.status
         ),
         Err(e) => sh3log!("spawn nogrant FAIL {:?} {:?}", e.kind(), e.raw_os_error()),
+    }
+}
+
+/// Spin (no sleep primitive exists yet) until this process's live thread count drops to
+/// `want`: a joined thread has posted its result but may not have reached `ThreadExit` yet;
+/// timer preemption runs it. Returns the final (threads, mappings).
+fn settle_threads(want: u64) -> (u64, u64) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (_, threads, mappings) = kumo_rt::thread_self();
+        if threads <= want || Instant::now() > deadline {
+            return (threads, mappings);
+        }
+        std::hint::spin_loop();
+    }
+}
+
+/// SH5-a: std::thread over relibc's pthread runtime (rlct_clone -> ThreadSpawn). Proves
+/// mutex/condvar handoffs between N threads, per-thread TLS, distinct OS thread ids, join,
+/// a flat thread and mapping census across repeated create/join cycles (the stack and the
+/// TLS/TCB mapping of every exited thread are released), and exit() from a non-main thread
+/// ending the whole process. — TEAL
+fn threads_suite() {
+    use std::cell::Cell;
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
+
+    const N: usize = 4;
+    const ROUNDS: usize = 25;
+
+    thread_local! {
+        static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    // 1. Live census: N workers and main meet at a barrier; main counts N + 1 threads.
+    let (main_tid, base_threads, _) = kumo_rt::thread_self();
+    let gate = Arc::new(Barrier::new(N + 1));
+    let release = Arc::new(Barrier::new(N + 1));
+    let mut handles = Vec::new();
+    for id in 0..N {
+        let (gate, release) = (gate.clone(), release.clone());
+        handles.push(std::thread::spawn(move || {
+            SLOT.with(|slot| slot.set(id));
+            gate.wait();
+            release.wait();
+            let tid = kumo_rt::thread_self().0;
+            (SLOT.with(|slot| slot.get()), tid)
+        }));
+    }
+    gate.wait();
+    let (_, live, _) = kumo_rt::thread_self();
+    release.wait();
+    let mut tids = Vec::new();
+    let mut tls_ok = true;
+    for (id, handle) in handles.into_iter().enumerate() {
+        match handle.join() {
+            Ok((slot, tid)) => {
+                tls_ok &= slot == id;
+                tids.push(tid);
+            }
+            Err(_) => tls_ok = false,
+        }
+    }
+    tids.push(main_tid);
+    tids.sort_unstable();
+    tids.dedup();
+    if base_threads == 1 && live == (N as u64) + 1 {
+        sh5log!("live -> OK ({} threads)", live);
+    } else {
+        sh5log!("live FAIL base={} live={}", base_threads, live);
+    }
+    if tls_ok && SLOT.with(|slot| slot.get()) == usize::MAX {
+        sh5log!("tls -> OK");
+    } else {
+        sh5log!("tls FAIL");
+    }
+    if tids.len() == N + 1 && !tids.contains(&0) {
+        sh5log!("tids -> OK");
+    } else {
+        sh5log!("tids FAIL {:?}", tids);
+    }
+
+    // 2. Handoffs: a token passes 0 -> 1 -> ... -> N-1 -> 0 under one mutex and condvar,
+    // ROUNDS times around the ring; the log must be the exact round-robin order.
+    let ring = Arc::new((Mutex::new((0usize, Vec::with_capacity(N * ROUNDS))), Condvar::new()));
+    let mut workers = Vec::new();
+    for id in 0..N {
+        let ring = ring.clone();
+        workers.push(std::thread::spawn(move || {
+            let (lock, turn) = &*ring;
+            for _ in 0..ROUNDS {
+                let mut state = lock.lock().unwrap();
+                while state.0 != id {
+                    state = turn.wait(state).unwrap();
+                }
+                state.1.push(id);
+                state.0 = (id + 1) % N;
+                turn.notify_all();
+            }
+        }));
+    }
+    let joined = workers.into_iter().all(|worker| worker.join().is_ok());
+    let order = &ring.0.lock().unwrap().1;
+    let exact = order.len() == N * ROUNDS && order.iter().enumerate().all(|(i, id)| *id == i % N);
+    if joined && exact {
+        sh5log!("handoff -> OK ({} handoffs)", order.len());
+    } else {
+        sh5log!("handoff FAIL joined={} len={}", joined, order.len());
+    }
+    let (after, _) = settle_threads(1);
+    if after == 1 {
+        sh5log!("join -> OK");
+    } else {
+        sh5log!("join FAIL threads={}", after);
+    }
+
+    // 3. Census: warm up, then 64 create/join cycles. Each exited thread's stack and its
+    // TLS/TCB mapping must be gone: same live thread count, same mapping count.
+    let cycle = |round: usize| {
+        let worker = std::thread::spawn(move || {
+            SLOT.with(|slot| slot.set(round));
+            SLOT.with(|slot| slot.get()) == round
+        });
+        worker.join().unwrap_or(false)
+    };
+    let mut cycles_ok = (0..4).all(cycle);
+    let (t0, m0) = settle_threads(1);
+    cycles_ok &= (0..64).all(cycle);
+    let (t1, m1) = settle_threads(1);
+    if cycles_ok && t0 == 1 && t1 == 1 && m0 == m1 {
+        sh5log!("cycles flat -> OK (64 cycles, threads {}, mappings {})", t1, m1);
+    } else {
+        sh5log!("cycles FAIL ok={} threads {}->{} mappings {}->{}", cycles_ok, t0, t1, m0, m1);
+    }
+
+    // 4. exit() from a non-main thread is a group exit: the child's main thread is parked
+    // in join and still the process ends with the worker's status.
+    match std::process::Command::new("/SMOKE.ELF")
+        .arg("threadexit")
+        .stdin(std::process::Stdio::piped())
+        .status()
+    {
+        Ok(status) if status.code() == Some(5) => sh5log!("group exit -> OK"),
+        Ok(status) => sh5log!("group exit FAIL {:?}", status),
+        Err(e) => sh5log!("group exit FAIL spawn {:?} {:?}", e.kind(), e.raw_os_error()),
     }
 }
 

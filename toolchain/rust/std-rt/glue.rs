@@ -1,4 +1,5 @@
 //j857
+//j873
 // SH0 (PLAN/022): the KUMO std runtime glue, moved verbatim from the J856 smoke so
 // every std image shares one entry contract. It is `include!`d into the binary crate
 // (not linked as an archive) because `start.o` enters the link through a link-arg that
@@ -12,43 +13,86 @@ unsafe extern "C" {
     static __tdata_start: u8;
     static __tdata_end: u8;
     static __tbss_end: u8;
+    /// lld's ELF-header symbol: link.ld keeps the file and program headers in the first
+    /// PT_LOAD, so the image can read its own PT_TLS (as musl does through AT_PHDR).
+    static __ehdr_start: u8;
 }
 
-/// The initial thread's TLS area: the PT_TLS template copied below a Variant-I thread
-/// pointer. The kernel does not own TPIDR_EL0 (firmware leaves a stale value), so the
-/// runtime must install it before any std code touches a thread-local.
+/// The initial thread's TLS area: the PT_TLS template copied at the AArch64 Variant-I
+/// offset above the thread pointer. The kernel does not own TPIDR_EL0 (firmware leaves a
+/// stale value), so the runtime must install it before any std code touches a thread-local.
 const TLS_AREA_SIZE: usize = 16 * 1024;
-static mut TLS_AREA: [u8; TLS_AREA_SIZE + 16] = [0; TLS_AREA_SIZE + 16];
-/// relibc's GenericTcb header for kumo (a zero-sized OsSpecific): `{tls_end, tls_len,
-/// tcb_ptr, tcb_len}`. `[TPIDR_EL0]` must name this header (`GenericTcb::current_ptr`
-/// follows the stored pointer), and `tcb_ptr` must name a `Tcb` below. — TIMBERDOODLE
-static mut TCB_HEADER: [usize; 4] = [0; 4];
-/// Zeroed `Tcb` storage: `linker_ptr` (0x38) and every other field stay null — no
-/// dynamic linker, no TLS masters, no pthread state for this static image.
-static mut TCB_STORAGE: [u8; 256] = [0; 256];
+static mut TLS_AREA: [u8; TLS_AREA_SIZE] = [0; TLS_AREA_SIZE];
 
+/// relibc's `Tcb` for the initial thread, laid out as relibc lays its own (ld_so::tcb):
+/// a `GenericTcb {tls_end, tls_len, tcb_ptr, tcb_len}` that names itself, then
+/// `masters_ptr`, `masters_len`, `num_copied_masters`, `linker_ptr` (null: no dynamic
+/// linker), then the pthread state relibc's `pthread::init` fills. `[TPIDR_EL0]` names it.
+#[repr(C, align(16))]
+struct TcbStorage([usize; 32]);
+static mut TCB_STORAGE: TcbStorage = TcbStorage([0; 32]);
+/// relibc's `Master {ptr, image_size, segment_size, offset}`: the TLS initialisation image a
+/// thread made by `pthread_create` copies into its own block (SH5). `offset` is measured
+/// from relibc's TLS region start, which sits 16 bytes above the thread pointer.
+static mut TLS_MASTER: [usize; 4] = [0; 4];
+
+/// PT_TLS's alignment, read from this image's own program headers (at least 1).
+unsafe fn tls_align() -> usize {
+    let ehdr = core::ptr::addr_of!(__ehdr_start);
+    let phoff = core::ptr::read_unaligned(ehdr.add(0x20).cast::<u64>()) as usize;
+    let phentsize = core::ptr::read_unaligned(ehdr.add(0x36).cast::<u16>()) as usize;
+    let phnum = core::ptr::read_unaligned(ehdr.add(0x38).cast::<u16>()) as usize;
+    for index in 0..phnum {
+        let phdr = ehdr.add(phoff + index * phentsize);
+        if core::ptr::read_unaligned(phdr.cast::<u32>()) == 7 {
+            // PT_TLS: p_align is the last field of an Elf64_Phdr.
+            return (core::ptr::read_unaligned(phdr.add(0x30).cast::<u64>()) as usize).max(1);
+        }
+    }
+    1
+}
+
+//j873
+// SH5: one Variant-I layout for every thread. The compiler addresses a thread-local at
+// TP + align_up(16, p_align) + offset. The old setup copied the template BELOW the thread
+// pointer (so an initialised `.tdata` value read back as zero) and kept relibc's header in
+// a separate static (so `pthread_create` sized a new thread's TLS from a zeroed `tls_len`
+// and faulted). Sizes come from the section symbols, not PT_TLS's memsz, which lld reports
+// short when link.ld page-aligns `.tbss`. — TEAL
 unsafe fn init_tls() {
     let tdata_start = core::ptr::addr_of!(__tdata_start) as usize;
     let tdata_end = core::ptr::addr_of!(__tdata_end) as usize;
     let tbss_end = core::ptr::addr_of!(__tbss_end) as usize;
-    let tdata_len = tdata_end - tdata_start;
-    let tls_size = tbss_end - tdata_start;
-    assert!(tls_size <= TLS_AREA_SIZE, "TLS template exceeds the area");
-    let area = core::ptr::addr_of_mut!(TLS_AREA).cast::<u8>();
-    let tp = (area as usize + tls_size + 15) & !15usize;
-    let block = (tp - tls_size) as *mut u8;
-    core::ptr::copy_nonoverlapping(tdata_start as *const u8, block, tdata_len);
-    core::ptr::write_bytes(block.add(tdata_len), 0, tls_size - tdata_len);
-    // relibc's Variant-I ABI slot: the word at TP names the GenericTcb header, whose
-    // tcb_ptr names the Tcb. The glibc {dtv, self} pair this used to hold left
-    // Tcb::current() null and faulted ld_so::fini at exit (J856).
-    let header = core::ptr::addr_of_mut!(TCB_HEADER).cast::<usize>();
-    let tcb = core::ptr::addr_of_mut!(TCB_STORAGE).cast::<u8>() as usize;
-    core::ptr::write(header, tp);
-    core::ptr::write(header.add(1), tls_size);
-    core::ptr::write(header.add(2), tcb);
-    core::ptr::write(header.add(3), 256);
-    core::ptr::write(tp as *mut usize, header as usize);
+    let image_size = tdata_end - tdata_start;
+    let segment_size = tbss_end - tdata_start;
+    let align = tls_align();
+    assert!(align.is_power_of_two(), "PT_TLS alignment");
+    let gap = (16 + align - 1) & !(align - 1);
+    // relibc's TLS region starts at TP + 16: the image sits `gap - 16` into it.
+    let offset = gap - 16;
+    let tls_len = offset + segment_size;
+    assert!(gap + segment_size + align <= TLS_AREA_SIZE, "TLS template exceeds the area");
+    let area = core::ptr::addr_of_mut!(TLS_AREA).cast::<u8>() as usize;
+    let block = (area + gap + align - 1) & !(align - 1);
+    let tp = block - gap;
+    core::ptr::copy_nonoverlapping(tdata_start as *const u8, block as *mut u8, image_size);
+    core::ptr::write_bytes((block + image_size) as *mut u8, 0, segment_size - image_size);
+
+    let master = core::ptr::addr_of_mut!(TLS_MASTER).cast::<usize>();
+    core::ptr::write(master, tdata_start);
+    core::ptr::write(master.add(1), image_size);
+    core::ptr::write(master.add(2), segment_size);
+    core::ptr::write(master.add(3), offset);
+
+    let tcb = core::ptr::addr_of_mut!(TCB_STORAGE).cast::<usize>();
+    core::ptr::write(tcb, tp + 16 + tls_len); // tls_end
+    core::ptr::write(tcb.add(1), tls_len);
+    core::ptr::write(tcb.add(2), tcb as usize); // tcb_ptr: itself
+    core::ptr::write(tcb.add(3), core::mem::size_of::<TcbStorage>());
+    core::ptr::write(tcb.add(4), master as usize); // masters_ptr
+    core::ptr::write(tcb.add(5), 4 * core::mem::size_of::<usize>()); // masters_len (bytes)
+    core::ptr::write(tcb.add(6), 1); // num_copied_masters: this thread holds its copy
+    core::ptr::write(tp as *mut usize, tcb as usize);
     core::arch::asm!("msr tpidr_el0, {}", in(reg) tp, options(nostack, preserves_flags));
 }
 

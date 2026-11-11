@@ -1,8 +1,8 @@
-//j790
 //j823
 //j824
 //j825
 //j871
+//j873
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -1738,6 +1738,68 @@ fn teardown_process_and_signal(koid: KoId) {
     }
 }
 
+/// SH5 `ThreadSpawn`: a sibling thread in the caller's own process. Returns the status and
+/// the new thread's koid. — TEAL
+fn spawn_thread_without_borrow(entry: u64, sp: u64, arg: u64) -> (kumo_abi::Status, u64) {
+    let Some(caller) = crate::user_thread::current_process_koid() else {
+        return (Errno::Internal.status(), 0);
+    };
+    if entry == 0 || sp == 0 || sp % 16 != 0 {
+        return (Errno::InvalidArgs.status(), 0);
+    }
+    with_sora_mut(|sora| {
+        if caller == sora.process.koid() {
+            return (Errno::NotSupported.status(), 0);
+        }
+        let Some(process) = sora.engine.process_by_koid(caller) else {
+            return (Errno::BadHandle.status(), 0);
+        };
+        let Some(ttbr0) = process.ttbr0 else {
+            return (Errno::InvalidArgs.status(), 0);
+        };
+        let root_vmar = process.root_vmar();
+        match crate::user_thread::spawn_thread(
+            sora.engine.objects_mut(),
+            caller,
+            root_vmar,
+            ttbr0,
+            entry,
+            sp,
+            arg,
+        ) {
+            Ok(koid) => (Errno::Ok.status(), koid.0 as u64),
+            Err(status) => (status, 0),
+        }
+    })
+}
+
+/// SH5 `ThreadExit`: unmap the exiting thread's own stack through the ordinary self-only
+/// `VmarUnmap` rule (exact recorded mapping), then reclaim its frames at once with a census
+/// that includes Sora's own table (as process teardown does).
+fn unmap_own_mapping_without_borrow(caller: KoId, virt: u64, len: u64) -> kumo_abi::Status {
+    with_sora_mut(|sora| {
+        let Some(process) = sora.engine.process_by_koid_mut(caller) else {
+            return Errno::BadHandle.status();
+        };
+        let process = process as *mut Process;
+        let status = match sora.engine.dispatch(
+            unsafe { &mut *process },
+            KernelCall::VmarUnmap {
+                process_handle: kumo_abi::INVALID_HANDLE,
+                virt,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => status,
+            _ => Errno::Internal.status(),
+        };
+        if status == Errno::Ok.status() {
+            sora.engine.retire_vmos(Some(&sora.process));
+        }
+        status
+    })
+}
+
 /// `ProcessKill` (J556). Resolve and check the target under the borrow, then stop its threads
 /// and close its handles outside it, in the order an exit uses: the threads first, so no wake the
 /// teardown causes can re-admit one. The report says what the process was doing, which is the
@@ -2540,6 +2602,9 @@ extern "C" fn svc_hook(regs: *mut u64) {
     if num == Syscall::ProcessExit as u64 {
         raise_tower_on_abend(r[0]);
         if crate::user_thread::is_started() {
+            // SH5: exit is a group exit — every sibling thread ends before the address
+            // space is retired underneath it.
+            crate::user_thread::end_sibling_threads_for_exit();
             teardown_current_process_and_signal();
             crate::user_thread::exit_current_user(r[0]);
         }
@@ -2549,10 +2614,68 @@ extern "C" fn svc_hook(regs: *mut u64) {
     if num == LINUX_ARM64_EXIT || num == LINUX_ARM64_EXIT_GROUP {
         raise_tower_on_abend(r[0]);
         if crate::user_thread::is_started() {
+            crate::user_thread::end_sibling_threads_for_exit();
             teardown_current_process_and_signal();
             crate::user_thread::exit_current_user(r[0]);
         }
         kumo_hal::active::el0_exit(r[0]);
+    }
+
+    // ---- threads (SH5) ---------------------------------------------------------------
+    //
+    // A resident process adds threads to itself only: no handle names the target, so no new
+    // authority exists. The supervisor (Sora) is the scheduler pump and takes none of these.
+    // — TEAL
+    if num == Syscall::ThreadSpawn as u64 {
+        let (status, koid) = spawn_thread_without_borrow(r[0], r[1], r[2]);
+        r[0] = status as u32 as u64;
+        r[1] = koid;
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
+    }
+
+    if num == Syscall::ThreadExit as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid && crate::user_thread::is_started() {
+                // The thread is in the kernel on its own kernel stack and never returns to
+                // EL0, so its user stack can go now. A non-matching range unmaps nothing.
+                if r[1] != 0 {
+                    let _ = unmap_own_mapping_without_borrow(cp_koid, r[0], r[1]);
+                }
+                if crate::user_thread::process_live_threads(cp_koid) <= 1 {
+                    // The last thread ending ends the process, exactly as ProcessExit(0).
+                    crate::user_thread::end_sibling_threads_for_exit();
+                    teardown_current_process_and_signal();
+                    crate::user_thread::exit_current_user(0);
+                }
+                crate::user_thread::silence_current_thread();
+                crate::user_thread::exit_current_user(0);
+            }
+        }
+        r[0] = Errno::NotSupported.status() as u32 as u64;
+        return;
+    }
+
+    if num == Syscall::ThreadSelf as u64 {
+        let thread = crate::user_thread::current_thread_koid().map_or(0, |koid| koid.0 as u64);
+        let process = crate::user_thread::current_process_koid();
+        let threads = process.map_or(0, crate::user_thread::process_live_threads) as u64;
+        let mappings = process.map_or(0, |koid| {
+            with_sora(|sora| {
+                if koid == sora.process.koid() {
+                    sora.process.mappings().len()
+                } else {
+                    sora.engine
+                        .process_by_koid(koid)
+                        .map_or(0, |proc| proc.mappings().len())
+                }
+            })
+        }) as u64;
+        r[0] = thread;
+        r[1] = threads;
+        r[2] = mappings;
+        return;
     }
 
     if num == Syscall::ProcessKill as u64 {
@@ -2892,6 +3015,16 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         r[0] = Errno::Ok.status() as u32 as u64;
                     } else {
                         r[0] = Errno::AccessDenied.status() as u32 as u64;
+                    }
+                } else if num == Syscall::VmarUnmap as u64 {
+                    // SH5: a child's munmap returns its frames now, not at the supervisor's
+                    // next dispatch: a threaded program can run create/join cycles for as
+                    // long as Sora sits in ProcessWait. This census includes Sora's own
+                    // table, which a child dispatch alone cannot see. — TEAL
+                    if !dispatch_object_syscall(&mut sora.engine, child, num, r) {
+                        r[0] = u64::MAX;
+                    } else if r[0] == Errno::Ok.status() as u32 as u64 {
+                        sora.engine.retire_vmos(Some(&sora.process));
                     }
                 } else if !dispatch_object_syscall(&mut sora.engine, child, num, r) {
                     r[0] = u64::MAX;

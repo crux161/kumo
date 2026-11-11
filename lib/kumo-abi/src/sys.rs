@@ -1,8 +1,8 @@
-//j790
 //j797
 //j824
 //j825
 //j871
+//j873
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,6 +147,23 @@ pub enum Syscall {
     /// limit every later spawn is checked against. A refusal is final for that value: a
     /// policy cap does not clear on retry, so callers must not loop on it. — TIMBERDOODLE
     JobSetPolicy = 57,
+    /// Start a sibling thread in the CALLER's own process (SH5): `(entry, sp, arg)` enters
+    /// EL0 at `entry` with `sp_el0 = sp` and `x0 = arg`, sharing the caller's address space,
+    /// handle table and futex domain. No handle is needed: a process may always add threads
+    /// to itself, and no other process can be named. `sp` must be non-zero and 16-byte
+    /// aligned. Returns `x0` = status and `x1` = the new thread's koid (its OS thread id).
+    /// Refused with [`Errno::BadState`] at the resident bound, [`Errno::NoMemory`] when the
+    /// kernel stack cannot be reserved, and [`Errno::NotSupported`] for the supervisor.
+    ThreadSpawn = 58,
+    /// End the calling thread only (SH5): `(stack_base, stack_size)` names the thread's own
+    /// user stack mapping, unmapped (exact match, as `VmarUnmap`) once the thread can no
+    /// longer touch it; `(0, 0)` unmaps nothing. Does not return. The last live thread of a
+    /// process ending this way ends the process with status 0, exactly as `ProcessExit(0)`.
+    ThreadExit = 59,
+    /// Self-introspection (SH5): returns `x0` = the calling thread's koid, `x1` = the live
+    /// threads of the caller's process (the caller included), and `x2` = the caller's
+    /// recorded mappings. Names nothing outside the caller's own process.
+    ThreadSelf = 60,
 }
 
 /// Stable indices for the RK3588 display unit's checked D0/D1 write table (DESIGN/022).
@@ -485,6 +502,14 @@ mod tests {
         // AX4: policy is additive and chain-private. Renumbering it would silently turn an
         // AX4 client's policy call into whatever occupied the slot.
         assert_eq!(Syscall::JobSetPolicy as usize, 57);
+    }
+
+    #[test]
+    fn thread_calls_take_the_next_free_slots() {
+        // SH5: relibc's pthread runtime calls these by number.
+        assert_eq!(Syscall::ThreadSpawn as usize, 58);
+        assert_eq!(Syscall::ThreadExit as usize, 59);
+        assert_eq!(Syscall::ThreadSelf as usize, 60);
     }
 }
 
