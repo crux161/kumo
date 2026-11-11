@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j870
 #j872
+#j874
 """SH3-e: the cargo-shaped metal suite on the Orange Pi 5 Plus, two PXE boots.
 
 Boot 1 (std::fs and C on the mounted volume, cross-process locks):
@@ -248,6 +249,13 @@ def classify(text):
     if "change the" in text or "Select Language" in text:
         return "firmware-menu"
     if "UEFI" in text:
+        return "firmware-menu"
+    # j874: a poke at the front page can redraw ONLY the help panel of the highlighted
+    # entry, so the capture holds one bare label (seen: "Reset" at row 8, column 71) and
+    # nothing else this function knows. A front-page label alone on its line is the menu.
+    if re.search(
+        r"^(\[[\d:.]+\]\s*)?(" + "|".join(FRONT_PAGE) + r")\s*$", text, re.MULTILINE
+    ):
         return "firmware-menu"
     return "unknown"
 
