@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j876
-"""SH6-a metal: the signal-subset suite on the Orange Pi 5 Plus, one PXE boot.
+#j878
+"""SH6 metal: the signal-subset suite on the Orange Pi 5 Plus, one PXE boot.
 
     ruststd signals    sigaction/raise/sigprocmask/sigpending/sigaltstack round-trips and
                        std's SIGPIPE-ignore (EPIPE); a child overflows its stack into the
@@ -28,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BOOT = (
     b"echo SH6 begins\n"
     b"ruststd signals\n"
+    b"ruststd sigasync\n"
     b"echo SH6 ends\n"
 )
 EXPECTED = (
@@ -37,6 +39,13 @@ EXPECTED = (
     "std: sh6 overflow handler -> OK",
     "std: sh6 overflow signaled -> OK",
     "std: sh6 sigpipe default -> OK",
+    # SH6-b: asynchronous delivery (PROPOSAL/004) and the group SIGINT to a spawn tree.
+    "std: sh6 async catch -> OK",
+    "std: sh6 async default -> OK",
+    "std: sh6 async ignore -> OK",
+    "std: sh6 async sigkill -> OK",
+    "std: sh6 async tree default -> OK",
+    "std: sh6 async tree catch -> OK",
 )
 
 
@@ -49,7 +58,7 @@ def load_board():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--work", type=Path, default=ROOT / "build/verification/sh6/sh6a-metal")
+    parser.add_argument("--work", type=Path, default=ROOT / "build/verification/sh6/sh6-metal")
     parser.add_argument("--timeout", type=float, default=180.0)
     args = parser.parse_args()
 
@@ -103,7 +112,7 @@ def main():
     finally:
         board.stop_all(pxehost, tio_pid, master)
         (work / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print("SH6-a metal suite green", flush=True)
+    print("SH6 metal suite green", flush=True)
 
 
 if __name__ == "__main__":
