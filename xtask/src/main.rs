@@ -978,6 +978,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let gfx_hold = build_graphics_client_image(&workspace_root()?, "gfx-hold")?;
             let bmp_view = build_graphics_client_image(&workspace_root()?, "bmp-view")?;
             let gpu_client = build_gpu_client_image(&workspace_root()?)?;
+            let persona_linux_shim = build_persona_linux_shim_image(&workspace_root()?)?;
             let gpu_contain_server =
                 build_gpu_contain_image(&workspace_root()?, "gpu-contain-server")?;
             let gpu_contain_client =
@@ -1017,6 +1018,10 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (AX4IDLE_PATH, ax4idle.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
+                (
+                    kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH,
+                    persona_linux_shim.as_slice(),
+                ),
                 (HELLO_PATH, hello.as_slice()),
                 (GFX_CLIENT_PATH, gfx_client.as_slice()),
                 (kumo_abi::initrd::GFX_KEYS_PATH, gfx_keys.as_slice()),
@@ -1238,6 +1243,32 @@ fn build_graphics_client_image(root: &Path, program: &str) -> Result<Vec<u8>, St
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as {program} ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+/// SH7: the persona-linux shim, linked high (0x1c00_0000) so a Linux image can sit low.
+fn build_persona_linux_shim_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "persona-linux-shim",
+            "--bin",
+            "persona-linux-shim",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+    let path = root.join("target/aarch64-unknown-none/release/persona-linux-shim");
+    let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    validate_aarch64_kernel_elf(&bytes).map_err(|err| {
+        format!(
+            "validate {} as persona-linux-shim ELF: {err}",
+            path.display()
+        )
+    })?;
     Ok(bytes)
 }
 

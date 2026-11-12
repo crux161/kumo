@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j876
 #j878
+#j885
 """SH6 metal: the signal-subset suite on the Orange Pi 5 Plus, one PXE boot.
 
     ruststd signals    sigaction/raise/sigprocmask/sigpending/sigaltstack round-trips and
@@ -98,7 +99,7 @@ def main():
                 raise RuntimeError("no login prompt after SH6 ends")
             time.sleep(0.2)
         text = board.log_whole(work / "boot.log")
-        board.validate(text, EXPECTED, "SH6 begins", "SH6 ends")
+        board.validate(text, EXPECTED, "SH6 begins", "SH6 ends", login_text=raw)
         window = text[text.index("SH6 begins"):text.index("SH6 ends")]
         if "TOWER" in window:
             raise RuntimeError("a TOWER inside the SH6 window: the overflow was not handled")

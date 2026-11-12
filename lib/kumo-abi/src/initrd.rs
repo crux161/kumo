@@ -50,6 +50,9 @@ pub const ACTORCALL_PATH: &str = "bin/actorcall";
 /// batch to prove resident capacity, flat census after teardown, and wake latency.
 pub const AX4IDLE_PATH: &str = "bin/ax4idle";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
+/// SH7: the in-process Linux personality runtime (PLAN.md §10 R1); a Linux program runs
+/// inside it.
+pub const PERSONA_LINUX_SHIM_PATH: &str = "bin/persona-linux-shim";
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.
 pub const HELLO_PATH: &str = "bin/hello";

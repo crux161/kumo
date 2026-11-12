@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j874
 #j883
+#j885
 """SH5-b: the std::thread suite on the Orange Pi 5 Plus, one PXE boot.
 
     ruststd threads    N threads meet at a barrier (live census), keep per-thread TLS and
@@ -91,7 +92,7 @@ def main():
                 raise RuntimeError("no login prompt after SH5 ends")
             time.sleep(0.2)
         text = board.log_whole(work / "boot.log")
-        board.validate(text, EXPECTED, "SH5 begins", "SH5 ends")
+        board.validate(text, EXPECTED, "SH5 begins", "SH5 ends", login_text=raw)
         manifest["boot"] = "PASS"
         manifest["passed"] = True
         print("boot: PASS", flush=True)

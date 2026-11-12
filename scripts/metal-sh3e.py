@@ -374,13 +374,16 @@ def wait_for(text_wanted, log_path, timeout):
     raise RuntimeError(f"timeout waiting for {text_wanted!r}; see {log_path}")
 
 
-def validate(text, expected, begin, end):
+def validate(text, expected, begin, end, login_text=None):
+    # `login_text`: where to look for the login prompt. A prompt ends without a newline, so
+    # tio's line log holds it only once later output follows on that line; callers that
+    # captured the raw stream pass it here (j885). — TEAL
     if text.count(begin) != 1 or text.count(end) != 1:
         raise RuntimeError(f"missing/duplicated {begin!r} or {end!r}")
     for marker in expected:
         if text.count(marker) != 1:
             raise RuntimeError(f"missing/duplicated {marker!r}")
-    if text.count("INDRA login:") < 1:
+    if (text if login_text is None else login_text).count("INDRA login:") < 1:
         raise RuntimeError("no login prompt")
 
 

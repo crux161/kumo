@@ -625,20 +625,6 @@ fn user_range_ok(process: &Process, ptr: u64, len: u64) -> bool {
     }
 }
 
-const LINUX_ARM64_READ: u64 = 63;
-const LINUX_ARM64_OPENAT: u64 = 56;
-const LINUX_ARM64_CLOSE: u64 = 57;
-const LINUX_ARM64_WRITE: u64 = 64;
-const LINUX_ARM64_WRITEV: u64 = 66;
-const LINUX_ARM64_NEWFSTATAT: u64 = 79;
-const LINUX_ARM64_EXIT: u64 = 93;
-const LINUX_ARM64_EXIT_GROUP: u64 = 94;
-const LINUX_ARM64_MUNMAP: u64 = 215;
-const LINUX_ARM64_BRK: u64 = 214;
-const LINUX_ARM64_MMAP: u64 = 222;
-const LINUX_ARM64_STDOUT: u64 = 1;
-const LINUX_ARM64_STDERR: u64 = 2;
-
 /// Queue bytes for the userspace framebuffer owner without switching threads. This
 /// helper is safe to call while an SVC already holds `&mut SoraState`: it takes that
 /// borrow explicitly instead of re-entering through `with_sora_mut`. `signal_ports`
@@ -732,111 +718,6 @@ pub(crate) fn console_write_without_switch(bytes: &[u8]) {
     let (_, write_hal) = console_delivery_plan(kernel_owns, queued);
     if write_hal {
         kumo_hal::active::early_console_write(bytes);
-    }
-}
-
-/// Temporary Stage-A M10 bridge for the first `persona-linux` smoke.
-///
-/// The real design keeps the Linux personality in userspace. Until the upcall
-/// path exists, non-Sora child SVCs that use ARM64 Linux syscall numbers are
-/// translated here narrowly enough to run a static hello payload.
-fn handle_linux_persona_syscall(
-    process: &Process,
-    regs: &mut [u64],
-    mut output: impl FnMut(&[u8]),
-) -> bool {
-    match regs[8] {
-        LINUX_ARM64_WRITE => {
-            let fd = regs[0];
-            let user_ptr = regs[1];
-            let len = (regs[2] as usize).min(256);
-            if fd != LINUX_ARM64_STDOUT && fd != LINUX_ARM64_STDERR {
-                regs[0] = (-1i64) as u64;
-                return true;
-            }
-            if !user_range_ok(process, user_ptr, len as u64) {
-                regs[0] = (-1i64) as u64;
-                return true;
-            }
-            let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-            output(bytes);
-            regs[0] = len as u64;
-            true
-        }
-        LINUX_ARM64_WRITEV => {
-            let fd = regs[0];
-            let iov = regs[1];
-            let iovcnt = (regs[2] as usize).min(8);
-            if fd != LINUX_ARM64_STDOUT && fd != LINUX_ARM64_STDERR {
-                regs[0] = (-1i64) as u64;
-                return true;
-            }
-            let bytes_len = (iovcnt as u64).saturating_mul(16);
-            if !user_range_ok(process, iov, bytes_len) {
-                regs[0] = (-1i64) as u64;
-                return true;
-            }
-            let mut total = 0u64;
-            for index in 0..iovcnt {
-                let base = iov + (index as u64) * 16;
-                let ptr = unsafe { core::ptr::read_unaligned(base as *const u64) };
-                let len = unsafe { core::ptr::read_unaligned((base + 8) as *const u64) };
-                let len = (len as usize).min(256);
-                if !user_range_ok(process, ptr, len as u64) {
-                    regs[0] = (-1i64) as u64;
-                    return true;
-                }
-                let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-                output(bytes);
-                total = total.saturating_add(len as u64);
-            }
-            regs[0] = total;
-            true
-        }
-        LINUX_ARM64_READ => {
-            // The first MVP payload has no stdin. Return EOF for fd 0 and EBADF-ish
-            // for anything else; enough for simple static startup probes.
-            regs[0] = if regs[0] == 0 { 0 } else { (-1i64) as u64 };
-            true
-        }
-        LINUX_ARM64_CLOSE | LINUX_ARM64_MUNMAP => {
-            regs[0] = 0;
-            true
-        }
-        LINUX_ARM64_OPENAT | LINUX_ARM64_NEWFSTATAT => {
-            regs[0] = (-1i64) as u64;
-            true
-        }
-        LINUX_ARM64_BRK => {
-            // No heap growth yet. A zero query returns the fixed bootstrap break; any
-            // request is left unchanged so minimalist static binaries can continue.
-            regs[0] = 0x1001_0000;
-            true
-        }
-        LINUX_ARM64_MMAP => {
-            regs[0] = (-1i64) as u64;
-            true
-        }
-        LINUX_ARM64_EXIT | LINUX_ARM64_EXIT_GROUP => {
-            // This dispatcher runs *inside* a `with_sora_mut` borrow and only for a child
-            // (the caller guards on `cp_koid != Sora`), so a non-zero exit is by construction
-            // a restartable microservice → reversed TOWER (contained), never a Sora-halt.
-            // Emit directly without re-entering `SoraState` (`current_process_koid` reads the
-            // scheduler, not Sora). A Linux-persona child is not the framebuffer owner.
-            if regs[0] != 0 {
-                crate::tower::raise_inverted(
-                    crate::tower::Cause::Abend { exit_code: regs[0] },
-                    crate::user_thread::current_process_koid(),
-                    false,
-                    console_write_without_switch,
-                );
-            }
-            if crate::user_thread::is_started() {
-                crate::user_thread::exit_current_user(regs[0]);
-            }
-            kumo_hal::active::el0_exit(regs[0])
-        }
-        _ => false,
     }
 }
 
@@ -2757,24 +2638,59 @@ fn dispatch_object_syscall(
 }
 
 extern "C" fn svc_hook(regs: *mut u64) {
+    //j885
+    // SH7 (PLAN.md §10, R1): a persona-hosting thread's foreign `svc` never reaches native
+    // dispatch. It is redirected into the in-process shim by rewriting the saved PC/SP (the
+    // 34-word frame: x0..x30, ELR, SPSR, SP_EL0); a foreign `svc` inside an open shim call
+    // ends the process (0x100 | SIGSYS). — TEAL
+    #[cfg(feature = "arch_aarch64")]
+    {
+        let frame = unsafe { core::slice::from_raw_parts_mut(regs, 34) };
+        match crate::user_thread::persona_trap(frame) {
+            crate::user_thread::PersonaTrap::Native => {}
+            crate::user_thread::PersonaTrap::Redirected => return,
+            crate::user_thread::PersonaTrap::Violation => {
+                const SIGNALED_SIGSYS: u64 = 0x100 | 31;
+                raise_tower_on_abend(SIGNALED_SIGSYS);
+                if crate::user_thread::is_started() {
+                    crate::user_thread::end_sibling_threads_for_exit();
+                    teardown_current_process_and_signal();
+                    crate::user_thread::exit_current_user(SIGNALED_SIGSYS);
+                }
+                kumo_hal::active::el0_exit(SIGNALED_SIGSYS);
+            }
+        }
+    }
     let r = unsafe { core::slice::from_raw_parts_mut(regs, 31) };
     let num = r[8];
+
+    if num == Syscall::PersonaShimSet as u64 {
+        let ok = crate::user_thread::set_current_persona(r[0], r[1], r[2], r[3]);
+        r[0] = if ok {
+            Errno::Ok.status() as u32 as u64
+        } else {
+            Errno::NotSupported.status() as u32 as u64
+        };
+        return;
+    }
+
+    if num == Syscall::PersonaReturn as u64 {
+        #[cfg(feature = "arch_aarch64")]
+        {
+            let frame = unsafe { core::slice::from_raw_parts_mut(regs, 34) };
+            if crate::user_thread::persona_resume(frame) {
+                return;
+            }
+        }
+        r[0] = Errno::BadState.status() as u32 as u64;
+        return;
+    }
 
     if num == Syscall::ProcessExit as u64 {
         raise_tower_on_abend(r[0]);
         if crate::user_thread::is_started() {
             // SH5: exit is a group exit — every sibling thread ends before the address
             // space is retired underneath it.
-            crate::user_thread::end_sibling_threads_for_exit();
-            teardown_current_process_and_signal();
-            crate::user_thread::exit_current_user(r[0]);
-        }
-        kumo_hal::active::el0_exit(r[0]);
-    }
-
-    if num == LINUX_ARM64_EXIT || num == LINUX_ARM64_EXIT_GROUP {
-        raise_tower_on_abend(r[0]);
-        if crate::user_thread::is_started() {
             crate::user_thread::end_sibling_threads_for_exit();
             teardown_current_process_and_signal();
             crate::user_thread::exit_current_user(r[0]);
@@ -3098,24 +3014,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     return;
                 };
                 let child = unsafe { &mut *child_ptr };
-                let mut linux_output = [0u8; 8 * 256];
-                let mut linux_output_len = 0usize;
-                let handled_linux = handle_linux_persona_syscall(child, r, |bytes| {
-                    let n = bytes.len().min(linux_output.len() - linux_output_len);
-                    linux_output[linux_output_len..linux_output_len + n]
-                        .copy_from_slice(&bytes[..n]);
-                    linux_output_len += n;
-                });
-                if handled_linux {
-                    // The Stage-A M10 bridge serves only Sora's boot smokes, so what they print
-                    // is a boot record: kept for `dmesg`, shown at INFO (J559).
-                    for chunk in linux_output[..linux_output_len].chunks(MAX_CHANNEL_BYTES) {
-                        if crate::kmsg::record(cp_koid.0, crate::kmsg::INFO, chunk) {
-                            console_write_in_state(sora, chunk);
-                        }
-                    }
-                    return;
-                }
                 // Arms that genuinely differ for a resident child are handled inline; every
                 // target-agnostic syscall routes through the shared `dispatch_object_syscall`
                 // below (against the CHILD's table), so a resident driver now gets the full

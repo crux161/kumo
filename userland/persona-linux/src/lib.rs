@@ -2,6 +2,7 @@
 
 //j459
 //j741
+//j885
 
 /// ARM64 Linux syscall numbers used by the M10 MVP.
 ///
@@ -32,6 +33,8 @@ pub mod elf {
     pub const EM_X86_64: u16 = 0x3e;
     pub const EM_AARCH64: u16 = 0xb7;
     pub const PT_LOAD: u32 = 1;
+    /// SH7: a dynamic executable names its loader here (PLAN/022 SH7, payload P1).
+    pub const PT_INTERP: u32 = 3;
     //j741
     /// The stack's program header. Its `p_memsz` is the stack size the program asks for
     /// (`lld -z stack-size=`); zero means "the loader's default". — TIMBERDOODLE

@@ -43,6 +43,7 @@ members = [
     "userland/bmp-view",
     "userland/wc",
     "userland/hello",
+    "userland/persona-linux-shim",
     "userland/gfx-client",
     "userland/gfx-hold",
     "userland/gfx-keys",

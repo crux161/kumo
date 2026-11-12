@@ -5776,87 +5776,37 @@ extern "C" fn sora_main(
         }
     }
 
-    // M10-a: first `persona-linux` smoke. This is not a native KUMO child: the
-    // payload uses ARM64 Linux syscall numbers (`write` = 64, `exit_group` = 94).
-    // The temporary Stage-A bridge in the kernel translates those numbers only for
-    // non-Sora children until the userspace persona runner owns the trap path.
-    {
-        let _ = linux_arm64::WRITE;
-        let _ = linux_arm64::EXIT_GROUP;
-        let linux_msg = b"M10 linux hello\n";
-        let child_vmo_h = vmo_create(0x2000);
-        if child_vmo_h == u64::MAX {
-            log(b"M10 linux: vmo fail\n");
-        } else if linux_msg.len() != 16 {
-            log(b"M10 linux: len fail\n");
-        } else {
-            let child_vmo = Handle(child_vmo_h as u32);
-            // Payload (9 aarch64 instructions, 36 bytes at VMO offset 0x1100),
-            // verified with `llvm-mc -triple=aarch64 --show-encoding`:
-            //   movz x0, #1                → fd = stdout
-            //   movz x1, #0x1000, lsl #16 → x1 = 0x1000_0000
-            //   movk x1, #0x1000          → buf = 0x1000_1000
-            //   movz x2, #16              → len
-            //   movz x8, #64              → Linux arm64 write
-            //   svc  #0
-            //   movz x0, #0               → status
-            //   movz x8, #94              → Linux arm64 exit_group
-            //   svc  #0
-            let code: [u32; 9] = [
-                0xd2800020, // movz x0, #1
-                0xd2a20001, // movz x1, #0x1000, lsl #16
-                0xf2820001, // movk x1, #0x1000
-                0xd2800202, // movz x2, #16
-                0xd2800808, // movz x8, #64
-                0xd4000001, // svc #0
-                0xd2800000, // movz x0, #0
-                0xd2800bc8, // movz x8, #94
-                0xd4000001, // svc #0
-            ];
-            let mut cb = [0u8; 36];
-            for (i, w) in code.iter().enumerate() {
-                cb[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
-            }
-            let msg_ok = vmo_write(child_vmo, 0x1000, linux_msg.as_ptr(), linux_msg.len()) == 0;
-            let code_ok = vmo_write(child_vmo, 0x1100, cb.as_ptr(), cb.len()) == 0;
-            if !msg_ok || !code_ok {
-                log(b"M10 linux: write fail\n");
-            } else {
-                let child_as_h = process_create(0, 0x2000_0000);
-                if child_as_h == u64::MAX {
-                    log(b"M10 linux: process fail\n");
-                } else {
-                    let child_as = Handle(child_as_h as u32);
-                    if vmar_map(child_as, child_vmo, 0, 0x10000000, 0x2000, 5) != 0 {
-                        log(b"M10 linux: map fail\n");
-                    } else if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
-                        log(b"M10 linux: as fail\n");
-                    } else {
-                        let st = process_run(child_as, 0x10001100, 0x1000FFF0, 0, 0, 0);
-                        if st == 0 {
-                            log(b"M10 linux: run ok\n");
-                        } else {
-                            log(b"M10 linux: run fail\n");
-                        }
-                    }
-                }
-            }
+    //j885
+    // SH7-b (PLAN.md §10, ratified R1): the M10 Linux ELF runs inside the persona shim. Sora
+    // copies the ELF out of the initrd into a VMO and runs the shim with it transferred; the
+    // shim loads the program into its own address space and the kernel redirects the program's
+    // `svc`s to it. The Stage-A kernel bridge and the hand-assembled M10-a payload it served are
+    // gone. — TEAL
+    let mut shim_status = 0i64;
+    let shim_ran = match initrd_file_vmo(initrd, PERSONA_LINUX_HELLO_PATH.as_bytes()) {
+        Some((elf, len)) => run_elf_threads_status(
+            initrd,
+            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
+            u64::from(elf.0),
+            len,
+            ProcessRunFlags::TRANSFER_ARG.bits(),
+            b"M10 elf",
+            0,
+            None,
+            &mut shim_status,
+            false,
+        ),
+        None => {
+            log(b"M10 elf: initrd copy fail\n");
+            false
         }
-    }
-
-    // M10-b: load the same hello path as an initrd-resident ARM64 Linux ELF.
-    // This is the first step from handmade payload toward "one static ELF".
-    if run_elf(
-        initrd,
-        PERSONA_LINUX_HELLO_PATH.as_bytes(),
-        0,
-        0,
-        0,
-        b"M10 elf",
-    ) {
+    };
+    if shim_ran {
         debug_write(b"M10-c Check ok\n".as_ptr(), 15);
     } else {
-        log(b"M10 elf: run fail\n");
+        let mut line = [0u8; 48];
+        let text = fmt_status_line(&mut line, b"M10 elf: run fail status=", shim_status);
+        log(text);
     }
 
     // Narrow the initrd handle before handing it to user programs. `ls` only needs READ
@@ -6808,6 +6758,58 @@ struct PersonaLoadSegment {
     virt_addr: u64,
     mem_size: u64,
     flags: u64,
+}
+
+/// `prefix` then a signed decimal and a newline, in `buf`.
+fn fmt_status_line<'a>(buf: &'a mut [u8; 48], prefix: &[u8], value: i64) -> &'a [u8] {
+    let mut at = prefix.len().min(30);
+    buf[..at].copy_from_slice(&prefix[..at]);
+    if value < 0 {
+        buf[at] = b'-';
+        at += 1;
+    }
+    let mut digits = [0u8; 20];
+    let mut n = value.unsigned_abs();
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (n % 10) as u8;
+        count += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in (0..count).rev() {
+        buf[at] = digits[i];
+        at += 1;
+    }
+    buf[at] = b'\n';
+    &buf[..at + 1]
+}
+
+/// SH7-b: one initrd file copied into a fresh VMO of its own (the persona shim maps the
+/// program it is handed). Returns the VMO and the file's length.
+fn initrd_file_vmo(initrd: Handle, target: &[u8]) -> Option<(Handle, u64)> {
+    let (offset, len) = find_initrd_file(initrd, target)?;
+    let raw = vmo_create(len.max(1));
+    if raw == 0 || raw == u64::MAX {
+        return None;
+    }
+    let vmo = Handle(raw as u32);
+    // VmoWrite moves at most VMO_TRANSFER_MAX bytes per call.
+    let mut chunk = [0u8; kumo_abi::sys::VMO_TRANSFER_MAX];
+    let mut at = 0u64;
+    while at < len {
+        let n = (len - at).min(chunk.len() as u64) as usize;
+        if vmo_read(initrd, offset + at, chunk.as_mut_ptr(), n) != 0
+            || vmo_write(vmo, at, chunk.as_ptr(), n) != 0
+        {
+            let _ = handle_close(vmo);
+            return None;
+        }
+        at += n as u64;
+    }
+    Some((vmo, len))
 }
 
 fn find_initrd_file(initrd: Handle, target: &[u8]) -> Option<(u64, u64)> {

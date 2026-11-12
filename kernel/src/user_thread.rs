@@ -246,6 +246,78 @@ struct ResidentChild {
     fault_entry: u64,
     /// The alternate stack top the trampoline starts on, or 0 for "below the faulting SP".
     fault_stack_top: u64,
+    /// SH7: this thread hosts a persona shim (PLAN.md §10 R1), or `None`.
+    persona: Option<PersonaShim>,
+}
+
+/// SH7 (PLAN.md §10, ratified R1): an in-process persona shim. A foreign (Linux) program and
+/// its personality runtime share one address space; the kernel tells their `svc`s apart only
+/// by where the instruction lies, and moves the thread between them by rewriting the saved
+/// PC/SP — the SH6 fault-redirect discipline, applied to system calls. — TEAL
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PersonaShim {
+    pub entry: u64,
+    pub code_base: u64,
+    pub code_len: u64,
+    pub stack_top: u64,
+    /// The interrupted foreign context `(pc after the svc, sp, x8)` while a call is open.
+    pub saved: Option<(u64, u64, u64)>,
+}
+
+/// What [`PersonaShim::redirect`] decided for one `svc`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersonaTrap {
+    /// The `svc` came from the shim's own code: a native call.
+    Native,
+    /// A foreign syscall, redirected into the shim.
+    Redirected,
+    /// A foreign `svc` while a shim call is already open: the foreign code ran without the
+    /// shim's leave. The process ends rather than letting a foreign number reach native
+    /// dispatch.
+    Violation,
+}
+
+/// Threads with a live persona registration. Every `svc` consults [`persona_trap`]; while this
+/// is 0 (any machine not running a foreign program) that costs one load, no child scan.
+static PERSONA_LIVE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// Trap-frame word indices (`kumo_svc_common`): x0..x30, then ELR, SPSR, SP_EL0.
+const FRAME_X8: usize = 8;
+const FRAME_ELR: usize = 31;
+const FRAME_SP_EL0: usize = 33;
+
+impl PersonaShim {
+    /// Whether the `svc` at `svc_pc` lies outside the shim's code.
+    pub fn is_foreign(&self, svc_pc: u64) -> bool {
+        !(svc_pc >= self.code_base && svc_pc < self.code_base.saturating_add(self.code_len))
+    }
+
+    /// Decide one `svc` (`frame` is the 34-word trap frame) and, for a foreign one, rewrite
+    /// the frame to enter the shim.
+    pub fn redirect(&mut self, frame: &mut [u64]) -> PersonaTrap {
+        let svc_pc = frame[FRAME_ELR].wrapping_sub(4);
+        if !self.is_foreign(svc_pc) {
+            return PersonaTrap::Native;
+        }
+        if self.saved.is_some() {
+            return PersonaTrap::Violation;
+        }
+        self.saved = Some((frame[FRAME_ELR], frame[FRAME_SP_EL0], frame[FRAME_X8]));
+        frame[FRAME_ELR] = self.entry;
+        frame[FRAME_SP_EL0] = self.stack_top & !15;
+        PersonaTrap::Redirected
+    }
+
+    /// `PersonaReturn`: restore the foreign PC, SP and x8; x0 already holds the result.
+    pub fn resume(&mut self, frame: &mut [u64]) -> bool {
+        let Some((pc, sp, x8)) = self.saved.take() else {
+            return false;
+        };
+        frame[FRAME_ELR] = pc;
+        frame[FRAME_SP_EL0] = sp;
+        frame[FRAME_X8] = x8;
+        true
+    }
 }
 
 /// The scheduler-integrated user-thread harness. Owns the dispatcher, the boot-flow
@@ -911,6 +983,7 @@ fn install_child(
         current_call: None,
         fault_entry: 0,
         fault_stack_top: 0,
+        persona: None,
     });
     child.thread.user_state = Some(UserState {
         x: {
@@ -943,6 +1016,13 @@ fn install_child(
     koid
 }
 
+/// SH7: a record leaving `children` takes its persona registration with it.
+fn release_persona(child: &ResidentChild) {
+    if child.persona.is_some() {
+        PERSONA_LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Remove resident children that have terminated, dropping any stale wait entry. Called at
 /// the `ProcessWait` / sync-run boundaries, where Sora has observed the exit.
 fn reap_done(s: &mut UserSched) {
@@ -952,6 +1032,7 @@ fn reap_done(s: &mut UserSched) {
             // SH5: a sibling thread's end is not a process status.
             let koid = s.children[i].thread.koid();
             s.wait_queue.remove_thread(koid);
+            release_persona(&s.children[i]);
             s.children.remove(i);
         } else if s.children[i].done {
             let koid = s.children[i].thread.koid();
@@ -970,6 +1051,7 @@ fn reap_done(s: &mut UserSched) {
                 s.reaped_len += 1;
             }
             s.wait_queue.remove_thread(koid);
+            release_persona(&s.children[i]);
             s.children.remove(i);
         } else {
             i += 1;
@@ -1175,6 +1257,95 @@ pub fn set_current_fault_entry(entry: u64, stack_top: u64) -> bool {
         return false;
     };
     set_fault_entry_for(s, current, entry, stack_top)
+}
+
+/// SH7 `PersonaShimSet` for `thread`. False when it has no resident record (the supervisor)
+/// or the entry lies outside the code range. `entry` 0 clears.
+fn set_persona_for(
+    s: &mut UserSched,
+    thread: KoId,
+    entry: u64,
+    code_base: u64,
+    code_len: u64,
+    stack_top: u64,
+) -> bool {
+    let Some(record) = s.children.iter_mut().find(|c| c.thread.koid() == thread) else {
+        return false;
+    };
+    if entry == 0 {
+        if record.persona.take().is_some() {
+            PERSONA_LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        return true;
+    }
+    let shim = PersonaShim {
+        entry,
+        code_base,
+        code_len,
+        stack_top,
+        saved: None,
+    };
+    if shim.is_foreign(entry) || stack_top == 0 {
+        return false;
+    }
+    if record.persona.replace(shim).is_none() {
+        PERSONA_LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
+/// SH7 `PersonaShimSet` for the CURRENT thread.
+pub fn set_current_persona(entry: u64, code_base: u64, code_len: u64, stack_top: u64) -> bool {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return false;
+    }
+    let s = unsafe { &mut *sched_ptr() };
+    let Some(current) = s.dispatcher.current() else {
+        return false;
+    };
+    set_persona_for(s, current, entry, code_base, code_len, stack_top)
+}
+
+/// SH7: decide the current thread's `svc` against its persona registration (if any).
+pub fn persona_trap(frame: &mut [u64]) -> PersonaTrap {
+    if PERSONA_LIVE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return PersonaTrap::Native;
+    }
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return PersonaTrap::Native;
+    }
+    let s = unsafe { &mut *sched_ptr() };
+    let Some(current) = s.dispatcher.current() else {
+        return PersonaTrap::Native;
+    };
+    let Some(shim) = s
+        .children
+        .iter_mut()
+        .find(|c| c.thread.koid() == current)
+        .and_then(|c| c.persona.as_mut())
+    else {
+        return PersonaTrap::Native;
+    };
+    shim.redirect(frame)
+}
+
+/// SH7 `PersonaReturn` for the current thread.
+pub fn persona_resume(frame: &mut [u64]) -> bool {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return false;
+    }
+    let s = unsafe { &mut *sched_ptr() };
+    let Some(current) = s.dispatcher.current() else {
+        return false;
+    };
+    s.children
+        .iter_mut()
+        .find(|c| c.thread.koid() == current)
+        .and_then(|c| c.persona.as_mut())
+        .is_some_and(|shim| shim.resume(frame))
 }
 
 /// SH6: the CURRENT thread's fault entry, taken for one delivery (see `FaultHandlerSet`).
@@ -3045,6 +3216,57 @@ mod ax4_capacity_tests {
         assert!(sched().children.is_empty());
     }
 
+    //j885
+    /// SH7: the persona redirect tells foreign `svc`s from the shim's own by address, saves
+    /// and restores exactly PC, SP and x8, refuses a foreign `svc` inside an open call, and
+    /// leaves every other register alone. — TEAL
+    #[test]
+    fn persona_redirect_round_trips_a_foreign_svc() {
+        let mut shim = super::PersonaShim {
+            entry: 0x1c00_1000,
+            code_base: 0x1c00_0000,
+            code_len: 0x10_0000,
+            stack_top: 0x1c80_0008,
+            saved: None,
+        };
+        let mut frame = [0u64; 34];
+        for (i, word) in frame.iter_mut().enumerate() {
+            *word = 0x100 + i as u64;
+        }
+        // A native svc from inside the shim passes through untouched.
+        frame[31] = 0x1c00_2004;
+        let before = frame;
+        assert_eq!(shim.redirect(&mut frame), super::PersonaTrap::Native);
+        assert_eq!(frame, before);
+        // A foreign svc at 0x40_1000 (ELR is the next instruction).
+        frame[31] = 0x40_1004;
+        frame[33] = 0x7fff_f000;
+        frame[8] = 64; // Linux write
+        assert_eq!(shim.redirect(&mut frame), super::PersonaTrap::Redirected);
+        assert_eq!((frame[31], frame[33]), (0x1c00_1000, 0x1c80_0000));
+        assert_eq!(
+            (frame[0], frame[1], frame[8], frame[30]),
+            (0x100, 0x101, 64, 0x11e)
+        );
+        // A second foreign svc before the leave is a violation, not a redirect.
+        let mut stray = frame;
+        stray[31] = 0x40_2004;
+        assert_eq!(shim.redirect(&mut stray), super::PersonaTrap::Violation);
+        // The leave: the shim made a native call (x8 = PersonaReturn) with the result in x0.
+        frame[8] = 64;
+        frame[0] = 16;
+        frame[31] = 0x1c00_3004;
+        assert!(shim.resume(&mut frame));
+        assert_eq!(
+            (frame[31], frame[33], frame[8], frame[0]),
+            (0x40_1004, 0x7fff_f000, 64, 16)
+        );
+        assert!(
+            !shim.resume(&mut frame),
+            "a second leave has nothing to restore"
+        );
+    }
+
     /// SH6: a fault registration is per thread, one-shot, and cleared by entry 0; the
     /// supervisor (no resident record) cannot register. — TEAL
     #[test]
@@ -3078,5 +3300,59 @@ mod ax4_capacity_tests {
         assert_eq!(process_wait(), Errno::Ok.status());
         while take_reaped(sched().user_thread.process()).is_some() {}
         assert!(sched().children.is_empty());
+    }
+
+    //j885
+    /// SH7: the live-registration count that gates every `svc`'s persona check follows
+    /// set, re-set, clear and reap, and the supervisor cannot register. — TEAL
+    #[test]
+    fn persona_live_count_follows_set_clear_and_reap() {
+        let _guard = AX4_LOCK.lock().unwrap();
+        let live = || super::PERSONA_LIVE.load(core::sync::atomic::Ordering::Relaxed);
+        let mut objects = ObjectManager::new();
+        let vmar = Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).unwrap();
+        init(&mut objects, KoId(7), vmar, 0).unwrap();
+        assert_eq!(spawn_actor(&mut objects, 720), Errno::Ok.status());
+        assert_eq!(spawn_actor(&mut objects, 721), Errno::Ok.status());
+        let a = sched().children[0].thread.koid();
+        let b = sched().children[1].thread.koid();
+        let sora_thread = sched().user_thread.koid();
+        let base = live();
+        let (entry, code, len, stack) = (0x1c00_1000, 0x1c00_0000, 0x1_0000, 0x1c80_0000);
+
+        assert!(!set_persona_for(
+            sched_mut(),
+            sora_thread,
+            entry,
+            code,
+            len,
+            stack
+        ));
+        // The entry must lie inside the code it names.
+        assert!(!set_persona_for(
+            sched_mut(),
+            a,
+            0x40_0000,
+            code,
+            len,
+            stack
+        ));
+        assert_eq!(live(), base);
+        assert!(set_persona_for(sched_mut(), a, entry, code, len, stack));
+        assert!(set_persona_for(sched_mut(), a, entry, code, len, stack));
+        assert_eq!(live(), base + 1, "re-registering counts once");
+        assert!(set_persona_for(sched_mut(), b, entry, code, len, stack));
+        assert_eq!(live(), base + 2);
+        assert!(set_persona_for(sched_mut(), b, 0, 0, 0, 0));
+        assert!(set_persona_for(sched_mut(), b, 0, 0, 0, 0));
+        assert_eq!(live(), base + 1, "clearing twice uncounts once");
+
+        // Reaping a registered thread releases its registration.
+        assert_eq!(kill_process_threads(KoId(720)).killed, 1);
+        assert_eq!(kill_process_threads(KoId(721)).killed, 1);
+        assert_eq!(process_wait(), Errno::Ok.status());
+        while take_reaped(sched().user_thread.process()).is_some() {}
+        assert!(sched().children.is_empty());
+        assert_eq!(live(), base);
     }
 }
