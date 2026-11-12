@@ -12,7 +12,7 @@
 //j873
 //j875
 //j877
-//j879
+//j880
 
 use core::cell::UnsafeCell;
 
@@ -1574,8 +1574,7 @@ pub fn wake_children_waiting_on_futex(process: KoId, addr: u64, count: u32) -> u
             }
             s.wait_queue.remove_thread(*waiter);
             child.ready();
-            // j879: a woken waiter runs ahead of equal-priority busy peers.
-            s.dispatcher.admit_woken(child.koid(), CHILD_PRIORITY);
+            s.dispatcher.admit(child.koid(), CHILD_PRIORITY);
             released += 1;
         }
         if released > 0 {
@@ -1827,8 +1826,7 @@ fn wake_child_waiting_on(target: WaitTarget) -> bool {
         }
         s.wait_queue.remove_thread(waiter);
         child.ready();
-        // j879: a woken waiter runs ahead of equal-priority busy peers.
-        s.dispatcher.admit_woken(child.koid(), CHILD_PRIORITY);
+        s.dispatcher.admit(child.koid(), CHILD_PRIORITY);
         if wait_target_needs_safe_reschedule(target) {
             s.safe_reschedule_pending = true;
         }

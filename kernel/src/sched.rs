@@ -21,7 +21,7 @@
 //! drives it from the timer IRQ, while cooperative demos and future syscalls enter
 //! through the same block / wake / yield / finish scheduling points.
 //j824
-//j879
+//j880
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -69,10 +69,6 @@ pub enum ClassId {
 pub trait SchedClass {
     /// Make `t` runnable in this class at `prio` (appended to its band).
     fn enqueue(&mut self, t: ThreadId, prio: Priority);
-    /// Make `t` runnable at the FRONT of its band (j879: a thread woken from a block).
-    fn enqueue_front(&mut self, t: ThreadId, prio: Priority) {
-        self.enqueue(t, prio);
-    }
     /// Remove `t` (e.g. it blocked or terminated). Returns whether it was present.
     fn dequeue(&mut self, t: ThreadId, prio: Priority) -> bool;
     /// Take the most-eligible runnable thread out of this class, or `None` if empty.
@@ -166,13 +162,6 @@ impl SchedClass for PriorityClass {
     fn enqueue(&mut self, t: ThreadId, prio: Priority) {
         let level = prio.0 as usize;
         self.queues[level].push_back(t);
-        self.set_bit(level);
-        self.len += 1;
-    }
-
-    fn enqueue_front(&mut self, t: ThreadId, prio: Priority) {
-        let level = prio.0 as usize;
-        self.queues[level].push_front(t);
         self.set_bit(level);
         self.len += 1;
     }
@@ -303,10 +292,6 @@ pub struct Dispatcher {
     /// Round-robin quantum, in timer ticks, for equal-priority threads.
     quantum: u32,
     ticks: u32,
-    /// j879: woken threads placed at the front of their level since the last quantum
-    /// expiry. A quantum expiry moves any still waiting behind the regular waiters, so a
-    /// CPU-bound peer gets the next quantum however tightly woken threads hand off.
-    boosted: Vec<(ThreadId, Priority)>,
 }
 
 impl Dispatcher {
@@ -317,7 +302,6 @@ impl Dispatcher {
             current: None,
             quantum: quantum_ticks.max(1),
             ticks: 0,
-            boosted: Vec::new(),
         }
     }
 
@@ -331,22 +315,9 @@ impl Dispatcher {
         self.rt.enqueue(t, prio);
     }
 
-    /// j879: make a thread woken from a block (futex, channel, port, interrupt) runnable
-    /// at the FRONT of its level. An equal-priority peer that kept the CPU busy then no
-    /// longer stands between a handoff and its receiver: the receiver runs as soon as the
-    /// current thread blocks or yields, instead of a whole quantum later. The boost lasts
-    /// until the next quantum expiry (see `on_timer_tick`), so nothing starves. A more
-    /// urgent level still wins outright, and a timer-preempted thread still goes to the
-    /// back. — TEAL
-    pub fn admit_woken(&mut self, t: ThreadId, prio: Priority) {
-        self.rt.enqueue_front(t, prio);
-        self.boosted.push((t, prio));
-    }
-
     /// Remove a ready RT thread from its run queue. Used when a waiter is cancelled,
     /// killed, or consumed by a bounded demo before it is picked again.
     pub fn remove_ready_rt(&mut self, t: ThreadId, prio: Priority) -> bool {
-        self.boosted.retain(|&(b, _)| b != t);
         self.rt.dequeue(t, prio)
     }
 
@@ -409,9 +380,6 @@ impl Dispatcher {
         //    thread waits at the *same* priority. A less urgent thread never preempts.
         if cur.class == ClassId::Rt && self.ticks >= self.quantum {
             self.ticks = 0;
-            // j879: the boosts end here — every woken thread still waiting moves behind
-            // the regular waiters, so the head of the level is whoever waited longest.
-            self.demote_boosted();
             if self.rt.peek_top() == Some(cur.prio) {
                 return self.rotate_same_level(cur);
             }
@@ -476,7 +444,6 @@ impl Dispatcher {
             // breaks, fall through to the idle floor rather than panic — the scheduler
             // is the §5.6 fixed point and must never bring the kernel down (DESIGN/003).
             if let Some(to) = self.rt.pick_next() {
-                self.forget_boost(to);
                 self.current = Some(Running {
                     id: to,
                     prio,
@@ -532,21 +499,6 @@ impl Dispatcher {
         }
     }
 
-    fn demote_boosted(&mut self) {
-        for (t, prio) in core::mem::take(&mut self.boosted) {
-            if self.rt.dequeue(t, prio) {
-                self.rt.enqueue(t, prio);
-            }
-        }
-    }
-
-    /// A picked thread is no longer waiting, so it is no longer boosted.
-    fn forget_boost(&mut self, t: ThreadId) {
-        if !self.boosted.is_empty() {
-            self.boosted.retain(|&(b, _)| b != t);
-        }
-    }
-
     fn rotate_same_level(&mut self, cur: Running) -> Decision {
         self.rt.enqueue(cur.id, cur.prio);
         // We just enqueued cur.id, so pick_next() is guaranteed Some; guard anyway so a
@@ -556,7 +508,6 @@ impl Dispatcher {
             self.current = Some(cur);
             return Decision::Continue(cur.id);
         };
-        self.forget_boost(to);
         self.current = Some(Running {
             id: to,
             prio: cur.prio,
@@ -763,106 +714,6 @@ mod tests {
         d.set_running(KoId(1), Priority(20), ClassId::Rt);
         d.admit(KoId(2), Priority(100)); // less urgent
         assert_eq!(d.on_timer_tick(), Decision::Continue(KoId(1)));
-    }
-
-    //j879
-    /// A thread woken from a block runs before an equal-priority peer that was already
-    /// waiting, as soon as the current thread blocks; a plain admit still queues behind.
-    /// — TEAL
-    #[test]
-    fn a_woken_thread_runs_before_a_waiting_equal_peer() {
-        let mut d = Dispatcher::new(1);
-        let p = Priority(63);
-        d.set_running(KoId(1), p, ClassId::Rt);
-        d.admit(KoId(9), p); // the busy peer, already waiting
-        d.admit_woken(KoId(2), p); // the handoff's receiver
-        assert_eq!(
-            d.block_current(),
-            Decision::Switch {
-                from: Some(KoId(1)),
-                to: KoId(2)
-            }
-        );
-        // A plain admission does not jump the queue.
-        d.admit(KoId(3), p);
-        assert_eq!(
-            d.block_current(),
-            Decision::Switch {
-                from: Some(KoId(2)),
-                to: KoId(9)
-            }
-        );
-    }
-
-    /// Two threads handing off through blocks and wakes cannot starve a CPU-bound peer:
-    /// every quantum expiry demotes the boosted receiver, so the peer runs at each tick.
-    /// — TEAL
-    #[test]
-    fn a_handoff_pair_cannot_starve_an_equal_peer() {
-        let mut d = Dispatcher::new(1);
-        let p = Priority(63);
-        let (a, b, peer) = (KoId(1), KoId(2), KoId(9));
-        d.set_running(a, p, ClassId::Rt);
-        d.admit(peer, p);
-        let mut peer_runs = 0;
-        for _round in 0..50 {
-            // Whoever is current hands off to its partner and blocks, many times per tick.
-            for _ in 0..8 {
-                let Some(cur) = d.current() else { break };
-                if cur == peer {
-                    break;
-                }
-                let partner = if cur == a { b } else { a };
-                d.admit_woken(partner, p);
-                let _ = d.block_current();
-            }
-            // The tick: whoever holds the CPU has spent its quantum.
-            let before = d.current();
-            let _ = d.on_timer_tick();
-            if d.current() == Some(peer) {
-                peer_runs += 1;
-                // The peer spends its quantum, then the pair resumes.
-                let _ = d.on_timer_tick();
-            }
-            assert!(before != Some(peer) || d.current() != Some(peer));
-        }
-        assert_eq!(
-            peer_runs, 50,
-            "the peer must run at every tick the pair held"
-        );
-    }
-
-    /// The boost survives only until a quantum expiry; a timer-preempted thread is not
-    /// boosted and goes to the back.
-    #[test]
-    fn a_quantum_expiry_ends_boosts_and_preempted_threads_go_last() {
-        let mut d = Dispatcher::new(1);
-        let p = Priority(63);
-        d.set_running(KoId(1), p, ClassId::Rt);
-        d.admit(KoId(9), p);
-        d.admit_woken(KoId(2), p);
-        // Tick: 2 is demoted behind 9, then 1 rotates behind both.
-        assert_eq!(
-            d.on_timer_tick(),
-            Decision::Switch {
-                from: Some(KoId(1)),
-                to: KoId(9)
-            }
-        );
-        assert_eq!(
-            d.on_timer_tick(),
-            Decision::Switch {
-                from: Some(KoId(9)),
-                to: KoId(2)
-            }
-        );
-        assert_eq!(
-            d.on_timer_tick(),
-            Decision::Switch {
-                from: Some(KoId(2)),
-                to: KoId(1)
-            }
-        );
     }
 
     #[test]
