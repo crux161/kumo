@@ -4,8 +4,7 @@
 //j846
 //j843
 //j844
-//j816
-//j817
+//j879
 
 //! `netprobe` — drive netstack's socket contract over a real granted channel (PLAN/020 NET2b).
 //!
@@ -1674,6 +1673,14 @@ fn tcp_serve(client: &mut Client, port: u16) {
         b"netprobe: tcp accepted 127.0.0.1:",
         dec(peer_port as u64).bytes(),
     ]);
+    // j879: hold off reading for a moment, so the client is sure to fill the send window
+    // and see a partial SEND. That path used to be exercised only by accident, because a
+    // woken server ran a whole tick late; with woken threads dispatched promptly the
+    // server drained every chunk at once. The client waits (up to 2 s) when it makes no
+    // progress, so the pause costs nothing but time. — TEAL
+    let pause = tcp_socket(client);
+    let _ = wait(client, pause, WAIT_CONNECTED, 200);
+    let _ = client.call(Op::Close, pause, 0, &[]);
     let (mut total, mut hash) = (0usize, FNV_START);
     let mut chunk = [0u8; 700];
     loop {

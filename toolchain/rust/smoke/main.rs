@@ -1,8 +1,8 @@
-//j870
 //j871
 //j873
 //j875
 //j877
+//j879
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -1892,6 +1892,7 @@ fn threads_suite() {
     // 2. Handoffs: a token passes 0 -> 1 -> ... -> N-1 -> 0 under one mutex and condvar,
     // ROUNDS times around the ring; the log must be the exact round-robin order.
     let ring = Arc::new((Mutex::new((0usize, Vec::with_capacity(N * ROUNDS))), Condvar::new()));
+    let ring_started = Instant::now();
     let mut workers = Vec::new();
     for id in 0..N {
         let ring = ring.clone();
@@ -1911,8 +1912,9 @@ fn threads_suite() {
     let joined = workers.into_iter().all(|worker| worker.join().is_ok());
     let order = &ring.0.lock().unwrap().1;
     let exact = order.len() == N * ROUNDS && order.iter().enumerate().all(|(i, id)| *id == i % N);
+    let ring_ms = ring_started.elapsed().as_millis();
     if joined && exact {
-        sh5log!("handoff -> OK ({} handoffs)", order.len());
+        sh5log!("handoff -> OK ({} handoffs, {} ms)", order.len(), ring_ms);
     } else {
         sh5log!("handoff FAIL joined={} len={}", joined, order.len());
     }
@@ -1921,6 +1923,49 @@ fn threads_suite() {
         sh5log!("join -> OK");
     } else {
         sh5log!("join FAIL threads={}", after);
+    }
+
+    // j879: the condvar wake latency, measured — two threads ping-pong a token 200 times;
+    // each round trip is two wakes. Reported as min/median/max microseconds per round trip.
+    {
+        let pair = Arc::new((Mutex::new(0u32), Condvar::new()));
+        let other = pair.clone();
+        const TRIPS: u32 = 200;
+        let ponger = std::thread::spawn(move || {
+            let (lock, turn) = &*other;
+            for _ in 0..TRIPS {
+                let mut ball = lock.lock().unwrap();
+                while *ball % 2 == 0 {
+                    ball = turn.wait(ball).unwrap();
+                }
+                *ball += 1;
+                turn.notify_one();
+            }
+        });
+        let (lock, turn) = &*pair;
+        let mut trips = Vec::with_capacity(TRIPS as usize);
+        for _ in 0..TRIPS {
+            let start = Instant::now();
+            let mut ball = lock.lock().unwrap();
+            *ball += 1;
+            turn.notify_one();
+            let mine = *ball + 1;
+            while *ball != mine {
+                ball = turn.wait(ball).unwrap();
+            }
+            drop(ball);
+            trips.push(start.elapsed().as_micros() as u64);
+        }
+        let _ = ponger.join();
+        trips.sort_unstable();
+        sh5log!(
+            "pingpong {} trips us min={} median={} max={} total_ms={}",
+            TRIPS,
+            trips[0],
+            trips[trips.len() / 2],
+            trips[trips.len() - 1],
+            trips.iter().sum::<u64>() / 1000
+        );
     }
 
     // 3. Census: warm up, then 64 create/join cycles. Each exited thread's stack and its
