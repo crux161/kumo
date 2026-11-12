@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j794
 //j797
 //j823
 //j875
 //j881
+//j882
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -1475,8 +1475,18 @@ pub fn fb_paint_band(phys: u64, len_bytes: u64, width: u32, stride: u32, y0: u32
 /// `GLYPH_H` pixel rows, clear the freed bottom band, and flush the moved region to RAM
 /// for the scanout. Replaces the old bottom-row clamp — the POST outgrew small displays
 /// (QEMU ramfb is 37 rows), where the tail lines overwrote each other.
-fn fb_scroll_up(base: *mut u32, len_px: usize, stride: usize, height_px: usize) {
-    let band = stride * GLYPH_H; // pixels per text row band
+/// j882: how many text rows one scroll moves on a console of `rows` rows. A whole-glass
+/// scroll is one memmove of the visible framebuffer plus a cache clean over all of it (5.8 MB
+/// on the opi5's 1600x900); paid once per new line it made every echoed LogWrite cost
+/// 35-170 ms while the kernel owned the glass. Jumping a third of the screen pays it once per
+/// ~rows/3 lines instead (CRUX's ruling, 2026-11-11). — TEAL
+fn jump_rows(rows: usize) -> usize {
+    (rows / 3).max(1)
+}
+
+/// Scroll the visible console up by `bands` text rows, clearing the rows freed at the bottom.
+fn fb_scroll_up(base: *mut u32, len_px: usize, stride: usize, height_px: usize, bands: usize) {
+    let band = stride * GLYPH_H * bands.max(1); // pixels in the scrolled-away row bands
     let visible_px = stride * ((height_px / GLYPH_H) * GLYPH_H);
     if band == 0 || visible_px <= band || visible_px > len_px {
         return;
@@ -1527,8 +1537,9 @@ fn fb_putchar(scalar: u32) {
                 row += 1;
             }
             if row >= rows {
-                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
-                row = rows - 1;
+                let jump = jump_rows(rows);
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize, jump);
+                row = rows - jump;
             }
             unsafe {
                 blit_glyph(
@@ -1552,8 +1563,9 @@ fn fb_putchar(scalar: u32) {
                 row += 1;
             }
             if row >= rows {
-                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
-                row = rows - 1;
+                let jump = jump_rows(rows);
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize, jump);
+                row = rows - jump;
             }
             let glyph = box_bitmap(&box_arms(c).unwrap());
             unsafe {
@@ -1577,8 +1589,9 @@ fn fb_putchar(scalar: u32) {
                 row += 1;
             }
             if row >= rows {
-                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
-                row = rows - 1;
+                let jump = jump_rows(rows);
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize, jump);
+                row = rows - jump;
             }
             let glyph = cjk_glyph(c).unwrap_or(&TOFU[..]);
             unsafe {
@@ -1601,8 +1614,9 @@ fn fb_putchar(scalar: u32) {
     // A trailing newline at the bottom scrolls eagerly, leaving a blank last row for
     // the next character (normal terminal behaviour).
     if row >= rows {
-        fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
-        row = rows - 1;
+        let jump = jump_rows(rows);
+        fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize, jump);
+        row = rows - jump;
     }
     FB_COL.store(col as u32, ORD);
     FB_ROW.store(row as u32, ORD);
@@ -6591,6 +6605,33 @@ pub fn spin_once() {
 
 #[cfg(test)]
 mod tests {
+    //j882
+    #[test]
+    fn jump_scroll_moves_a_third_of_the_console() {
+        assert_eq!(super::jump_rows(56), 18); // the opi5's 1600x900 at 16 px rows
+        assert_eq!(super::jump_rows(3), 1);
+        assert_eq!(super::jump_rows(2), 1);
+        assert_eq!(super::jump_rows(1), 1);
+    }
+
+    #[test]
+    fn a_multi_band_scroll_moves_rows_up_and_clears_the_freed_ones() {
+        // 2 px wide, 4 text rows: row r holds pixels of value r + 1.
+        let stride = 2usize;
+        let rows = 4usize;
+        let height = rows * super::GLYPH_H;
+        let mut glass = [0u32; 2 * 4 * super::GLYPH_H];
+        for (i, px) in glass.iter_mut().enumerate() {
+            *px = (i / (stride * super::GLYPH_H)) as u32 + 1;
+        }
+        assert_eq!(glass.len(), stride * height);
+        let len = glass.len();
+        super::fb_scroll_up(glass.as_mut_ptr(), len, stride, height, 2);
+        let row = |glass: &[u32], r: usize| glass[r * stride * super::GLYPH_H];
+        assert_eq!((row(&glass, 0), row(&glass, 1)), (3, 4));
+        assert_eq!((row(&glass, 2), row(&glass, 3)), (super::BG, super::BG));
+    }
+
     #[test]
     fn nv1_probe_page_is_readonly_device_nx_and_inaccessible_to_el0() {
         let descriptor = super::readonly_probe_page_descriptor(0x9_0010_0000).unwrap();

@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j873
 //j875
 //j877
 //j880
 //j881
+//j882
 
 use core::cell::UnsafeCell;
 
@@ -1926,6 +1926,23 @@ pub fn yield_current_child() -> bool {
     true
 }
 
+static LOG_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOG_ECHOED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOG_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOG_MAX_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// j882: account one LogWrite's kernel time; each census window reports the calls, how many
+/// were echoed to the console, their total and their worst. — TEAL
+pub fn census_log_write(echoed: bool, ns: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    LOG_CALLS.fetch_add(1, Relaxed);
+    if echoed {
+        LOG_ECHOED.fetch_add(1, Relaxed);
+    }
+    LOG_NS.fetch_add(ns, Relaxed);
+    LOG_MAX_NS.fetch_max(ns, Relaxed);
+}
+
 /// Write a finished census window, if one is waiting (syscall context).
 pub fn census_report_if_due() {
     let c = unsafe { &mut *CENSUS.0.get() };
@@ -1951,6 +1968,16 @@ pub fn census_report_if_due() {
             let _ = write!(pcs, " {:#x}", pc);
         }
         crate::klog!("cpu: pcs {:#x}:{}\n", window.slots[index].0, pcs);
+    }
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        crate::klog!(
+            "cpu: logwrite calls={} echoed={} total_us={} max_us={}\n",
+            LOG_CALLS.swap(0, Relaxed),
+            LOG_ECHOED.swap(0, Relaxed),
+            LOG_NS.swap(0, Relaxed) / 1000,
+            LOG_MAX_NS.swap(0, Relaxed) / 1000
+        );
     }
     crate::klog!(
         "cpu: ticks {}-{} of {}: kernel(incl. dropped)={} idle={} sora={} other={} |{}\n",

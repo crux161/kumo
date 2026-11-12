@@ -1,8 +1,8 @@
-//j871
 //j873
 //j875
 //j877
 //j881
+//j882
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -691,9 +691,17 @@ fn log_write_in_state(sora: &mut SoraState, source: KoId, readable: bool, r: &[u
         return u64::MAX;
     }
     let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-    if crate::kmsg::record(source.0, level as u8, bytes) {
+    let started = kumo_hal::active::monotonic_nanos();
+    let echoed = crate::kmsg::record(source.0, level as u8, bytes);
+    if echoed {
         console_write_in_state(sora, bytes);
     }
+    // j882: the boot CPU census also times LogWrite. It found each echoed line costing
+    // 35-170 ms in the kernel framebuffer console's per-line whole-glass scroll. — TEAL
+    crate::user_thread::census_log_write(
+        echoed,
+        kumo_hal::active::monotonic_nanos().saturating_sub(started),
+    );
     len as u64
 }
 
