@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j832
 //j833
 //j840
 //j843
 //j881
+//j886
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -5481,13 +5481,27 @@ fn ready_superspeed_port(caplength: u8, max_ports: u8, primary: u8) -> Option<(u
     scan.first_superspeed_ready()
 }
 
-/// Poll PORTSC after HCRST re-links the root ports until [`RootPortScan::choice`] picks one.
-/// Returns `(port_number, speed)` (port number is 1-based).
+/// USB 2.0 §7.1.7.5 TRSTRCY: after a port reset completes, the device gets at least 10 ms before
+/// the first request (SET_ADDRESS here).
+const RESET_RECOVERY_NS: u64 = 10_000_000;
+
+/// Bus-reset every connected root port once, then poll PORTSC until [`RootPortScan::choice`]
+/// picks one. Returns `(port_number, speed)` (port number is 1-based).
+///
+/// Every connected port is reset, enabled or not (`kumo_xhci::needs_bus_reset`). The firmware
+/// enumerates USB before the hand-off, and on the RK3588's DWC3 a port it enabled stays enabled
+/// across HCRST, with the device still answering only at the firmware's address. Until
+/// 2026-11-12 an enabled port was taken as ready, Address Device failed with cc 4, and nothing
+/// behind the Orange Pi's hub enumerated: no keyboard, no stick. A port counts as reset only when
+/// its Port Reset Change latches; nothing is chosen while a reset of ours is outstanding, so the
+/// SuperSpeed sibling has settled by the time `ready_superspeed_port` looks at it. Then the
+/// device gets its reset recovery time. — TEAL
 fn wait_for_device_port(caplength: u8, max_ports: u8) -> Option<(u8, u8)> {
     // A port reset must be issued through a neutral PORTSC value: PED is RW1CS and every change
     // bit is RW1C, so a raw read-modify-write can disable the port or clear a change latch.
     // — TIMBERDOODLE
     let mut reset_issued = [false; MAX_LOGGED_PORTS as usize];
+    let mut reset_done = [false; MAX_LOGGED_PORTS as usize];
     let mut fallback_ready = None;
     let deadline = Deadline::after(PORT_POLL_BUDGET_NS);
     for spin in 0..PORT_POLL_LIMIT {
@@ -5501,16 +5515,26 @@ fn wait_for_device_port(caplength: u8, max_ports: u8) -> Option<(u8, u8)> {
             if let Some(offset) = portsc_offset(caplength, port) {
                 let raw = read32(offset);
                 let status = PortStatus::new(raw);
-                scan.observe(port + 1, status);
-                if status.connected() && !status.enabled() {
-                    // Connected but not enabled: issue one neutral port reset per port, then
-                    // keep polling for PED. — TIMBERDOODLE
-                    let index = port as usize;
-                    if index < reset_issued.len() && !reset_issued[index] {
-                        write32(offset, kumo_xhci::port_reset_value(raw));
-                        reset_issued[index] = true;
+                let index = port as usize;
+                let tracked = index < reset_issued.len();
+                if tracked && kumo_xhci::needs_bus_reset(status, reset_issued[index]) {
+                    log(b"drv-xhci: bus reset port=");
+                    log_hex(port as u64 + 1);
+                    log(b" was enabled=");
+                    log_hex(status.enabled() as u64);
+                    log(b"\n");
+                    write32(offset, kumo_xhci::port_reset_value(raw));
+                    reset_issued[index] = true;
+                    scan.hold_for_reset();
+                } else if tracked && reset_issued[index] && !reset_done[index] {
+                    if status.reset_done() && !status.reset_in_progress() {
+                        reset_done[index] = true;
+                        write32(offset, kumo_xhci::port_clear_reset_change_value(raw));
+                    } else if status.connected() {
+                        scan.hold_for_reset();
                     }
                 }
+                scan.observe(port + 1, status);
             }
             port += 1;
         }
@@ -5521,8 +5545,12 @@ fn wait_for_device_port(caplength: u8, max_ports: u8) -> Option<(u8, u8)> {
         // a reset never settles, the poll budget bounds the wait and the last known-good ready
         // port is used instead.
         if let Some(ready) = scan.choice() {
+            settle(RESET_RECOVERY_NS);
             return Some(ready);
         }
+    }
+    if fallback_ready.is_some() {
+        settle(RESET_RECOVERY_NS);
     }
     fallback_ready
 }

@@ -1,9 +1,9 @@
 #![no_std]
-//j827
 //j828
 //j829
 //j830
 //j831
+//j886
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -65,8 +65,9 @@ pub use quiesce::{
     STOP_RETRIES,
 };
 pub use registers::{
-    port_power_value, port_reset_value, port_state_to_neutral, port_warm_reset_value,
-    portsc_offset, CapabilityRegisters, PortStatus, RootPortScan,
+    needs_bus_reset, port_clear_reset_change_value, port_power_value, port_reset_value,
+    port_state_to_neutral, port_warm_reset_value, portsc_offset, CapabilityRegisters, PortStatus,
+    RootPortScan,
 };
 pub use ring::{
     CommandRing, EventRing, EventRingSegmentTableEntry, RingRestart, RingSegment, RingToken,
