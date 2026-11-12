@@ -1,8 +1,8 @@
-//j825
 //j859
 //j871
 //j873
 //j881
+//j884
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -421,6 +421,10 @@ pub fn channel_read_with_handle(channel: Handle, buf: *mut u8, cap: usize) -> (u
             in("x0") channel.0 as u64,
             in("x1") buf as u64,
             in("x2") cap as u64,
+            // j884: x3 carries CHANNEL_READ_NONBLOCK since j871. Left unset, whatever the
+            // register held could make this blocking read answer ShouldWait (drv-gpu's
+            // session loop took that for the end of session 1 under gpu-client). — TEAL
+            in("x3") 0u64,
             lateout("x0") ret,
             lateout("x1") handle,
             clobber_abi("C"),

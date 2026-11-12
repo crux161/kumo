@@ -1,8 +1,8 @@
-//j871
 //j873
 //j875
 //j877
 //j881
+//j884
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -847,6 +847,9 @@ fn channel_read_with_handle(channel: u32, tag: &mut u8) -> (u64, u64) {
             in("x0") u64::from(channel),
             in("x1") core::ptr::from_mut(tag) as u64,
             in("x2") 1_u64,
+            // j884: blocking — x3 (CHANNEL_READ_NONBLOCK since j871) must not be left to
+            // chance, or the startup intake can stop early and drop granted handles. — TEAL
+            in("x3") 0_u64,
             lateout("x0") count,
             lateout("x1") handle,
             clobber_abi("C"),

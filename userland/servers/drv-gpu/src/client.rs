@@ -1,8 +1,8 @@
-//j752
 //j754
 //j755
 //j775
 //j778
+//j884
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -1158,6 +1158,10 @@ pub(super) fn serve(
     // One granted channel is one session: this loop reads only the channel it was handed and
     // ends when that channel does. A fresh session is a fresh `serve` over a fresh `g`, never
     // a second loop over a spent channel. — TIMBERDOODLE
+    // j884: every way out of the session names itself; a silent exit hid why gpu-client's
+    // session 1 ended under it (`Transport(Closed)` at drv-gpu's `serving session 2`).
+    let mut last_op = 0u8;
+    let exit: &str;
     loop {
         let mut bytes = [0u8; REQUEST_LEN + 1];
         let (len, raw_handle) =
@@ -1167,8 +1171,17 @@ pub(super) fn serve(
             let _ = kumo_rt::handle_close(handle);
         }
         if len == 0 || len > bytes.len() {
+            log(
+                log_level::NOTICE,
+                format_args!(
+                    "drv-gpu: session read ended len=0x{:x} after op 0x{:02x}\n",
+                    len, last_op
+                ),
+            );
+            exit = "read";
             break;
         }
+        last_op = bytes[0];
         let request = bytes.get(..len).and_then(Request::decode);
         let (id, mut result) = match request {
             Some(request) if unexpected.is_none() => {
@@ -1211,25 +1224,50 @@ pub(super) fn serve(
             if let Some(handle) = grant {
                 let _ = kumo_rt::handle_close(handle);
             }
+            log(
+                log_level::ERR,
+                format_args!(
+                    "drv-gpu: session reply write failed status=0x{:x} after op 0x{:02x}\n",
+                    sent, last_op
+                ),
+            );
+            exit = "reply";
             break;
         }
         if retired {
+            exit = "retired";
             break;
         }
         match hw.finish_pending(&mut session) {
             Ok(Some(point)) => {
                 if session.complete(point, 0).is_err() {
+                    exit = "complete";
                     break;
                 }
                 hw.drain_fence_waits(&session);
             }
             Ok(None) => (),
-            Err(_) => {
+            Err(error) => {
+                log(
+                    log_level::ERR,
+                    format_args!(
+                        "drv-gpu: session pending work failed {:?} after op 0x{:02x}\n",
+                        error, last_op
+                    ),
+                );
                 hw.fail_group(protocol::GroupReport::UNKNOWN);
+                exit = "pending";
                 break;
             }
         }
     }
+    log(
+        log_level::NOTICE,
+        format_args!(
+            "drv-gpu: session ended ({}) after op 0x{:02x}\n",
+            exit, last_op
+        ),
+    );
     // G8d-a: the loop above was the only reader, so service has stopped accepting. Quiesce
     // first; only a confirmed reset licenses releasing anything. The record states exactly
     // what was released, and a failed reset yields retained=yes with the session poisoned.
