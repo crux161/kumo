@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j793
 //j794
 //j797
 //j823
 //j875
+//j881
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -6505,6 +6505,22 @@ pub fn interrupted_at_el0() -> bool {
 #[cfg(not(target_os = "none"))]
 pub fn interrupted_at_el0() -> bool {
     false
+}
+
+/// j881: the PC the current exception interrupted (`ELR_EL1`), read in the same window as
+/// [`interrupted_at_el0`] — for the boot CPU census's PC samples.
+#[cfg(target_os = "none")]
+pub fn interrupted_pc() -> u64 {
+    let elr: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, elr_el1", out(reg) elr, options(nostack, nomem));
+    }
+    elr
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn interrupted_pc() -> u64 {
+    0
 }
 
 /// Wait until every byte already handed to the console UART has left the wire.

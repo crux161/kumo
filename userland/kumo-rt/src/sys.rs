@@ -1,8 +1,8 @@
-//j824
 //j825
 //j859
 //j871
 //j873
+//j881
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -1068,6 +1068,18 @@ pub fn thread_self() -> (u64, u64, u64) {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn thread_self() -> (u64, u64, u64) {
     (0, 0, 0)
+}
+
+/// j881: give up the CPU to the next ready thread at this priority (`ThreadYield`). For poll
+/// loops: the caller keeps its own clock deadline but stops holding the CPU while it waits.
+#[cfg(target_arch = "aarch64")]
+pub fn thread_yield() -> u64 {
+    syscall(Syscall::ThreadYield, 0, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn thread_yield() -> u64 {
+    0
 }
 
 /// Set the root Job's resident-actor bound (PLAN/021 AX4).

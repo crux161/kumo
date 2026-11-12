@@ -1,8 +1,8 @@
-//j632
 //j634
 //j635
 //j636
 //j678
+//j881
 
 //! D1a/D1c: owned scanout, alternating buffers and consumed-load retirement.
 //!
@@ -98,6 +98,7 @@ pub fn wait_latched(
         if elapsed > timeout_ns {
             return None;
         }
+        hw.relax();
     }
 }
 

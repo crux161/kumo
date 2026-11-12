@@ -1,8 +1,8 @@
-//j869
 //j871
 //j873
 //j875
 //j877
+//j881
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -76,6 +76,7 @@ const SYSCALL_THREAD_SPAWN: u64 = 58;
 const SYSCALL_THREAD_EXIT: u64 = 59;
 const SYSCALL_THREAD_SELF: u64 = 60;
 const SYSCALL_FAULT_HANDLER_SET: u64 = 61;
+const SYSCALL_THREAD_YIELD: u64 = 62;
 
 // SH4 spawn constants. The VMAR bits mirror `kumo_abi::VmarFlags`; a child's segments are
 // user pages. Rights::ALL for the duplicated standard handles.
@@ -4121,8 +4122,12 @@ impl Pal for Sys {
         vfs_two_path_status(VFS_OP_RENAME, old_path, new_path)
     }
 
+    /// j881: `ThreadYield` — the next ready thread at this priority runs first.
     fn sched_yield() -> Result<()> {
-        Err(unsupported())
+        match syscall4(SYSCALL_THREAD_YIELD, 0, 0, 0, 0) as i32 {
+            KUMO_OK => Ok(()),
+            _ => Err(unsupported()),
+        }
     }
 
     unsafe fn setgroups(size: size_t, list: *const gid_t) -> Result<()> {

@@ -1,8 +1,8 @@
-//j825
 //j871
 //j873
 //j875
 //j877
+//j881
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -463,6 +463,7 @@ extern "C" fn signal_irq(irq: u32) {
         IRQ_BUSY_SKIPS.fetch_add(1, Ordering::Relaxed);
         if irq < 32 {
             TIMER_TICK_SKIPS.fetch_add(1, Ordering::Relaxed);
+            crate::user_thread::census_dropped_tick();
         }
         // A full deferral set would lose this line rather than storm the machine; with
         // `DEFERRED_INTERRUPT_SLOTS` far above any board's device-line count it cannot fill.
@@ -492,6 +493,8 @@ extern "C" fn signal_irq(irq: u32) {
     // Timer ticks only: a busy device stream must not drive peer rotation or inflate the runaway
     // budget, or a driver servicing a fast controller would be preempted for doing its job well.
     if irq < 32 {
+        // j881: charge the tick before any rotation, to what it interrupted.
+        crate::user_thread::census_tick();
         crate::user_thread::preempt_child_on_timer_tick_if_safe();
     }
     // Wake Sora if parked — InterruptWait uses park_current_user().
@@ -2804,6 +2807,16 @@ extern "C" fn svc_hook(regs: *mut u64) {
             }
         }
         r[0] = Errno::NotSupported.status() as u32 as u64;
+        return;
+    }
+
+    if num == Syscall::ThreadYield as u64 {
+        // j881: a resident child gives up the CPU to the next ready thread. — TEAL
+        r[0] = if crate::user_thread::yield_current_child() {
+            Errno::Ok.status() as u32 as u64
+        } else {
+            Errno::NotSupported.status() as u32 as u64
+        };
         return;
     }
 

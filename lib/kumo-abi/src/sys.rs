@@ -1,8 +1,8 @@
-//j825
 //j871
 //j873
 //j875
 //j877
+//j881
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +187,12 @@ pub enum Syscall {
     /// clears. A thread made by `ThreadSpawn` inherits its creator's entry without a stack.
     /// The supervisor is refused with [`Errno::NotSupported`].
     FaultHandlerSet = 61,
+    /// Give up the CPU (j881): the calling thread goes to the back of its priority level and
+    /// the next ready thread runs; with none ready it continues at once. For a poll loop that
+    /// must keep its clock deadline (the kernel's timers only resolve to the scheduler tick,
+    /// too coarse for a register poll) but should not hold the CPU while it waits. Returns 0;
+    /// the supervisor gets [`Errno::NotSupported`].
+    ThreadYield = 62,
 }
 
 /// `ProcessKill` flag (SH6-b): kill the target's whole spawn tree, the KUMO stand-in for
@@ -543,6 +549,7 @@ mod tests {
     fn fault_handler_takes_the_next_free_slot() {
         // SH6: relibc's signal runtime calls this by number.
         assert_eq!(Syscall::FaultHandlerSet as usize, 61);
+        assert_eq!(Syscall::ThreadYield as usize, 62);
     }
 }
 

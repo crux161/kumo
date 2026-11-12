@@ -1,8 +1,8 @@
-//j871
 //j873
 //j875
 //j877
 //j879
+//j881
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -1821,7 +1821,8 @@ fn settle_threads(want: u64) -> (u64, u64) {
         if threads <= want || Instant::now() > deadline {
             return (threads, mappings);
         }
-        std::hint::spin_loop();
+        // j881: let the exiting thread (and everyone else) run instead of spinning.
+        std::thread::yield_now();
     }
 }
 

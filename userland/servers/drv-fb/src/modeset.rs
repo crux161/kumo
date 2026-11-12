@@ -1,8 +1,8 @@
-//j683
 //j685
 //j686
 //j790
 //j837
+//j881
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -124,6 +124,12 @@ impl Hardware for Device {
 
     fn sleep_ms(&mut self, ms: u64) {
         let _ = kumo_rt::sleep_ns(ms * 1_000_000);
+    }
+
+    /// j881: a latch poll gives the CPU away between reads (the boot CPU census charged
+    /// drv-fb 40% of the machine while boot settled). — TEAL
+    fn relax(&mut self) {
+        let _ = kumo_rt::thread_yield();
     }
 }
 

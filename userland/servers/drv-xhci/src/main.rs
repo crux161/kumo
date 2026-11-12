@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j831
 //j832
 //j833
 //j840
 //j843
+//j881
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -5226,14 +5226,14 @@ impl Deadline {
     }
 }
 
-/// Give the scheduler a chance to run someone else. A resident driver child is NOT preemptible —
-/// `irq_handoff_allowed` only permits a context switch when Sora is the interrupted context — so a
-/// long spin in a driver yields the CPU to nobody and can strand a sibling driver's (masked)
-/// interrupt for the whole duration. A cheap syscall reaches an SVC boundary, where
-/// `reschedule_if_pending_after_svc` dispatches any child made runnable in the meantime.
+/// Give the scheduler a chance to run someone else. j881: this was a ClockGet syscall, which
+/// reached an SVC boundary but kept the CPU at equal priority, so every poll held it for a
+/// whole quantum; the boot CPU census charged the three xhci instances a third of the machine
+/// while boot settled. `ThreadYield` hands the CPU to the next ready thread and returns when
+/// this driver's turn comes round; every caller keeps its own clock deadline. — TEAL
 #[inline]
 fn cooperative_yield() {
-    let _ = clock_get();
+    let _ = kumo_rt::thread_yield();
 }
 
 /// How long a device gets after `Address Device` before its first control request. USB 2.0

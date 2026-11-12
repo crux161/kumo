@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j871
 //j873
 //j875
 //j877
 //j880
+//j881
 
 use core::cell::UnsafeCell;
 
@@ -1780,6 +1780,191 @@ pub fn preempt_child_on_timer_tick_if_safe() {
     }
 }
 
+// ---- j881: the boot CPU census --------------------------------------------------------
+//
+// Which processes hold the CPU while boot settles? Every timer tick is charged to what it
+// interrupted — kernel mode, the idle floor, Sora, or a resident child's process — and each
+// 5 s window is logged at INFO (visible at KUMO_CONSOLE_LOGLEVEL=6, kept in dmesg) for the
+// first two minutes. The IRQ side only counts; the report is written at the next syscall
+// boundary. Single core: an IRQ landing mid-report can blur one window by a tick. — TEAL
+
+const CENSUS_WINDOW_TICKS: u32 = 100;
+const CENSUS_LIMIT_TICKS: u32 = 2400;
+const CENSUS_SLOTS: usize = 24;
+const CENSUS_PCS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct CensusWindow {
+    kernel: u32,
+    idle: u32,
+    sora: u32,
+    other: u32,
+    slots: [(u64, u32); CENSUS_SLOTS],
+    /// The last few interrupted EL0 PCs per slot: where each process spends its ticks.
+    pcs: [[u64; CENSUS_PCS]; CENSUS_SLOTS],
+}
+
+impl CensusWindow {
+    const EMPTY: Self = Self {
+        kernel: 0,
+        idle: 0,
+        sora: 0,
+        other: 0,
+        slots: [(0, 0); CENSUS_SLOTS],
+        pcs: [[0; CENSUS_PCS]; CENSUS_SLOTS],
+    };
+
+    fn charge(&mut self, process: u64, pc: u64) {
+        let index = match self.slots.iter().position(|slot| slot.0 == process) {
+            Some(index) => index,
+            None => match self.slots.iter().position(|slot| slot.1 == 0) {
+                Some(index) => {
+                    self.slots[index] = (process, 0);
+                    index
+                }
+                None => {
+                    self.other += 1;
+                    return;
+                }
+            },
+        };
+        let ticks = self.slots[index].1;
+        self.pcs[index][ticks as usize % CENSUS_PCS] = pc;
+        self.slots[index].1 = ticks + 1;
+    }
+}
+
+struct Census {
+    total: u32,
+    window: CensusWindow,
+    report: Option<(u32, CensusWindow)>,
+}
+
+struct CensusCell(UnsafeCell<Census>);
+unsafe impl Sync for CensusCell {}
+static CENSUS: CensusCell = CensusCell(UnsafeCell::new(Census {
+    total: 0,
+    window: CensusWindow::EMPTY,
+    report: None,
+}));
+
+/// Charge this timer tick (IRQ context, timer IRQs only).
+pub fn census_tick() {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return;
+    }
+    let c = unsafe { &mut *CENSUS.0.get() };
+    if c.total >= CENSUS_LIMIT_TICKS {
+        return;
+    }
+    c.total += 1;
+    let s = unsafe { &*sched_ptr() };
+    if !kumo_hal::active::interrupted_at_el0() {
+        c.window.kernel += 1;
+    } else {
+        match s.dispatcher.current() {
+            None => c.window.idle += 1,
+            Some(current) if current == s.idle.koid() => c.window.idle += 1,
+            Some(current) if current == s.user_thread.koid() => c.window.sora += 1,
+            Some(current) => match s.children.iter().find(|c| c.thread.koid() == current) {
+                Some(child) => c
+                    .window
+                    .charge(child.process.0, kumo_hal::active::interrupted_pc()),
+                None => c.window.other += 1,
+            },
+        }
+    }
+    if c.total % CENSUS_WINDOW_TICKS == 0 {
+        c.report = Some((c.total, c.window));
+        c.window = CensusWindow::EMPTY;
+    }
+}
+
+/// A timer tick dropped because the SoraState borrow was busy (IRQ context): it still
+/// belongs to the census, as kernel time — a busy borrow is the kernel at work.
+pub fn census_dropped_tick() {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return;
+    }
+    let c = unsafe { &mut *CENSUS.0.get() };
+    if c.total >= CENSUS_LIMIT_TICKS {
+        return;
+    }
+    c.total += 1;
+    c.window.kernel += 1;
+    if c.total % CENSUS_WINDOW_TICKS == 0 {
+        c.report = Some((c.total, c.window));
+        c.window = CensusWindow::EMPTY;
+    }
+}
+
+/// j881 `ThreadYield`: the current resident child goes to the back of its level and the next
+/// ready thread runs. Returns false for anything that is not a resident child (the supervisor
+/// is the pump and must not yield into its children this way). — TEAL
+pub fn yield_current_child() -> bool {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return false;
+    }
+    let p = sched_ptr();
+    let switch = unsafe {
+        let s = &mut *p;
+        let Some(current) = s.dispatcher.current() else {
+            return false;
+        };
+        if !s.children.iter().any(|c| c.thread.koid() == current) {
+            return false;
+        }
+        let decision = s.dispatcher.yield_current();
+        dispatch_context(s, decision)
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
+    true
+}
+
+/// Write a finished census window, if one is waiting (syscall context).
+pub fn census_report_if_due() {
+    let c = unsafe { &mut *CENSUS.0.get() };
+    let Some((total, window)) = c.report.take() else {
+        return;
+    };
+    let mut order: [usize; CENSUS_SLOTS] = core::array::from_fn(|i| i);
+    order.sort_unstable_by(|&a, &b| window.slots[b].1.cmp(&window.slots[a].1));
+    let mut line = alloc::string::String::new();
+    for &index in order.iter().filter(|&&i| window.slots[i].1 > 0).take(6) {
+        use core::fmt::Write as _;
+        let _ = write!(
+            line,
+            " {:#x}={}",
+            window.slots[index].0, window.slots[index].1
+        );
+    }
+    for &index in order.iter().filter(|&&i| window.slots[i].1 > 0).take(3) {
+        use core::fmt::Write as _;
+        let mut pcs = alloc::string::String::new();
+        let n = (window.slots[index].1 as usize).min(CENSUS_PCS);
+        for pc in &window.pcs[index][..n] {
+            let _ = write!(pcs, " {:#x}", pc);
+        }
+        crate::klog!("cpu: pcs {:#x}:{}\n", window.slots[index].0, pcs);
+    }
+    crate::klog!(
+        "cpu: ticks {}-{} of {}: kernel(incl. dropped)={} idle={} sora={} other={} |{}\n",
+        total - CENSUS_WINDOW_TICKS,
+        total,
+        CENSUS_WINDOW_TICKS,
+        window.kernel,
+        window.idle,
+        window.sora,
+        window.other,
+        line
+    );
+}
+
 /// How many times a child has been preempted for monopolising the CPU. A rising count is a
 /// misbehaving program, and it should be visible rather than silently absorbed.
 pub fn preempted_runaways() -> u64 {
@@ -1852,6 +2037,7 @@ pub fn reschedule_if_pending_after_svc() {
     if !started {
         return;
     }
+    census_report_if_due();
 
     let p = sched_ptr();
     let switch = unsafe {

@@ -1,4 +1,5 @@
 //j609
+//j881
 
 //! R2's live device-window adapter. The CRU view is read-only; each reset is a checked
 //! DeviceResetSet. All PHY data is the measured image, not a vendor init table. — KESTREL
@@ -86,9 +87,10 @@ impl relock::Hardware for Device {
         clock_get() / 1000
     }
     fn delay_us(&mut self, us: u64) {
+        // j881: yield between clock reads instead of spinning on the CPU. — TEAL
         let start = clock_get();
         while clock_get().saturating_sub(start) < us * 1000 {
-            core::hint::spin_loop();
+            let _ = kumo_rt::thread_yield();
         }
     }
 }

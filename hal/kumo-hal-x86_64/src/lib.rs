@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j614
 //j619
 //j625
 //j660
 //j823
+//j881
 
 mod fpsimd;
 mod gdt;
@@ -1107,6 +1107,11 @@ pub fn console_drain() {}
 /// Ring of the interrupted context. Not yet wired on this backend, so preemption stays off.
 pub fn interrupted_at_el0() -> bool {
     false
+}
+
+/// j881: the boot CPU census's PC sample. x86 has no EL0 census source yet: 0.
+pub fn interrupted_pc() -> u64 {
+    0
 }
 
 /// No PSCI on x86; power-off would go through ACPI. Returns so the caller falls back to a halt.

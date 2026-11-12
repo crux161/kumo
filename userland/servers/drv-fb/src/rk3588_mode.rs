@@ -1,6 +1,7 @@
 //j607
 //j608
 //j614
+//j881
 
 //! R1 (DESIGN/020 Amendment D0): KUMO rebuilds the HDMI0 mode's VOP2 and TX program from its
 //! own mode table, after scrubbing it to TRM reset values with VP2 in standby.
@@ -262,6 +263,9 @@ pub trait Hardware {
     /// Order every earlier device write before what follows.
     fn barrier(&mut self);
     fn sleep_ms(&mut self, ms: u64);
+    /// Called on every iteration of a register poll (j881): the device hands the CPU to the
+    /// next ready thread instead of spinning through a whole quantum. Host fakes do nothing.
+    fn relax(&mut self) {}
 }
 
 /// Timing choices for the visible sequence.

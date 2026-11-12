@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j792
 //j793
 //j794
 //j823
 //j875
+//j881
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -43,7 +43,7 @@ pub mod active {
         fb_fill, fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
         gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
         handoff_framebuffer_console, init_timer_interrupts, install_exception_vectors,
-        interrupted_at_el0, invalidate_user_aspace, iommu_create_device_context,
+        interrupted_at_el0, interrupted_pc, invalidate_user_aspace, iommu_create_device_context,
         iommu_destroy_device_context, iommu_init, iommu_map_device_page, iommu_unmap_device_range,
         irq_unmask, mali_g610_status_from_dtb, map_user_device_block, map_user_page,
         mask_spi_interrupt, mask_tlmm_gpio_interrupt, mmu600_pcie_status_from_dtb, monotonic_nanos,
@@ -84,7 +84,7 @@ pub mod active {
         gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
         handoff_framebuffer_console, init_local_timer_from_reference, init_timer_interrupts,
         inspect_acpi_rsdp, inspect_boot_io_apic, install_descriptor_tables,
-        install_exception_vectors, interrupted_at_el0, invalidate_user_aspace,
+        install_exception_vectors, interrupted_at_el0, interrupted_pc, invalidate_user_aspace,
         io_apic_timer_irq_count, iommu_create_device_context, iommu_destroy_device_context,
         iommu_init, iommu_map_device_page, iommu_unmap_device_range, irq_unmask,
         local_timer_irq_count, map_user_device_block, map_user_page, mask_pic_timer_source,
