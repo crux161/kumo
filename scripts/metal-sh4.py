@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j872
+#j883
 """SH4-b: the process-spawn suite on the Orange Pi 5 Plus, one PXE boot.
 
     ruststd spawnparent    a child fed through its stdin pipe (exact stdout/stderr/
@@ -20,6 +21,7 @@ import importlib.util
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,8 +76,18 @@ def main():
     try:
         board.wake_board(work / "boot.log")
         board.wait_for("SH4 ends", work / "boot.log", args.timeout)
-        # validate() requires the login prompt that follows autoexec.
-        board.wait_for("INDRA login:", work / "boot.log", 60)
+        # The login prompt that follows autoexec must come AFTER the end marker (j883, as
+        # metal-sh6.py since j876): a capture that starts at a stale login already holds one,
+        # and stopping there leaves the board mid-boot for the next run. Prompts end without
+        # a newline, so only the raw capture holds them.
+        deadline = time.monotonic() + 60
+        while True:
+            raw = board.raw_text_since(work / "boot.log", 0)
+            if "SH4 ends" in raw and "INDRA login:" in raw[raw.rindex("SH4 ends"):]:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError("no login prompt after SH4 ends")
+            time.sleep(0.2)
         text = board.log_whole(work / "boot.log")
         board.validate(text, EXPECTED, "SH4 begins", "SH4 ends")
         manifest["boot"] = "PASS"
