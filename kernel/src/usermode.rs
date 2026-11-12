@@ -1,8 +1,8 @@
-//j824
 //j825
 //j871
 //j873
 //j875
+//j877
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -1914,7 +1914,16 @@ extern "C" fn fault_resume_hook(esr: u64, far: u64, frame: *mut u64) -> u64 {
 /// and close its handles outside it, in the order an exit uses: the threads first, so no wake the
 /// teardown causes can re-admit one. The report says what the process was doing, which is the
 /// question a supervisor that gave up on it cannot otherwise answer. — TIMBERDOODLE
-fn kill_process_without_borrow(handle: Handle) -> kumo_abi::Status {
+fn kill_process_without_borrow(handle: Handle, code: u64, flags: u64) -> kumo_abi::Status {
+    // SH6-b: the status the kill reports (0 keeps J556's 137) and the TREE flag.
+    let code = if code == 0 {
+        crate::user_thread::KILLED_EXIT_CODE
+    } else {
+        code
+    };
+    if flags & !kumo_abi::sys::PROCESS_KILL_TREE != 0 {
+        return Errno::InvalidArgs.status();
+    }
     let Some(caller) = crate::user_thread::current_process_koid() else {
         return Errno::Internal.status();
     };
@@ -1932,7 +1941,23 @@ fn kill_process_without_borrow(handle: Handle) -> kumo_abi::Status {
         Ok(target) => target,
         Err(error) => return error.status(),
     };
-    let report = crate::user_thread::kill_process_threads(target);
+    if flags & kumo_abi::sys::PROCESS_KILL_TREE != 0 {
+        // SH6-b: the target's whole spawn tree, deepest first, each with the same status —
+        // authority over a process covers what it spawned. — TEAL
+        let tree = crate::user_thread::process_descendants(target);
+        for member in tree.iter().rev() {
+            let report = crate::user_thread::kill_process_threads_with(*member, code);
+            teardown_process_and_signal(*member);
+            crate::klog!(
+                "kill: process {:#x} (tree of {:#x}): {} thread(s), status {:#x}\n",
+                member.0,
+                target.0,
+                report.killed,
+                code
+            );
+        }
+    }
+    let report = crate::user_thread::kill_process_threads_with(target, code);
     // Asked before the teardown closes that endpoint. A thread parked on a channel that already
     // held a message missed its wake, which is a kernel fault. Parked on an empty one, it was
     // waiting on a peer that never answered.
@@ -2809,7 +2834,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
     }
 
     if num == Syscall::ProcessKill as u64 {
-        r[0] = kill_process_without_borrow(Handle(r[0] as u32)) as u32 as u64;
+        r[0] = kill_process_without_borrow(Handle(r[0] as u32), r[1], r[2]) as u32 as u64;
         crate::user_thread::reschedule_if_pending_after_svc();
         return;
     }

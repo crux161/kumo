@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j875
+#j877
 """SH6-a: one QEMU boot asserting the signal subset end to end.
 
 Reuses the AXH harness's own boot machinery (import only). The case runs `ruststd signals`:
@@ -8,6 +9,9 @@ sigaction/raise/sigprocmask/sigpending/sigaltstack round-trips and std's SIGPIPE
 under a rustc-style SA_ONSTACK|SA_SIGINFO handler (the kernel redirects the fault to the
 handler on the alternate stack; the handler reports and re-raises with SIG_DFL, so the
 parent sees WTERMSIG 11), and a second child dies by SIGPIPE at SIG_DFL (WTERMSIG 13).
+Then `ruststd sigasync` (SH6-b): PROPOSAL/004 asynchronous delivery between a parent and
+its children - caught on the hidden handler thread while main spins, default death,
+ignored, SIGKILL, and a group SIGINT taking a default and a catching spawn tree whole.
 The case allows no TOWER: the overflow must be reported through the handler. The image is
 rebuilt with the proof loglevel, then the default image is restored.
 """
@@ -50,7 +54,7 @@ def main():
 
     case = axh.Case(
         "signals",
-        b"echo AXH signals begins\nruststd signals\necho AXH signals ends\n",
+        b"echo AXH signals begins\nruststd signals\nruststd sigasync\necho AXH signals ends\n",
         (
             "std: sh6 state -> OK",
             "std: sh6 epipe -> OK",
@@ -58,6 +62,13 @@ def main():
             "std: sh6 overflow handler -> OK",
             "std: sh6 overflow signaled -> OK",
             "std: sh6 sigpipe default -> OK",
+            # SH6-b: asynchronous delivery (PROPOSAL/004).
+            "std: sh6 async catch -> OK",
+            "std: sh6 async default -> OK",
+            "std: sh6 async ignore -> OK",
+            "std: sh6 async sigkill -> OK",
+            "std: sh6 async tree default -> OK",
+            "std: sh6 async tree catch -> OK",
         ),
         ready=0,
     )
@@ -81,7 +92,7 @@ def main():
         with (work / "restore-default.log").open("wb") as log:
             subprocess.run(axh.IMAGE_ARGS, cwd=ROOT, env=default_env, stdout=log, stderr=log, check=True)
         (work / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print("SH6-a signal smoke green", flush=True)
+    print("SH6 signal smoke green", flush=True)
 
 
 if __name__ == "__main__":

@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j824
 //j825
 //j871
 //j873
 //j875
+//j877
 
 use core::cell::UnsafeCell;
 
@@ -1188,6 +1188,39 @@ pub fn take_current_fault_entry() -> Option<(u64, u64)> {
     take_fault_entry_for(s, current)
 }
 
+/// SH6-b: every live process below `root` in the spawn tree (each resident record names
+/// the process that admitted it), nearest first. `root` itself is not included. This is
+/// the KUMO stand-in for a process group: a spawned child leads the group of everything
+/// it spawned in turn. — TEAL
+pub fn process_descendants(root: KoId) -> alloc::vec::Vec<KoId> {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return alloc::vec::Vec::new();
+    }
+    let s = unsafe { &*sched_ptr() };
+    descendants_in(&s.children, root)
+}
+
+fn descendants_in(
+    children: &[alloc::boxed::Box<ResidentChild>],
+    root: KoId,
+) -> alloc::vec::Vec<KoId> {
+    let mut found: alloc::vec::Vec<KoId> = alloc::vec::Vec::new();
+    let mut frontier = 0;
+    let mut parents = alloc::vec![root];
+    while frontier < parents.len() {
+        let parent = parents[frontier];
+        frontier += 1;
+        for child in children.iter().filter(|c| !c.done && c.parent == parent) {
+            if child.process != root && !found.contains(&child.process) {
+                found.push(child.process);
+                parents.push(child.process);
+            }
+        }
+    }
+    found
+}
+
 /// Live (not yet exited) threads of `process` among the resident records (SH5).
 pub fn process_live_threads(process: KoId) -> usize {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
@@ -1583,6 +1616,12 @@ pub struct KillReport {
 /// never resumed. That is safe for the same reason preempting one is: it holds no `SoraState`
 /// borrow while parked. — TIMBERDOODLE
 pub fn kill_process_threads(process: KoId) -> KillReport {
+    kill_process_threads_with(process, KILLED_EXIT_CODE)
+}
+
+/// [`kill_process_threads`] with the status the kill reports (SH6-b: a signal death is
+/// `0x100 | signo`, which relibc's `waitpid` turns into WIFSIGNALED). — TEAL
+pub fn kill_process_threads_with(process: KoId, code: u64) -> KillReport {
     let mut report = KillReport::default();
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     if !unsafe { (&*opt).is_some() } {
@@ -1614,7 +1653,7 @@ pub fn kill_process_threads(process: KoId) -> KillReport {
                     }
                 }
             }
-            child.exit_code = KILLED_EXIT_CODE;
+            child.exit_code = code;
             child.done = true;
             child.thread.terminate();
             report.killed += 1;
@@ -1625,7 +1664,7 @@ pub fn kill_process_threads(process: KoId) -> KillReport {
             if let Some(first) = s
                 .children
                 .iter_mut()
-                .find(|c| c.process == process && c.done && c.exit_code == KILLED_EXIT_CODE)
+                .find(|c| c.process == process && c.done && c.exit_code == code)
             {
                 first.reports = true;
             }
@@ -2730,6 +2769,64 @@ mod ax4_capacity_tests {
                 Some((KoId(702), KILLED_EXIT_CODE)),
             ]
         );
+        assert!(sched().children.is_empty());
+    }
+
+    //j877
+    /// SH6-b: the spawn tree below a process is found through each record's parent, a
+    /// kill reports the status it was given, and a killed tree reports one status per
+    /// process. — TEAL
+    #[test]
+    fn descendants_follow_the_spawn_tree_and_kills_carry_their_status() {
+        let _guard = AX4_LOCK.lock().unwrap();
+        let mut objects = ObjectManager::new();
+        let vmar = Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).unwrap();
+        init(&mut objects, KoId(7), vmar, 0).unwrap();
+        let sora = sched().user_thread.process();
+        // 720 spawned 721 and 722; 721 spawned 723; 724 is unrelated.
+        for koid in [720, 721, 722, 723, 724] {
+            assert_eq!(spawn_actor(&mut objects, koid), Errno::Ok.status());
+        }
+        let set_parent = |process: u64, parent: u64| {
+            for c in sched_mut()
+                .children
+                .iter_mut()
+                .filter(|c| c.process == KoId(process))
+            {
+                c.parent = KoId(parent);
+            }
+        };
+        set_parent(721, 720);
+        set_parent(722, 720);
+        set_parent(723, 721);
+        let mut tree = process_descendants(KoId(720));
+        tree.sort();
+        assert_eq!(tree, [KoId(721), KoId(722), KoId(723)]);
+        assert!(process_descendants(KoId(723)).is_empty());
+        assert!(process_descendants(KoId(724)).is_empty());
+
+        const SIGINT_DEATH: u64 = 0x100 | 2;
+        for koid in [723, 722, 721, 720] {
+            assert_eq!(
+                kill_process_threads_with(KoId(koid), SIGINT_DEATH).killed,
+                1
+            );
+        }
+        // Dead records are not tree members.
+        assert!(process_descendants(KoId(720)).is_empty());
+        assert_eq!(kill_process_threads(KoId(724)).killed, 1);
+        assert_eq!(process_wait(), Errno::Ok.status());
+        assert_eq!(take_reaped(sora), Some((KoId(720), SIGINT_DEATH)));
+        assert_eq!(take_reaped(sora), Some((KoId(724), KILLED_EXIT_CODE)));
+        assert_eq!(
+            take_reaped(KoId(720)).map(|(_, code)| code),
+            Some(SIGINT_DEATH)
+        );
+        assert_eq!(
+            take_reaped(KoId(720)).map(|(_, code)| code),
+            Some(SIGINT_DEATH)
+        );
+        assert_eq!(take_reaped(KoId(721)), Some((KoId(723), SIGINT_DEATH)));
         assert!(sched().children.is_empty());
     }
 

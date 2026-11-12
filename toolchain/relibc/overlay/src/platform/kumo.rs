@@ -1,8 +1,8 @@
-//j868
 //j869
 //j871
 //j873
 //j875
+//j877
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -84,7 +84,11 @@ const VMAR_USER: u64 = 1 << 3;
 /// Rights for a duplicated standard handle: enough to use the channel end and transfer it
 /// into the child, and no more — a duplicate may only narrow its source (the kernel
 /// refuses amplification), and Sora's transfers use exactly this subset.
-const RIGHTS_CHANNEL: u64 = 0x2 | 0x4 | 0x8; // TRANSFER | READ | WRITE
+// DUPLICATE | TRANSFER | READ | WRITE. SH6-b: DUPLICATE stays on the copy, or a spawned
+// child could never pass its own stdio (or an opted-in filesystem grant) to a child of
+// its own: SH4's copies dropped it, which closed a grandchild's fds 1 and 2 and made
+// std's startup abort. Nothing widens: duplicating already required DUPLICATE. — TEAL
+const RIGHTS_CHANNEL: u64 = 0x1 | 0x2 | 0x4 | 0x8;
 const PROCESS_RUN_ASYNC: u64 = 1 << 0;
 const PROCESS_RUN_TRANSFER_ARG: u64 = 1 << 1;
 /// The child address-space reservation ProcessCreate is given, as Sora gives its children.
@@ -125,6 +129,12 @@ const STARTUP_TAG_NET: u8 = b'n';
 /// SH2: mirror of `kumo-rt`'s `STARTUP_TAG_ENV`; the env VMO uses the argv wire
 /// format (`[count u32][K=V\0 ...]`) and only an explicit launcher grant sends one.
 const STARTUP_TAG_ENV: u8 = b'v';
+/// SH6-b: the child's end of its signal channel (PROPOSAL/004's event channel). The
+/// spawner keeps the other end; asynchronous signals travel down it and this process's
+/// caught/ignored masks travel up it.
+const STARTUP_TAG_SIGNAL: u8 = b's';
+/// SH6-b: the environment entry that asks a spawn to pass this process's filesystem grant.
+const KUMO_GRANT_FS: &[u8] = b"KUMO_GRANT=fs";
 
 // The `kumo-vfs` wire protocol. relibc is built from its own vendored source tree by a
 // separate cargo invocation, so it cannot depend on the `kumo-vfs` crate; these constants
@@ -281,6 +291,8 @@ static TTY_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// The explicitly granted client end of this process's `kns1` netstack session, or `0`
 /// when the launcher granted none — in which case no socket can exist at all.
 static NET_HANDLE: AtomicU32 = AtomicU32::new(0);
+/// SH6-b: this process's end of its signal channel, from the spawner (0 = none).
+static SIGNAL_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// The session generation the first HELLO answer established; zero before it.
 static NET_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// Request ids start at one; zero is never a legal id (DESIGN/026 §4).
@@ -581,7 +593,11 @@ fn run_disposition(sig: usize) {
         0 => exit_signaled(sig),
         1 => {}
         handler => {
-            if SIG_FLAGS[sig].load(Ordering::Acquire) & SA_SIGINFO_FLAG != 0 {
+            let flags = SIG_FLAGS[sig].load(Ordering::Acquire);
+            if flags & SA_RESETHAND_FLAG != 0 {
+                SIG_HANDLER[sig].store(0, Ordering::Release);
+            }
+            if flags & SA_SIGINFO_FLAG != 0 {
                 let mut info = [0u64; 16];
                 info[0] = sig as u64; // si_signo; si_errno 0; si_code SI_USER (0)
                 let handler: extern "C" fn(c_int, *mut c_void, *mut c_void) =
@@ -601,6 +617,166 @@ fn broken_pipe() -> Errno {
 
     run_disposition(SIGPIPE_NO);
     Errno(EPIPE)
+}
+
+// ---- SH6-b asynchronous signals (PROPOSAL/004) -------------------------------------
+//
+// A signal to another process is a message on that process's signal channel, never an
+// interruption: the target's relibc starts a hidden thread (only once it catches some
+// asynchronous signal) that blocks on the channel and runs the disposition there, on its
+// own thread — no reentrancy into the interrupted code. What a target catches or ignores
+// travels up the same channel, so a sender can apply the default itself when there is
+// nobody to deliver to: `ProcessKill` with `0x100 | signo`. A group (`kill(-pid)`,
+// `killpg`) is the spawn tree under `pid`: the handler thread forwards a group signal to
+// this process's own children before running the handler, and a default-action group
+// death takes the whole tree in one kernel call. — TEAL
+
+const SIGNAL_MSG_MASKS: u8 = b'M';
+const SIGNAL_MSG_SIGNAL: u8 = b'S';
+const SA_RESETHAND_FLAG: usize = 0x8000_0000;
+static SIGNAL_THREAD_STARTED: AtomicU32 = AtomicU32::new(0);
+static SIGNAL_REPORTED: [core::sync::atomic::AtomicU64; 2] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 2];
+
+/// Signals the hidden thread can deliver: everything but the synchronous faults and the
+/// two that cannot be caught.
+fn is_async_signal(sig: usize) -> bool {
+    sig != 0
+        && sig < SIG_COUNT
+        && !matches!(sig, SIGSEGV_NO | SIGBUS_NO | SIGILL_NO | SIGKILL_NO | SIGSTOP_NO)
+}
+
+/// This process's (caught, ignored) asynchronous-signal masks, bit `sig - 1`.
+fn async_masks() -> (u64, u64) {
+    let (mut caught, mut ignored) = (0u64, 0u64);
+    for sig in 1..SIG_COUNT {
+        if !is_async_signal(sig) {
+            continue;
+        }
+        match SIG_HANDLER[sig].load(Ordering::Acquire) {
+            0 => {}
+            1 => ignored |= 1 << (sig - 1),
+            _ => caught |= 1 << (sig - 1),
+        }
+    }
+    (caught, ignored)
+}
+
+/// After an asynchronous disposition changed: start the handler thread once something is
+/// caught, and report the masks to the spawner when they differ from the last report.
+fn refresh_async_registration() {
+    let channel = SIGNAL_HANDLE.load(Ordering::Acquire);
+    if channel == 0 {
+        return;
+    }
+    let (caught, ignored) = async_masks();
+    if caught != 0
+        && SIGNAL_THREAD_STARTED
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        let started = unsafe {
+            crate::pthread::create(None, signal_thread_main, core::ptr::null_mut())
+        };
+        match started {
+            Ok(thread) => unsafe {
+                let _ = crate::header::pthread::pthread_detach(thread);
+            },
+            Err(_) => SIGNAL_THREAD_STARTED.store(0, Ordering::Release),
+        }
+    }
+    if SIGNAL_REPORTED[0].load(Ordering::Acquire) == caught
+        && SIGNAL_REPORTED[1].load(Ordering::Acquire) == ignored
+    {
+        return;
+    }
+    let mut message = [0u8; 17];
+    message[0] = SIGNAL_MSG_MASKS;
+    message[1..9].copy_from_slice(&caught.to_le_bytes());
+    message[9..17].copy_from_slice(&ignored.to_le_bytes());
+    if channel_write_bytes(channel, &message) == 0 {
+        SIGNAL_REPORTED[0].store(caught, Ordering::Release);
+        SIGNAL_REPORTED[1].store(ignored, Ordering::Release);
+    }
+}
+
+/// The hidden handler thread: one signal message at a time, run where it lands.
+extern "C" fn signal_thread_main(_arg: *mut c_void) -> *mut c_void {
+    let channel = SIGNAL_HANDLE.load(Ordering::Acquire);
+    let mut message = [0u8; 16];
+    loop {
+        let n = channel_read_bytes(channel, &mut message);
+        if n == 0 || n == u64::MAX {
+            // The spawner is gone: no signal can arrive any more.
+            return core::ptr::null_mut();
+        }
+        if n < 3 || message[0] != SIGNAL_MSG_SIGNAL {
+            continue;
+        }
+        let sig = message[1] as usize;
+        if !is_async_signal(sig) {
+            continue;
+        }
+        if message[2] != 0 {
+            forward_to_children(sig);
+        }
+        run_disposition(sig);
+    }
+}
+
+/// Fold every masks report the child sent since the last look into its slot.
+fn child_signal_sync(slot: &mut ChildSlot) {
+    if slot.signal == 0 {
+        return;
+    }
+    let mut message = [0u8; 32];
+    loop {
+        let n = channel_read_bytes_nonblock(slot.signal, &mut message);
+        if n == 0 || n == u64::MAX || n as u32 as i32 == KUMO_SHOULD_WAIT {
+            return;
+        }
+        if n as usize >= 17 && message[0] == SIGNAL_MSG_MASKS {
+            slot.caught = u64::from_le_bytes(message[1..9].try_into().unwrap());
+            slot.ignored = u64::from_le_bytes(message[9..17].try_into().unwrap());
+        }
+    }
+}
+
+/// Deliver `sig` to one live child (and, for a group, its spawn tree). Returns the kernel
+/// status of a default-action kill, or 0.
+fn signal_child(slot: &mut ChildSlot, sig: usize, group: bool) -> u64 {
+    child_signal_sync(slot);
+    let bit = 1u64 << (sig - 1);
+    if sig != SIGKILL_NO && slot.caught & bit != 0 {
+        let message = [SIGNAL_MSG_SIGNAL, sig as u8, u8::from(group)];
+        if channel_write_bytes(slot.signal, &message) == 0 {
+            return 0;
+        }
+        // Nobody reads any more: fall through to the default.
+    }
+    if sig != SIGKILL_NO && (slot.ignored & bit != 0 || ignored_by_default(sig)) {
+        // Recorded limit: an ignoring member does not pass a group signal on to the
+        // processes it spawned.
+        return 0;
+    }
+    process_kill_signaled(slot.process, sig, group)
+}
+
+/// A group signal reached this process: pass it on to every live child's tree first.
+fn forward_to_children(sig: usize) {
+    for index in 0..MAX_CHILDREN {
+        let slot = unsafe {
+            (&raw mut CHILD_TABLE)
+                .cast::<Option<ChildSlot>>()
+                .add(index)
+                .as_mut()
+        };
+        if let Some(Some(slot)) = slot {
+            if matches!(slot.state, ChildState::Live) {
+                let _ = signal_child(slot, sig, true);
+            }
+        }
+    }
 }
 
 /// Where the kernel's fault redirect lands (via `__relibc_kumo_signal_entry`), on the
@@ -810,6 +986,18 @@ fn process_kill_raw(process: u32) -> u64 {
     syscall4(SYSCALL_PROCESS_KILL, u64::from(process), 0, 0, 0)
 }
 
+/// SH6-b `ProcessKill` with the status the parent sees and, for a group, the whole spawn
+/// tree (`PROCESS_KILL_TREE`).
+fn process_kill_signaled(process: u32, sig: usize, tree: bool) -> u64 {
+    syscall4(
+        SYSCALL_PROCESS_KILL,
+        u64::from(process),
+        SIGNALED_EXIT | sig as u64,
+        u64::from(tree),
+        0,
+    )
+}
+
 fn address_space_create(process: u32, stack_top: u64, stack_size: u64) -> u64 {
     syscall4(
         SYSCALL_ADDRESS_SPACE_CREATE,
@@ -926,6 +1114,7 @@ fn spawn_elf(
     let mut process = 0u32;
     let mut child_end = 0u32;
     let mut sender = 0u32;
+    let mut signal_end = 0u32;
     let result = (|| -> Result<pid_t> {
         let mut header = [0u8; 64];
         let n = Sys::pread(fd, &mut header, 0)?;
@@ -1052,10 +1241,44 @@ fn spawn_elf(
         };
         child_end = first;
         sender = second;
+        // SH6-b: the child's signal channel; this process keeps `signal_end`.
+        let Some((ours, theirs)) = channel_pair() else {
+            return Err(Errno(ENOMEM));
+        };
+        signal_end = ours;
+        if channel_write_tag(sender, STARTUP_TAG_SIGNAL, theirs) != 0 {
+            close_handle(theirs);
+            return Err(Errno(EIO));
+        }
         for entry in stdio.iter().flatten() {
             let (tag, handle) = *entry;
             if channel_write_tag(sender, tag, handle) != 0 {
                 close_handle(handle);
+                return Err(Errno(EIO));
+            }
+        }
+        // SH6-b: the filesystem grant travels only when this spawn asks for it — the
+        // ratified opt-in, so a cargo-shaped tree can spawn again while the default stays
+        // SH4's "no grant". `KUMO_GRANT=fs` is consumed here, not passed on. — TEAL
+        let mut kept: [&[u8]; 16] = [b""; 16];
+        let mut kept_len = 0usize;
+        let mut grant_fs = false;
+        for env in envs {
+            if *env == KUMO_GRANT_FS {
+                grant_fs = true;
+            } else if kept_len < kept.len() {
+                kept[kept_len] = env;
+                kept_len += 1;
+            }
+        }
+        let envs = &kept[..kept_len];
+        let fs = FS_HANDLE.load(Ordering::Relaxed);
+        if grant_fs && fs != 0 {
+            let Some(duplicate) = handle_duplicate_raw(fs) else {
+                return Err(Errno(ENOMEM));
+            };
+            if channel_write_tag(sender, STARTUP_TAG_FS, duplicate) != 0 {
+                close_handle(duplicate);
                 return Err(Errno(EIO));
             }
         }
@@ -1096,17 +1319,21 @@ fn spawn_elf(
         close_handle(vmo);
         vmo = 0;
 
-        let Some(pid) = child_alloc(process, koid) else {
+        let Some(pid) = child_alloc(process, koid, signal_end) else {
             let _ = process_kill_raw(process);
             return Err(Errno(EAGAIN));
         };
         process = 0;
+        signal_end = 0;
         Ok(pid)
     })();
 
     if result.is_err() {
         if sender != 0 {
             close_handle(sender);
+        }
+        if signal_end != 0 {
+            close_handle(signal_end);
         }
         if child_end != 0 {
             close_handle(child_end);
@@ -1711,6 +1938,11 @@ struct ChildSlot {
     state: ChildState,
     process: u32,
     koid: u64,
+    /// SH6-b: this side of the child's signal channel (0 = none) and the dispositions the
+    /// child last reported up it: signals it catches and signals it ignores.
+    signal: u32,
+    caught: u64,
+    ignored: u64,
 }
 
 static mut CHILD_TABLE: [Option<ChildSlot>; MAX_CHILDREN] = [None; MAX_CHILDREN];
@@ -1744,7 +1976,7 @@ fn child_by_koid(koid: u64) -> Option<&'static mut ChildSlot> {
     None
 }
 
-fn child_alloc(process: u32, koid: u64) -> Option<c_int> {
+fn child_alloc(process: u32, koid: u64, signal: u32) -> Option<c_int> {
     for index in 0..MAX_CHILDREN {
         let slot = unsafe {
             (&raw mut CHILD_TABLE)
@@ -1757,6 +1989,9 @@ fn child_alloc(process: u32, koid: u64) -> Option<c_int> {
                 state: ChildState::Live,
                 process,
                 koid,
+                signal,
+                caught: 0,
+                ignored: 0,
             });
             return Some(CHILD_PID_BASE + index as c_int);
         }
@@ -2250,6 +2485,7 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> (u32, u32) {
             STARTUP_TAG_FS => install_startup_handle(&FS_HANDLE, handle),
             STARTUP_TAG_TTY => install_startup_handle(&TTY_HANDLE, handle),
             STARTUP_TAG_NET => install_startup_handle(&NET_HANDLE, handle),
+            STARTUP_TAG_SIGNAL => install_startup_handle(&SIGNAL_HANDLE, handle),
             STARTUP_TAG_ENV => {
                 close_handle(core::mem::replace(&mut env_vmo, handle));
             }
@@ -4095,6 +4331,9 @@ impl Pal for Sys {
                         unsafe { *out.as_mut_ptr() = raw };
                     }
                     close_handle(slot.process);
+                    if slot.signal != 0 {
+                        close_handle(slot.signal);
+                    }
                     *entry = None;
                     return Ok(pid);
                 }
@@ -4488,20 +4727,39 @@ impl PalSignal for Sys {
         Err(unsupported())
     }
 
-    /// Kill a spawned child by pid (SH4). Every signal terminates for now — SH6 refines
-    /// delivery; the kernel's ProcessKill takes the process off every wait and closes its
-    /// handles, and the reap reports the killed status.
+    /// SH6-b: signal a spawned child by pid, or its spawn tree by `-pid` (the KUMO
+    /// process group). A caught signal is a message the child's handler thread runs; an
+    /// ignored one is dropped; otherwise the default action applies here, as a kill whose
+    /// status reads WIFSIGNALED. `pid` 0 is this process's own group: its children's trees,
+    /// then itself. Any other pid (no relation to this process) is ESRCH. — TEAL
     fn kill(pid: pid_t, sig: c_int) -> Result<()> {
-        use crate::header::errno::ESRCH;
+        use crate::header::errno::{EINVAL, EPERM, ESRCH};
 
-        let _ = sig;
-        let Some(slot) = child_slot(pid) else {
+        if sig < 0 || sig as usize >= SIG_COUNT {
+            return Err(Errno(EINVAL));
+        }
+        let sig = sig as usize;
+        if pid == -1 {
+            return Err(Errno(EPERM));
+        }
+        if pid == 0 {
+            if sig != 0 {
+                forward_to_children(sig);
+                run_disposition(sig);
+            }
+            return Ok(());
+        }
+        let group = pid < 0;
+        let Some(slot) = child_slot(pid.checked_abs().ok_or(Errno(ESRCH))?) else {
             return Err(Errno(ESRCH));
         };
         if matches!(slot.state, ChildState::Exited(_)) {
             return Err(Errno(ESRCH));
         }
-        let status = process_kill_raw(slot.process) as u32 as i32;
+        if sig == 0 {
+            return Ok(());
+        }
+        let status = signal_child(slot, sig, group) as u32 as i32;
         if status != 0 {
             return Err(Errno(-status));
         }
@@ -4512,8 +4770,14 @@ impl PalSignal for Sys {
         Err(unsupported())
     }
 
+    /// SH6-b: `kill(-pgrp, sig)` — the spawn tree under `pgrp`.
     fn killpg(pgrp: pid_t, sig: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::EINVAL;
+
+        if pgrp <= 0 {
+            return Err(Errno(EINVAL));
+        }
+        Self::kill(-pgrp, sig)
     }
 
     /// SH6-a: run `sig`'s disposition on this thread now — a handler is called, SIG_IGN
@@ -4564,6 +4828,8 @@ impl PalSignal for Sys {
             SIG_HANDLER[sig].store(handler, Ordering::Release);
             if matches!(sig, SIGSEGV_NO | SIGBUS_NO | SIGILL_NO) {
                 refresh_fault_registration();
+            } else if is_async_signal(sig) {
+                refresh_async_registration();
             }
         }
         Ok(())

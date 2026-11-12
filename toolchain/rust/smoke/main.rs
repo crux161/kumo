@@ -1,8 +1,8 @@
-//j869
 //j870
 //j871
 //j873
 //j875
+//j877
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -231,6 +231,11 @@ fn main() {
             return;
         }
         Some("stackoverflow") => sh6_stack_overflow_child(),
+        Some("sigasync") => {
+            sh6_async_suite();
+            return;
+        }
+        Some("sigchild") => sh6_signal_child(std::env::args().nth(2).as_deref().unwrap_or("")),
         Some("sigpipedefault") => sh6_sigpipe_default_child(),
         Some("threadexit") => {
             let worker = std::thread::spawn(|| {
@@ -1235,7 +1240,13 @@ fn spawn_parent() {
         Ok(mut child) => {
             let killed = child.kill().is_ok();
             match child.wait() {
-                Ok(status) if killed && !status.success() && status.code() == Some(137) => {
+                // SH6-b: Child::kill is SIGKILL, now reported as WTERMSIG 9 (it was exit 137).
+                Ok(status)
+                    if killed && {
+                        use std::os::unix::process::ExitStatusExt;
+                        status.signal() == Some(9)
+                    } =>
+                {
                     sh3log!("spawn kill -> OK");
                 }
                 Ok(status) => sh3log!("spawn kill FAIL killed={} {:?}", killed, status),
@@ -1505,6 +1516,207 @@ fn signals_suite() {
         }
         Ok(status) => sh6log!("sigpipe default FAIL {:?}", status),
         Err(error) => sh6log!("sigpipe default spawn FAIL {:?}", error),
+    }
+}
+
+/// SH6-b: what the `sigchild` modes print from their handlers (on the hidden thread).
+extern "C" fn sh6_child_on_term(sig: i32) {
+    unsafe { sh6::write(1, b"caught 15\n".as_ptr(), 10) };
+    std::process::exit(if sig == 15 { 0 } else { 5 });
+}
+
+extern "C" fn sh6_child_on_int(_sig: i32) {
+    unsafe { sh6::write(1, b"cleanup\n".as_ptr(), 8) };
+    std::process::exit(130);
+}
+
+/// SH6-b children. `catch` spins (a busy main thread) with a SIGTERM handler; `default`
+/// and `ignore` (SIGINT at SIG_IGN) block on stdin; `tree`/`treecatch` spawn two `default`
+/// grandchildren sharing this stdout, `treecatch` catching SIGINT to clean up. Each says
+/// "ready" (or "tree ready") once its dispositions are in place. A deadline ends a spinner
+/// that was never signalled, so a failed run cannot starve the machine. — TEAL
+fn sh6_signal_child(mode: &str) -> ! {
+    use std::io::{Read as _, Write as _};
+
+    let mut keep = Vec::new();
+    match mode {
+        "catch" => {
+            sh6::install(15, sh6_child_on_term as usize, 0);
+        }
+        "ignore" => {
+            sh6::install(2, sh6::SIG_IGN, 0);
+        }
+        "tree" | "treecatch" => {
+            if mode == "treecatch" {
+                sh6::install(2, sh6_child_on_int as usize, 0);
+            }
+            for _ in 0..2 {
+                match std::process::Command::new("/SMOKE.ELF")
+                    .args(["sigchild", "default"])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => keep.push(child),
+                    Err(_) => std::process::exit(6),
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{}", if keep.is_empty() { "ready" } else { "tree ready" });
+    let _ = out.flush();
+    if mode == "catch" {
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        while Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+        std::process::exit(3);
+    }
+    let mut buf = [0u8; 16];
+    let _ = std::io::stdin().read(&mut buf);
+    std::process::exit(4);
+}
+
+/// SH6-b: asynchronous signals per PROPOSAL/004 between a parent and its spawned
+/// children: a caught SIGTERM runs on the child's hidden handler thread while its main
+/// thread spins; an uncaught one is the default death (WTERMSIG 15); an ignored SIGINT
+/// leaves the child running; SIGKILL is WTERMSIG 9; a group SIGINT (`kill(-pid)`) takes a
+/// default-action tree whole, and a catching tree's handler forwards to its children
+/// before cleaning up. A tree is gone when the shared stdout reaches EOF. — TEAL
+fn sh6_async_suite() {
+    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Child, ChildStdout, Command, Stdio};
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // The tree children spawn again, so they get the filesystem grant (the SH6-b opt-in).
+    let spawn = |mode: &str| {
+        let mut command = Command::new("/SMOKE.ELF");
+        command.args(["sigchild", mode]).stdin(Stdio::piped()).stdout(Stdio::piped());
+        if mode.starts_with("tree") {
+            command.env("KUMO_GRANT", "fs");
+        }
+        command.spawn()
+    };
+    // Read lines until `want` of them arrived; returns them.
+    let lines = |reader: &mut BufReader<ChildStdout>, want: usize| {
+        let mut seen = Vec::new();
+        while seen.len() < want {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => seen.push(line.trim_end().to_string()),
+            }
+        }
+        seen
+    };
+    let open = |child: &mut Child| BufReader::new(child.stdout.take().unwrap());
+
+    // 1. Caught: the handler runs on the hidden thread while main spins.
+    match spawn("catch") {
+        Ok(mut child) => {
+            let mut out = open(&mut child);
+            let ready = lines(&mut out, 1);
+            let sent = unsafe { kill(child.id() as i32, 15) } == 0;
+            let mut rest = String::new();
+            let _ = out.read_to_string(&mut rest);
+            match child.wait() {
+                Ok(status) if ready == ["ready"] && sent && status.code() == Some(0)
+                    && rest.contains("caught 15") =>
+                {
+                    sh6log!("async catch -> OK (handler ran while main spun)")
+                }
+                other => sh6log!("async catch FAIL ready={:?} sent={} {:?} {:?}", ready, sent, rest, other),
+            }
+        }
+        Err(e) => sh6log!("async catch FAIL spawn {:?}", e.kind()),
+    }
+
+    // 2. Default: the sender applies it — WTERMSIG 15.
+    match spawn("default") {
+        Ok(mut child) => {
+            let mut out = open(&mut child);
+            let ready = lines(&mut out, 1);
+            let sent = unsafe { kill(child.id() as i32, 15) } == 0;
+            match child.wait() {
+                Ok(status) if ready == ["ready"] && sent && status.signal() == Some(15) => {
+                    sh6log!("async default -> OK (WTERMSIG 15)")
+                }
+                other => sh6log!("async default FAIL ready={:?} sent={} {:?}", ready, sent, other),
+            }
+        }
+        Err(e) => sh6log!("async default FAIL spawn {:?}", e.kind()),
+    }
+
+    // 3. Ignored: SIGINT changes nothing; SIGTERM still ends it.
+    match spawn("ignore") {
+        Ok(mut child) => {
+            let mut out = open(&mut child);
+            let ready = lines(&mut out, 1);
+            let sent = unsafe { kill(child.id() as i32, 2) } == 0;
+            let settle = Instant::now() + std::time::Duration::from_millis(300);
+            while Instant::now() < settle {
+                std::hint::spin_loop();
+            }
+            let alive = matches!(child.try_wait(), Ok(None));
+            let _ = unsafe { kill(child.id() as i32, 15) };
+            match child.wait() {
+                Ok(status) if ready == ["ready"] && sent && alive && status.signal() == Some(15) => {
+                    sh6log!("async ignore -> OK")
+                }
+                other => sh6log!("async ignore FAIL alive={} {:?}", alive, other),
+            }
+        }
+        Err(e) => sh6log!("async ignore FAIL spawn {:?}", e.kind()),
+    }
+
+    // 4. SIGKILL through std's Child::kill.
+    match spawn("default") {
+        Ok(mut child) => {
+            let mut out = open(&mut child);
+            let ready = lines(&mut out, 1);
+            let killed = child.kill().is_ok();
+            match child.wait() {
+                Ok(status) if ready == ["ready"] && killed && status.signal() == Some(9) => {
+                    sh6log!("async sigkill -> OK (WTERMSIG 9)")
+                }
+                other => sh6log!("async sigkill FAIL {:?}", other),
+            }
+        }
+        Err(e) => sh6log!("async sigkill FAIL spawn {:?}", e.kind()),
+    }
+
+    // 5/6. Group SIGINT to a spawn tree: three writers share the pipe, so EOF means all
+    // three are gone.
+    for (mode, label) in [("tree", "tree default"), ("treecatch", "tree catch")] {
+        match spawn(mode) {
+            Ok(mut child) => {
+                let mut out = open(&mut child);
+                let mut ready = lines(&mut out, 3);
+                ready.sort();
+                let sent = unsafe { kill(-(child.id() as i32), 2) } == 0;
+                let mut rest = String::new();
+                let eof = out.read_to_string(&mut rest).is_ok();
+                let status = child.wait();
+                let ok = ready == ["ready", "ready", "tree ready"]
+                    && sent
+                    && eof
+                    && match (mode, &status) {
+                        ("tree", Ok(status)) => status.signal() == Some(2),
+                        (_, Ok(status)) => status.code() == Some(130) && rest.contains("cleanup"),
+                        _ => false,
+                    };
+                if ok {
+                    sh6log!("async {} -> OK (3 processes, EOF)", label);
+                } else {
+                    sh6log!("async {} FAIL ready={:?} sent={} rest={:?} {:?}", label, ready, sent, rest, status);
+                }
+            }
+            Err(e) => sh6log!("async {} FAIL spawn {:?}", label, e.kind()),
+        }
     }
 }
 

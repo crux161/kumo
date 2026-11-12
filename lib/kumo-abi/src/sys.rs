@@ -1,8 +1,8 @@
-//j824
 //j825
 //j871
 //j873
 //j875
+//j877
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +100,10 @@ pub enum Syscall {
     /// then close its handles as an exit would, so peers see `PEER_CLOSED`. Requires
     /// `Rights::MANAGE` on the process handle, which `ProcessCreate` gives the creator. A
     /// process cannot kill itself (that is [`Syscall::ProcessExit`]).
+    /// SH6-b: `x1` is the status the kill reports to the parent (0 keeps 137; relibc
+    /// passes `0x100 | signo` for a signal death) and `x2` holds flags:
+    /// [`PROCESS_KILL_TREE`] also kills every live process the target spawned, at any
+    /// depth, with the same status.
     ProcessKill = 46,
     /// Keep a diagnostic in the kernel log (`dmesg`) at a [`log_level`]: `(level, ptr, len)`.
     /// The console also shows it while its level is at or above the console's. Same authority
@@ -184,6 +188,10 @@ pub enum Syscall {
     /// The supervisor is refused with [`Errno::NotSupported`].
     FaultHandlerSet = 61,
 }
+
+/// `ProcessKill` flag (SH6-b): kill the target's whole spawn tree, the KUMO stand-in for
+/// a process group.
+pub const PROCESS_KILL_TREE: u64 = 1;
 
 /// Stable indices for the RK3588 display unit's checked D0/D1 write table (DESIGN/022).
 /// These are selectors, never byte offsets. Other device apertures do not implement this table.
