@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j905
 //j907
 //j912
 //j913
 //j914
+//j887
 
 extern crate alloc;
 
@@ -261,11 +261,32 @@ unsafe fn validate_dtb_handoff(boot: &BootInfo) -> Result<Option<(u64, u32)>, Dt
     Ok(Some((address, total_size)))
 }
 
+/// j887: name each HAL hook that was already non-zero at kernel entry. Each is cleared by then;
+/// a line here means memory this boot never wrote held a previous kernel's function address.
+#[cfg(feature = "arch_aarch64")]
+fn report_stale_hooks(stale: &[usize; 6]) {
+    for (name, &word) in kumo_hal::active::HOOK_NAMES.iter().zip(stale) {
+        if word != 0 {
+            klog_at!(
+                kmsg::WARNING,
+                "STALE HOOK         Warn      {} hook={:#x} at entry; cleared (not written by this boot)\n",
+                name,
+                word
+            );
+        }
+    }
+}
+
 pub fn stage_a(boot: &BootInfo) -> ! {
     // Own the fault path and the console before any fallible work: install our exception
     // vectors ("The Tower") so faults are caught and visible, then bring up the
     // framebuffer console (the X13s has no serial here), which clears to the black
     // phosphor backdrop. Interrupts stay masked (see `_start`) until we own the GIC.
+    // j887: every HAL hook must still be 0 here. Take them before anything can unmask an
+    // interrupt, so a word this boot never wrote is neither called nor lost; it is reported
+    // below once the console exists.
+    #[cfg(feature = "arch_aarch64")]
+    let stale_hooks = kumo_hal::active::take_stale_hooks();
     kumo_hal::active::install_exception_vectors();
 
     // Tell the console where this board's UART is, from the BSP, before any `klog!` (DESIGN/017
@@ -322,6 +343,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             fb.phys
         );
     }
+    #[cfg(feature = "arch_aarch64")]
+    report_stale_hooks(&stale_hooks);
 
     let report = match inspect_boot(boot) {
         Ok(report) => report,

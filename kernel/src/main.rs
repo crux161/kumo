@@ -9,6 +9,7 @@
 //j447
 //j825
 //j904
+//j887
 
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
@@ -37,6 +38,18 @@ fn panic_report(info: &core::panic::PanicInfo<'_>) -> ! {
         &mut Console,
         format_args!("\nTOWER: KERNEL PANIC: {info}\n"),
     );
+    // j887: the callers on the panicking stack — the panic location alone names only the
+    // `expect` that fired. Symbolize with `llvm-addr2line -f -C -e kumo-kernel.elf`.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut callers = [0u64; 16];
+        let count = kernel::diag::panic_return_addresses(&mut callers);
+        let _ = core::fmt::write(&mut Console, format_args!("ret addrs on stack:"));
+        for address in &callers[..count] {
+            let _ = core::fmt::write(&mut Console, format_args!(" {address:#x}"));
+        }
+        let _ = core::fmt::write(&mut Console, format_args!("\n"));
+    }
     kumo_hal::active::halt()
 }
 

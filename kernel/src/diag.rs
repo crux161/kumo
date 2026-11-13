@@ -15,6 +15,7 @@
 //! they need build-side support this does not.
 
 //j493
+//j887
 
 /// The exception class and, for aborts, what actually went wrong.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +229,31 @@ pub fn set_boot_stack(lo: u64, hi: u64) {
     BOOT_STACK
         .1
         .store(hi, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// j887: the saved return addresses above the caller's stack pointer, for the kernel panic
+/// report. A Rust panic names only the `expect` that fired (the Orange Pi's
+/// `user_thread sched not initialized` named `sched_ptr`, never its caller); these symbolize
+/// against `kumo-kernel.elf` with `llvm-addr2line -f -C -e`. Reads only the boot stack or the
+/// heap region holding SP, and only words inside the image; never allocates.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn panic_return_addresses(out: &mut [u64]) -> usize {
+    let sp: u64;
+    unsafe { core::arch::asm!("mov {0}, sp", out(reg) sp, options(nostack, nomem)) };
+    let sp = sp & !0xf;
+    let map = current_map();
+    let stack_limit = match place(&map, sp) {
+        Placement::Inside {
+            region: Region::BootStack,
+            ..
+        } => map.boot_stack.1,
+        Placement::Inside {
+            region: Region::Heap,
+            ..
+        } => map.heap.1,
+        _ => 0,
+    };
+    kumo_hal::active::kernel_return_addresses(sp, stack_limit, map.image, out)
 }
 
 /// This kernel's live region map.

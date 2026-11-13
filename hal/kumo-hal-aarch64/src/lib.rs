@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j875
 //j881
 //j882
 //j905
 //j912
+//j887
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -174,7 +174,7 @@ fn scan_return_addresses(
     image: (u64, u64),
     read_word: impl Fn(u64) -> u64,
     read_insn: impl Fn(u64) -> u32,
-    out: &mut [u64; TOWER_RETURN_ADDRESSES],
+    out: &mut [u64],
 ) -> usize {
     if sp % 16 != 0 || stack_limit <= sp || image.0 >= image.1 {
         return 0;
@@ -192,6 +192,74 @@ fn scan_return_addresses(
         addr += 8;
     }
     count
+}
+
+/// Saved return addresses on the current kernel stack, for the kernel's panic report: the same
+/// scan the EL1 exception TOWER runs, over `[sp, stack_limit)`, keeping words in `image` that
+/// follow a `BL`/`BLR`. A Rust panic names only the `expect` that fired; these name the path
+/// that reached it. Never allocates, never reads outside the stack or the image. — j887
+#[cfg(target_os = "none")]
+pub fn kernel_return_addresses(
+    sp: u64,
+    stack_limit: u64,
+    image: (u64, u64),
+    out: &mut [u64],
+) -> usize {
+    scan_return_addresses(
+        sp,
+        stack_limit,
+        image,
+        |addr| unsafe { core::ptr::read_volatile(addr as *const u64) },
+        |addr| unsafe { core::ptr::read_volatile(addr as *const u32) },
+        out,
+    )
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn kernel_return_addresses(
+    _sp: u64,
+    _stack_limit: u64,
+    _image: (u64, u64),
+    _out: &mut [u64],
+) -> usize {
+    0
+}
+
+/// The kernel-installed HAL hooks, in [`take_stale_hooks`] order.
+pub const HOOK_NAMES: [&str; 6] = [
+    "preempt",
+    "interrupt",
+    "tower-context",
+    "svc",
+    "fault",
+    "fault-resume",
+];
+
+/// Clear every kernel-installed hook and return what each held. Called first thing at kernel
+/// entry, where every hook must still be 0: the kernel installs them only later (the IRQ, SVC
+/// and fault hooks in `run_sora`). A non-zero word here was not written by this boot. The
+/// Orange Pi 5 Plus once panicked in `user_thread::sched_ptr` before `SORA INITRD`, which only
+/// `signal_irq` (installed by `run_sora`) can reach from IRQ context; this both reports such a
+/// word and stops the HAL from calling through it. — j887
+pub fn take_stale_hooks() -> [usize; 6] {
+    [
+        PREEMPT_HOOK.swap(0, Ordering::AcqRel),
+        INTERRUPT_HOOK.swap(0, Ordering::AcqRel),
+        TOWER_CONTEXT_HOOK.swap(0, Ordering::AcqRel),
+        el0_take_stale_hook(0),
+        el0_take_stale_hook(1),
+        el0_take_stale_hook(2),
+    ]
+}
+
+#[cfg(target_os = "none")]
+fn el0_take_stale_hook(index: usize) -> usize {
+    el0::take_stale_hook(index)
+}
+
+#[cfg(not(target_os = "none"))]
+fn el0_take_stale_hook(_index: usize) -> usize {
+    0
 }
 
 #[cfg(any(target_os = "none", test))]
@@ -2069,6 +2137,15 @@ pub mod el0 {
     /// Register the kernel's synchronous-fault redirect (see [`FAULT_RESUME_HOOK`]).
     pub fn set_fault_resume_hook(hook: extern "C" fn(u64, u64, *mut u64) -> u64) {
         FAULT_RESUME_HOOK.store(hook as usize, Ordering::Release);
+    }
+
+    /// [`super::take_stale_hooks`]'s EL0 half: 0 = SVC, 1 = fault, 2 = fault-resume.
+    pub(super) fn take_stale_hook(index: usize) -> usize {
+        match index {
+            0 => SVC_HOOK.swap(0, Ordering::AcqRel),
+            1 => FAULT_HOOK.swap(0, Ordering::AcqRel),
+            _ => FAULT_RESUME_HOOK.swap(0, Ordering::AcqRel),
+        }
     }
 
     /// Outcome of the EL0 round-trip, for the boot report.
@@ -6143,6 +6220,45 @@ mod tests {
             &mut callers,
         );
         assert_eq!(&callers[..count], &[call_site]);
+    }
+
+    //j887
+    /// Entry finds a hook a previous boot left behind, clears it, and reports it by position;
+    /// a second take finds nothing. Hooks installed after entry are untouched by design.
+    #[test]
+    fn stale_hooks_are_reported_once_and_cleared() {
+        extern "C" fn tick() {}
+        extern "C" fn irq(_: u32) {}
+        super::set_preempt_hook(tick);
+        super::set_interrupt_hook(irq);
+        let stale = super::take_stale_hooks();
+        assert_eq!(stale[0], tick as usize);
+        assert_eq!(stale[1], irq as usize);
+        assert_eq!(&stale[2..], &[0, 0, 0, 0]);
+        assert_eq!(super::HOOK_NAMES[1], "interrupt");
+        assert_eq!(super::take_stale_hooks(), [0; 6]);
+    }
+
+    /// The panic report's scan fills a caller-sized buffer, not only the TOWER's eight.
+    #[test]
+    fn scan_fills_a_buffer_of_any_length() {
+        let call_site = IMAGE.0 + 0x13aa8;
+        let stack: [(u64, u64); 3] = [
+            (KERNEL_SP, call_site),
+            (KERNEL_SP + 8, call_site),
+            (KERNEL_SP + 16, call_site),
+        ];
+        let insns = |addr: u64| if addr == call_site - 4 { BL } else { 0 };
+        let mut two = [0u64; 2];
+        let count = scan_return_addresses(
+            KERNEL_SP,
+            KERNEL_SP + 0x100,
+            IMAGE,
+            reader(&stack),
+            insns,
+            &mut two,
+        );
+        assert_eq!(count, 2);
     }
 
     #[test]

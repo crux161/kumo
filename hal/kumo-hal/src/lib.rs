@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j875
 //j881
 //j905
 //j907
 //j912
+//j887
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -67,6 +67,8 @@ pub mod active {
         display_iommu_from_dtb, display_iommu_unit_ready, display_latched_fault,
         display_live_binding, display_mmu_read_routes, display_mmu_read_state, DisplayIoMmu,
     };
+    //j887
+    pub use kumo_hal_aarch64::{kernel_return_addresses, take_stale_hooks, HOOK_NAMES};
 }
 
 #[cfg(feature = "arch_x86_64")]
