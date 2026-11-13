@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 //j885
+//j888
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -22,6 +23,7 @@ use core::fmt::Write as _;
 use kumo_abi::Handle;
 use kumo_rt::{log_write, process_exit, vmar_map, vmar_map_anywhere, vmar_unmap, vmo_create};
 use persona_linux::elf::{self, Machine};
+use persona_linux::launch;
 
 kumo_rt::entry!(main);
 
@@ -73,6 +75,13 @@ const MAP_X: u64 = 4;
 /// The program's stack: 256 KiB ending here, below the shim's image at 0x1c00_0000.
 const LINUX_STACK_TOP: u64 = 0x1b00_0000;
 const LINUX_STACK_SIZE: u64 = 0x4_0000;
+
+/// SH7-c: where a position-independent program and its interpreter are loaded. The child VMAR
+/// is 512 MiB from 0; the kernel places anywhere-maps above the highest mapping (the shim at
+/// 0x1c00_0000), so these fixed bases stay clear of it, of each other and of the stack. The
+/// fixed-address M10 hello links at 0x1000_0000 and never shares a process with them.
+const PROGRAM_BIAS: u64 = 0x0100_0000;
+const INTERP_BASE: u64 = 0x1400_0000;
 
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
@@ -259,7 +268,16 @@ fn write(fd: u64, buf: u64, len: u64) -> i64 {
     len as i64
 }
 
+/// One `writev` reaches the log as few records as possible: its vectors are gathered into
+/// record-sized (256-byte) pieces, so a short line arrives whole. musl's stdio hands `printf`'s
+/// text and its `\n` over as two vectors; written one record each, another process's line could
+/// land between them (seen on metal, j888). A small `writev` is atomic on Linux too.
 fn writev(fd: u64, iov: u64, count: u64) -> i64 {
+    if fd != 1 && fd != 2 {
+        return -errno::EBADF;
+    }
+    let mut record = [0u8; 256];
+    let mut used = 0usize;
     let mut total = 0i64;
     for index in 0..count.min(1024) {
         let entry = iov + index * 16;
@@ -269,11 +287,24 @@ fn writev(fd: u64, iov: u64, count: u64) -> i64 {
                 core::ptr::read_unaligned((entry + 8) as *const u64),
             )
         };
-        let written = write(fd, base, len);
-        if written < 0 {
-            return if total > 0 { total } else { written };
+        if base == 0 && len != 0 {
+            return if total > 0 { total } else { -errno::EFAULT };
         }
-        total += written;
+        let mut bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len as usize) };
+        while !bytes.is_empty() {
+            let take = bytes.len().min(record.len() - used);
+            record[used..used + take].copy_from_slice(&bytes[..take]);
+            used += take;
+            bytes = &bytes[take..];
+            if used == record.len() {
+                let _ = log_write(kumo_abi::sys::log_level::INFO, &record);
+                used = 0;
+            }
+        }
+        total += len as i64;
+    }
+    if used > 0 {
+        let _ = log_write(kumo_abi::sys::log_level::INFO, &record[..used]);
     }
     total
 }
@@ -371,10 +402,25 @@ fn fail(what: &str) -> ! {
 
 // ---- loading ------------------------------------------------------------------------------
 
+/// What the stack and auxv need to know about the loaded images.
+struct Loaded {
+    /// The program's entry, biased: `AT_ENTRY`.
+    program_entry: u64,
+    /// The program's headers in memory: `AT_PHDR`.
+    phdr: u64,
+    phnum: u64,
+    /// The interpreter's base (`AT_BASE`), or 0 for a static program.
+    interp_base: u64,
+    /// Where control goes first: the interpreter's entry, or the program's.
+    start: u64,
+    /// The end of the program's image, where the break starts.
+    image_end: u64,
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn main(
-    elf_vmo: u64,
-    elf_len: u64,
+    image_vmo: u64,
+    image_len: u64,
     _a3: u64,
     _a4: u64,
     _a5: u64,
@@ -382,45 +428,26 @@ extern "C" fn main(
     _a7: u64,
     _a8: u64,
 ) -> ! {
-    let elf_vmo = Handle(elf_vmo as u32);
-    let map_len = elf_len.next_multiple_of(PAGE);
-    let image = match vmar_map_anywhere(elf_vmo, map_len, MAP_R) {
+    let image_vmo = Handle(image_vmo as u32);
+    let map_len = image_len.next_multiple_of(PAGE);
+    let image = match vmar_map_anywhere(image_vmo, map_len, MAP_R) {
         (0, addr) if addr != 0 => unsafe {
-            core::slice::from_raw_parts(addr as *const u8, elf_len as usize)
+            core::slice::from_raw_parts(addr as *const u8, image_len as usize)
         },
         _ => fail("cannot map the program image"),
     };
-    let header = match elf::parse_header_for_machine(image, Machine::Aarch64) {
-        Ok(header) => header,
-        Err(_) => fail("not a static aarch64 Linux executable"),
+    // SH7-c: a launch bundle carries a program and the interpreter its PT_INTERP names; a bare
+    // ELF is one static program, as M10 has always sent.
+    let (program, interp, name) = match launch::parse(image) {
+        Ok(bundle) => (bundle.program, bundle.interp, bundle.name),
+        Err(launch::LaunchError::NotABundle) => (image, None, &b"persona"[..]),
+        Err(_) => fail("malformed launch bundle"),
     };
+    let loaded = load(program, interp);
+    let program_state = unsafe { &mut *core::ptr::addr_of_mut!(PROGRAM) };
+    program_state.brk_end = loaded.image_end.next_multiple_of(PAGE);
 
-    let mut phdr_addr = 0u64;
-    let mut image_end = 0u64;
-    for index in 0..header.phnum as u64 {
-        let at = (header.phoff + index * header.phentsize as u64) as usize;
-        let Some(bytes) = image.get(at..at + elf::ELF_PHDR_LEN) else {
-            fail("program header out of range");
-        };
-        let Ok(ph) = elf::parse_program_header(bytes) else {
-            fail("bad program header");
-        };
-        if ph.kind == elf::PT_INTERP {
-            fail("dynamic executables (PT_INTERP) arrive in SH7-c");
-        }
-        if ph.kind != elf::PT_LOAD || ph.mem_size == 0 {
-            continue;
-        }
-        load_segment(image, &ph);
-        if header.phoff >= ph.file_offset && header.phoff < ph.file_offset + ph.file_size {
-            phdr_addr = ph.virt_addr + (header.phoff - ph.file_offset);
-        }
-        image_end = image_end.max(ph.virt_addr + ph.mem_size);
-    }
-    let program = unsafe { &mut *core::ptr::addr_of_mut!(PROGRAM) };
-    program.brk_end = image_end.next_multiple_of(PAGE);
-
-    let sp = build_stack(header.entry, phdr_addr, header.phnum as u64);
+    let sp = build_stack(&loaded, name);
 
     let code_base = core::ptr::addr_of!(__ehdr_start) as u64;
     let code_len = core::ptr::addr_of!(etext) as u64 - code_base;
@@ -435,12 +462,86 @@ extern "C" fn main(
     {
         fail("PersonaShimSet refused");
     }
-    unsafe { persona_enter(header.entry, sp) }
+    unsafe { persona_enter(loaded.start, sp) }
 }
 
-fn load_segment(image: &[u8], ph: &elf::ProgramHeader) {
-    let start = ph.virt_addr & !(PAGE - 1);
-    let end = (ph.virt_addr + ph.mem_size).next_multiple_of(PAGE);
+/// Load the program and, for a dynamic one, the interpreter it names, as Linux's `execve`
+/// does: a PIE goes at `PROGRAM_BIAS`, the interpreter at `INTERP_BASE`, and control starts in
+/// the interpreter, which finds the program through `AT_PHDR`/`AT_ENTRY`.
+fn load(program: &[u8], interp: Option<&[u8]>) -> Loaded {
+    let header = match elf::parse_linux_image(program, Machine::Aarch64) {
+        Ok(header) => header,
+        Err(_) => fail("not an aarch64 Linux executable"),
+    };
+    let bias = if header.position_independent {
+        PROGRAM_BIAS
+    } else {
+        0
+    };
+    let wants = match elf::interpreter(program, &header) {
+        Ok(path) => path,
+        Err(_) => fail("bad PT_INTERP"),
+    };
+    let (phdr, image_end) = load_image(program, &header, bias);
+
+    let (interp_base, start) = match (wants, interp) {
+        (None, None) => (0, header.entry + bias),
+        (Some(_), Some(interp)) => {
+            let interp_header = match elf::parse_linux_image(interp, Machine::Aarch64) {
+                Ok(h) if h.position_independent => h,
+                _ => fail("the interpreter is not a position-independent aarch64 image"),
+            };
+            if !matches!(elf::interpreter(interp, &interp_header), Ok(None)) {
+                fail("the interpreter names an interpreter of its own");
+            }
+            let _ = load_image(interp, &interp_header, INTERP_BASE);
+            (INTERP_BASE, INTERP_BASE + interp_header.entry)
+        }
+        (Some(_), None) => fail("a dynamic program arrived without its interpreter"),
+        (None, Some(_)) => fail("an interpreter arrived for a static program"),
+    };
+    Loaded {
+        program_entry: header.entry + bias,
+        phdr,
+        phnum: header.phnum as u64,
+        interp_base,
+        start,
+        image_end,
+    }
+}
+
+/// Map every `PT_LOAD` of `image` at `bias` + its link address. Returns where the program
+/// headers are in memory (from `PT_PHDR`, else the load that holds them) and the image's end.
+fn load_image(image: &[u8], header: &elf::ElfHeader, bias: u64) -> (u64, u64) {
+    let mut phdr_addr = 0u64;
+    let mut image_end = 0u64;
+    for index in 0..header.phnum {
+        let Ok(ph) = elf::program_header(image, header, index) else {
+            fail("bad program header");
+        };
+        if ph.kind == elf::PT_PHDR {
+            phdr_addr = ph.virt_addr + bias;
+            continue;
+        }
+        if ph.kind != elf::PT_LOAD || ph.mem_size == 0 {
+            continue;
+        }
+        load_segment(image, &ph, bias);
+        if phdr_addr == 0
+            && header.phoff >= ph.file_offset
+            && header.phoff < ph.file_offset + ph.file_size
+        {
+            phdr_addr = ph.virt_addr + bias + (header.phoff - ph.file_offset);
+        }
+        image_end = image_end.max(ph.virt_addr + bias + ph.mem_size);
+    }
+    (phdr_addr, image_end)
+}
+
+fn load_segment(image: &[u8], ph: &elf::ProgramHeader, bias: u64) {
+    let vaddr = ph.virt_addr + bias;
+    let start = vaddr & !(PAGE - 1);
+    let end = (vaddr + ph.mem_size).next_multiple_of(PAGE);
     let Some(vmo) = vmo(end - start) else {
         fail("no memory for a segment");
     };
@@ -449,7 +550,8 @@ fn load_segment(image: &[u8], ph: &elf::ProgramHeader) {
         fail("segment out of range");
     };
     // Fill through a temporary writable view: VmoWrite moves at most VMO_TRANSFER_MAX (256)
-    // bytes per call, far too few for a real program's segments.
+    // bytes per call, far too few for a real program's segments. The fresh VMO is zeroed, so
+    // the bytes between `p_filesz` and `p_memsz` (.bss) start as zero.
     if !bytes.is_empty() {
         let view = match vmar_map_anywhere(vmo, end - start, MAP_R | MAP_W) {
             (0, addr) if addr != 0 => addr,
@@ -458,7 +560,7 @@ fn load_segment(image: &[u8], ph: &elf::ProgramHeader) {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                (view + (ph.virt_addr - start)) as *mut u8,
+                (view + (vaddr - start)) as *mut u8,
                 bytes.len(),
             );
         }
@@ -482,7 +584,7 @@ fn load_segment(image: &[u8], ph: &elf::ProgramHeader) {
 
 /// The Linux initial stack (SysV aarch64): argc, argv, NULL, envp NULL, auxv, then the data
 /// the vectors point at. Returns the 16-byte-aligned SP that points at argc.
-fn build_stack(entry: u64, phdr: u64, phnum: u64) -> u64 {
+fn build_stack(loaded: &Loaded, name: &[u8]) -> u64 {
     let Some(vmo) = vmo(LINUX_STACK_SIZE) else {
         fail("no memory for the stack");
     };
@@ -492,9 +594,9 @@ fn build_stack(entry: u64, phdr: u64, phnum: u64) -> u64 {
     }
     let _ = kumo_rt::handle_close(vmo);
 
-    // Data area at the top: argv[0] and AT_RANDOM's 16 bytes.
-    let name = b"persona\0";
-    let mut top = LINUX_STACK_TOP - 64;
+    // Data area at the top: argv[0] (NUL-terminated; the stack is fresh, so zeroed) and
+    // AT_RANDOM's 16 bytes. `name` is at most launch::NAME_MAX bytes.
+    let mut top = LINUX_STACK_TOP - 128;
     let name_at = top;
     unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), name_at as *mut u8, name.len()) };
     top -= 32;
@@ -506,12 +608,12 @@ fn build_stack(entry: u64, phdr: u64, phnum: u64) -> u64 {
     }
 
     let auxv = [
-        (AT_PHDR, phdr),
+        (AT_PHDR, loaded.phdr),
         (AT_PHENT, elf::ELF_PHDR_LEN as u64),
-        (AT_PHNUM, phnum),
+        (AT_PHNUM, loaded.phnum),
         (AT_PAGESZ, PAGE),
-        (AT_BASE, 0),
-        (AT_ENTRY, entry),
+        (AT_BASE, loaded.interp_base),
+        (AT_ENTRY, loaded.program_entry),
         (AT_UID, 0),
         (AT_EUID, 0),
         (AT_GID, 0),

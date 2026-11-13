@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j856
 //j857
 //j859
 //j864
 //j870
+//j888
 
 extern crate alloc;
 
@@ -5809,6 +5809,38 @@ extern "C" fn sora_main(
         log(text);
     }
 
+    //j888
+    // SH7-c (PLAN/022, payload P1): a dynamically linked musl program. Sora packs it with the
+    // interpreter its PT_INTERP names (musl's own loader) into one launch bundle; the shim loads
+    // both, and ld-musl relocates and starts the program like on Linux. — TEAL
+    let mut dyn_status = 0i64;
+    let dyn_ran = match persona_launch_vmo(
+        initrd,
+        kumo_abi::initrd::PERSONA_LINUX_HELLO_DYN_PATH.as_bytes(),
+        b"persona-linux-hello-dyn",
+    ) {
+        Some((bundle, len)) => run_elf_threads_status(
+            initrd,
+            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
+            u64::from(bundle.0),
+            len,
+            ProcessRunFlags::TRANSFER_ARG.bits(),
+            b"M10 dyn",
+            0,
+            None,
+            &mut dyn_status,
+            false,
+        ),
+        None => false,
+    };
+    if dyn_ran {
+        debug_write(b"M10-d Check ok\n".as_ptr(), 15);
+    } else {
+        let mut line = [0u8; 48];
+        let text = fmt_status_line(&mut line, b"M10 dyn: run fail status=", dyn_status);
+        log(text);
+    }
+
     // Narrow the initrd handle before handing it to user programs. `ls` only needs READ
     // authority; Sora keeps the full bootstrap handle for its own loader duties.
     let prog_initrd = handle_duplicate(initrd, Rights::READ | Rights::DUPLICATE);
@@ -6810,6 +6842,112 @@ fn initrd_file_vmo(initrd: Handle, target: &[u8]) -> Option<(Handle, u64)> {
         at += n as u64;
     }
     Some((vmo, len))
+}
+
+//j888
+/// SH7-c: pack a Linux program and the interpreter its `PT_INTERP` names into one
+/// `persona_linux::launch` bundle VMO for the persona shim. Sora is the exec authority for now:
+/// it resolves the absolute interpreter path in the initrd (dropping the leading `/`) until the
+/// shim has a file surface of its own (SH7-d). Every refusal is logged by name. — TEAL
+fn persona_launch_vmo(initrd: Handle, program_path: &[u8], name: &[u8]) -> Option<(Handle, u64)> {
+    let refuse = |why: &[u8]| {
+        log(b"M10 dyn: ");
+        log(why);
+        log(b"\n");
+    };
+    let Some((program_off, program_len)) = find_initrd_file(initrd, program_path) else {
+        refuse(b"program missing from the initrd");
+        return None;
+    };
+    let mut program = alloc::vec![0u8; program_len as usize];
+    if !read_initrd_into(initrd, program_off, &mut program) {
+        refuse(b"program read fail");
+        return None;
+    }
+    let Ok(header) = linux_elf::parse_linux_image(&program, linux_elf::Machine::Aarch64) else {
+        refuse(b"not an aarch64 Linux image");
+        return None;
+    };
+    let interp = match linux_elf::interpreter(&program, &header) {
+        Ok(None) => None,
+        Ok(Some(path)) => {
+            let Some(rel) = path.strip_prefix(b"/") else {
+                refuse(b"PT_INTERP is not an absolute path");
+                return None;
+            };
+            match find_initrd_file(initrd, rel) {
+                Some(found) => Some(found),
+                None => {
+                    refuse(b"interpreter missing from the initrd");
+                    return None;
+                }
+            }
+        }
+        Err(_) => {
+            refuse(b"bad PT_INTERP");
+            return None;
+        }
+    };
+    let interp_len = interp.map_or(0, |(_, len)| len);
+    let layout = persona_linux::launch::layout(program_len, interp_len)?;
+    let Ok(head) = persona_linux::launch::header(&layout, program_len, interp_len, name) else {
+        refuse(b"name too long");
+        return None;
+    };
+    let raw = vmo_create(layout.total);
+    if raw == 0 || raw == u64::MAX {
+        refuse(b"bundle vmo fail");
+        return None;
+    }
+    let bundle = Handle(raw as u32);
+    let mut ok =
+        write_vmo_bytes(bundle, 0, &head) && write_vmo_bytes(bundle, layout.program_off, &program);
+    if let Some((off, len)) = interp {
+        ok = ok && copy_initrd_to_vmo(initrd, off, len, bundle, layout.interp_off);
+    }
+    if !ok {
+        refuse(b"bundle write fail");
+        let _ = handle_close(bundle);
+        return None;
+    }
+    Some((bundle, layout.total))
+}
+
+/// Read `out.len()` initrd bytes at `offset` (VmoRead moves at most VMO_TRANSFER_MAX per call).
+fn read_initrd_into(initrd: Handle, offset: u64, out: &mut [u8]) -> bool {
+    out.chunks_mut(kumo_abi::sys::VMO_TRANSFER_MAX)
+        .enumerate()
+        .all(|(i, chunk)| {
+            let at = offset + (i * kumo_abi::sys::VMO_TRANSFER_MAX) as u64;
+            vmo_read(initrd, at, chunk.as_mut_ptr(), chunk.len()) == 0
+        })
+}
+
+/// Write `bytes` into `vmo` at `offset`, VMO_TRANSFER_MAX bytes per VmoWrite.
+fn write_vmo_bytes(vmo: Handle, offset: u64, bytes: &[u8]) -> bool {
+    bytes
+        .chunks(kumo_abi::sys::VMO_TRANSFER_MAX)
+        .enumerate()
+        .all(|(i, chunk)| {
+            let at = offset + (i * kumo_abi::sys::VMO_TRANSFER_MAX) as u64;
+            vmo_write(vmo, at, chunk.as_ptr(), chunk.len()) == 0
+        })
+}
+
+/// Copy `len` initrd bytes at `from` into `vmo` at `to`, through one transfer-sized buffer.
+fn copy_initrd_to_vmo(initrd: Handle, from: u64, len: u64, vmo: Handle, to: u64) -> bool {
+    let mut chunk = [0u8; kumo_abi::sys::VMO_TRANSFER_MAX];
+    let mut at = 0u64;
+    while at < len {
+        let n = (len - at).min(chunk.len() as u64) as usize;
+        if vmo_read(initrd, from + at, chunk.as_mut_ptr(), n) != 0
+            || vmo_write(vmo, to + at, chunk.as_ptr(), n) != 0
+        {
+            return false;
+        }
+        at += n as u64;
+    }
+    true
 }
 
 fn find_initrd_file(initrd: Handle, target: &[u8]) -> Option<(u64, u64)> {

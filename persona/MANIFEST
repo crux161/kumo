@@ -1,0 +1,13 @@
+# persona/ — Linux-side payloads for the persona shim (PLAN/022 SH7-c, j888).
+# Rebuild: scripts/persona-payloads.sh (needs docker + network). xtask refuses to pack a file
+# whose sha256 differs from this list (PERSONA_PAYLOADS in xtask/src/main.rs).
+#
+# Source image : alpine:3.22, arm64, alpine@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
+# Packages     : musl-1.2.5-r13 (MIT), musl-dev-1.2.5-r13, gcc-14.2.0-r6, binutils-2.44-r3
+# hello-dyn    : gcc -O2 -o hello-dyn hello-dyn.c && strip hello-dyn  (PIE, PT_INTERP /lib/ld-musl-aarch64.so.1)
+# musl/ld-musl-aarch64.so.1 : /lib/ld-musl-aarch64.so.1 from musl-1.2.5-r13 (musl's libc.so and dynamic loader)
+# musl/COPYRIGHT : https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5 (MIT; covers ld-musl-aarch64.so.1)
+#
+9d5c57f5fd8dd7f905baa7d5f28253081dd53750128366528f7e80a6db8bdbbf  hello-dyn
+42fb025bc758b76e60e7b3b0fcdcfab93b6ba1694b363244c2e8e6f51847e28c  musl/ld-musl-aarch64.so.1
+f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af  musl/COPYRIGHT

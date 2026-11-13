@@ -1,8 +1,8 @@
-//j798
 //j815
 //j824
 //j825
 //j857
+//j888
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -53,6 +53,12 @@ pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// SH7: the in-process Linux personality runtime (PLAN.md §10 R1); a Linux program runs
 /// inside it.
 pub const PERSONA_LINUX_SHIM_PATH: &str = "bin/persona-linux-shim";
+//j888
+/// SH7-c: a dynamically linked musl hello (persona/hello-dyn); its PT_INTERP names
+/// `/lib/ld-musl-aarch64.so.1`, which Sora resolves in the initrd by dropping the leading `/`.
+pub const PERSONA_LINUX_HELLO_DYN_PATH: &str = "bin/persona-linux-hello-dyn";
+/// SH7-c: musl's dynamic loader (musl's own `libc.so`), as an absolute Linux path names it.
+pub const PERSONA_LINUX_MUSL_LOADER_PATH: &str = "lib/ld-musl-aarch64.so.1";
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.
 pub const HELLO_PATH: &str = "bin/hello";

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 #j885
-"""SH7-b: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1).
+#j888
+"""SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
+program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
 Reuses the AXH harness's own boot machinery (import only). Sora's boot runs the M10 aarch64
 Linux ELF inside `persona-linux-shim`: the shim loads the program into its own address space,
@@ -52,6 +54,9 @@ def main():
         (
             "M10 elf linux hi",
             "M10-c Check ok",
+            # SH7-c (j888): a dynamic musl program, through musl's own loader (PT_INTERP).
+            "SH7-c dynamic musl hello: argc=1 argv0=persona-linux-hello-dyn",
+            "M10-d Check ok",
         ),
         ready=0,
     )
@@ -75,7 +80,7 @@ def main():
         with (work / "restore-default.log").open("wb") as log:
             subprocess.run(axh.IMAGE_ARGS, cwd=ROOT, env=default_env, stdout=log, stderr=log, check=True)
         (work / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print("SH7-b persona smoke green", flush=True)
+    print("SH7-b/c persona smoke green", flush=True)
 
 
 if __name__ == "__main__":

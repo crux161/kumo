@@ -1,8 +1,8 @@
-//j823
 //j824
 //j825
 //j857
 //j871
+//j888
 
 use std::env;
 use std::fmt;
@@ -958,6 +958,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let drv_fb = build_drv_fb_image(&workspace_root()?)?;
             let drv_gpu = build_drv_gpu_image(&workspace_root()?)?;
             let mali_firmware = build_mali_firmware(&workspace_root()?)?;
+            let persona_payloads = build_persona_payloads(&workspace_root()?)?;
             let drv_i2c_hid = build_drv_i2c_hid_image(&workspace_root()?)?;
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
             let drv_nvme = build_drv_nvme_image(&workspace_root()?)?;
@@ -1021,6 +1022,14 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (
                     kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH,
                     persona_linux_shim.as_slice(),
+                ),
+                (
+                    kumo_abi::initrd::PERSONA_LINUX_HELLO_DYN_PATH,
+                    persona_payloads[0].as_slice(),
+                ),
+                (
+                    kumo_abi::initrd::PERSONA_LINUX_MUSL_LOADER_PATH,
+                    persona_payloads[1].as_slice(),
                 ),
                 (HELLO_PATH, hello.as_slice()),
                 (GFX_CLIENT_PATH, gfx_client.as_slice()),
@@ -1623,6 +1632,42 @@ fn build_drv_fb_image(root: &Path) -> Result<Vec<u8>, String> {
 fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
     let path = root.join("firmware/mali_csffw.bin");
     fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))
+}
+
+//j888
+/// SH7-c: the vendored Linux-side persona payloads (persona/, rebuilt by
+/// scripts/persona-payloads.sh from a pinned Alpine image): a dynamic musl hello, then musl's
+/// loader. Each is checked against the digest persona/MANIFEST records, so the initrd carries
+/// exactly the bytes that manifest and musl's COPYRIGHT describe. — TEAL
+const PERSONA_PAYLOADS: [(&str, &str); 2] = [
+    (
+        "persona/hello-dyn",
+        "9d5c57f5fd8dd7f905baa7d5f28253081dd53750128366528f7e80a6db8bdbbf",
+    ),
+    (
+        "persona/musl/ld-musl-aarch64.so.1",
+        "42fb025bc758b76e60e7b3b0fcdcfab93b6ba1694b363244c2e8e6f51847e28c",
+    ),
+];
+
+fn build_persona_payloads(root: &Path) -> Result<[Vec<u8>; 2], String> {
+    let read = |(rel, want): (&str, &str)| -> Result<Vec<u8>, String> {
+        let path = root.join(rel);
+        let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        let got: String = kumo_sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if got != want {
+            return Err(format!(
+                "{}: sha256 {got} does not match persona/MANIFEST ({want}); rerun \
+                 scripts/persona-payloads.sh and update both",
+                path.display()
+            ));
+        }
+        Ok(bytes)
+    };
+    Ok([read(PERSONA_PAYLOADS[0])?, read(PERSONA_PAYLOADS[1])?])
 }
 
 fn build_drv_gpu_image(root: &Path) -> Result<Vec<u8>, String> {
