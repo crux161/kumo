@@ -2,6 +2,7 @@
 #![no_main]
 //j885
 //j888
+//j889
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -48,6 +49,7 @@ mod nr {
     pub const BRK: u64 = 214;
     pub const MUNMAP: u64 = 215;
     pub const MMAP: u64 = 222;
+    pub const MPROTECT: u64 = 226;
 }
 
 mod errno {
@@ -102,6 +104,26 @@ const AT_RANDOM: u64 = 25;
 // ---- KUMO persona calls ------------------------------------------------------------------
 
 const SYSCALL_PERSONA_SHIM_SET: u64 = 63;
+const SYSCALL_VMAR_PROTECT: u64 = 16;
+
+/// SH7-d1: native `VmarProtect` on this process. Linux PROT_READ/WRITE/EXEC are the same bits as
+/// KUMO's READ/WRITE/EXECUTE, so `prot` passes through unchanged.
+fn vmar_protect(virt: u64, len: u64, prot: u64) -> u64 {
+    let status: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_VMAR_PROTECT,
+            inlateout("x0") kumo_abi::INVALID_HANDLE.0 as u64 => status,
+            in("x1") virt,
+            in("x2") len,
+            in("x3") prot,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    status
+}
 
 fn persona_shim_set(entry: u64, code_base: u64, code_len: u64, stack_top: u64) -> u64 {
     let status: u64;
@@ -233,13 +255,8 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31]) {
         nr::RT_SIGACTION | nr::RT_SIGPROCMASK => 0,
         nr::BRK => brk(a0) as i64,
         nr::MMAP => mmap(a0, a1, a2, frame[3]),
-        nr::MUNMAP => {
-            if vmar_unmap(a0, a1.next_multiple_of(PAGE)) == 0 {
-                0
-            } else {
-                -errno::EINVAL
-            }
-        }
+        nr::MUNMAP => munmap(a0, a1),
+        nr::MPROTECT => mprotect(a0, a1, a2),
         nr::EXIT | nr::EXIT_GROUP => process_exit(a0 & 0xff),
         other => {
             log(format_args!(
@@ -328,6 +345,32 @@ fn brk(request: u64) -> u64 {
     program.brk_end
 }
 
+/// SH7-d1: Linux `munmap` over any page range, by the kernel's page-range VmarUnmap. A range
+/// with nothing mapped succeeds, as on Linux; only an unaligned or empty one is EINVAL.
+fn munmap(addr: u64, len: u64) -> i64 {
+    if addr % PAGE != 0 || len == 0 {
+        return -errno::EINVAL;
+    }
+    let _ = vmar_unmap(addr, len.next_multiple_of(PAGE));
+    0
+}
+
+/// SH7-d1: Linux `mprotect` over any page range, by the kernel's page-range VmarProtect. A
+/// range with a hole is ENOMEM (the kernel changes nothing then), an unaligned one EINVAL.
+fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    if addr % PAGE != 0 || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return -errno::EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    match vmar_protect(addr, len.next_multiple_of(PAGE), prot) as u32 as i32 {
+        0 => 0,
+        status if status == kumo_abi::Errno::NoMemory as i32 => -errno::ENOMEM,
+        _ => -errno::EINVAL,
+    }
+}
+
 /// Anonymous private mappings only in this slice; a file mapping answers -ENOSYS.
 fn mmap(addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
     if flags & MAP_ANONYMOUS == 0 {
@@ -353,7 +396,15 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
     if prot & PROT_EXEC != 0 {
         map |= MAP_X;
     }
-    // MAP_FIXED must land at `addr`; without it `addr` is only a hint (Linux semantics).
+    // MAP_FIXED must land at `addr`, replacing whatever is mapped there (SH7-d1: unmap the page
+    // range, then map); without it `addr` is only a hint (Linux semantics).
+    if flags & MAP_FIXED != 0 {
+        if addr % PAGE != 0 {
+            let _ = kumo_rt::handle_close(vmo);
+            return -errno::EINVAL;
+        }
+        let _ = vmar_unmap(addr, len);
+    }
     let at_hint = addr != 0 && addr % PAGE == 0 && vmar_map(Handle(0), vmo, 0, addr, len, map) == 0;
     let result = if at_hint {
         addr as i64

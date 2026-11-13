@@ -1,8 +1,8 @@
-//j659
 //j660
 //j743
 //j825
 //j875
+//j889
 use alloc::vec::Vec;
 
 use kumo_abi::{KoId, ObjectKind, Signals};
@@ -171,64 +171,92 @@ impl Process {
         Some(self.mappings.remove(index))
     }
 
-    /// Every record wholly inside `[virt, virt + len)` (SH6 `VmarUnmap`): `None` when a
-    /// record straddles either edge (a partial unmap is never made) or none lies inside.
-    /// An exact single record is the J660 case; a range spanning a guard hole made by
-    /// `VmarProtect` is the SH6 one. — TEAL
-    pub fn mappings_within(&self, virt: u64, len: u64) -> Option<Vec<(Mapping, KoId)>> {
-        let end = virt.checked_add(len)?;
-        let mut inside = Vec::new();
-        for &(mapping, koid) in &self.mappings {
-            let m_end = mapping.virt.saturating_add(mapping.len);
-            if m_end <= virt || mapping.virt >= end {
-                continue;
-            }
-            if mapping.virt < virt || m_end > end {
-                return None;
-            }
-            inside.push((mapping, koid));
-        }
-        (!inside.is_empty()).then_some(inside)
+    //j889
+    /// SH7-d1: split the record that straddles page-aligned `at`, if any, into two records at
+    /// `at` over the same VMO. The tail's VMO offset advances by the head's length. Both pieces
+    /// keep the record's flags and VMO reference, and retirement and teardown already handle a
+    /// VMO named by several records. — TEAL
+    fn split_at(&mut self, at: u64) {
+        let Some(index) = self
+            .mappings
+            .iter()
+            .position(|(m, _)| m.virt < at && at < m.virt.saturating_add(m.len))
+        else {
+            return;
+        };
+        let (record, koid) = self.mappings[index];
+        let head_len = at - record.virt;
+        let head = Mapping {
+            len: head_len,
+            ..record
+        };
+        let tail = Mapping {
+            virt: at,
+            len: record.len - head_len,
+            vmo_offset: record.vmo_offset + head_len,
+            flags: record.flags,
+        };
+        self.mappings[index] = (head, koid);
+        self.mappings.insert(index + 1, (tail, koid));
     }
 
-    /// Trim `[virt, virt + len)` off one end of the record that holds it (SH6
-    /// `VmarProtect` PROT_NONE). The range must be a strict prefix or suffix of exactly one
-    /// record; that record shrinks (a prefix also advances its VMO offset), and the removed
-    /// span comes back so the caller can clear its leaves. A middle range would split the
-    /// record in two and is refused (`None`). — TEAL
-    pub fn trim_mapping(&mut self, virt: u64, len: u64) -> Option<Mapping> {
+    /// SH7-d1: make `[virt, virt + len)` a union of whole records, by splitting the at most two
+    /// records that straddle its edges, and return the records now inside it in address order.
+    /// `None` for an empty, unaligned or overflowing range. An empty `Vec` means nothing is
+    /// mapped there (no record is split then either). Linux `munmap`/`mprotect` act on any page
+    /// range, and musl's library loader relies on that. — TEAL
+    pub fn isolate(&mut self, virt: u64, len: u64) -> Option<Vec<(Mapping, KoId)>> {
         let end = virt.checked_add(len)?;
-        let (record, _) = self.mappings.iter_mut().find(|(mapping, _)| {
-            mapping.virt <= virt && end <= mapping.virt.saturating_add(mapping.len)
-        })?;
-        let m_end = record.virt + record.len;
-        if len == 0 || len >= record.len {
+        if len == 0 || virt % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
             return None;
         }
-        let removed = if virt == record.virt {
-            let removed = Mapping {
-                virt,
-                len,
-                vmo_offset: record.vmo_offset,
-                flags: record.flags,
-            };
-            record.virt += len;
-            record.vmo_offset += len;
-            record.len -= len;
-            removed
-        } else if end == m_end {
-            let removed = Mapping {
-                virt,
-                len,
-                vmo_offset: record.vmo_offset + (virt - record.virt),
-                flags: record.flags,
-            };
-            record.len -= len;
-            removed
-        } else {
-            return None;
+        let touches = |m: &Mapping| m.virt < end && virt < m.virt.saturating_add(m.len);
+        if !self.mappings.iter().any(|(m, _)| touches(m)) {
+            return Some(Vec::new());
+        }
+        self.split_at(virt);
+        self.split_at(end);
+        let mut inside: Vec<(Mapping, KoId)> = self
+            .mappings
+            .iter()
+            .filter(|(m, _)| touches(m))
+            .copied()
+            .collect();
+        inside.sort_by_key(|(m, _)| m.virt);
+        Some(inside)
+    }
+
+    /// SH7-d1: whether records cover every byte of `[virt, virt + len)`, with no hole.
+    pub fn covers(&self, virt: u64, len: u64) -> bool {
+        let Some(end) = virt.checked_add(len) else {
+            return false;
         };
-        Some(removed)
+        let mut spans: Vec<(u64, u64)> = self
+            .mappings
+            .iter()
+            .map(|(m, _)| (m.virt, m.virt.saturating_add(m.len)))
+            .filter(|&(start, stop)| start < end && virt < stop)
+            .collect();
+        spans.sort_unstable();
+        let mut reached = virt;
+        for (start, stop) in spans {
+            if start > reached {
+                return false;
+            }
+            reached = reached.max(stop);
+        }
+        reached >= end
+    }
+
+    /// SH7-d1: give the record starting exactly at `virt` the access bits `access` (READ /
+    /// WRITE / EXECUTE; every other flag is kept) and return the updated record. An access set
+    /// of none keeps the record and its VMO pages with no leaves, so a later protect restores the
+    /// same contents, as Linux `PROT_NONE` does. — TEAL
+    pub fn set_access(&mut self, virt: u64, access: u64) -> Option<Mapping> {
+        const ACCESS: u64 = (1 << 0) | (1 << 1) | (1 << 2);
+        let (record, _) = self.mappings.iter_mut().find(|(m, _)| m.virt == virt)?;
+        record.flags = kumo_hal::PageFlags((record.flags.0 & !ACCESS) | (access & ACCESS));
+        Some(*record)
     }
 
     /// Whether `[start, start + len)` is unused by both VMO mappings and the user stack.

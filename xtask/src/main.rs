@@ -1,8 +1,8 @@
-//j824
 //j825
 //j857
 //j871
 //j888
+//j889
 
 use std::env;
 use std::fmt;
@@ -1031,6 +1031,10 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                     kumo_abi::initrd::PERSONA_LINUX_MUSL_LOADER_PATH,
                     persona_payloads[1].as_slice(),
                 ),
+                (
+                    kumo_abi::initrd::PERSONA_LINUX_VMPROBE_PATH,
+                    persona_payloads[2].as_slice(),
+                ),
                 (HELLO_PATH, hello.as_slice()),
                 (GFX_CLIENT_PATH, gfx_client.as_slice()),
                 (kumo_abi::initrd::GFX_KEYS_PATH, gfx_keys.as_slice()),
@@ -1639,7 +1643,7 @@ fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
 /// scripts/persona-payloads.sh from a pinned Alpine image): a dynamic musl hello, then musl's
 /// loader. Each is checked against the digest persona/MANIFEST records, so the initrd carries
 /// exactly the bytes that manifest and musl's COPYRIGHT describe. — TEAL
-const PERSONA_PAYLOADS: [(&str, &str); 2] = [
+const PERSONA_PAYLOADS: [(&str, &str); 3] = [
     (
         "persona/hello-dyn",
         "9d5c57f5fd8dd7f905baa7d5f28253081dd53750128366528f7e80a6db8bdbbf",
@@ -1648,9 +1652,14 @@ const PERSONA_PAYLOADS: [(&str, &str); 2] = [
         "persona/musl/ld-musl-aarch64.so.1",
         "42fb025bc758b76e60e7b3b0fcdcfab93b6ba1694b363244c2e8e6f51847e28c",
     ),
+    //j889
+    (
+        "persona/vmprobe",
+        "0e84821cf1431fe44d67939403a5094b7646c48dc72bd88e0b4d05c0056c4743",
+    ),
 ];
 
-fn build_persona_payloads(root: &Path) -> Result<[Vec<u8>; 2], String> {
+fn build_persona_payloads(root: &Path) -> Result<[Vec<u8>; 3], String> {
     let read = |(rel, want): (&str, &str)| -> Result<Vec<u8>, String> {
         let path = root.join(rel);
         let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
@@ -1667,7 +1676,11 @@ fn build_persona_payloads(root: &Path) -> Result<[Vec<u8>; 2], String> {
         }
         Ok(bytes)
     };
-    Ok([read(PERSONA_PAYLOADS[0])?, read(PERSONA_PAYLOADS[1])?])
+    Ok([
+        read(PERSONA_PAYLOADS[0])?,
+        read(PERSONA_PAYLOADS[1])?,
+        read(PERSONA_PAYLOADS[2])?,
+    ])
 }
 
 fn build_drv_gpu_image(root: &Path) -> Result<Vec<u8>, String> {

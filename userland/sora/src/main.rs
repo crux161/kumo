@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j857
 //j859
 //j864
 //j870
 //j888
+//j889
 
 extern crate alloc;
 
@@ -5838,6 +5838,37 @@ extern "C" fn sora_main(
     } else {
         let mut line = [0u8; 48];
         let text = fmt_status_line(&mut line, b"M10 dyn: run fail status=", dyn_status);
+        log(text);
+    }
+
+    //j889
+    // SH7-d1: Linux address-space semantics (mmap/mprotect/munmap over page ranges) on the
+    // kernel's page-range VmarUnmap/VmarProtect, checked by a dynamic musl probe. — TEAL
+    let mut vm_status = 0i64;
+    let vm_ran = match persona_launch_vmo(
+        initrd,
+        kumo_abi::initrd::PERSONA_LINUX_VMPROBE_PATH.as_bytes(),
+        b"persona-linux-vmprobe",
+    ) {
+        Some((bundle, len)) => run_elf_threads_status(
+            initrd,
+            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
+            u64::from(bundle.0),
+            len,
+            ProcessRunFlags::TRANSFER_ARG.bits(),
+            b"M10 vm",
+            0,
+            None,
+            &mut vm_status,
+            false,
+        ),
+        None => false,
+    };
+    if vm_ran {
+        debug_write(b"M10-e Check ok\n".as_ptr(), 15);
+    } else {
+        let mut line = [0u8; 48];
+        let text = fmt_status_line(&mut line, b"M10 vm: run fail status=", vm_status);
         log(text);
     }
 

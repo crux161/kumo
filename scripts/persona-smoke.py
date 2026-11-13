@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j885
 #j888
+#j889
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -57,6 +58,9 @@ def main():
             # SH7-c (j888): a dynamic musl program, through musl's own loader (PT_INTERP).
             "SH7-c dynamic musl hello: argc=1 argv0=persona-linux-hello-dyn",
             "M10-d Check ok",
+            # SH7-d1 (j889): Linux mmap/mprotect/munmap over page ranges.
+            "vmprobe: OK (0 failures)",
+            "M10-e Check ok",
         ),
         ready=0,
     )
