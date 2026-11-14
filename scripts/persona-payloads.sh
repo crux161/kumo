@@ -1,6 +1,7 @@
 #!/bin/sh
 #j888
 #j889
+#j890
 # SH7-c: rebuild the Linux-side persona payloads in persona/ from a pinned Alpine image.
 # musl's dynamic loader (ld-musl-aarch64.so.1, which is musl's libc.so) and a dynamic musl
 # hello built against it. Needs docker (OrbStack) and network for the image and apk.
@@ -20,7 +21,17 @@ for prog in hello-dyn vmprobe; do
     docker exec "$NAME" sh -c "cd /w && gcc -O2 -o $prog $prog.c && strip $prog"
     docker cp "$NAME:/w/$prog" "$OUT/$prog"
 done
+# SH7-d2: a shared library and a program that NEEDs it (musl finds it in /lib), and the file probe.
+for src in libgreet greet fileprobe; do
+    docker cp "$OUT/$src.c" "$NAME:/w/$src.c"
+done
+docker exec "$NAME" sh -c 'cd /w && gcc -O2 -fPIC -shared -o libgreet.so libgreet.c && strip libgreet.so \
+    && gcc -O2 -o greet greet.c -L. -lgreet && strip greet \
+    && gcc -O2 -o fileprobe fileprobe.c && strip fileprobe'
+for out in libgreet.so greet fileprobe; do
+    docker cp "$NAME:/w/$out" "$OUT/$out"
+done
 docker cp -L "$NAME:/lib/ld-musl-aarch64.so.1" "$OUT/musl/ld-musl-aarch64.so.1"
 docker exec "$NAME" wget -q -O /w/COPYRIGHT "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5"
 docker cp "$NAME:/w/COPYRIGHT" "$OUT/musl/COPYRIGHT"
-cd "$OUT" && shasum -a 256 hello-dyn vmprobe musl/ld-musl-aarch64.so.1 musl/COPYRIGHT
+cd "$OUT" && shasum -a 256 hello-dyn vmprobe greet libgreet.so fileprobe musl/ld-musl-aarch64.so.1 musl/COPYRIGHT

@@ -1,8 +1,8 @@
-//j825
 //j857
 //j871
 //j888
 //j889
+//j890
 
 use std::env;
 use std::fmt;
@@ -22,9 +22,9 @@ use kumo_abi::initrd::{
     DRV_FB_PATH, DRV_GPU_PATH, DRV_I2C_HID_PATH, DRV_NVME_PATH, DRV_SERIAL_PATH, DRV_XHCI_PATH,
     FATFS_PATH, GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, HELLO_PATH,
     INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX,
-    INITRD_VERSION, KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SDK_SMOKE_PATH, SORA_INIT_PATH, STD_SMOKE_PATH,
-    SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
+    INITRD_VERSION, KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH, RELIBC_SMOKE_PATH,
+    SDK_SMOKE_PATH, SORA_INIT_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH,
+    WC_PATH,
 };
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
@@ -776,54 +776,333 @@ fn stage_kernel(
     }))
 }
 
-/// Build a minimal FAT32 disk image with:
-///   sector 0:   BPB
-///   sector 1:   FSInfo (signatures only)
-///   sectors 2–31: reserved (zeroed)
-///   sectors 32–63: FAT #1
-///   sectors 64–95: FAT #2
-///   sector 96:  root directory (cluster 2): volume label + README/HELLO + EFI/
-///   sector 97:  HELLO.TXT data (cluster 3)
-///   sector 98:  EFI/ directory (cluster 4)
-///   sector 99:  EFI/BOOT/ directory (cluster 5)
-///   sector 100: EFI/BOOT/BOOTAA64.EFI data (cluster 6)
+//j890
+/// The RAM FAT32 image Sora serves as the `fatfs` filesystem (`bin/fat32.img`).
 ///
-/// The `EFI/BOOT/BOOTAA64.EFI` subtree mirrors the ESP shape so the reader's path
-/// resolution (`kumo-fatfs::resolve_path`) can be exercised against a real image;
-/// the total size is unchanged (the clusters were already inside the 2 MiB image),
-/// so the initrd layout — and `drv-blk`'s view of it — is untouched.
+/// SH7-d2 replaced the hand-laid 2 MiB image with a builder that lays out any tree of files with
+/// **VFAT long names**, because Linux programs name paths such as `/lib/ld-musl-aarch64.so.1`
+/// that 8.3 cannot hold. The image sizes itself to its contents plus [`FAT_FREE_CLUSTERS`] free
+/// clusters (writes under `/tmp`), and keeps every fixture the older image carried at the same
+/// path: the `KUMO` label, `README.TXT` (a 128-byte entry with no data), `HELLO.TXT`,
+/// `EFI/BOOT/BOOTAA64.EFI` and `SMOKE.ELF` (the SH4 spawn preview). The host tests mount the
+/// result with `kumo-fatfs`'s own reader, the one that runs on target. — TEAL
 ///
-/// Layout constants (must be internally consistent):
+/// Geometry: 512-byte sectors, one sector per cluster, 32 reserved sectors, two FATs, the root
+/// directory at cluster 2; every file and directory is one contiguous run of clusters.
 const FAT_SEC_SIZE: u16 = 512;
 const FAT_RESERVED: u16 = 32;
 const FAT_NUM_FATS: u8 = 2;
 const FAT_SPC: u8 = 1;
-const FAT_SPF: u32 = 32; // sectors per FAT
-const FAT_TOTAL_SECS: u32 = 4096;
 const ROOT_CLUSTER: u32 = 2;
-/// First data cluster of the std-smoke copy packed as SMOKE.ELF (SH4 spawn preview).
-const SMOKE_FIRST_CLUSTER: u32 = 7;
-const DATA_START: u64 = FAT_RESERVED as u64 + (FAT_NUM_FATS as u64 * FAT_SPF as u64);
+/// Free clusters left after the contents: 1 MiB, about what the old fixed image had spare.
+const FAT_FREE_CLUSTERS: u32 = 2048;
+const FAT_EOF: u32 = 0x0FFF_FFFF;
 
-/// Byte offset of the first sector of `cluster` within the FAT image.
-fn fat_cluster_off(cluster: u32) -> usize {
-    (DATA_START as usize + (cluster as usize - 2) * FAT_SPC as usize) * FAT_SEC_SIZE as usize
+/// A node of the image's tree.
+enum FatNode<'a> {
+    Dir(Vec<(String, FatNode<'a>)>),
+    File(&'a [u8]),
+    /// A directory entry that claims `size` bytes but owns no cluster (the old README.TXT).
+    Phantom(u32),
 }
 
-/// Write a 32-byte short (8.3) directory entry at `off` within a directory slice.
-fn put_dir_entry(dir: &mut [u8], off: usize, name: &[u8; 11], attr: u8, cluster: u32, size: u32) {
-    let e = &mut dir[off..off + 32];
-    e[..11].copy_from_slice(name);
-    e[11] = attr;
-    e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
-    e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
-    e[28..32].copy_from_slice(&size.to_le_bytes());
+impl<'a> FatNode<'a> {
+    /// Insert `bytes` at `path` (absolute, `/`-separated), creating directories on the way.
+    fn insert(&mut self, path: &str, node: FatNode<'a>) {
+        let FatNode::Dir(children) = self else {
+            panic!("fat image: {path} lies under a file");
+        };
+        let path = path.trim_start_matches('/');
+        let (first, rest) = match path.split_once('/') {
+            Some((first, rest)) => (first, Some(rest)),
+            None => (path, None),
+        };
+        match (children.iter().position(|(name, _)| name == first), rest) {
+            (None, None) => children.push((first.to_string(), node)),
+            (None, Some(rest)) => {
+                children.push((first.to_string(), FatNode::Dir(Vec::new())));
+                let last = children.len() - 1;
+                children[last].1.insert(rest, node);
+            }
+            (Some(index), Some(rest)) => children[index].1.insert(rest, node),
+            (Some(_), None) => panic!("fat image: {path} inserted twice"),
+        }
+    }
 }
 
-fn build_fat32_image(smoke: &[u8]) -> Vec<u8> {
-    let total = FAT_TOTAL_SECS as usize * FAT_SEC_SIZE as usize;
-    let mut img = vec![0u8; total];
+/// The 8.3 form a name can take exactly (upper case, at most 8.3, only valid characters), or
+/// `None` when it needs a long name.
+fn fat_exact_83(name: &str) -> Option<[u8; 11]> {
+    let valid =
+        |c: u8| c.is_ascii_uppercase() || c.is_ascii_digit() || b"$%'-_@~`!(){}^#&".contains(&c);
+    let (base, ext) = match name.rsplit_once('.') {
+        Some((base, ext)) => (base, ext),
+        None => (name, ""),
+    };
+    if base.is_empty()
+        || base.len() > 8
+        || ext.len() > 3
+        || !base.bytes().chain(ext.bytes()).all(valid)
+    {
+        return None;
+    }
+    let mut out = [b' '; 11];
+    out[..base.len()].copy_from_slice(base.as_bytes());
+    out[8..8 + ext.len()].copy_from_slice(ext.as_bytes());
+    Some(out)
+}
 
+/// A unique `BASE~N.EXT` short alias for a long `name` among `taken`.
+fn fat_alias(name: &str, taken: &[[u8; 11]]) -> [u8; 11] {
+    let clean = |s: &str| -> Vec<u8> {
+        s.bytes()
+            .map(|c| c.to_ascii_uppercase())
+            .filter(|&c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+            .collect()
+    };
+    let (base, ext) = match name.rsplit_once('.') {
+        Some((base, ext)) if !base.is_empty() => (clean(base), clean(ext)),
+        _ => (clean(name), Vec::new()),
+    };
+    for n in 1..1000u32 {
+        let tail = format!("~{n}");
+        let keep = (8 - tail.len()).min(base.len());
+        let mut out = [b' '; 11];
+        let stem = if base.is_empty() {
+            b"_".to_vec()
+        } else {
+            base[..keep].to_vec()
+        };
+        out[..stem.len()].copy_from_slice(&stem);
+        out[stem.len()..stem.len() + tail.len()].copy_from_slice(tail.as_bytes());
+        let ext_len = ext.len().min(3);
+        out[8..8 + ext_len].copy_from_slice(&ext[..ext_len]);
+        if !taken.contains(&out) {
+            return out;
+        }
+    }
+    panic!("fat image: no free short alias for {name}");
+}
+
+/// The VFAT checksum of a short name, stored in each of its long-name slots.
+fn fat_lfn_checksum(short: &[u8; 11]) -> u8 {
+    short.iter().fold(0u8, |sum, &c| {
+        ((sum & 1) << 7).wrapping_add(sum >> 1).wrapping_add(c)
+    })
+}
+
+/// The 32-byte directory slots naming `name` with a short entry carrying `attr`, `cluster` and
+/// `size`: long-name slots first (highest order first) when the name needs them.
+fn fat_dir_slots(
+    name: &str,
+    taken: &mut Vec<[u8; 11]>,
+    attr: u8,
+    cluster: u32,
+    size: u32,
+) -> Vec<[u8; 32]> {
+    let mut slots = Vec::new();
+    let short = match fat_exact_83(name) {
+        Some(short) if !taken.contains(&short) => short,
+        _ => {
+            let alias = fat_alias(name, taken);
+            let checksum = fat_lfn_checksum(&alias);
+            let units: Vec<u16> = name.encode_utf16().collect();
+            assert!(units.len() <= 255, "fat image: name too long: {name}");
+            let count = units.len().div_ceil(13);
+            for order in (1..=count).rev() {
+                let mut slot = [0u8; 32];
+                slot[0] = order as u8 | if order == count { 0x40 } else { 0 };
+                slot[11] = 0x0F;
+                slot[13] = checksum;
+                let unit = |i: usize| -> u16 {
+                    let at = (order - 1) * 13 + i;
+                    match at.cmp(&units.len()) {
+                        std::cmp::Ordering::Less => units[at],
+                        std::cmp::Ordering::Equal => 0x0000,
+                        std::cmp::Ordering::Greater => 0xFFFF,
+                    }
+                };
+                let offsets = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+                for (i, &off) in offsets.iter().enumerate() {
+                    slot[off..off + 2].copy_from_slice(&unit(i).to_le_bytes());
+                }
+                slots.push(slot);
+            }
+            alias
+        }
+    };
+    taken.push(short);
+    slots.push(fat_short_entry(&short, attr, cluster, size));
+    slots
+}
+
+/// One 32-byte short directory entry.
+fn fat_short_entry(short: &[u8; 11], attr: u8, cluster: u32, size: u32) -> [u8; 32] {
+    let mut entry = [0u8; 32];
+    entry[..11].copy_from_slice(short);
+    entry[11] = attr;
+    entry[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+    entry[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    entry[28..32].copy_from_slice(&size.to_le_bytes());
+    entry
+}
+
+/// Directory slots a node's children take (with `.`/`..` for a subdirectory), for sizing.
+fn fat_dir_slot_count(children: &[(String, FatNode)], is_root: bool) -> usize {
+    let mut taken = Vec::new();
+    let named: usize = children
+        .iter()
+        .map(|(name, _)| fat_dir_slots(name, &mut taken, 0, 0, 0).len())
+        .sum();
+    named + if is_root { 1 } else { 2 } + 1 // label or dot entries, plus an end marker
+}
+
+/// Clusters a node and everything under it occupy.
+fn fat_clusters(node: &FatNode, is_root: bool) -> u32 {
+    match node {
+        FatNode::Dir(children) => {
+            let own =
+                (fat_dir_slot_count(children, is_root) * 32).div_ceil(FAT_SEC_SIZE as usize) as u32;
+            own + children
+                .iter()
+                .map(|(_, child)| fat_clusters(child, false))
+                .sum::<u32>()
+        }
+        FatNode::File(bytes) => bytes.len().div_ceil(FAT_SEC_SIZE as usize) as u32,
+        FatNode::Phantom(_) => 0,
+    }
+}
+
+struct FatLayout {
+    img: Vec<u8>,
+    fat: Vec<u32>,
+    next: u32,
+    data_start: usize,
+}
+
+impl FatLayout {
+    fn cluster_off(&self, cluster: u32) -> usize {
+        (self.data_start + (cluster as usize - 2) * FAT_SPC as usize) * FAT_SEC_SIZE as usize
+    }
+
+    /// Claim `count` contiguous clusters, chained in the FAT; 0 for an empty run.
+    fn claim(&mut self, count: u32) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        let first = self.next;
+        for c in first..first + count {
+            self.fat[c as usize] = if c + 1 == first + count {
+                FAT_EOF
+            } else {
+                c + 1
+            };
+        }
+        self.next += count;
+        first
+    }
+
+    /// Write directory `children` into the run at `first`, laying out each child as it goes.
+    fn place_dir(
+        &mut self,
+        children: &[(String, FatNode)],
+        first: u32,
+        parent: u32,
+        is_root: bool,
+    ) {
+        let mut slots: Vec<[u8; 32]> = Vec::new();
+        let mut taken = Vec::new();
+        if is_root {
+            let mut label = [0u8; 32];
+            label[..11].copy_from_slice(b"KUMO       ");
+            label[11] = 0x08;
+            slots.push(label);
+        } else {
+            // A subdirectory opens with `.` (itself) and `..` (its parent; the root is cluster 0).
+            let dotdot = if parent == ROOT_CLUSTER { 0 } else { parent };
+            slots.push(fat_short_entry(b".          ", 0x10, first, 0));
+            slots.push(fat_short_entry(b"..         ", 0x10, dotdot, 0));
+        }
+        for (name, child) in children {
+            let (attr, cluster, size) = match child {
+                FatNode::Dir(grand) => {
+                    let own = (fat_dir_slot_count(grand, false) * 32)
+                        .div_ceil(FAT_SEC_SIZE as usize) as u32;
+                    let at = self.claim(own);
+                    self.place_dir(grand, at, first, false);
+                    (0x10, at, 0)
+                }
+                FatNode::File(bytes) => {
+                    let at = self.claim(bytes.len().div_ceil(FAT_SEC_SIZE as usize) as u32);
+                    if at != 0 {
+                        let off = self.cluster_off(at);
+                        self.img[off..off + bytes.len()].copy_from_slice(bytes);
+                    }
+                    (0x20, at, bytes.len() as u32)
+                }
+                FatNode::Phantom(size) => (0x20, 0, *size),
+            };
+            slots.extend(fat_dir_slots(name, &mut taken, attr, cluster, size));
+        }
+        let off = self.cluster_off(first);
+        for (i, slot) in slots.iter().enumerate() {
+            self.img[off + i * 32..off + i * 32 + 32].copy_from_slice(slot);
+        }
+        // The cluster run was zeroed, so the byte after the last slot is the end marker.
+    }
+}
+
+/// The 1000-byte file SH7-d2's `fileprobe` reads: byte `i` is `\n` when `i % 50 == 49`, else
+/// `a + (i * 7) % 26` (the probe recomputes it).
+fn fileprobe_text() -> Vec<u8> {
+    (0..1000u32)
+        .map(|i| {
+            if i % 50 == 49 {
+                b'\n'
+            } else {
+                b'a' + ((i * 7) % 26) as u8
+            }
+        })
+        .collect()
+}
+
+fn build_fat32_image(smoke: &[u8], extra: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut root = FatNode::Dir(Vec::new());
+    root.insert("/README.TXT", FatNode::Phantom(128));
+    root.insert("/HELLO.TXT", FatNode::File(b"hello!"));
+    root.insert("/EFI/BOOT/BOOTAA64.EFI", FatNode::File(b"esp-ok"));
+    root.insert("/SMOKE.ELF", FatNode::File(smoke));
+    for (path, bytes) in extra {
+        root.insert(path, FatNode::File(bytes));
+    }
+    let FatNode::Dir(ref children) = root else {
+        unreachable!()
+    };
+
+    let used = fat_clusters(&root, true);
+    let clusters = used + FAT_FREE_CLUSTERS;
+    let spf = ((clusters as usize + 2) * 4).div_ceil(FAT_SEC_SIZE as usize) as u32;
+    let data_start = FAT_RESERVED as usize + FAT_NUM_FATS as usize * spf as usize;
+    let total = data_start as u32 + clusters;
+    let mut layout = FatLayout {
+        img: vec![0u8; total as usize * FAT_SEC_SIZE as usize],
+        fat: vec![0u32; clusters as usize + 2],
+        next: ROOT_CLUSTER,
+        data_start,
+    };
+    layout.fat[0] = 0x0FFF_FFF8;
+    layout.fat[1] = FAT_EOF;
+    let root_own = (fat_dir_slot_count(children, true) * 32).div_ceil(FAT_SEC_SIZE as usize) as u32;
+    let root_first = layout.claim(root_own);
+    assert_eq!(root_first, ROOT_CLUSTER);
+    layout.place_dir(children, root_first, 0, true);
+    assert_eq!(
+        layout.next,
+        ROOT_CLUSTER + used,
+        "fat image: cluster accounting"
+    );
+
+    let img = &mut layout.img;
     // ---- sector 0: BPB ----
     let s = &mut img[..512];
     s[0..3].copy_from_slice(&[0xEB, 0xFE, 0x90]);
@@ -835,8 +1114,8 @@ fn build_fat32_image(smoke: &[u8]) -> Vec<u8> {
     s[0x15] = 0xF8;
     s[0x18..0x1A].copy_from_slice(&63u16.to_le_bytes());
     s[0x1A..0x1C].copy_from_slice(&255u16.to_le_bytes());
-    s[0x20..0x24].copy_from_slice(&FAT_TOTAL_SECS.to_le_bytes());
-    s[0x24..0x28].copy_from_slice(&FAT_SPF.to_le_bytes());
+    s[0x20..0x24].copy_from_slice(&total.to_le_bytes());
+    s[0x24..0x28].copy_from_slice(&spf.to_le_bytes());
     s[0x2C..0x30].copy_from_slice(&ROOT_CLUSTER.to_le_bytes());
     s[0x30..0x32].copy_from_slice(&1u16.to_le_bytes()); // FSInfo sector
     s[0x32..0x34].copy_from_slice(&6u16.to_le_bytes()); // backup boot sector
@@ -846,103 +1125,19 @@ fn build_fat32_image(smoke: &[u8]) -> Vec<u8> {
     s[0x47..0x52].copy_from_slice(b"KUMO       ");
     s[0x52..0x5A].copy_from_slice(b"FAT32   ");
     s[0x1FE..0x200].copy_from_slice(&[0x55, 0xAA]);
-
     // ---- sector 1: FSInfo (signatures only) ----
     img[512..516].copy_from_slice(b"RRaA");
     img[512 + 0x1E4..512 + 0x1E8].copy_from_slice(b"rrAa");
-
-    // ---- FAT #1 at sector 32 ----
-    let fat1_off = FAT_RESERVED as usize * FAT_SEC_SIZE as usize;
-    let fat_size = FAT_SPF as usize * FAT_SEC_SIZE as usize;
-    {
-        let fat1 = &mut img[fat1_off..fat1_off + fat_size];
-        let eof: [u8; 4] = [0xFF, 0xFF, 0xFF, 0x0F];
-        fat1[0..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0x0F]); // media byte + reserved
-        fat1[4..8].copy_from_slice(&eof); // cluster 1 reserved
-        fat1[8..12].copy_from_slice(&eof); // cluster 2 = root dir = EOF
-        fat1[12..16].copy_from_slice(&eof); // cluster 3 = HELLO.TXT = EOF
-        fat1[16..20].copy_from_slice(&eof); // cluster 4 = EFI/ dir = EOF
-        fat1[20..24].copy_from_slice(&eof); // cluster 5 = EFI/BOOT/ dir = EOF
-        fat1[24..28].copy_from_slice(&eof); // cluster 6 = BOOTAA64.EFI = EOF
-
-        // SMOKE.ELF: the std-smoke copy the spawn proof executes (SH4), one chain from
-        // cluster 7.
-        // An empty payload (the host fixture test) leaves the entry at size 0, cluster 0.
-        let smoke_clusters = smoke.len().div_ceil(512);
-        assert!(
-            SMOKE_FIRST_CLUSTER as usize + smoke_clusters < 4096,
-            "SMOKE.ELF too large for the fixture FAT"
-        );
-        for index in 0..smoke_clusters {
-            let cluster = SMOKE_FIRST_CLUSTER as usize + index;
-            let next = if index + 1 == smoke_clusters {
-                eof
-            } else {
-                ((cluster + 1) as u32).to_le_bytes()
-            };
-            fat1[cluster * 4..cluster * 4 + 4].copy_from_slice(&next);
+    // ---- both FATs ----
+    let fat_off = FAT_RESERVED as usize * FAT_SEC_SIZE as usize;
+    let fat_bytes = spf as usize * FAT_SEC_SIZE as usize;
+    for copy in 0..FAT_NUM_FATS as usize {
+        let base = fat_off + copy * fat_bytes;
+        for (i, entry) in layout.fat.iter().enumerate() {
+            img[base + i * 4..base + i * 4 + 4].copy_from_slice(&entry.to_le_bytes());
         }
     }
-
-    // ---- FAT #2 at sector 64 (copy of FAT #1) ----
-    let fat2_off = fat1_off + fat_size;
-    img.copy_within(fat1_off..fat1_off + fat_size, fat2_off);
-
-    // ---- cluster 3 (sector 97): HELLO.TXT payload ----
-    img[fat_cluster_off(3)..fat_cluster_off(3) + 6].copy_from_slice(b"hello!");
-
-    // ---- SMOKE.ELF payload from cluster 7 ----
-    for (index, chunk) in smoke.chunks(512).enumerate() {
-        let at = fat_cluster_off(SMOKE_FIRST_CLUSTER + index as u32);
-        img[at..at + chunk.len()].copy_from_slice(chunk);
-    }
-
-    // ---- root directory at cluster 2 (sector 96) ----
-    {
-        let dir = &mut img[fat_cluster_off(2)..fat_cluster_off(2) + 512];
-        put_dir_entry(dir, 0, b"KUMO       ", 0x08, 0, 0); // volume label
-        put_dir_entry(dir, 32, b"README  TXT", 0x20, 0, 128);
-        put_dir_entry(dir, 64, b"HELLO   TXT", 0x20, 3, 6); // cluster 3, 6 bytes
-        put_dir_entry(dir, 96, b"EFI        ", 0x10, 4, 0); // subdirectory, cluster 4
-        put_dir_entry(
-            dir,
-            128,
-            b"SMOKE   ELF",
-            0x20,
-            if smoke.is_empty() {
-                0
-            } else {
-                SMOKE_FIRST_CLUSTER
-            },
-            smoke.len() as u32,
-        ); // the spawn proof's child (SH4)
-        dir[160] = 0x00; // end of directory
-    }
-
-    // ---- EFI/ directory at cluster 4 (sector 98) ----
-    // A real subdirectory opens with `.` (itself) and `..` (parent; the root is
-    // denoted by cluster 0); kumo-fatfs skips both while scanning for a name.
-    {
-        let dir = &mut img[fat_cluster_off(4)..fat_cluster_off(4) + 512];
-        put_dir_entry(dir, 0, b".          ", 0x10, 4, 0);
-        put_dir_entry(dir, 32, b"..         ", 0x10, 0, 0);
-        put_dir_entry(dir, 64, b"BOOT       ", 0x10, 5, 0); // subdirectory, cluster 5
-        dir[96] = 0x00;
-    }
-
-    // ---- EFI/BOOT/ directory at cluster 5 (sector 99) ----
-    {
-        let dir = &mut img[fat_cluster_off(5)..fat_cluster_off(5) + 512];
-        put_dir_entry(dir, 0, b".          ", 0x10, 5, 0);
-        put_dir_entry(dir, 32, b"..         ", 0x10, 4, 0);
-        put_dir_entry(dir, 64, b"BOOTAA64EFI", 0x20, 6, 6); // cluster 6, 6 bytes
-        dir[96] = 0x00;
-    }
-
-    // ---- cluster 6 (sector 100): EFI/BOOT/BOOTAA64.EFI payload ----
-    img[fat_cluster_off(6)..fat_cluster_off(6) + 6].copy_from_slice(b"esp-ok");
-
-    img
+    layout.img
 }
 
 fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleAsset>, String> {
@@ -996,7 +1191,15 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let kilo = build_kilo_image(&workspace_root()?)?;
             let autoexec = build_autoexec();
             let shadow = identity::shadow_file()?;
-            let fat32_img = build_fat32_image(std_smoke.as_slice());
+            // SH7-d2: the Linux tree the persona shim reads through its filesystem grant.
+            let fileprobe_txt = fileprobe_text();
+            let mut linux_files: Vec<(&str, &[u8])> = persona_payloads
+                .iter()
+                .map(|(path, bytes)| (*path, bytes.as_slice()))
+                .collect();
+            linux_files.push(("/bin/m10-hello", persona_linux_hello.as_slice()));
+            linux_files.push(("/etc/fileprobe.txt", fileprobe_txt.as_slice()));
+            let fat32_img = build_fat32_image(std_smoke.as_slice(), &linux_files);
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
@@ -1018,22 +1221,9 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (ACTORCALL_PATH, actorcall.as_slice()),
                 (AX4IDLE_PATH, ax4idle.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
-                (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (
                     kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH,
                     persona_linux_shim.as_slice(),
-                ),
-                (
-                    kumo_abi::initrd::PERSONA_LINUX_HELLO_DYN_PATH,
-                    persona_payloads[0].as_slice(),
-                ),
-                (
-                    kumo_abi::initrd::PERSONA_LINUX_MUSL_LOADER_PATH,
-                    persona_payloads[1].as_slice(),
-                ),
-                (
-                    kumo_abi::initrd::PERSONA_LINUX_VMPROBE_PATH,
-                    persona_payloads[2].as_slice(),
                 ),
                 (HELLO_PATH, hello.as_slice()),
                 (GFX_CLIENT_PATH, gfx_client.as_slice()),
@@ -1639,48 +1829,72 @@ fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
 }
 
 //j888
-/// SH7-c: the vendored Linux-side persona payloads (persona/, rebuilt by
-/// scripts/persona-payloads.sh from a pinned Alpine image): a dynamic musl hello, then musl's
-/// loader. Each is checked against the digest persona/MANIFEST records, so the initrd carries
-/// exactly the bytes that manifest and musl's COPYRIGHT describe. — TEAL
-const PERSONA_PAYLOADS: [(&str, &str); 3] = [
+//j890
+/// The vendored Linux-side persona payloads (persona/, rebuilt by scripts/persona-payloads.sh from
+/// a pinned Alpine image), each with the Linux path it takes on the FAT image. SH7-d2 moved them
+/// out of the initrd: the persona shim now opens programs and libraries by path through its
+/// filesystem grant, as Linux `execve` and musl's loader expect. Each file is checked against the
+/// digest persona/MANIFEST records, so the image carries exactly the bytes that manifest and musl's
+/// COPYRIGHT describe. — TEAL
+const PERSONA_PAYLOADS: [(&str, &str, &str); 7] = [
     (
         "persona/hello-dyn",
+        "/bin/hello-dyn",
         "9d5c57f5fd8dd7f905baa7d5f28253081dd53750128366528f7e80a6db8bdbbf",
     ),
     (
         "persona/musl/ld-musl-aarch64.so.1",
+        "/lib/ld-musl-aarch64.so.1",
         "42fb025bc758b76e60e7b3b0fcdcfab93b6ba1694b363244c2e8e6f51847e28c",
     ),
-    //j889
     (
         "persona/vmprobe",
+        "/bin/vmprobe",
         "0e84821cf1431fe44d67939403a5094b7646c48dc72bd88e0b4d05c0056c4743",
+    ),
+    (
+        "persona/greet",
+        "/bin/greet",
+        "02f75bff61ab33904b62ff58a6e2199c468cdfec1fb5a8ffcbc95f787674c806",
+    ),
+    (
+        "persona/libgreet.so",
+        "/lib/libgreet.so",
+        "fd6a3056417ccd32ab30d26fa68f11128c4769040556d58a7eb7043680879c8a",
+    ),
+    (
+        "persona/fileprobe",
+        "/bin/fileprobe",
+        "e10a14f0a7b1b9b4d8de4c3a25278ba0a2ebff1596f3ce75871359cd2e5436f3",
+    ),
+    (
+        "persona/musl/COPYRIGHT",
+        "/usr/share/licenses/musl/COPYRIGHT",
+        "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
     ),
 ];
 
-fn build_persona_payloads(root: &Path) -> Result<[Vec<u8>; 3], String> {
-    let read = |(rel, want): (&str, &str)| -> Result<Vec<u8>, String> {
-        let path = root.join(rel);
-        let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-        let got: String = kumo_sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        if got != want {
-            return Err(format!(
-                "{}: sha256 {got} does not match persona/MANIFEST ({want}); rerun \
-                 scripts/persona-payloads.sh and update both",
-                path.display()
-            ));
-        }
-        Ok(bytes)
-    };
-    Ok([
-        read(PERSONA_PAYLOADS[0])?,
-        read(PERSONA_PAYLOADS[1])?,
-        read(PERSONA_PAYLOADS[2])?,
-    ])
+/// Read and verify [`PERSONA_PAYLOADS`]: `(linux path, bytes)` for each.
+fn build_persona_payloads(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    PERSONA_PAYLOADS
+        .iter()
+        .map(|&(rel, linux, want)| {
+            let path = root.join(rel);
+            let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+            let got: String = kumo_sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if got != want {
+                return Err(format!(
+                    "{}: sha256 {got} does not match persona/MANIFEST ({want}); rerun \
+                     scripts/persona-payloads.sh and update both",
+                    path.display()
+                ));
+            }
+            Ok((linux, bytes))
+        })
+        .collect()
 }
 
 fn build_drv_gpu_image(root: &Path) -> Result<Vec<u8>, String> {
@@ -3245,7 +3459,7 @@ mod fat32_image_tests {
 
     #[test]
     fn generated_image_resolves_root_and_esp_paths() {
-        let mut disk = ImageDisk(build_fat32_image(&[]));
+        let mut disk = ImageDisk(build_fat32_image(&[], &[]));
         let vol = FatVolume::mount(&mut disk).expect("mount generated fat32.img");
 
         // The existing root file still resolves (regression guard).
@@ -3270,6 +3484,68 @@ mod fat32_image_tests {
             vol.resolve_path(&mut disk, b"efi/boot/bootaa64.efi"),
             Some(app)
         );
+    }
+
+    //j890
+    /// SH7-d2: Linux paths with long names, multi-cluster files and a directory that spans
+    /// clusters all read back through the target's own reader, beside the old fixtures.
+    #[test]
+    fn long_names_and_large_files_read_back_through_kumo_fatfs() {
+        let big: Vec<u8> = (0..70_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let text = super::fileprobe_text();
+        let mut files: Vec<(String, Vec<u8>)> = vec![
+            ("/lib/ld-musl-aarch64.so.1".into(), big.clone()),
+            ("/etc/fileprobe.txt".into(), text.clone()),
+            ("/bin/hello-dyn".into(), b"dyn".to_vec()),
+            ("/bin/VMPROBE".into(), b"upper".to_vec()),
+        ];
+        // Enough long names that /bin spans several clusters.
+        for i in 0..40 {
+            files.push((
+                format!("/bin/a-long-program-name-{i:02}"),
+                format!("p{i}").into_bytes(),
+            ));
+        }
+        let refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_slice()))
+            .collect();
+        let mut disk = ImageDisk(build_fat32_image(b"smoke!", &refs));
+        let vol = FatVolume::mount(&mut disk).expect("mount");
+
+        let read_all = |disk: &mut ImageDisk, path: &[u8]| -> Vec<u8> {
+            let entry = vol
+                .resolve_path(disk, path)
+                .unwrap_or_else(|| panic!("resolve {}", String::from_utf8_lossy(path)));
+            let mut out = vec![0u8; entry.size as usize];
+            assert_eq!(vol.read_file(disk, &entry, &mut out), out.len());
+            out
+        };
+        assert_eq!(read_all(&mut disk, b"/lib/ld-musl-aarch64.so.1"), big);
+        assert_eq!(read_all(&mut disk, b"/etc/fileprobe.txt"), text);
+        assert_eq!(read_all(&mut disk, b"/bin/hello-dyn"), b"dyn");
+        assert_eq!(read_all(&mut disk, b"/bin/VMPROBE"), b"upper");
+        assert_eq!(read_all(&mut disk, b"/bin/a-long-program-name-39"), b"p39");
+        assert_eq!(read_all(&mut disk, b"/HELLO.TXT"), b"hello!");
+        assert_eq!(read_all(&mut disk, b"/SMOKE.ELF"), b"smoke!");
+        assert_eq!(read_all(&mut disk, b"/EFI/BOOT/BOOTAA64.EFI"), b"esp-ok");
+
+        // Listing /bin yields every long name whole, once.
+        let bin = vol.resolve_path(&mut disk, b"/bin").expect("/bin");
+        assert!(bin.is_dir());
+        let mut names = Vec::new();
+        assert!(
+            vol.for_each_named_in_dir(&mut disk, bin.first_cluster, |_, name| {
+                names.push(String::from_utf8_lossy(name.as_bytes()).into_owned());
+                true
+            })
+        );
+        assert!(names.contains(&"hello-dyn".to_string()), "{names:?}");
+        assert!(names.contains(&"VMPROBE".to_string()), "{names:?}");
+        for i in 0..40 {
+            let want = format!("a-long-program-name-{i:02}");
+            assert_eq!(names.iter().filter(|n| **n == want).count(), 1, "{want}");
+        }
     }
 }
 

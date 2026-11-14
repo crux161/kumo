@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j859
 //j864
 //j870
 //j888
 //j889
+//j890
 
 extern crate alloc;
 
@@ -16,8 +16,7 @@ use kumo_abi::{
     BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
     GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GPU_LANE_PATH, GROUP_PATH,
     HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, NETSTACK_PATH, PASSWD_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH,
-    TTYD_PATH, WC_PATH,
+    RELIBC_SMOKE_PATH, SHADOW_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -35,7 +34,7 @@ use kumo_rt::{
     STARTUP_TAG_FS, STARTUP_TAG_NET, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
 };
 use kumoza::{parse, DirectoryError, WorkingDirectory};
-use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
+use persona_linux::elf as linux_elf;
 use persona_posix::{FdTable, TtyRpc, TtyRpcTransport, TtyStream, STDIN_FILENO, STDOUT_FILENO};
 use svc_health::{Request as HealthRequest, Response as HealthResponse};
 use ttyd::{Reply as TtyReply, Request as TtyRequest};
@@ -5776,101 +5775,10 @@ extern "C" fn sora_main(
         }
     }
 
-    //j885
-    // SH7-b (PLAN.md §10, ratified R1): the M10 Linux ELF runs inside the persona shim. Sora
-    // copies the ELF out of the initrd into a VMO and runs the shim with it transferred; the
-    // shim loads the program into its own address space and the kernel redirects the program's
-    // `svc`s to it. The Stage-A kernel bridge and the hand-assembled M10-a payload it served are
-    // gone. — TEAL
-    let mut shim_status = 0i64;
-    let shim_ran = match initrd_file_vmo(initrd, PERSONA_LINUX_HELLO_PATH.as_bytes()) {
-        Some((elf, len)) => run_elf_threads_status(
-            initrd,
-            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
-            u64::from(elf.0),
-            len,
-            ProcessRunFlags::TRANSFER_ARG.bits(),
-            b"M10 elf",
-            0,
-            None,
-            &mut shim_status,
-            false,
-        ),
-        None => {
-            log(b"M10 elf: initrd copy fail\n");
-            false
-        }
-    };
-    if shim_ran {
-        debug_write(b"M10-c Check ok\n".as_ptr(), 15);
-    } else {
-        let mut line = [0u8; 48];
-        let text = fmt_status_line(&mut line, b"M10 elf: run fail status=", shim_status);
-        log(text);
-    }
-
-    //j888
-    // SH7-c (PLAN/022, payload P1): a dynamically linked musl program. Sora packs it with the
-    // interpreter its PT_INTERP names (musl's own loader) into one launch bundle; the shim loads
-    // both, and ld-musl relocates and starts the program like on Linux. — TEAL
-    let mut dyn_status = 0i64;
-    let dyn_ran = match persona_launch_vmo(
-        initrd,
-        kumo_abi::initrd::PERSONA_LINUX_HELLO_DYN_PATH.as_bytes(),
-        b"persona-linux-hello-dyn",
-    ) {
-        Some((bundle, len)) => run_elf_threads_status(
-            initrd,
-            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
-            u64::from(bundle.0),
-            len,
-            ProcessRunFlags::TRANSFER_ARG.bits(),
-            b"M10 dyn",
-            0,
-            None,
-            &mut dyn_status,
-            false,
-        ),
-        None => false,
-    };
-    if dyn_ran {
-        debug_write(b"M10-d Check ok\n".as_ptr(), 15);
-    } else {
-        let mut line = [0u8; 48];
-        let text = fmt_status_line(&mut line, b"M10 dyn: run fail status=", dyn_status);
-        log(text);
-    }
-
-    //j889
-    // SH7-d1: Linux address-space semantics (mmap/mprotect/munmap over page ranges) on the
-    // kernel's page-range VmarUnmap/VmarProtect, checked by a dynamic musl probe. — TEAL
-    let mut vm_status = 0i64;
-    let vm_ran = match persona_launch_vmo(
-        initrd,
-        kumo_abi::initrd::PERSONA_LINUX_VMPROBE_PATH.as_bytes(),
-        b"persona-linux-vmprobe",
-    ) {
-        Some((bundle, len)) => run_elf_threads_status(
-            initrd,
-            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
-            u64::from(bundle.0),
-            len,
-            ProcessRunFlags::TRANSFER_ARG.bits(),
-            b"M10 vm",
-            0,
-            None,
-            &mut vm_status,
-            false,
-        ),
-        None => false,
-    };
-    if vm_ran {
-        debug_write(b"M10-e Check ok\n".as_ptr(), 15);
-    } else {
-        let mut line = [0u8; 48];
-        let text = fmt_status_line(&mut line, b"M10 vm: run fail status=", vm_status);
-        log(text);
-    }
+    //j890
+    // SH7-d2: Linux programs no longer run from Sora's boot path. The shell's `linux` word
+    // launches the persona shim with a filesystem grant, and the shim loads the program and its
+    // interpreter by path (j888's launch bundle and the M10 blocks retired). — TEAL
 
     // Narrow the initrd handle before handing it to user programs. `ls` only needs READ
     // authority; Sora keeps the full bootstrap handle for its own loader duties.
@@ -6823,164 +6731,6 @@ struct PersonaLoadSegment {
     flags: u64,
 }
 
-/// `prefix` then a signed decimal and a newline, in `buf`.
-fn fmt_status_line<'a>(buf: &'a mut [u8; 48], prefix: &[u8], value: i64) -> &'a [u8] {
-    let mut at = prefix.len().min(30);
-    buf[..at].copy_from_slice(&prefix[..at]);
-    if value < 0 {
-        buf[at] = b'-';
-        at += 1;
-    }
-    let mut digits = [0u8; 20];
-    let mut n = value.unsigned_abs();
-    let mut count = 0;
-    loop {
-        digits[count] = b'0' + (n % 10) as u8;
-        count += 1;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    for i in (0..count).rev() {
-        buf[at] = digits[i];
-        at += 1;
-    }
-    buf[at] = b'\n';
-    &buf[..at + 1]
-}
-
-/// SH7-b: one initrd file copied into a fresh VMO of its own (the persona shim maps the
-/// program it is handed). Returns the VMO and the file's length.
-fn initrd_file_vmo(initrd: Handle, target: &[u8]) -> Option<(Handle, u64)> {
-    let (offset, len) = find_initrd_file(initrd, target)?;
-    let raw = vmo_create(len.max(1));
-    if raw == 0 || raw == u64::MAX {
-        return None;
-    }
-    let vmo = Handle(raw as u32);
-    // VmoWrite moves at most VMO_TRANSFER_MAX bytes per call.
-    let mut chunk = [0u8; kumo_abi::sys::VMO_TRANSFER_MAX];
-    let mut at = 0u64;
-    while at < len {
-        let n = (len - at).min(chunk.len() as u64) as usize;
-        if vmo_read(initrd, offset + at, chunk.as_mut_ptr(), n) != 0
-            || vmo_write(vmo, at, chunk.as_ptr(), n) != 0
-        {
-            let _ = handle_close(vmo);
-            return None;
-        }
-        at += n as u64;
-    }
-    Some((vmo, len))
-}
-
-//j888
-/// SH7-c: pack a Linux program and the interpreter its `PT_INTERP` names into one
-/// `persona_linux::launch` bundle VMO for the persona shim. Sora is the exec authority for now:
-/// it resolves the absolute interpreter path in the initrd (dropping the leading `/`) until the
-/// shim has a file surface of its own (SH7-d). Every refusal is logged by name. — TEAL
-fn persona_launch_vmo(initrd: Handle, program_path: &[u8], name: &[u8]) -> Option<(Handle, u64)> {
-    let refuse = |why: &[u8]| {
-        log(b"M10 dyn: ");
-        log(why);
-        log(b"\n");
-    };
-    let Some((program_off, program_len)) = find_initrd_file(initrd, program_path) else {
-        refuse(b"program missing from the initrd");
-        return None;
-    };
-    let mut program = alloc::vec![0u8; program_len as usize];
-    if !read_initrd_into(initrd, program_off, &mut program) {
-        refuse(b"program read fail");
-        return None;
-    }
-    let Ok(header) = linux_elf::parse_linux_image(&program, linux_elf::Machine::Aarch64) else {
-        refuse(b"not an aarch64 Linux image");
-        return None;
-    };
-    let interp = match linux_elf::interpreter(&program, &header) {
-        Ok(None) => None,
-        Ok(Some(path)) => {
-            let Some(rel) = path.strip_prefix(b"/") else {
-                refuse(b"PT_INTERP is not an absolute path");
-                return None;
-            };
-            match find_initrd_file(initrd, rel) {
-                Some(found) => Some(found),
-                None => {
-                    refuse(b"interpreter missing from the initrd");
-                    return None;
-                }
-            }
-        }
-        Err(_) => {
-            refuse(b"bad PT_INTERP");
-            return None;
-        }
-    };
-    let interp_len = interp.map_or(0, |(_, len)| len);
-    let layout = persona_linux::launch::layout(program_len, interp_len)?;
-    let Ok(head) = persona_linux::launch::header(&layout, program_len, interp_len, name) else {
-        refuse(b"name too long");
-        return None;
-    };
-    let raw = vmo_create(layout.total);
-    if raw == 0 || raw == u64::MAX {
-        refuse(b"bundle vmo fail");
-        return None;
-    }
-    let bundle = Handle(raw as u32);
-    let mut ok =
-        write_vmo_bytes(bundle, 0, &head) && write_vmo_bytes(bundle, layout.program_off, &program);
-    if let Some((off, len)) = interp {
-        ok = ok && copy_initrd_to_vmo(initrd, off, len, bundle, layout.interp_off);
-    }
-    if !ok {
-        refuse(b"bundle write fail");
-        let _ = handle_close(bundle);
-        return None;
-    }
-    Some((bundle, layout.total))
-}
-
-/// Read `out.len()` initrd bytes at `offset` (VmoRead moves at most VMO_TRANSFER_MAX per call).
-fn read_initrd_into(initrd: Handle, offset: u64, out: &mut [u8]) -> bool {
-    out.chunks_mut(kumo_abi::sys::VMO_TRANSFER_MAX)
-        .enumerate()
-        .all(|(i, chunk)| {
-            let at = offset + (i * kumo_abi::sys::VMO_TRANSFER_MAX) as u64;
-            vmo_read(initrd, at, chunk.as_mut_ptr(), chunk.len()) == 0
-        })
-}
-
-/// Write `bytes` into `vmo` at `offset`, VMO_TRANSFER_MAX bytes per VmoWrite.
-fn write_vmo_bytes(vmo: Handle, offset: u64, bytes: &[u8]) -> bool {
-    bytes
-        .chunks(kumo_abi::sys::VMO_TRANSFER_MAX)
-        .enumerate()
-        .all(|(i, chunk)| {
-            let at = offset + (i * kumo_abi::sys::VMO_TRANSFER_MAX) as u64;
-            vmo_write(vmo, at, chunk.as_ptr(), chunk.len()) == 0
-        })
-}
-
-/// Copy `len` initrd bytes at `from` into `vmo` at `to`, through one transfer-sized buffer.
-fn copy_initrd_to_vmo(initrd: Handle, from: u64, len: u64, vmo: Handle, to: u64) -> bool {
-    let mut chunk = [0u8; kumo_abi::sys::VMO_TRANSFER_MAX];
-    let mut at = 0u64;
-    while at < len {
-        let n = (len - at).min(chunk.len() as u64) as usize;
-        if vmo_read(initrd, from + at, chunk.as_mut_ptr(), n) != 0
-            || vmo_write(vmo, to + at, chunk.as_ptr(), n) != 0
-        {
-            return false;
-        }
-        at += n as u64;
-    }
-    true
-}
-
 fn find_initrd_file(initrd: Handle, target: &[u8]) -> Option<(u64, u64)> {
     let mut header = [0u8; 16];
     if vmo_read(initrd, 0, header.as_mut_ptr(), 16) != 0 {
@@ -7322,6 +7072,44 @@ fn eval_command(
             debug_write(b" -> OK: heap grew on target\n".as_ptr(), 28);
         } else {
             debug_write(b" -> FAIL: no growth\n".as_ptr(), 21);
+        }
+        return true;
+    } else if cmd.name == "linux" {
+        //j890
+        // SH7-d2 (PLAN/022, cut X1): run a Linux program. The persona shim is launched like any
+        // program, with argv `[persona-linux-shim, path, args...]` and a private filesystem
+        // session over the image; it then loads the program and its interpreter by path itself,
+        // as Linux `execve` does. Only this word grants the shim files. The verdict line is the
+        // shell's own, from the program's exit status. — TEAL
+        if cmd.args.is_empty() {
+            usage(b"usage: linux <path> [args...]\n");
+            return true;
+        }
+        let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+        slots[0] = b"persona-linux-shim";
+        let mut count = 1;
+        for arg in cmd.args.iter().take(MAX_ARGV - 1) {
+            slots[count] = arg.as_bytes();
+            count += 1;
+        }
+        run_with_startup_input(
+            initrd,
+            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
+            b"linux",
+            Some(&slots[..count]),
+            false,
+            FsGrant::Image,
+            false,
+            false,
+            StdinMode::None,
+            false,
+        );
+        log(b"linux: ");
+        log(cmd.args[0].as_bytes());
+        if LAST_STATUS.load(Ordering::Relaxed) == 0 {
+            log(b" exited 0\n");
+        } else {
+            log(b" failed\n");
         }
         return true;
     } else if cmd.name == "kilo" {

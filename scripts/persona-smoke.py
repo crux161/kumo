@@ -2,6 +2,7 @@
 #j885
 #j888
 #j889
+#j890
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -51,16 +52,26 @@ def main():
 
     case = axh.Case(
         "persona",
-        b"echo AXH persona begins\necho AXH persona ends\n",
+        # SH7-d2 (j890): every Linux program runs through the shell's `linux` word, which
+        # grants the shim a filesystem; the shim loads the program and its interpreter by path.
+        b"echo AXH persona begins\n"
+        b"linux /bin/m10-hello\n"
+        b"linux /bin/hello-dyn\n"
+        b"linux /bin/vmprobe\n"
+        b"linux /bin/greet\n"
+        b"linux /bin/fileprobe\n"
+        b"echo AXH persona ends\n",
         (
             "M10 elf linux hi",
-            "M10-c Check ok",
-            # SH7-c (j888): a dynamic musl program, through musl's own loader (PT_INTERP).
-            "SH7-c dynamic musl hello: argc=1 argv0=persona-linux-hello-dyn",
-            "M10-d Check ok",
-            # SH7-d1 (j889): Linux mmap/mprotect/munmap over page ranges.
+            "linux: /bin/m10-hello exited 0",
+            "SH7-c dynamic musl hello: argc=1 argv0=/bin/hello-dyn",
+            "linux: /bin/hello-dyn exited 0",
             "vmprobe: OK (0 failures)",
-            "M10-e Check ok",
+            "linux: /bin/vmprobe exited 0",
+            "greet: hello from libgreet.so",
+            "linux: /bin/greet exited 0",
+            "fileprobe: OK (0 failures)",
+            "linux: /bin/fileprobe exited 0",
         ),
         ready=0,
     )
@@ -84,7 +95,7 @@ def main():
         with (work / "restore-default.log").open("wb") as log:
             subprocess.run(axh.IMAGE_ARGS, cwd=ROOT, env=default_env, stdout=log, stderr=log, check=True)
         (work / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print("SH7-b/c persona smoke green", flush=True)
+    print("SH7 persona smoke green", flush=True)
 
 
 if __name__ == "__main__":

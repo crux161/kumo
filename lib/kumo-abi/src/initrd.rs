@@ -1,8 +1,8 @@
-//j824
 //j825
 //j857
 //j888
 //j889
+//j890
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -51,19 +51,11 @@ pub const ACTORCALL_PATH: &str = "bin/actorcall";
 /// The AX4 heapless idle actor (PLAN/021): Sora's `ax4bench` launches 256 copies as one
 /// batch to prove resident capacity, flat census after teardown, and wake latency.
 pub const AX4IDLE_PATH: &str = "bin/ax4idle";
-pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// SH7: the in-process Linux personality runtime (PLAN.md §10 R1); a Linux program runs
 /// inside it.
 pub const PERSONA_LINUX_SHIM_PATH: &str = "bin/persona-linux-shim";
-//j888
-/// SH7-c: a dynamically linked musl hello (persona/hello-dyn); its PT_INTERP names
-/// `/lib/ld-musl-aarch64.so.1`, which Sora resolves in the initrd by dropping the leading `/`.
-pub const PERSONA_LINUX_HELLO_DYN_PATH: &str = "bin/persona-linux-hello-dyn";
-/// SH7-c: musl's dynamic loader (musl's own `libc.so`), as an absolute Linux path names it.
-pub const PERSONA_LINUX_MUSL_LOADER_PATH: &str = "lib/ld-musl-aarch64.so.1";
-//j889
-/// SH7-d1: a dynamic musl program checking Linux mmap/mprotect/munmap semantics (persona/vmprobe).
-pub const PERSONA_LINUX_VMPROBE_PATH: &str = "bin/persona-linux-vmprobe";
+//j890
+// SH7-d2: the Linux programs the shim runs live on the FAT image (`/bin`, `/lib`), not here.
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.
 pub const HELLO_PATH: &str = "bin/hello";

@@ -3,14 +3,16 @@
 //j885
 //j888
 //j889
+//j890
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
-//! This is the process image. Sora runs it with a VMO holding an aarch64 Linux ELF (`x0`,
-//! transferred) and that ELF's length (`x1`). The shim loads the program's `PT_LOAD` segments
-//! into its own address space at their link addresses, builds the Linux initial stack
-//! (argc/argv/envp/auxv), registers itself with the kernel (`PersonaShimSet`) and jumps to the
-//! program's entry. From then on every `svc` the program executes is redirected here by the
+//! This is the process image. Since SH7-d2 Sora launches it like any program (its `linux`
+//! word): a bootstrap channel in `x0` carries stdout, argv `[shim, /path/to/program, args…]`, env
+//! and a filesystem grant. The shim then does Linux `execve`'s loading itself: it opens the
+//! program by path, and for a dynamic one the interpreter its `PT_INTERP` names, loads their
+//! `PT_LOAD` segments into its own address space, builds the Linux initial stack
+//! (argc/argv/envp/auxv), registers itself with the kernel (`PersonaShimSet`) and jumps in. From then on every `svc` the program executes is redirected here by the
 //! kernel (registers only — the kernel interprets no Linux number): `persona_trap_entry` saves
 //! the program's registers, `persona_dispatch` serves the call on KUMO's native ABI, and
 //! `PersonaReturn` resumes the program with the result in `x0`.
@@ -22,21 +24,29 @@
 use core::fmt::Write as _;
 
 use kumo_abi::Handle;
-use kumo_rt::{log_write, process_exit, vmar_map, vmar_map_anywhere, vmar_unmap, vmo_create};
+use kumo_rt::{
+    log_write, process_exit, vmar_map, vmar_map_anywhere, vmar_unmap, vmo_create, vmo_read,
+};
 use persona_linux::elf::{self, Machine};
-use persona_linux::launch;
+
+mod files;
 
 kumo_rt::entry!(main);
 
 // ---- Linux aarch64 ABI ------------------------------------------------------------------
 
 mod nr {
+    pub const FCNTL: u64 = 25;
     pub const IOCTL: u64 = 29;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
+    pub const GETDENTS64: u64 = 61;
+    pub const LSEEK: u64 = 62;
     pub const READ: u64 = 63;
     pub const WRITE: u64 = 64;
+    pub const READV: u64 = 65;
     pub const WRITEV: u64 = 66;
+    pub const PREAD64: u64 = 67;
     pub const NEWFSTATAT: u64 = 79;
     pub const FSTAT: u64 = 80;
     pub const EXIT: u64 = 93;
@@ -52,13 +62,22 @@ mod nr {
     pub const MPROTECT: u64 = 226;
 }
 
-mod errno {
+pub(crate) mod errno {
     pub const ENOENT: i64 = 2;
+    pub const EIO: i64 = 5;
     pub const EBADF: i64 = 9;
     pub const ENOMEM: i64 = 12;
+    pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
+    pub const ENODEV: i64 = 19;
+    pub const ENOTDIR: i64 = 20;
+    pub const EISDIR: i64 = 21;
     pub const EINVAL: i64 = 22;
+    pub const EMFILE: i64 = 24;
     pub const ENOTTY: i64 = 25;
+    pub const ESPIPE: i64 = 29;
+    pub const EROFS: i64 = 30;
+    pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
 }
 
@@ -66,6 +85,7 @@ const PAGE: u64 = 4096;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
+const MAP_SHARED: u64 = 0x01;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 
@@ -100,6 +120,7 @@ const AT_HWCAP: u64 = 16;
 const AT_CLKTCK: u64 = 17;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
+const AT_EXECFN: u64 = 31;
 
 // ---- KUMO persona calls ------------------------------------------------------------------
 
@@ -240,21 +261,22 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31]) {
     let result: i64 = match frame[8] {
         nr::WRITE => write(a0, a1, a2),
         nr::WRITEV => writev(a0, a1, a2),
-        nr::READ => {
-            if a0 == 0 {
-                0 // no stdin in this slice: end of file
-            } else {
-                -errno::EBADF
-            }
-        }
-        nr::CLOSE => 0,
-        nr::OPENAT | nr::NEWFSTATAT => -errno::ENOENT,
-        nr::FSTAT => -errno::EBADF,
+        // SH7-d2: the file surface, over the persona's vfs session (files.rs).
+        nr::READ => files::read(a0 as i64, a1, a2),
+        nr::READV => files::readv(a0 as i64, a1, a2),
+        nr::PREAD64 => files::pread(a0 as i64, a1, a2, frame[3]),
+        nr::OPENAT => files::openat(a0 as i64, a1, a2),
+        nr::CLOSE => files::close(a0 as i64),
+        nr::LSEEK => files::lseek(a0 as i64, a1 as i64, a2),
+        nr::FSTAT => files::fstat(a0 as i64, a1),
+        nr::NEWFSTATAT => files::newfstatat(a0 as i64, a1, a2, frame[3]),
+        nr::GETDENTS64 => files::getdents64(a0 as i64, a1, a2),
+        nr::FCNTL => files::fcntl(a0 as i64, a1),
         nr::IOCTL => -errno::ENOTTY,
         nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => 1,
         nr::RT_SIGACTION | nr::RT_SIGPROCMASK => 0,
         nr::BRK => brk(a0) as i64,
-        nr::MMAP => mmap(a0, a1, a2, frame[3]),
+        nr::MMAP => mmap(a0, a1, a2, frame[3], frame[4] as i64, frame[5]),
         nr::MUNMAP => munmap(a0, a1),
         nr::MPROTECT => mprotect(a0, a1, a2),
         nr::EXIT | nr::EXIT_GROUP => process_exit(a0 & 0xff),
@@ -269,35 +291,27 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31]) {
     frame[0] = result as u64;
 }
 
-/// Standard output and error go to the kernel log, as the Stage-A bridge sent them (an INFO
-/// boot record, echoed when the console level allows).
+/// Standard output and error: the launcher's stdout channel (SH7-d2), else the kernel log.
 fn write(fd: u64, buf: u64, len: u64) -> i64 {
-    if fd != 1 && fd != 2 {
-        return -errno::EBADF;
-    }
     if buf == 0 && len != 0 {
         return -errno::EFAULT;
     }
+    // SAFETY: the program's buffer, as it named it.
     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
-    for chunk in bytes.chunks(256) {
-        let _ = log_write(kumo_abi::sys::log_level::INFO, chunk);
-    }
-    len as i64
+    files::write_out(fd as i64, bytes)
 }
 
-/// One `writev` reaches the log as few records as possible: its vectors are gathered into
-/// record-sized (256-byte) pieces, so a short line arrives whole. musl's stdio hands `printf`'s
-/// text and its `\n` over as two vectors; written one record each, another process's line could
-/// land between them (seen on metal, j888). A small `writev` is atomic on Linux too.
+/// One `writev` goes out in as few messages as possible: its vectors are gathered into 256-byte
+/// pieces, so a short line arrives whole. musl's stdio hands `printf`'s text and its `\n` over
+/// as two vectors; sent one message each, another process's line could land between them (seen
+/// on metal, j888). A small `writev` is atomic on Linux too.
 fn writev(fd: u64, iov: u64, count: u64) -> i64 {
-    if fd != 1 && fd != 2 {
-        return -errno::EBADF;
-    }
     let mut record = [0u8; 256];
     let mut used = 0usize;
     let mut total = 0i64;
     for index in 0..count.min(1024) {
         let entry = iov + index * 16;
+        // SAFETY: the program's iovec array.
         let (base, len) = unsafe {
             (
                 core::ptr::read_unaligned(entry as *const u64),
@@ -307,6 +321,7 @@ fn writev(fd: u64, iov: u64, count: u64) -> i64 {
         if base == 0 && len != 0 {
             return if total > 0 { total } else { -errno::EFAULT };
         }
+        // SAFETY: as above.
         let mut bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len as usize) };
         while !bytes.is_empty() {
             let take = bytes.len().min(record.len() - used);
@@ -314,14 +329,20 @@ fn writev(fd: u64, iov: u64, count: u64) -> i64 {
             used += take;
             bytes = &bytes[take..];
             if used == record.len() {
-                let _ = log_write(kumo_abi::sys::log_level::INFO, &record);
+                let sent = files::write_out(fd as i64, &record);
+                if sent < 0 {
+                    return if total > 0 { total } else { sent };
+                }
                 used = 0;
             }
         }
         total += len as i64;
     }
     if used > 0 {
-        let _ = log_write(kumo_abi::sys::log_level::INFO, &record[..used]);
+        let sent = files::write_out(fd as i64, &record[..used]);
+        if sent < 0 {
+            return if total > 0 { total } else { sent };
+        }
     }
     total
 }
@@ -371,21 +392,48 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     }
 }
 
-/// Anonymous private mappings only in this slice; a file mapping answers -ENOSYS.
-fn mmap(addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
-    if flags & MAP_ANONYMOUS == 0 {
-        log(format_args!(
-            "persona-linux: file-backed mmap unsupported (-ENOSYS)\n"
-        ));
-        return -errno::ENOSYS;
-    }
-    if len == 0 {
+/// Linux `mmap`: anonymous memory, or (SH7-d2) a private copy of a file range. A file mapping
+/// reads the range into a fresh VMO through the vfs session (bytes past the end of the file are
+/// zero), so MAP_PRIVATE is exact. There is no shared page cache, so a writable MAP_SHARED
+/// mapping is refused (EACCES, as for a read-only open on Linux); a read-only shared one is the
+/// same copy.
+fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> i64 {
+    if len == 0 || offset % PAGE != 0 {
         return -errno::EINVAL;
+    }
+    let file = if flags & MAP_ANONYMOUS == 0 {
+        match files::file_of(fd) {
+            Ok(file) => Some(file),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    if file.is_some() && flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
+        return -errno::EACCES;
     }
     let len = len.next_multiple_of(PAGE);
     let Some(vmo) = vmo(len) else {
         return -errno::ENOMEM;
     };
+    if let Some((handle, size)) = file {
+        let view = match vmar_map_anywhere(vmo, len, MAP_R | MAP_W) {
+            (0, view) if view != 0 => view,
+            _ => {
+                let _ = kumo_rt::handle_close(vmo);
+                return -errno::ENOMEM;
+            }
+        };
+        let want = len.min(size.saturating_sub(offset));
+        // SAFETY: `view` is this fresh, writable mapping of `len >= want` bytes.
+        let out = unsafe { core::slice::from_raw_parts_mut(view as *mut u8, want as usize) };
+        let read = files::vfs_pread(handle, size, offset, out);
+        let _ = vmar_unmap(view, len);
+        if read < 0 || read as u64 != want {
+            let _ = kumo_rt::handle_close(vmo);
+            return if read < 0 { read } else { -errno::EIO };
+        }
+    }
     let mut map = 0;
     if prot & PROT_READ != 0 {
         map |= MAP_R;
@@ -468,10 +516,15 @@ struct Loaded {
     image_end: u64,
 }
 
+/// The argv wire VMOs the launcher sends hold at most this many bytes.
+const ARGV_BYTES: usize = 256;
+static mut ARGV_BUF: [u8; ARGV_BYTES] = [0; ARGV_BYTES];
+static mut ENV_BUF: [u8; ARGV_BYTES] = [0; ARGV_BYTES];
+
 #[unsafe(no_mangle)]
 extern "C" fn main(
-    image_vmo: u64,
-    image_len: u64,
+    bootstrap: u64,
+    _a2: u64,
     _a3: u64,
     _a4: u64,
     _a5: u64,
@@ -479,26 +532,70 @@ extern "C" fn main(
     _a7: u64,
     _a8: u64,
 ) -> ! {
-    let image_vmo = Handle(image_vmo as u32);
-    let map_len = image_len.next_multiple_of(PAGE);
-    let image = match vmar_map_anywhere(image_vmo, map_len, MAP_R) {
-        (0, addr) if addr != 0 => unsafe {
-            core::slice::from_raw_parts(addr as *const u8, image_len as usize)
-        },
-        _ => fail("cannot map the program image"),
+    // SH7-d2: the standard startup protocol, like every other program Sora launches.
+    let startup = kumo_rt::startup(Handle(bootstrap as u32));
+    files::init(
+        startup.fs.unwrap_or(Handle(0)),
+        startup.stdin.unwrap_or(Handle(0)),
+        startup.stdout.unwrap_or(Handle(0)),
+    );
+    if startup.fs.is_none() {
+        fail("no filesystem grant; launch Linux programs with `linux <path>`");
+    }
+    // SAFETY: written once here, before the program exists; read-only afterwards.
+    let argv_buf = unsafe { &mut *core::ptr::addr_of_mut!(ARGV_BUF) };
+    let env_buf = unsafe { &mut *core::ptr::addr_of_mut!(ENV_BUF) };
+    let Some(argv_vmo) = startup.argv else {
+        fail("no argv");
     };
-    // SH7-c: a launch bundle carries a program and the interpreter its PT_INTERP names; a bare
-    // ELF is one static program, as M10 has always sent.
-    let (program, interp, name) = match launch::parse(image) {
-        Ok(bundle) => (bundle.program, bundle.interp, bundle.name),
-        Err(launch::LaunchError::NotABundle) => (image, None, &b"persona"[..]),
-        Err(_) => fail("malformed launch bundle"),
+    if vmo_read(argv_vmo, 0, argv_buf.as_mut_ptr(), argv_buf.len()) != 0 {
+        fail("argv read failed");
+    }
+    if let Some(env_vmo) = startup.env {
+        if vmo_read(env_vmo, 0, env_buf.as_mut_ptr(), env_buf.len()) != 0 {
+            env_buf.fill(0);
+        }
+    }
+    // argv[0] is the shim itself; argv[1] is the program, which is also the program's argv[0].
+    let mut linux_argv: [&[u8]; 16] = [b""; 16];
+    let mut argc = 0usize;
+    for arg in kumo_abi::unpack_argv(&argv_buf[..])
+        .skip(1)
+        .take(linux_argv.len())
+    {
+        linux_argv[argc] = arg;
+        argc += 1;
+    }
+    if argc == 0 {
+        fail("usage: linux <path> [args...]");
+    }
+    let mut envp: [&[u8]; 16] = [b""; 16];
+    let mut envc = 0usize;
+    for pair in kumo_abi::unpack_argv(&env_buf[..]).take(envp.len()) {
+        envp[envc] = pair;
+        envc += 1;
+    }
+
+    // execve: the program by path, then the interpreter its PT_INTERP names.
+    let program = read_image(linux_argv[0]);
+    let header = match elf::parse_linux_image(program.bytes, Machine::Aarch64) {
+        Ok(header) => header,
+        Err(_) => fail_path("not an aarch64 Linux executable", linux_argv[0]),
     };
-    let loaded = load(program, interp);
+    let interp = match elf::interpreter(program.bytes, &header) {
+        Ok(Some(path)) => Some(read_image(path)),
+        Ok(None) => None,
+        Err(_) => fail_path("bad PT_INTERP", linux_argv[0]),
+    };
+    let loaded = load(program.bytes, interp.as_ref().map(|image| image.bytes));
+    program.release();
+    if let Some(interp) = interp {
+        interp.release();
+    }
     let program_state = unsafe { &mut *core::ptr::addr_of_mut!(PROGRAM) };
     program_state.brk_end = loaded.image_end.next_multiple_of(PAGE);
 
-    let sp = build_stack(&loaded, name);
+    let sp = build_stack(&loaded, &linux_argv[..argc], &envp[..envc]);
 
     let code_base = core::ptr::addr_of!(__ehdr_start) as u64;
     let code_len = core::ptr::addr_of!(etext) as u64 - code_base;
@@ -514,6 +611,59 @@ extern "C" fn main(
         fail("PersonaShimSet refused");
     }
     unsafe { persona_enter(loaded.start, sp) }
+}
+
+/// A whole file read into a private mapping for the loader.
+struct Image {
+    bytes: &'static [u8],
+    map_at: u64,
+    map_len: u64,
+}
+
+impl Image {
+    fn release(self) {
+        let _ = vmar_unmap(self.map_at, self.map_len);
+    }
+}
+
+/// Read the file at absolute `path` through the vfs session, whole.
+fn read_image(path: &[u8]) -> Image {
+    let (handle, size) = match files::open_path(path) {
+        Ok(open) => open,
+        Err(_) => fail_path("cannot open", path),
+    };
+    if size == 0 {
+        fail_path("empty file", path);
+    }
+    let map_len = size.next_multiple_of(PAGE);
+    let Some(vmo) = vmo(map_len) else {
+        fail_path("no memory to read", path);
+    };
+    let map_at = match vmar_map_anywhere(vmo, map_len, MAP_R | MAP_W) {
+        (0, at) if at != 0 => at,
+        _ => fail_path("cannot map to read", path),
+    };
+    let _ = kumo_rt::handle_close(vmo);
+    // SAFETY: `map_at` is this fresh mapping of `map_len >= size` bytes.
+    let out = unsafe { core::slice::from_raw_parts_mut(map_at as *mut u8, size as usize) };
+    if files::vfs_pread(handle, size, 0, out) != size as i64 {
+        fail_path("short read", path);
+    }
+    files::close_handle(handle);
+    Image {
+        bytes: out,
+        map_at,
+        map_len,
+    }
+}
+
+fn fail_path(what: &str, path: &[u8]) -> ! {
+    log(format_args!(
+        "persona-linux: {}: {}\n",
+        what,
+        core::str::from_utf8(path).unwrap_or("<path>")
+    ));
+    process_exit(127)
 }
 
 /// Load the program and, for a dynamic one, the interpreter it names, as Linux's `execve`
@@ -633,9 +783,9 @@ fn load_segment(image: &[u8], ph: &elf::ProgramHeader, bias: u64) {
     let _ = kumo_rt::handle_close(vmo);
 }
 
-/// The Linux initial stack (SysV aarch64): argc, argv, NULL, envp NULL, auxv, then the data
-/// the vectors point at. Returns the 16-byte-aligned SP that points at argc.
-fn build_stack(loaded: &Loaded, name: &[u8]) -> u64 {
+/// The Linux initial stack (SysV aarch64): argc, argv[], NULL, envp[], NULL, auxv, with the strings
+/// and AT_RANDOM's 16 bytes above them. Returns the 16-byte-aligned SP that points at argc.
+fn build_stack(loaded: &Loaded, argv: &[&[u8]], envp: &[&[u8]]) -> u64 {
     let Some(vmo) = vmo(LINUX_STACK_SIZE) else {
         fail("no memory for the stack");
     };
@@ -645,15 +795,27 @@ fn build_stack(loaded: &Loaded, name: &[u8]) -> u64 {
     }
     let _ = kumo_rt::handle_close(vmo);
 
-    // Data area at the top: argv[0] (NUL-terminated; the stack is fresh, so zeroed) and
-    // AT_RANDOM's 16 bytes. `name` is at most launch::NAME_MAX bytes.
-    let mut top = LINUX_STACK_TOP - 128;
-    let name_at = top;
-    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), name_at as *mut u8, name.len()) };
-    top -= 32;
+    // Strings at the top, each NUL-terminated (the stack is fresh, so zeroed).
+    let mut top = LINUX_STACK_TOP - 16;
+    let mut place = |s: &[u8]| -> u64 {
+        top -= s.len() as u64 + 1;
+        // SAFETY: inside the stack mapped just above.
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), top as *mut u8, s.len()) };
+        top
+    };
+    let mut argv_at = [0u64; 16];
+    for (slot, arg) in argv_at.iter_mut().zip(argv) {
+        *slot = place(arg);
+    }
+    let mut envp_at = [0u64; 16];
+    for (slot, pair) in envp_at.iter_mut().zip(envp) {
+        *slot = place(pair);
+    }
+    let execfn = argv_at[0];
+    top = (top - 32) & !15;
     let random_at = top;
     let seed = kumo_rt::clock_get();
-    let random = [seed ^ 0x9e37_79b9_7f4a_7c15, seed.rotate_left(29) ^ name_at];
+    let random = [seed ^ 0x9e37_79b9_7f4a_7c15, seed.rotate_left(29) ^ execfn];
     for (i, word) in random.iter().enumerate() {
         unsafe { ((random_at + i as u64 * 8) as *mut u64).write(*word) };
     }
@@ -673,19 +835,24 @@ fn build_stack(loaded: &Loaded, name: &[u8]) -> u64 {
         (AT_CLKTCK, 100),
         (AT_SECURE, 0),
         (AT_RANDOM, random_at),
+        (AT_EXECFN, execfn),
         (AT_NULL, 0),
     ];
-    // argc + argv[0] + NULL + envp NULL + auxv pairs.
-    let words = 1 + 2 + 1 + auxv.len() * 2;
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + auxv.len() * 2;
     let sp = (top - words as u64 * 8) & !15;
     let mut at = sp;
     let mut push = |value: u64| {
         unsafe { (at as *mut u64).write(value) };
         at += 8;
     };
-    push(1);
-    push(name_at);
+    push(argv.len() as u64);
+    for &arg in &argv_at[..argv.len()] {
+        push(arg);
+    }
     push(0);
+    for &pair in &envp_at[..envp.len()] {
+        push(pair);
+    }
     push(0);
     for (key, value) in auxv {
         push(key);

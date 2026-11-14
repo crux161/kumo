@@ -12,6 +12,8 @@ version.workspace = true
 kumo-rt = { path = "../kumo-rt" }
 kumo-abi.workspace = true
 persona-linux = { path = "../persona-linux" }
+# SH7-d2 (j890): the Linux file surface speaks kumo-vfs to the persona's filesystem grant.
+kumo-vfs = { path = "../../lib/kumo-vfs" }
 
 [[bin]]
 name = "persona-linux-shim"
