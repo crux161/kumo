@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j712
 //j713
 //j714
 //j732
 //j742
+//j899
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -234,7 +234,7 @@ fn submit_wait(
     stream: &[u64],
 ) -> Result<(), Failure> {
     if stream.len() * 8 > kumo_gpu::PAGE_BYTES as usize {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("command stream larger than one page"));
     }
     for (i, word) in stream.iter().enumerate() {
         // SAFETY: the validated command page, reused only after the last completed point.
@@ -259,13 +259,13 @@ fn submit_wait(
             barrier();
             Ok(())
         }
-        FenceStatus::Done { .. } => Err(Failure::Failed),
+        FenceStatus::Done { .. } => Err(Failure::Failed("fence completed with a failure status")),
         FenceStatus::Armed(wake) => {
             if wait_wake(wake) {
                 barrier();
                 Ok(())
             } else {
-                Err(Failure::Failed)
+                Err(Failure::Failed("fence result did not verify"))
             }
         }
     }
@@ -333,7 +333,7 @@ fn churn_abort(frame: u32, status: Option<PresentStatus>, cause: &str) -> Failur
             frame, status, cause
         ),
     );
-    Failure::Failed
+    Failure::Failed("churn aborted")
 }
 
 /// The same record for a session-API failure, keeping the server status distinguishable.
@@ -354,7 +354,7 @@ fn churn_api_fail(frame: u32, cause: &str, error: ClientError) -> Failure {
             ),
         ),
     }
-    Failure::Failed
+    Failure::Failed("churn GPU API call failed")
 }
 
 /// Fill the image extent with the poison word before every submission, exactly as the
@@ -630,7 +630,7 @@ fn churn_run(
                     frame, x, y, got, want
                 ),
             );
-            return Err(Failure::Failed);
+            return Err(Failure::Failed("churn frame pixel mismatch"));
         }
         copy_paint_to_surface(churn_cpu, surface)
             .map_err(|cause| churn_abort(frame, None, cause))?;
@@ -693,13 +693,20 @@ fn churn_run(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// j899: every failure names its cause, so a session never ends as a bare "session failed"
+/// (the opi5 boot ABEND was unexplained for days because the reason was swallowed). — TEAL
 enum Failure {
-    Failed,
+    Failed(&'static str),
     Cancelled,
 }
 impl From<()> for Failure {
     fn from(_: ()) -> Self {
-        Self::Failed
+        Self::Failed("a setup step returned no detail")
+    }
+}
+impl From<&'static str> for Failure {
+    fn from(cause: &'static str) -> Self {
+        Self::Failed(cause)
     }
 }
 impl From<ClientError> for Failure {
@@ -708,7 +715,26 @@ impl From<ClientError> for Failure {
             "gpu-client: native GPU API failed: {:?}\n",
             error
         ));
-        Self::Failed
+        Self::Failed("native GPU API call failed")
+    }
+}
+
+/// j899: a presenter that gave up before this image (drv-fb's R1 refused the live mode, or the
+/// J0a wait timed out) queues a `Cancelled` reply and closes, so our next write fails. That is
+/// the presenter's cancellation, not a client failure: read what it left. The channel is
+/// peer-closed here, so the read answers at once with the queued reply or an error.
+fn presenter_gone(channel: Handle, refused: &'static str) -> Failure {
+    let mut bytes = [0; kumo_graphics::native::REQUEST_LEN + 1];
+    let (n, extra) = kumo_rt::channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len());
+    if let Some(extra) = handle(extra) {
+        let _ = kumo_rt::handle_close(extra);
+    }
+    match bytes
+        .get(..n)
+        .and_then(kumo_graphics::native::Reply::decode)
+    {
+        Some(reply) if reply.is_cancelled() => Failure::Cancelled,
+        _ => Failure::Failed(refused),
     }
 }
 
@@ -719,7 +745,7 @@ fn present_image(
     lease: &mut kumo_graphics::native::Lease,
 ) -> Result<(), Failure> {
     if !lease.begin(image, kumo_rt::handle_koid(vmo)) {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("display lease refused this image"));
     }
     let grant = handle(kumo_rt::handle_duplicate(
         vmo,
@@ -735,18 +761,24 @@ fn present_image(
     let wait_frame = wait.encode();
     if kumo_rt::channel_write(channel, wait_frame.as_ptr(), wait_frame.len()) != 0 {
         let _ = kumo_rt::handle_close(grant);
-        return Err(Failure::Failed);
+        return Err(presenter_gone(
+            channel,
+            "presenter channel refused the retire-wait",
+        ));
     }
     let bytes = image.encode();
     if kumo_rt::channel_write_with_handle(channel, bytes.as_ptr(), bytes.len(), grant) != 0 {
         let _ = kumo_rt::handle_close(grant);
-        return Err(Failure::Failed);
+        return Err(presenter_gone(
+            channel,
+            "presenter channel refused the image",
+        ));
     }
     log(format_args!("gpu-client: J0c sequence{} point{} leased READ-only; GPU/CPU writes blocked until matching retirement\n",image.sequence,image.gpu_point));
     let port = handle(kumo_rt::port_create()).ok_or(())?;
     let timer = handle(kumo_rt::timer_create(120_000_000_000)).ok_or(())?;
     if kumo_rt::port_bind(port, channel) != 0 || kumo_rt::port_bind(port, timer) != 0 {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("reply port bind failed"));
     }
     let channel_koid = kumo_rt::handle_koid(channel);
     let mut bytes = [0; kumo_graphics::native::REQUEST_LEN + 1];
@@ -770,12 +802,12 @@ fn present_image(
                 if let Some(extra) = extra {
                     if wake.is_some() || kumo_rt::port_bind(port, extra) != 0 {
                         let _ = kumo_rt::handle_close(extra);
-                        return Err(Failure::Failed);
+                        return Err(Failure::Failed("second or unbindable frame-retired wake"));
                     }
                     wake = Some(extra);
                 }
                 if wait_reply.armed != wake.is_some() {
-                    return Err(Failure::Failed);
+                    return Err(Failure::Failed("wait reply disagrees with the wake handle"));
                 }
                 armed = wait_reply.armed;
             } else if let Some(image_reply) = bytes
@@ -783,7 +815,7 @@ fn present_image(
                 .and_then(kumo_graphics::native::Reply::decode)
             {
                 if extra.is_some() {
-                    return Err(Failure::Failed);
+                    return Err(Failure::Failed("image reply carried a handle"));
                 }
                 reply = Some(image_reply);
                 if !armed {
@@ -793,7 +825,7 @@ fn present_image(
                     break;
                 }
             } else {
-                return Err(Failure::Failed);
+                return Err(Failure::Failed("unrecognised presenter reply"));
             }
         } else if let Some(wake_handle) = wake.filter(|w| kumo_rt::handle_koid(*w) == source) {
             let mut byte = [0u8; 1];
@@ -803,7 +835,7 @@ fn present_image(
                 break;
             }
         } else {
-            return Err(Failure::Failed);
+            return Err(Failure::Failed("wake on an unknown port source"));
         }
     }
     let _ = kumo_rt::port_unbind(port, channel);
@@ -815,14 +847,14 @@ fn present_image(
     let _ = kumo_rt::handle_close(timer);
     let _ = kumo_rt::handle_close(port);
     if armed && !woken {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("armed wait never woke"));
     }
     let reply = reply.ok_or(())?;
     if reply.is_cancelled() {
         return Err(Failure::Cancelled);
     }
     if !lease.retire(reply) {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("display lease refused the retirement"));
     }
     log(format_args!("gpu-client: J0c sequence{} point{} retired after consumed GOP replacement/unmap; next GPU reuse permitted\n",image.sequence,image.gpu_point));
     Ok(())
@@ -832,7 +864,7 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
     let mut client = Client::new(Channel { channel });
     let info = client.info()?;
     if info.gpu_id & 0xffff_0000 != 0xa867_0000 {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("not a Mali-G610 GPU_ID"));
     }
     let topology = client.topology()?;
     log(format_args!(
@@ -847,10 +879,12 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
     // window is a contradiction, not a usable property, so it fails the session. — SAKER
     let va_bits = mmu.mmu_features & 0xff;
     let Some(hardware_va_bytes) = 1u64.checked_shl(va_bits) else {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("MMU VA bits out of range"));
     };
     if hardware_va_bytes < VA_END {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed(
+            "hardware VA smaller than the service window",
+        ));
     }
     log(format_args!(
         "gpu-client: G7d attested MMU: features0x{:08x}, va bits={}, hardware range0..0x{:x} holds service window0x{:x}..0x{:x}\n",
@@ -873,7 +907,7 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
         Err(ClientError::Server(GpuStatus::NotSupported)) => log(format_args!(
             "gpu-client: G7e tiler properties unavailable; compute path unaffected\n"
         )),
-        Err(_) => return Err(Failure::Failed),
+        Err(_) => return Err(Failure::Failed("tiler property query failed")),
     }
     // Same optional rule: upstream reads this word whole as the compressed-format mask and
     // reads bit 25 as AFRC presence on arch 10, so KUMO reduces it to neither. — SAKER
@@ -886,7 +920,7 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
         Err(ClientError::Server(GpuStatus::NotSupported)) => log(format_args!(
             "gpu-client: G7f texture features unavailable; compute path unaffected\n"
         )),
-        Err(_) => return Err(Failure::Failed),
+        Err(_) => return Err(Failure::Failed("texture feature query failed")),
     }
     // G7o-a: required, so any failure fails the session. Decoded exactly as upstream's
     // pan_query_l2_slices (MEM_FEATURES[11:8] + 1) and pan_query_bus_width
@@ -915,7 +949,9 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
     // The next real query proves the shared API can continue after that refusal. — KESTREL
     if client.create_vm() != Err(ClientError::Server(GpuStatus::BadState)) || client.info()? != info
     {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed(
+            "duplicate VM not refused or query changed after refusal",
+        ));
     }
     log(format_args!("gpu-client: G7a shared API: duplicate VM refused, next query live; unique request IDs, no replay\n"));
     let buffer = client.create_buffer(BUFFER_BYTES)?;
@@ -926,7 +962,7 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
         (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
     );
     if status != 0 || cpu == 0 {
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("shared buffer map failed"));
     }
     upload(cpu, BINARY_OFFSET, KUMO_PAINT_V10.binary)?;
     upload(cpu, DATA_OFFSET, &compute_data().map_err(|_| ())?)?;
@@ -963,7 +999,7 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
                 "gpu-client: point {} wrong value 0x{:08x}, expected 0x{:08x}\n",
                 point, got, value
             ));
-            return Err(Failure::Failed);
+            return Err(Failure::Failed("GPU wrote a wrong point value"));
         }
         log(format_args!(
             "gpu-client: point {} complete, GPU wrote 0x{:08x} into shared VMO\n",
@@ -1000,7 +1036,7 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
             "gpu-client: first wrong pixel ({}, {}): got 0x{:08x}, want 0x{:08x}\n",
             x, y, got, want
         ));
-        return Err(Failure::Failed);
+        return Err(Failure::Failed("compute paint pixel mismatch"));
     }
     log(format_args!(
         "gpu-client: client compute frame verified; 32768 pixels match\n"
@@ -1076,7 +1112,7 @@ fn native_frames(
         // This check precedes EVERY poison/write and GPU submission. Only a verified
         // previous display retirement reply can reopen the image for production. — KESTREL
         if !lease.can_render() {
-            return Err(Failure::Failed);
+            return Err(Failure::Failed("display lease does not allow rendering"));
         }
         let point = u64::from(sequence) + 3;
         let is_triangle = sequence % 2 == 1;
@@ -1112,7 +1148,7 @@ fn native_frames(
                 "gpu-client: J0c mismatch ({},{}): got0x{:08x} want0x{:08x}\n",
                 x, y, got, want
             ));
-            return Err(Failure::Failed);
+            return Err(Failure::Failed("J0c pixel mismatch"));
         }
         if presentation.0 != 0 {
             present_image(
@@ -1132,7 +1168,7 @@ fn native_frames(
     }
     if presentation.0 != 0 {
         if !lease.complete() {
-            return Err(Failure::Failed);
+            return Err(Failure::Failed("display lease incomplete after J0c"));
         }
         log(format_args!("gpu-client: J0c complete: 3 native frames, same VMO/image pages, 2 GPU reuses only after display retirement\n"));
     }
@@ -1191,8 +1227,8 @@ extern "C" fn main(channel: u64, bootstrap: u64) -> ! {
             log(format_args!("gpu-client: presenter cancelled diagnostic; stopping without image reuse or fabricated completion\n"));
             false
         }
-        Err(Failure::Failed) => {
-            log(format_args!("gpu-client: session failed\n"));
+        Err(Failure::Failed(cause)) => {
+            log(format_args!("gpu-client: session failed: {cause}\n"));
             true
         }
     };
