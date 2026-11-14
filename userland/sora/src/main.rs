@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j856
 //j857
 //j859
 //j864
 //j870
+//j893
 
 extern crate alloc;
 
@@ -172,6 +172,11 @@ static GPU_SESSION_HANDOFF: AtomicU32 = AtomicU32::new(0);
 /// path, so this slot stays zero after the boot transfer. — TIMBERDOODLE
 static GPU_CLIENT_CHANNEL: AtomicU32 = AtomicU32::new(0);
 static GPU_NATIVE_CHANNEL: AtomicU32 = AtomicU32::new(0);
+//j893
+/// Sora's end of drv-thermal's bootstrap channel, which carries the shell's `thermal` status
+/// requests once the grants are delivered. Zero where the live DTB has no RK3588 TS-ADC.
+/// — TEAL
+static THERMAL_CHANNEL: AtomicU32 = AtomicU32::new(0);
 //j711
 /// The sending end of one launch's lane bootstrap pair. Every launch mints a fresh pair —
 /// the boot one and each G8d-b regrant — and names its lane before dropping the sender:
@@ -2695,6 +2700,189 @@ fn media() -> Option<Media> {
 fn set_media(media: Option<Media>) {
     // SAFETY: see `MediaCell`.
     unsafe { *MEDIA.0.get() = media }
+}
+
+//j893
+/// Map the read-only DTB capability (header page first, then its declared extent) and report
+/// whether it describes the RK3588 TS-ADC drv-thermal drives. — TEAL
+fn thermal_tsadc_in_dtb(dtb_vmo: Handle, dtb_phys: u64) -> bool {
+    const PAGE_SIZE: u64 = 4096;
+    const HEADER_VA: u64 = 0x0000_0000_3900_0000;
+    const DTB_VA: u64 = 0x0000_0000_3a00_0000;
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const MAX_DTB_BYTES: u64 = 16 * 1024 * 1024;
+
+    if dtb_vmo.0 == 0 || dtb_phys == 0 {
+        return false;
+    }
+    let offset = dtb_phys & (PAGE_SIZE - 1);
+    if offset > PAGE_SIZE - 8
+        || vmar_map(
+            Handle(0),
+            dtb_vmo,
+            0,
+            HEADER_VA,
+            PAGE_SIZE,
+            VmarFlags::READ.0,
+        ) != 0
+    {
+        return false;
+    }
+    let word = |at: u64| unsafe { core::ptr::read((HEADER_VA + offset + at) as *const [u8; 4]) };
+    if u32::from_be_bytes(word(0)) != FDT_MAGIC {
+        return false;
+    }
+    let total = u64::from(u32::from_be_bytes(word(4)));
+    if !(40..=MAX_DTB_BYTES).contains(&total) {
+        return false;
+    }
+    let mapped_len = (offset + total + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if vmar_map(Handle(0), dtb_vmo, 0, DTB_VA, mapped_len, VmarFlags::READ.0) != 0 {
+        return false;
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts((DTB_VA + offset) as *const u8, total as usize) };
+    drv_thermal::tsadc_in_dtb(bytes)
+}
+
+/// T0 of the thermal cut (build/verification/thermal/thermal-cut.md, ratified 2026-11-14): start
+/// drv-thermal where the live DTB has the RK3588 TS-ADC. x0 is the sensor's own WRITE child
+/// Resource; the bootstrap channel then carries one READ-only grant each for the CRU's first
+/// page (clock/gate/reset checks), the two pad blocks and the PWM12-15 page (diagnostics for
+/// T1), then `G`. Sora keeps the other end for the `thermal` word. No CRU, pad or PWM write
+/// reach leaves Sora. — TEAL
+fn launch_thermal(initrd: Handle, root: Handle, dtb_vmo: Handle, dtb_phys: u64) {
+    use drv_thermal::{
+        BOOT_BUS_IOC, BOOT_CRU, BOOT_GO, BOOT_PWM, BOOT_VCCIO3_5_IOC, BUS_IOC_BASE, CRU_BASE,
+        CRU_LEN, PAGE_LEN, PWM_BASE, TSADC_BASE, TSADC_LEN, VCCIO3_5_IOC_BASE,
+    };
+    if !thermal_tsadc_in_dtb(dtb_vmo, dtb_phys) {
+        log(b"drv-thermal: no TS-ADC in the live DTB; not launched\n");
+        return;
+    }
+    let sensor = resource_create_child(root, TSADC_BASE, TSADC_LEN, 0, 0);
+    let (sora_end, driver_end) = channel_create_pair();
+    let valid = |raw: u64| syscall_handle(raw).is_some();
+    if !valid(sensor) || !valid(sora_end) || !valid(driver_end) {
+        for raw in [sensor, sora_end, driver_end] {
+            if valid(raw) {
+                let _ = handle_close(Handle(raw as u32));
+            }
+        }
+        log(b"drv-thermal: resource or channel setup failed\n");
+        return;
+    }
+    let sora_end = Handle(sora_end as u32);
+    for (tag, base, len) in [
+        (BOOT_CRU, CRU_BASE, CRU_LEN),
+        (BOOT_BUS_IOC, BUS_IOC_BASE, PAGE_LEN),
+        (BOOT_VCCIO3_5_IOC, VCCIO3_5_IOC_BASE, PAGE_LEN),
+        (BOOT_PWM, PWM_BASE, PAGE_LEN),
+    ] {
+        let raw = resource_create_child(root, base, len, 0, 0);
+        if syscall_handle(raw).is_none() {
+            let mut line = drv_thermal::Line::<160>::new();
+            let _ = core::fmt::Write::write_fmt(
+                &mut line,
+                format_args!(
+                    "drv-thermal: resource child base=0x{base:x} len=0x{len:x} errno {}\n",
+                    raw as u32 as i32
+                ),
+            );
+            log(line.as_bytes());
+        }
+        let grant = read_only_grant(raw);
+        if grant.0 == 0 && syscall_handle(raw).is_some() {
+            log(b"drv-thermal: read-only grant setup failed\n");
+        }
+        if grant.0 != 0 && channel_write_with_handle(sora_end, [tag].as_ptr(), 1, grant) != 0 {
+            let _ = handle_close(grant);
+        }
+    }
+    let go_sent = channel_write(sora_end, [BOOT_GO].as_ptr(), 1) == 0;
+    if !go_sent
+        || !run_elf(
+            initrd,
+            kumo_abi::DRV_THERMAL_PATH.as_bytes(),
+            sensor,
+            driver_end,
+            (ProcessRunFlags::ASYNC
+                | ProcessRunFlags::TRANSFER_ARG
+                | ProcessRunFlags::TRANSFER_ARG2)
+                .bits(),
+            b"drv-thermal",
+        )
+    {
+        for raw in [sensor, driver_end] {
+            let _ = handle_close(Handle(raw as u32));
+        }
+        let _ = handle_close(sora_end);
+        log(b"drv-thermal: launch failed\n");
+        return;
+    }
+    THERMAL_CHANNEL.store(sora_end.0, Ordering::Relaxed);
+}
+
+/// The `thermal` word: one status request to drv-thermal, answered within half a second or
+/// reported as silent. — TEAL
+fn thermal_status() {
+    const REPLY_WAIT_NS: u64 = 500_000_000;
+    let raw = THERMAL_CHANNEL.load(Ordering::Relaxed);
+    if raw == 0 {
+        log(b"thermal: no sensor\n");
+        fail_status(1);
+        return;
+    }
+    let channel = Handle(raw);
+    if channel_write(channel, [drv_thermal::STATUS_REQUEST].as_ptr(), 1) != 0 {
+        log(b"thermal: drv-thermal is gone\n");
+        fail_status(1);
+        return;
+    }
+    let (Some(port), Some(timer)) = (
+        syscall_handle(port_create()),
+        syscall_handle(timer_create(REPLY_WAIT_NS)),
+    ) else {
+        log(b"thermal: no port or timer\n");
+        fail_status(1);
+        return;
+    };
+    let channel_koid = handle_koid(channel);
+    let mut record = [0u8; drv_thermal::STATUS_LEN + 1];
+    let mut got = 0u64;
+    if port_bind(port, channel) == 0 && port_bind(port, timer) == 0 {
+        if port_wait(port) == channel_koid {
+            got = channel_read(channel, record.as_mut_ptr(), record.len());
+        }
+        let _ = port_unbind(port, channel);
+        let _ = port_unbind(port, timer);
+    }
+    let _ = handle_close(timer);
+    let _ = handle_close(port);
+    let status = (got as usize == drv_thermal::STATUS_LEN)
+        .then(|| drv_thermal::Status::decode(&record[..drv_thermal::STATUS_LEN]))
+        .flatten();
+    let Some(status) = status else {
+        log(b"thermal: no answer from drv-thermal\n");
+        fail_status(1);
+        return;
+    };
+    let mut line = drv_thermal::Line::<240>::new();
+    let _ = core::fmt::Write::write_str(&mut line, "thermal: ");
+    let _ = status.write_temperatures(&mut line);
+    if status.flags & drv_thermal::FLAG_FAN_DRIVEN != 0 {
+        let _ = core::fmt::Write::write_fmt(
+            &mut line,
+            format_args!(" fan {}% {} rpm", status.duty_permille / 10, status.rpm),
+        );
+    }
+    if status.flags & drv_thermal::FLAG_CLOCK_FAULT != 0 {
+        let _ = core::fmt::Write::write_str(&mut line, " [clock fault]");
+    } else if status.flags & drv_thermal::FLAG_SENSOR_OK == 0 {
+        let _ = core::fmt::Write::write_str(&mut line, " [sensor fault]");
+    }
+    let _ = core::fmt::Write::write_str(&mut line, "\n");
+    log(line.as_bytes());
 }
 
 /// Spawn a drv-xhci per xHCI controller and return the keyboard-channel reader (bound to the serve
@@ -5519,6 +5707,8 @@ extern "C" fn sora_main(
                     log(b"drv-i2c-hid: no matched i2c21 hid bus\n");
                 }
             }
+            //j893
+            launch_thermal(initrd, res, Handle(dtb_vmo as u32), bootinfo.platform.dtb);
         } else {
             // Static analysis says this self-map (in-bounds of Sora's root VMAR, READ right
             // present, physical-backed BootInfo VMO, identity-map switch in the kernel
@@ -7361,6 +7551,14 @@ fn eval_command(
             usage(b"usage: net <program> [args...]\n");
         } else {
             run_program_granted(initrd, &cmd.args, true);
+        }
+    } else if cmd.name == "thermal" {
+        //j893 thermal: the seven TS-ADC sensors (and, from T1, the fan) as drv-thermal last read
+        // them. — TEAL
+        if cmd.args.is_empty() {
+            thermal_status();
+        } else {
+            usage(b"usage: thermal\n");
         }
     } else if cmd.name == "payload" {
         // PROPOSAL/025: `payload fetch <server-ip> [retries]` starts payloadd and returns at

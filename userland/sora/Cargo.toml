@@ -1,8 +1,8 @@
-#j597
 #j649
 #j798
 #j805
 #j820
+#j893
 
 [package]
 name = "sora"
@@ -18,6 +18,7 @@ drv-gpu = { path = "../servers/drv-gpu" }
 drv-blk = { path = "../servers/drv-blk" }
 drv-i2c-hid = { path = "../servers/drv-i2c-hid" }
 drv-nvme = { path = "../servers/drv-nvme" }
+drv-thermal = { path = "../servers/drv-thermal" }
 kumo-pcie.workspace = true
 kumo-abi.workspace = true
 kumo-fatfs = { path = "../../lib/kumo-fatfs" }

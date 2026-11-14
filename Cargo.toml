@@ -1,8 +1,8 @@
-#j822
 #j823
 #j824
 #j825
 #j826
+#j893
 [workspace]
 members = [
     "boot/niji-loader",
@@ -65,6 +65,7 @@ members = [
     "userland/servers/drv-nvme",
     "userland/servers/drv-xhci",
     "userland/servers/drv-serial",
+    "userland/servers/drv-thermal",
     "userland/servers/fatfs",
     "userland/servers/identityd",
     "userland/servers/netstack",

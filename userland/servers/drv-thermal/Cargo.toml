@@ -1,0 +1,25 @@
+#j893
+[package]
+name = "drv-thermal"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "drv-thermal"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+[dependencies]
+kumo-fdt.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../../kumo-rt" }

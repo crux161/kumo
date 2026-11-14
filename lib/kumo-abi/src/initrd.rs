@@ -1,8 +1,8 @@
-//j798
 //j815
 //j824
 //j825
 //j857
+//j893
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -29,6 +29,8 @@ pub const DRV_I2C_HID_PATH: &str = "bin/drv-i2c-hid";
 pub const DRV_XHCI_PATH: &str = "bin/drv-xhci";
 pub const DRV_NVME_PATH: &str = "bin/drv-nvme";
 pub const DRV_BLK_PATH: &str = "bin/drv-blk";
+/// The RK3588 TS-ADC driver (j893): Sora launches it only when the live DTB has the sensor.
+pub const DRV_THERMAL_PATH: &str = "bin/drv-thermal";
 /// The resident filesystem server. It is handed a read-only backing VMO and the
 /// byte offset of a FAT image inside it, then answers `kumo-vfs` Open/Read frames
 /// on the same channel — the storage domain's first live server.

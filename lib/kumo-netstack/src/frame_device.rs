@@ -1,4 +1,5 @@
 //j842
+//j893
 //! An Ethernet `FrameDevice`: the smoltcp device whose frames cross the KNF1 channel.
 //!
 //! The loopback device models a stack talking to itself. This device models one stack's
@@ -607,7 +608,10 @@ mod tests {
                 .push_inbound(&frame)
                 .unwrap_or_else(|e| panic!("frame {i}: {e:?}"));
         }
-        assert!(b.provider.send_rx(&frame).is_none(), "the window closes with the ring");
+        assert!(
+            b.provider.send_rx(&frame).is_none(),
+            "the window closes with the ring"
+        );
         assert_eq!(b.provider.counters().rx_drop_no_credit, 1);
         assert_eq!(b.device.push_inbound(&frame), Err(InjectError::Full));
         assert_eq!(b.device.counters().ingress_full, 1);

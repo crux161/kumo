@@ -1,8 +1,8 @@
-//j823
 //j824
 //j825
 //j857
 //j871
+//j893
 
 use std::env;
 use std::fmt;
@@ -1080,6 +1080,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let shadow = identity::shadow_file()?;
             let fat32_img = build_fat32_image(std_smoke.as_slice());
             let payloadd = build_native_bin(&workspace_root()?, "payloadd")?;
+            let drv_thermal = build_native_bin(&workspace_root()?, "drv-thermal")?;
             let files: Vec<(&str, &[u8])> = vec![
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
@@ -1092,6 +1093,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (DRV_XHCI_PATH, drv_xhci.as_slice()),
                 (DRV_NVME_PATH, drv_nvme.as_slice()),
                 (DRV_BLK_PATH, drv_blk.as_slice()),
+                (kumo_abi::DRV_THERMAL_PATH, drv_thermal.as_slice()),
                 (FATFS_PATH, fatfs.as_slice()),
                 (IDENTITYD_PATH, identityd.as_slice()),
                 (kumo_abi::initrd::NETSTACK_PATH, netstack.as_slice()),
