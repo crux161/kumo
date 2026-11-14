@@ -817,8 +817,8 @@ impl NicResident {
                 let snapshot = unsafe { &mut *RX_SNAPSHOT.0.get() };
                 self.rx.buffer.read_into(0, &mut snapshot[..actual]);
                 if crate::frame_chan::active() {
-                    let (sent, no_credit) = crate::frame_chan::forward_rx(&snapshot[..actual]);
-                    self.rx_window.note(actual, sent, no_credit);
+                    let outcome = crate::frame_chan::forward_rx(&snapshot[..actual]);
+                    self.rx_window.note(actual, outcome);
                     return;
                 }
                 if ax88_link::RX_ENABLED {
@@ -1709,11 +1709,16 @@ struct RxWindow {
     bytes: u64,
     frames: u32,
     no_credit: u32,
+    flagged: u32,
+    parse_errors: u32,
     max_frames: u32,
 }
 
 impl RxWindow {
-    fn note(&mut self, bytes: usize, frames: u32, no_credit: u32) {
+    fn note(&mut self, bytes: usize, outcome: crate::frame_chan::RxOutcome) {
+        let (frames, no_credit) = (outcome.sent, outcome.no_credit);
+        self.flagged += outcome.flagged;
+        self.parse_errors += u32::from(outcome.parse_error);
         let now = clock_get();
         if self.start_ns == 0 {
             self.start_ns = now;
@@ -1726,11 +1731,13 @@ impl RxWindow {
         let span = now.saturating_sub(self.start_ns);
         if span >= 1_000_000_000 {
             ax88_record(format_args!(
-                "NET rx/s transfers={} bytes={} frames={} no_credit={} max_frames_per_transfer={} span_ms={}\n",
+                "NET rx/s transfers={} bytes={} frames={} no_credit={} flagged={} parse_errors={} max_frames_per_transfer={} span_ms={}\n",
                 self.transfers,
                 self.bytes,
                 self.frames,
                 self.no_credit,
+                self.flagged,
+                self.parse_errors,
                 self.max_frames,
                 span / 1_000_000
             ));

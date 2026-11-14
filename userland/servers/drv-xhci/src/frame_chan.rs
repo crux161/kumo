@@ -367,20 +367,33 @@ pub(super) fn note_complete(actual: usize) -> bool {
 }
 
 /// Forward one RX aggregate to netstack as RX_FRAMEs within the granted window.
-/// Returns `(frames sent, frames dropped for want of RX credit)`.
-pub(super) fn forward_rx(bytes: &[u8]) -> (u32, u32) {
+/// What one RX aggregate became.
+#[derive(Clone, Copy, Default)]
+pub(super) struct RxOutcome {
+    pub sent: u32,
+    pub no_credit: u32,
+    /// Packets the chip flagged (CRC, hardware drop, runt, oversize).
+    pub flagged: u32,
+    /// The whole aggregate failed to parse; its frames are lost.
+    pub parse_error: bool,
+}
+
+/// Forward one RX aggregate to netstack as RX_FRAMEs within the granted window.
+pub(super) fn forward_rx(bytes: &[u8]) -> RxOutcome {
+    let mut out = RxOutcome::default();
     let Some(s) = service().as_mut() else {
-        return (0, 0);
+        return out;
     };
     let Some(channel) = s.channel else {
-        return (0, 0);
+        return out;
     };
     if !s.hello_sent {
-        return (0, 0);
+        return out;
     }
     let Ok(aggregate) = kumo_ax88::rx::Aggregate::parse(bytes) else {
         s.provider.note_rx_bad();
-        return (0, 0);
+        out.parse_error = true;
+        return out;
     };
     let (mut sent, mut no_credit) = (0u32, 0u32);
     for packet in aggregate.packets() {
@@ -393,11 +406,16 @@ pub(super) fn forward_rx(bytes: &[u8]) -> (u32, u32) {
                     no_credit += 1;
                 }
             }
-            kumo_ax88::rx::Packet::Dropped { .. } => s.provider.note_rx_bad(),
+            kumo_ax88::rx::Packet::Dropped { .. } => {
+                s.provider.note_rx_bad();
+                out.flagged += 1;
+            }
             kumo_ax88::rx::Packet::Dummy => {}
         }
     }
-    (sent, no_credit)
+    out.sent = sent;
+    out.no_credit = no_credit;
+    out
 }
 
 /// A link-status change reached the driver; report it without polling.

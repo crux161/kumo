@@ -475,7 +475,12 @@ fn pump_frame(frame: &mut Option<Frame>, server: &mut Server) {
             b"netstack: frame tx handed to provider\n",
         );
     }
-    let delivered = server.wire_delivered();
+    // Every RX_FRAME the lane accepted holds one credit until it is either consumed by the
+    // wire stack or refused at ingress (unknown ethertype, fragment, full ring...). Refused
+    // frames used to keep theirs forever: LAN chatter (IPv6, mDNS, LLDP) drained the 32-frame
+    // window in minutes and the wire went deaf (2026-11-13 opi5, payload fetch stalled at
+    // block 1615 with both ends retransmitting). Both outcomes return the credit.
+    let delivered = server.wire_delivered() + f.device_drops;
     let owed = delivered.saturating_sub(f.returned);
     if owed > 0 {
         if let Some(credit) = f.lane.return_rx(owed as u32) {

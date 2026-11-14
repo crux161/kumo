@@ -225,6 +225,19 @@ pub fn rearm_take<P: Port>(port: &mut P) -> bool {
     if !REARM_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed) {
         return false;
     }
+    // Look before toggling. The RX_CTL off/on cycle is the reference driver's cure for a TX
+    // FIFO stuck full; run unconditionally after every transmit it closed the receiver for
+    // ~1 ms per frame sent, and dropped exactly the frames those frames had solicited (a
+    // windowed TFTP fetch on the opi5, 2026-11-13: 370 gap ACKs and 45 server timeouts for
+    // 2.7 MB, with every frame the chip delivered accounted for).
+    let mut back = [0u8; 6];
+    if port.exchange(&Request::fifo_status(), &mut back).is_err() {
+        return false;
+    }
+    let fifo = u32::from_le_bytes([back[0], back[1], back[2], back[3]]);
+    if fifo & TX_FIFO_FULL == 0 {
+        return true;
+    }
     let on = match Request::mac_write(
         MacRegister::RxControl,
         &(RX_CTL_START | RX_CTL_AB | RX_CTL_IPE).to_le_bytes(),
@@ -235,7 +248,6 @@ pub fn rearm_take<P: Port>(port: &mut P) -> bool {
     let Ok(off) = Request::mac_write(MacRegister::RxControl, &[0x00, 0x00]) else {
         return false;
     };
-    let mut back = [0u8; 6];
     if port.exchange(&off, &mut back).is_err()
         || port.exchange(&on, &mut back).is_err()
         || port.exchange(&Request::fifo_status(), &mut back).is_err()
@@ -243,11 +255,15 @@ pub fn rearm_take<P: Port>(port: &mut P) -> bool {
         return false;
     }
     port.record(format_args!(
-        "NET7 tx rearm fifo={:#010x}\n",
-        u32::from_le_bytes([back[0], back[1], back[2], back[3]])
+        "NET7 tx rearm fifo={:#010x} (was {:#010x})\n",
+        u32::from_le_bytes([back[0], back[1], back[2], back[3]]),
+        fifo
     ));
     true
 }
+
+/// The TX FIFO-full bit of the 0x81/0x8c status word (the reference link_reset's wait).
+const TX_FIFO_FULL: u32 = 0x4000_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkConfig {
