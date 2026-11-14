@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j833
 //j840
 //j843
 //j881
 //j886
+//j896
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -136,7 +136,8 @@ const IRQ_EVENT_DRAIN_LIMIT: u32 = 4096;
 /// Transfer completions serviced per interrupt wake. Two HID lanes at their polling intervals
 /// complete at most twice per wake in normal use; the bound only caps a pathological burst.
 const HID_EVENTS_PER_WAKE: usize = 4;
-/// Boot HID devices served together from one resident loop: the keyboard and the composite
+/// HID devices served together from one resident loop: boot input or the known raw arcade stick.
+/// The keyboard and the composite
 /// receiver behind the same hub. Each device contributes one lane, or two for a pair.
 const MAX_HID_DEVICES: usize = 2;
 const MAX_HID_LANES: usize = 4;
@@ -1506,7 +1507,8 @@ fn enumerate_root_device(
     let mut device = [0u8; 18];
     data_buf.read_into(0, &mut device);
     let ax88_candidate = drv_xhci::ax88::family(&device).is_some();
-    let device_exact = if ax88_candidate {
+    let strict_candidate = ax88_candidate || kumo_hid::arcade::matches(&device);
+    let device_exact = if strict_candidate {
         dsb();
         if control_in_exact(
             io,
@@ -1576,7 +1578,7 @@ fn enumerate_root_device(
         read_len as u8,
         (read_len >> 8) as u8,
     ];
-    let config_result = if ax88_candidate {
+    let config_result = if strict_candidate {
         control_in_exact(
             io,
             layout,
@@ -1698,7 +1700,11 @@ fn enumerate_root_device(
     if role == RootRole::SuperSpeedSide {
         return log(b"drv-xhci: ss side device is neither hub nor storage; left alone\n");
     }
-    let Some(plan) = HidPlan::from_config(&config[..read_len as usize]) else {
+    let Some(plan) = HidPlan::from_config(
+        &device,
+        &config[..read_len as usize],
+        device_exact && config_result == Some((1, 0)) && total_length == read_len,
+    ) else {
         return log(b"drv-xhci: no hid boot iface\n");
     };
     let Some(primary) = plan.primary() else {
@@ -3119,39 +3125,125 @@ fn log_ascii(bytes: &[u8]) {
     log(&safe[..length]);
 }
 
-/// The boot HID interfaces a configuration publishes: a keyboard, a mouse, or both. A composite
+/// The supported HID interfaces: a boot keyboard/mouse pair or one known raw arcade interface.
+/// A composite
 /// receiver needs both endpoints added by one Configure Endpoint command, so the pair travels
 /// together.
 #[derive(Clone, Copy)]
 struct HidPlan {
     keyboard: Option<kumo_hid::HidBootInterface>,
     mouse: Option<kumo_hid::HidBootInterface>,
+    arcade: Option<kumo_hid::arcade::Interface>,
 }
 
 impl HidPlan {
-    fn from_config(config: &[u8]) -> Option<Self> {
+    fn from_config(device: &[u8], config: &[u8], exact: bool) -> Option<Self> {
+        if kumo_hid::arcade::matches(device) {
+            if !exact {
+                record(
+                    kumo_abi::sys::log_level::NOTICE,
+                    format_args!("JOY descriptors incomplete; unconfigured\n"),
+                );
+                return None;
+            }
+            return match kumo_hid::arcade::find(device, config) {
+                Ok(Some(arcade)) => Some(Self {
+                    keyboard: None,
+                    mouse: None,
+                    arcade: Some(arcade),
+                }),
+                result => {
+                    record(
+                        kumo_abi::sys::log_level::NOTICE,
+                        format_args!("JOY interface refused: {result:?}\n"),
+                    );
+                    None
+                }
+            };
+        }
         let (keyboard, mouse) = kumo_hid::find_hid_boot_pair(config);
         if keyboard.is_none() && mouse.is_none() {
             None
         } else {
-            Some(Self { keyboard, mouse })
+            Some(Self {
+                keyboard,
+                mouse,
+                arcade: None,
+            })
         }
     }
 
     /// The interface logged first and served alone when the pair cannot be configured: the
-    /// keyboard when present, else the mouse.
-    fn primary(self) -> Option<kumo_hid::HidBootInterface> {
-        self.keyboard.or(self.mouse)
+    /// keyboard when present, else the mouse or known raw arcade interface.
+    fn primary(self) -> Option<HidInterface> {
+        self.keyboard
+            .or(self.mouse)
+            .map(Into::into)
+            .or_else(|| self.arcade.map(Into::into))
     }
 }
 
-/// One boot HID interface's report lane: its own ring, report buffer, decoders, and one
+/// Transport geometry stays independent of boot decoding. Raw arcade reports never enter
+/// keyboard/mouse decoders or receive boot SET_PROTOCOL. — KESTREL
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HidKind {
+    Keyboard,
+    Mouse,
+    Arcade,
+}
+#[derive(Clone, Copy)]
+struct HidInterface {
+    interface_number: u8,
+    protocol: u8,
+    in_endpoint_address: u8,
+    max_packet_size: u16,
+    interval: u8,
+    kind: HidKind,
+}
+impl HidInterface {
+    fn is_mouse(self) -> bool {
+        self.kind == HidKind::Mouse
+    }
+    fn is_arcade(self) -> bool {
+        self.kind == HidKind::Arcade
+    }
+}
+impl From<kumo_hid::HidBootInterface> for HidInterface {
+    fn from(hid: kumo_hid::HidBootInterface) -> Self {
+        Self {
+            interface_number: hid.interface_number,
+            protocol: hid.protocol,
+            in_endpoint_address: hid.in_endpoint_address,
+            max_packet_size: hid.max_packet_size,
+            interval: hid.interval,
+            kind: if hid.is_mouse() {
+                HidKind::Mouse
+            } else {
+                HidKind::Keyboard
+            },
+        }
+    }
+}
+impl From<kumo_hid::arcade::Interface> for HidInterface {
+    fn from(hid: kumo_hid::arcade::Interface) -> Self {
+        Self {
+            interface_number: hid.interface_number,
+            protocol: 0,
+            in_endpoint_address: hid.in_endpoint_address,
+            max_packet_size: hid.max_packet_size,
+            interval: hid.interval,
+            kind: HidKind::Arcade,
+        }
+    }
+}
+
+/// One HID interface's report lane: its own ring, report buffer, decoders, and one
 /// outstanding transfer. The keyboard keeps the historical OFF_INT_RING/OFF_REPORT regions; a
 /// composite mouse takes the spare window above the input context. A lane names its device slot
 /// and owns its report decoders, so one resident loop can serve several devices without their
 /// key or button edges interfering.
 struct HidLane {
-    hid: kumo_hid::HidBootInterface,
+    hid: HidInterface,
     ring: TransferRing,
     ring_va: u64,
     report: DmaBuf,
@@ -3165,13 +3257,14 @@ struct HidLane {
     armed_logged: bool,
     decoder: kumo_hid::Decoder,
     mouse_decoder: kumo_hid::MouseDecoder,
+    capture: kumo_hid::arcade::Capture,
 }
 
 impl HidLane {
     /// Create the lane over its page regions. Both offsets are 64-byte aligned for the xHCI
     /// ring rules, and the lane reaches the page only through the DMA views.
     fn new(
-        hid: kumo_hid::HidBootInterface,
+        hid: impl Into<HidInterface>,
         dci: u8,
         slot_id: u8,
         ring_off: usize,
@@ -3179,6 +3272,15 @@ impl HidLane {
         base_va: u64,
         enum_phys: u64,
     ) -> Option<Self> {
+        let hid = hid.into();
+        let report_bytes = if hid.is_arcade() {
+            kumo_hid::arcade::MAX_REPORT_BYTES
+        } else {
+            8
+        };
+        if report_off.checked_add(report_bytes)? > PAGE_SIZE as usize {
+            return None;
+        }
         // SAFETY: both regions live inside this device's mapped page.
         let mut ring_seg =
             unsafe { DmaTrbs::new((base_va as usize + ring_off) as *mut Trb, INT_RING_TRBS) };
@@ -3188,7 +3290,7 @@ impl HidLane {
             DmaBuf::new(
                 (base_va as usize + report_off) as *mut u8,
                 enum_phys + report_off as u64,
-                8,
+                report_bytes,
             )
         };
         Some(Self {
@@ -3206,6 +3308,7 @@ impl HidLane {
             armed_logged: false,
             decoder: kumo_hid::Decoder::new(),
             mouse_decoder: kumo_hid::MouseDecoder::new(),
+            capture: kumo_hid::arcade::Capture::default(),
         })
     }
 
@@ -3341,8 +3444,9 @@ fn configure_hid_endpoint_pair(
     }
 }
 
-/// Bring a device's boot HID interface or interfaces online: SET_CONFIGURATION, Configure
-/// Endpoint for each lane's interrupt-IN endpoint, and SET_PROTOCOL(boot), appending the device's
+/// Bring supported HID online: SET_CONFIGURATION, Configure Endpoint for interrupt-IN,
+/// and SET_PROTOCOL(boot) only for boot input. The raw arcade path reads its report descriptor.
+/// Append the device's
 /// lanes to `lanes`. [`run_hid_lanes`] then serves every device's lanes from one resident loop.
 #[allow(clippy::too_many_arguments)]
 fn bring_up_hid_device(
@@ -3378,6 +3482,78 @@ fn bring_up_hid_device(
         Some((1, _)) => log(b"drv-xhci: set config cc=0x1\n"),
         Some((cc, _)) => return log_cc(b"drv-xhci: set config cc=", cc),
         None => return log(b"drv-xhci: set config timeout\n"),
+    }
+
+    let mut arcade_capture = None;
+    if let Some(arcade) = plan.arcade {
+        let mut pipe = match kumo_xhci::ControlPipe::new(slot_id) {
+            Ok(pipe) => pipe,
+            Err(_) => return,
+        };
+        let n = arcade.report_descriptor_bytes;
+        let setup = [
+            0x81,
+            6,
+            0,
+            0x22,
+            arcade.interface_number,
+            0,
+            n as u8,
+            (n >> 8) as u8,
+        ];
+        // SAFETY: this owner retains the mapped page; no report DMA has been armed yet.
+        let data = unsafe {
+            DmaBuf::new(
+                (base_va as usize + OFF_DATA) as *mut u8,
+                enum_phys + OFF_DATA as u64,
+                DATA_BUF_LEN,
+            )
+        };
+        DMA_RETAINED.store(true, Ordering::Relaxed);
+        if let Err(error) = control_data_exact(
+            io,
+            layout,
+            image,
+            evt,
+            ep0_ring,
+            ep0_seg,
+            slot_id,
+            &mut pipe,
+            setup,
+            data,
+            &[],
+        ) {
+            record(
+                kumo_abi::sys::log_level::NOTICE,
+                format_args!("JOY report descriptor failed: {error:?}\n"),
+            );
+            return;
+        }
+        dsb();
+        let mut descriptor = [0u8; DATA_BUF_LEN];
+        data.read_into(0, &mut descriptor[..usize::from(n)]);
+        let capture = kumo_hid::arcade::Capture::for_descriptor(&descriptor[..usize::from(n)]);
+        record(
+            kumo_abi::sys::log_level::NOTICE,
+            format_args!(
+                "JOY capture control_prefix={:?}; full raw bytes retained\n",
+                capture.control_prefix_bytes()
+            ),
+        );
+        arcade_capture = Some(capture);
+        record(kumo_abi::sys::log_level::NOTICE, format_args!(
+            "JOY device 1a34:0203 slot={slot_id} if={} ep=0x{:02x} mps={} interval={} report_bytes={n}\n",
+            arcade.interface_number, arcade.in_endpoint_address, arcade.max_packet_size, arcade.interval));
+        for (i, bytes) in descriptor[..usize::from(n)].chunks(32).enumerate() {
+            record(
+                kumo_abi::sys::log_level::NOTICE,
+                format_args!(
+                    "JOY descriptor slot={slot_id} offset={} bytes={}\n",
+                    i * 32,
+                    kumo_hid::arcade::Hex(bytes)
+                ),
+            );
+        }
     }
 
     // --- Configure Endpoint for the device's boot HID lane(s) ---
@@ -3454,7 +3630,7 @@ fn bring_up_hid_device(
             return;
         };
         log(b"drv-xhci: config ep cc=0x1\n");
-        let Some(lane) = HidLane::new(
+        let Some(mut lane) = HidLane::new(
             primary,
             dci,
             slot_id,
@@ -3465,6 +3641,9 @@ fn bring_up_hid_device(
         ) else {
             return log(b"drv-xhci: hid lane ring fail\n");
         };
+        if let Some(capture) = arcade_capture.take() {
+            lane.capture = capture;
+        }
         lanes[*count] = Some(lane);
         *count += 1;
     }
@@ -3473,6 +3652,9 @@ fn bring_up_hid_device(
     // bmRequestType=0x21, bRequest=0x0B, wValue=0 (boot), wIndex=interface, no data. A device
     // that fails here drops its lanes rather than serving misparsed reports.
     for lane in lanes[first..*count].iter().flatten() {
+        if lane.hid.is_arcade() {
+            continue;
+        }
         let set_proto = [
             0x21,
             0x0b,
@@ -3545,7 +3727,13 @@ fn poll_hid_completion(
             }
         }
         dsb();
-        let _ = pump_event(io, layout, image, evt);
+        // This is an IRQ drain, not a polled command wait. Once the ring is empty,
+        // let the next interrupt wake us, avoiding 4096 empty MMIO polls after
+        // each periodic arcade report. Queued actors were checked
+        // above, and ERDP/EHB plus InterruptComplete retain the wake race. — KESTREL
+        if pump_event(io, layout, image, evt).is_none() {
+            return None;
+        }
     }
     None
 }
@@ -3635,17 +3823,21 @@ fn run_hid_lanes(
                 }
             }
             for lane in lanes.iter().flatten() {
-                log(if lane.hid.is_mouse() {
+                log(if lane.hid.is_arcade() {
+                    b"drv-xhci: arcade raw irq-driven port=" as &[u8]
+                } else if lane.hid.is_mouse() {
                     b"drv-xhci: mouse irq-driven port=" as &[u8]
                 } else {
                     b"drv-xhci: keyboard irq-driven port=" as &[u8]
                 });
                 log_hex(irq_port.is_some() as u64);
-                if !lane.hid.is_mouse() {
+                if lane.hid.kind == HidKind::Keyboard {
                     log(b"; type at the shell");
                 }
                 log(b"\n");
-                notice(&[if lane.hid.is_mouse() {
+                notice(&[if lane.hid.is_arcade() {
+                    b"usb: arcade raw capture ready (128 changed reports per boot)\n" as &[u8]
+                } else if lane.hid.is_mouse() {
                     b"usb: mouse ready\n" as &[u8]
                 } else {
                     b"usb: keyboard ready\n"
@@ -3751,6 +3943,32 @@ fn run_hid_lanes(
                         lane.ticket = None;
                         resident_nic::note_hid_report();
                         let actual = lane.hid.max_packet_size as usize - event.remaining as usize;
+                        if lane.hid.is_arcade() {
+                            if actual != 0 && actual <= kumo_hid::arcade::MAX_REPORT_BYTES {
+                                dsb();
+                                let mut raw = [0u8; kumo_hid::arcade::MAX_REPORT_BYTES];
+                                lane.report.read_into(0, &mut raw[..actual]);
+                                if lane.capture.changed(&raw[..actual]) {
+                                    record(
+                                        kumo_abi::sys::log_level::NOTICE,
+                                        format_args!(
+                                            "JOY raw slot={} if={} seq={} len={} bytes={}\n",
+                                            lane.slot_id,
+                                            lane.hid.interface_number,
+                                            lane.capture.count(),
+                                            actual,
+                                            kumo_hid::arcade::Hex(&raw[..actual])
+                                        ),
+                                    );
+                                    if lane.capture.count() == kumo_hid::arcade::MAX_CAPTURE_REPORTS
+                                    {
+                                        record(kumo_abi::sys::log_level::NOTICE, format_args!(
+                                            "JOY capture limit reached; reports continue without logging\n"));
+                                    }
+                                }
+                            }
+                            break;
+                        }
                         if (!lane.hid.is_mouse() && actual != kumo_hid::REPORT_BYTES)
                             || (lane.hid.is_mouse() && actual < 3)
                         {
@@ -4112,7 +4330,8 @@ fn read_device_config(
     let mut device = [0u8; 18];
     data_buf.read_into(0, &mut device);
     let ax88_candidate = drv_xhci::ax88::family(&device).is_some();
-    let device_exact = if ax88_candidate {
+    let strict_candidate = ax88_candidate || kumo_hid::arcade::matches(&device);
+    let device_exact = if strict_candidate {
         dsb();
         control_in_exact(
             io, layout, image, evt, ep0_ring, ep0_seg, slot_id, dev_full, data_buf, 18,
@@ -4152,7 +4371,7 @@ fn read_device_config(
         total as u8,
         (total >> 8) as u8,
     ];
-    let config_result = if ax88_candidate {
+    let config_result = if strict_candidate {
         control_in_exact(
             io, layout, image, evt, ep0_ring, ep0_seg, slot_id, cfg, data_buf, total,
         )
@@ -4215,6 +4434,10 @@ fn configure_interrupt_endpoint(
     let stride = ContextSize::Bytes64;
     let slot_off = stride.input_offset(0)?;
     let ep_off = stride.input_offset(dci)?;
+    // New report-mode endpoints must also fit before the shared output context. — KESTREL
+    if ep_off + stride.bytes() > OFF_OUTPUT_CTX {
+        return skipped(b"drv-xhci: interrupt context overlaps output context; refused\n");
+    }
     write_ctx(base_va + OFF_INPUT_CTX as u64, icc.words());
     write_ctx(base_va + OFF_INPUT_CTX as u64 + slot_off as u64, slot);
     write_ctx(
@@ -4891,7 +5114,7 @@ fn enumerate_hub_downstream(
         Err(_) => log(b"drv-xhci: malformed storage interface\n"),
         Ok(None) => {}
     }
-    let Some(plan) = HidPlan::from_config(config.bytes()) else {
+    let Some(plan) = HidPlan::from_config(&config.device, config.bytes(), config.exact) else {
         return skipped(b"drv-xhci: dev no hid boot iface\n");
     };
     let Some(primary) = plan.primary() else {

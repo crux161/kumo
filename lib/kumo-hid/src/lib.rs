@@ -2,12 +2,15 @@
 //j383
 //j555
 //j665
+//j896
 
 //! Allocation-free USB HID boot-keyboard report decoding.
 //!
 //! [`Decoder`] compares each 8-byte boot report with the preceding valid report and emits key
 //! release/press edges. It deliberately owns no USB transport or hardware state, so the same core
 //! can be host-tested now and embedded in the eventual xHCI keyboard driver.
+
+pub mod arcade;
 
 /// Bytes in a USB HID boot-keyboard input report.
 pub const REPORT_BYTES: usize = 8;
