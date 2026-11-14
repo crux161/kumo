@@ -1,7 +1,7 @@
-//j871
 //j873
 //j881
 //j884
+//j891
 //j894
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
@@ -883,6 +883,36 @@ pub fn vmar_map_anywhere(vmo: Handle, len: u64, flags: u64) -> (u64, u64) {
 
 #[cfg(not(target_arch = "aarch64"))]
 pub fn vmar_map_anywhere(_vmo: Handle, _len: u64, _flags: u64) -> (u64, u64) {
+    (u64::MAX, 0)
+}
+
+/// [`vmar_map_anywhere`] of `len` bytes of `vmo` from page-aligned `vmo_offset` (SH7-d3a): a
+/// server maps just the window of a client's VMO that one request names.
+#[cfg(target_arch = "aarch64")]
+pub fn vmar_map_anywhere_at(vmo: Handle, vmo_offset: u64, len: u64, flags: u64) -> (u64, u64) {
+    let status: u64;
+    let addr: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::VmarMap as u64,
+            in("x0") 0u64,           // process: self
+            in("x1") vmo.0 as u64,
+            in("x2") vmo_offset,
+            in("x3") 0u64,           // virt: 0 asks the kernel to place it
+            in("x4") len,
+            in("x5") flags,
+            lateout("x0") status,
+            lateout("x1") addr,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status, addr)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn vmar_map_anywhere_at(_vmo: Handle, _vmo_offset: u64, _len: u64, _flags: u64) -> (u64, u64) {
     (u64::MAX, 0)
 }
 

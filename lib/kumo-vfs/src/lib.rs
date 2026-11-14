@@ -1,9 +1,9 @@
 #![no_std]
-//j514
 //j547
 //j860
 //j865
 //j869
+//j891
 
 //! `kumo-vfs` — the wire protocol for KUMO's filesystem servers.
 //!
@@ -23,9 +23,9 @@
 //! Scope (grown one provable slice at a time, `GUIDANCE/006 §6`): resolve/open,
 //! read, create, resize, write, and flush — the bounded surface Kilo's save path
 //! needs — and, since J547, listing a directory for `ls`. Namespace mutation beyond create remains a later storage slice.
-//! Larger reads currently return their bytes inline in the reply (bounded by the
-//! IPC inline ceiling, J174); `DESIGN/001`'s zero-copy `Vmo` file-data transfer
-//! is the throughput follow-up, not this gate.
+//! `Read` returns its bytes inline in the reply (bounded by the IPC inline ceiling,
+//! J174). Since SH7-d3a, `ReadVmo` is `DESIGN/001`'s VMO file-data transfer: the
+//! request carries a VMO and the server writes the bytes into it.
 
 /// Op code: open a file by absolute path. Reply: `(handle, size)` on success.
 pub const OP_OPEN: u8 = 0x00;
@@ -65,6 +65,12 @@ pub const OP_CHMOD: u8 = 0x0e;
 /// are server-table indexes with no lifetime of their own, so this is what keeps the
 /// table from exhausting under a client's open/close churn.
 pub const OP_CLOSE: u8 = 0x0f;
+/// Op code: read file bytes into a VMO the request carries (SH7-d3a, DESIGN/001's zero-copy
+/// file data). The frame is [`READ_VMO_REQUEST_LEN`] bytes and the channel message carries one
+/// VMO handle; the server writes up to `len` bytes of `handle` from `offset` into that VMO at
+/// `vmo_offset`, closes its copy of the VMO, and answers `[status][count: u32 LE]`. `len` is at
+/// most [`READ_VMO_MAX`]. A request without a VMO answers [`VFS_BAD_REQUEST`].
+pub const OP_READ_VMO: u8 = 0x10;
 
 /// Open option: the returned handle may read.
 pub const OPEN_READ: u8 = 1 << 0;
@@ -140,6 +146,14 @@ pub const SET_LEN_REQUEST_LEN: usize = 13;
 pub const FLUSH_REQUEST_LEN: usize = 5;
 /// Wire length of a [`Request::Close`] frame: `op(1) + handle(4)`.
 pub const CLOSE_REQUEST_LEN: usize = 5;
+/// Wire length of a [`Request::ReadVmo`] frame:
+/// `op(1) + handle(4) + offset(8) + len(4) + vmo_offset(8)`.
+pub const READ_VMO_REQUEST_LEN: usize = 25;
+/// Most bytes one [`Request::ReadVmo`] moves. The server maps the window for the length of the
+/// request, so this bounds the address space a client can make it reserve.
+pub const READ_VMO_MAX: u32 = 4 * 1024 * 1024;
+/// Wire length of a successful `ReadVmo` reply: `status(1) + count(4)`.
+pub const READ_VMO_REPLY_LEN: usize = 5;
 
 /// Wire length of a successful `Open` reply: `status(1) + handle(4) + size(8)`.
 pub const OPEN_REPLY_LEN: usize = 13;
@@ -186,6 +200,14 @@ pub enum Request<'a> {
     Chmod { path: &'a [u8], mode: u16 },
     /// Release the open file `handle` (SH3-d2d).
     Close { handle: u32 },
+    /// Read up to `len` bytes of `handle` from `offset` into the VMO the message carries, at
+    /// `vmo_offset` (SH7-d3a).
+    ReadVmo {
+        handle: u32,
+        offset: u64,
+        len: u32,
+        vmo_offset: u64,
+    },
 }
 
 impl<'a> Request<'a> {
@@ -392,6 +414,23 @@ impl<'a> Request<'a> {
                 out[5] = operation;
                 Some(LOCK_REQUEST_LEN)
             }
+            Request::ReadVmo {
+                handle,
+                offset,
+                len,
+                vmo_offset,
+            } => {
+                if len > READ_VMO_MAX {
+                    return None;
+                }
+                let out = buf.get_mut(..READ_VMO_REQUEST_LEN)?;
+                out[0] = OP_READ_VMO;
+                out[1..5].copy_from_slice(&handle.to_le_bytes());
+                out[5..13].copy_from_slice(&offset.to_le_bytes());
+                out[13..17].copy_from_slice(&len.to_le_bytes());
+                out[17..25].copy_from_slice(&vmo_offset.to_le_bytes());
+                Some(READ_VMO_REQUEST_LEN)
+            }
             Request::Close { handle } => {
                 let out = buf.get_mut(..CLOSE_REQUEST_LEN)?;
                 out[0] = OP_CLOSE;
@@ -520,6 +559,19 @@ impl<'a> Request<'a> {
             OP_CLOSE => {
                 let handle = u32::from_le_bytes(raw.get(1..5)?.try_into().ok()?);
                 Some(Request::Close { handle })
+            }
+            OP_READ_VMO => {
+                let b = raw.get(..READ_VMO_REQUEST_LEN)?;
+                let len = u32::from_le_bytes(b[13..17].try_into().ok()?);
+                if len > READ_VMO_MAX {
+                    return None;
+                }
+                Some(Request::ReadVmo {
+                    handle: u32::from_le_bytes(b[1..5].try_into().ok()?),
+                    offset: u64::from_le_bytes(b[5..13].try_into().ok()?),
+                    len,
+                    vmo_offset: u64::from_le_bytes(b[17..25].try_into().ok()?),
+                })
             }
             OP_CHMOD => {
                 let mode = u16::from_le_bytes(raw.get(1..3)?.try_into().ok()?);
@@ -699,6 +751,28 @@ pub fn read_payload(resp: &[u8]) -> Result<&[u8], VfsError> {
     }
 }
 
+/// Encode a successful `ReadVmo` reply: how many bytes landed in the VMO (SH7-d3a).
+pub fn encode_read_vmo_ok(count: u32) -> [u8; READ_VMO_REPLY_LEN] {
+    let mut b = [0u8; READ_VMO_REPLY_LEN];
+    b[0] = VFS_OK;
+    b[1..5].copy_from_slice(&count.to_le_bytes());
+    b
+}
+
+/// Parse the byte count from a `ReadVmo` reply (SH7-d3a).
+pub fn parse_read_vmo_reply(resp: &[u8]) -> Result<u32, VfsError> {
+    match resp.first() {
+        None => Err(VfsError::Empty),
+        Some(&VFS_OK) => {
+            let b = resp.get(..READ_VMO_REPLY_LEN).ok_or(VfsError::Malformed)?;
+            Ok(u32::from_le_bytes(
+                b[1..5].try_into().map_err(|_| VfsError::Malformed)?,
+            ))
+        }
+        Some(&status) => Err(VfsError::Status(status)),
+    }
+}
+
 /// Parse the committed byte count from a `Write` reply.
 pub fn parse_write_reply(resp: &[u8]) -> Result<u32, VfsError> {
     match resp.first() {
@@ -753,6 +827,36 @@ pub fn parse_stat_reply(resp: &[u8]) -> Result<StatReply, VfsError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_vmo_round_trips_and_refuses_oversized_windows() {
+        let request = Request::ReadVmo {
+            handle: 3,
+            offset: 0x1_2345_6789,
+            len: READ_VMO_MAX,
+            vmo_offset: 0x4000,
+        };
+        let mut buf = [0u8; 64];
+        let n = request.encode_into(&mut buf).unwrap();
+        assert_eq!(n, READ_VMO_REQUEST_LEN);
+        assert_eq!(Request::decode(&buf[..n]), Some(request));
+        assert_eq!(Request::decode(&buf[..n - 1]), None);
+        let too_big = Request::ReadVmo {
+            handle: 3,
+            offset: 0,
+            len: READ_VMO_MAX + 1,
+            vmo_offset: 0,
+        };
+        assert_eq!(too_big.encode_into(&mut buf), None);
+        buf[13..17].copy_from_slice(&(READ_VMO_MAX + 1).to_le_bytes());
+        assert_eq!(Request::decode(&buf[..n]), None);
+        assert_eq!(parse_read_vmo_reply(&encode_read_vmo_ok(77)), Ok(77));
+        assert_eq!(
+            parse_read_vmo_reply(&[VFS_BAD_HANDLE]),
+            Err(VfsError::Status(VFS_BAD_HANDLE))
+        );
+        assert_eq!(parse_read_vmo_reply(&[VFS_OK, 1]), Err(VfsError::Malformed));
+    }
+
     use super::*;
 
     #[test]

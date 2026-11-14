@@ -1,8 +1,8 @@
-//j823
 //j824
 //j825
 //j871
 //j875
+//j889
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -3338,6 +3338,15 @@ impl SyscallEngine {
     }
 
     fn clear_from_live_tree(&self, ttbr0: u64, mapping: Mapping) -> Result<(), Errno> {
+        //j889
+        // SH7-d1: a record with no access (VmarProtect to none) never has leaves, and the HAL
+        // refuses to clear a span with holes. VmarProtect, VmarUnmap and teardown all come
+        // here, so a PROT_NONE record would otherwise be stuck: not re-protectable, not
+        // unmappable, and kept (its VMO with it) at process exit. — TEAL
+        const ACCESS: u64 = PageFlags::READ.0 | PageFlags::WRITE.0 | PageFlags::EXECUTE.0;
+        if mapping.flags.0 & ACCESS == 0 {
+            return Ok(());
+        }
         // SAFETY: caller switched TTBR0 to the kernel identity map; `ttbr0` is the user tree
         // root and the range was validated against the process's own mapping record.
         unsafe { kumo_hal::active::unmap_user_span(ttbr0, mapping.virt, mapping.len) }
@@ -4587,10 +4596,13 @@ impl SyscallEngine {
                 if process_handle != kumo_abi::INVALID_HANDLE {
                     return KernelCallResult::Status(Errno::NotSupported.status());
                 }
-                // SH6: every record wholly inside the range goes (J660's exact record is
-                // the one-record case); a record straddling either edge refuses the call.
-                let Some(records) = process.mappings_within(virt, len) else {
-                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                // SH7-d1: any page range. The at most two records straddling its edges are
+                // split, and every record inside goes (J660's exact record and SH6's span over
+                // guard holes are special cases). A range with nothing mapped is refused, as
+                // before. — TEAL
+                let records = match process.isolate(virt, len) {
+                    Some(records) if !records.is_empty() => records,
+                    _ => return KernelCallResult::Status(Errno::InvalidArgs.status()),
                 };
                 for (mapping, _) in records {
                     if let Err(errno) = self.clear_mapping_leaves(process, mapping) {
@@ -4606,25 +4618,57 @@ impl SyscallEngine {
                 len,
                 prot,
             } => {
-                // SH6: the one protection change std's stack-overflow machinery makes — a
-                // PROT_NONE guard at one end of its own fresh mapping. Self only; any other
-                // protection is not supported yet, and a middle range (which would split a
-                // record in two) is refused. The trimmed pages stay owned by the VMO until
-                // its last record goes. — TEAL
+                // SH7-d1: any of READ/WRITE/EXECUTE over any page range the caller has mapped
+                // (the bits Linux PROT_* uses). The edges are split; each record inside takes
+                // the new access, and its leaves are rebuilt from the VMO's own pages, so the
+                // contents survive. No access keeps the record with no leaves, the way Linux
+                // PROT_NONE keeps memory. A range with a hole is refused before anything
+                // changes (Linux: ENOMEM). Self only, as before. — TEAL
+                const ACCESS: u64 = (1 << 0) | (1 << 1) | (1 << 2);
                 if process_handle != kumo_abi::INVALID_HANDLE {
                     return KernelCallResult::Status(Errno::NotSupported.status());
                 }
-                if prot != 0 {
-                    return KernelCallResult::Status(Errno::NotSupported.status());
-                }
-                if len == 0 || virt % crate::mm::PAGE_SIZE != 0 || len % crate::mm::PAGE_SIZE != 0 {
+                if prot & !ACCESS != 0
+                    || len == 0
+                    || virt % crate::mm::PAGE_SIZE != 0
+                    || len % crate::mm::PAGE_SIZE != 0
+                {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 }
-                let Some(removed) = process.trim_mapping(virt, len) else {
+                if !process.covers(virt, len) {
+                    return KernelCallResult::Status(Errno::NoMemory.status());
+                }
+                let Some(records) = process.isolate(virt, len) else {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 };
-                if let Err(errno) = self.clear_mapping_leaves(process, removed) {
-                    return KernelCallResult::Status(errno.status());
+                for (old, vmo_koid) in records {
+                    if let Err(errno) = self.clear_mapping_leaves(process, old) {
+                        return KernelCallResult::Status(errno.status());
+                    }
+                    let Some(updated) = process.set_access(old.virt, prot) else {
+                        return KernelCallResult::Status(Errno::Internal.status());
+                    };
+                    let (Some(ttbr0), true) = (process.ttbr0, prot != 0) else {
+                        continue;
+                    };
+                    #[cfg(target_os = "none")]
+                    {
+                        let saved = kumo_hal::active::read_user_aspace_root();
+                        unsafe {
+                            kumo_hal::active::set_user_aspace_root(
+                                crate::user_thread::kernel_ttbr0(),
+                            )
+                        };
+                        let result = self.apply_to_live_tree(ttbr0, updated, vmo_koid);
+                        unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+                        if let Err(errno) = result {
+                            return KernelCallResult::Status(errno.status());
+                        }
+                    }
+                    #[cfg(not(target_os = "none"))]
+                    {
+                        let _ = self.apply_to_live_tree(ttbr0, updated, vmo_koid);
+                    }
                 }
                 KernelCallResult::Status(Errno::Ok.status())
             }
@@ -4759,6 +4803,15 @@ impl SyscallEngine {
                 };
                 let mut user_mappings = Vec::new();
                 for (mapping, vmo_koid) in process_mappings {
+                    //j889
+                    // SH7-d1: a record with no access (VmarProtect to none) holds its pages but
+                    // has no leaves; the initial tables must not give it any either. — TEAL
+                    if mapping.flags.0
+                        & (PageFlags::READ.0 | PageFlags::WRITE.0 | PageFlags::EXECUTE.0)
+                        == 0
+                    {
+                        continue;
+                    }
                     let executable = mapping.flags.contains(PageFlags::EXECUTE);
                     // W^X: an executable mapping is RX, never writable.
                     let writable = mapping.flags.contains(PageFlags::WRITE) && !executable;
@@ -8667,12 +8720,13 @@ mod tests {
     }
 
     //j875
-    /// SH6: std's alternate-stack shape — map three pages, PROT_NONE the first, then
-    /// munmap the ORIGINAL whole range across the guard hole. A middle page, a non-zero
-    /// protection and a whole-record protect are refused; a straddling unmap still is.
-    /// — TEAL
+    //j889
+    /// SH6's alternate-stack shape under SH7-d1's general contract: map three pages,
+    /// PROT_NONE the first (the record stays, with no access), then munmap the ORIGINAL whole
+    /// range. Unaligned ranges, unknown protection bits and a range with a hole are refused;
+    /// a middle page can now be re-protected, and an aligned straddling unmap splits. — TEAL
     #[test]
-    fn vmar_protect_trims_a_guard_and_unmap_spans_the_hole() {
+    fn vmar_protect_and_unmap_work_on_any_page_range() {
         let mut engine = SyscallEngine::new();
         let mut process = test_process(&mut engine);
         let page = crate::mm::PAGE_SIZE;
@@ -8701,33 +8755,6 @@ mod tests {
                 },
             )
         };
-        let invalid = KernelCallResult::Status(Errno::InvalidArgs.status());
-        let ok = KernelCallResult::Status(Errno::Ok.status());
-        assert_eq!(
-            protect(&mut engine, &mut process, base, page, 3),
-            KernelCallResult::Status(Errno::NotSupported.status())
-        );
-        assert_eq!(
-            protect(&mut engine, &mut process, base + page, page, 0),
-            invalid
-        );
-        assert_eq!(
-            protect(&mut engine, &mut process, base, page * 3, 0),
-            invalid
-        );
-        assert_eq!(protect(&mut engine, &mut process, base, page, 0), ok);
-        assert_eq!(process.mappings().len(), 1);
-        let (rest, _) = process.mappings()[0];
-        assert_eq!(
-            (rest.virt, rest.len, rest.vmo_offset),
-            (base + page, page * 2, page)
-        );
-        // The guard page is free VA now; a suffix trim works too.
-        assert_eq!(
-            protect(&mut engine, &mut process, base + page * 2, page, 0),
-            ok
-        );
-        assert_eq!(process.mappings()[0].0.len, page);
         let unmap = |engine: &mut SyscallEngine, process: &mut Process, virt, len| {
             engine.dispatch(
                 process,
@@ -8738,15 +8765,161 @@ mod tests {
                 },
             )
         };
-        // Straddling the surviving record is still refused.
+        let invalid = KernelCallResult::Status(Errno::InvalidArgs.status());
+        let ok = KernelCallResult::Status(Errno::Ok.status());
+        let records = |process: &Process| -> Vec<(u64, u64, u64, u64)> {
+            let mut out: Vec<_> = process
+                .mappings()
+                .iter()
+                .map(|(m, _)| (m.virt - base, m.len, m.vmo_offset, m.flags.0 & 7))
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        // Refusals change nothing.
+        assert_eq!(protect(&mut engine, &mut process, base, page, 8), invalid);
+        assert_eq!(
+            protect(&mut engine, &mut process, base + 1, page, 1),
+            invalid
+        );
+        assert_eq!(protect(&mut engine, &mut process, base, 0, 1), invalid);
+        assert_eq!(records(&process), vec![(0, page * 3, 0, 1)]);
+        // std's guard: PROT_NONE on the first page keeps it, with no access.
+        assert_eq!(protect(&mut engine, &mut process, base, page, 0), ok);
+        assert_eq!(
+            records(&process),
+            vec![(0, page, 0, 0), (page, page * 2, page, 1)]
+        );
+        // A middle page goes read-write; its VMO offset follows it.
+        assert_eq!(protect(&mut engine, &mut process, base + page, page, 3), ok);
+        assert_eq!(
+            records(&process),
+            vec![
+                (0, page, 0, 0),
+                (page, page, page, 3),
+                (page * 2, page, page * 2, 1)
+            ]
+        );
+        // The guard page's contents survive: PROT_READ brings the same VMO page back.
+        assert_eq!(protect(&mut engine, &mut process, base, page, 1), ok);
+        assert_eq!(records(&process)[0], (0, page, 0, 1));
+        // An unaligned unmap is refused; an aligned one inside a record splits it.
         assert_eq!(
             unmap(&mut engine, &mut process, base, page + page / 2),
             invalid
         );
-        // The original whole range spans the holes and takes the survivor.
+        assert_eq!(unmap(&mut engine, &mut process, base + page * 2, page), ok);
+        // A protect over the hole that left is ENOMEM, before anything changes.
+        assert_eq!(
+            protect(&mut engine, &mut process, base, page * 3, 1),
+            KernelCallResult::Status(Errno::NoMemory.status())
+        );
+        assert_eq!(
+            records(&process),
+            vec![(0, page, 0, 1), (page, page, page, 3)]
+        );
+        // The original whole range spans the hole and takes what is left.
         assert_eq!(unmap(&mut engine, &mut process, base, page * 3), ok);
         assert!(process.mappings().is_empty());
         assert_eq!(unmap(&mut engine, &mut process, base, page * 3), invalid);
+    }
+
+    /// SH7-d1: musl's library-loader shape. Map a whole span, then overlay pages inside it by
+    /// unmap-then-map at another offset of the same VMO (MAP_FIXED as the shim does it), and
+    /// unmap a range that straddles two records. Splits keep each piece's VMO offset, and the
+    /// VMO stays referenced until its last record goes. — TEAL
+    #[test]
+    fn a_span_overlaid_page_by_page_keeps_offsets_and_references() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let page = crate::mm::PAGE_SIZE;
+        let vmo = create_physical_vmo(&mut engine, &mut process, 0x9500_0000, page * 8);
+        let base = 0xffff_0000_0000_0000;
+        let map = |engine: &mut SyscallEngine, process: &mut Process, offset, virt, len, flags| {
+            engine.dispatch(
+                process,
+                KernelCall::VmarMap {
+                    process_handle: kumo_abi::INVALID_HANDLE,
+                    vmo_handle: vmo,
+                    vmo_offset: offset,
+                    virt,
+                    len,
+                    flags,
+                },
+            )
+        };
+        let unmap = |engine: &mut SyscallEngine, process: &mut Process, virt, len| {
+            engine.dispatch(
+                process,
+                KernelCall::VmarUnmap {
+                    process_handle: kumo_abi::INVALID_HANDLE,
+                    virt,
+                    len,
+                },
+            )
+        };
+        let ok = KernelCallResult::Status(Errno::Ok.status());
+        assert!(mapped(map(
+            &mut engine,
+            &mut process,
+            0,
+            base,
+            page * 4,
+            PageFlags::READ
+        )));
+        // MAP_FIXED over pages 2..4 with file offset 6 pages: unmap, then map.
+        assert_eq!(
+            unmap(&mut engine, &mut process, base + page * 2, page * 2),
+            ok
+        );
+        assert!(mapped(map(
+            &mut engine,
+            &mut process,
+            page * 6,
+            base + page * 2,
+            page * 2,
+            PageFlags(PageFlags::READ.0 | PageFlags::WRITE.0),
+        )));
+        let mut spans: Vec<_> = process
+            .mappings()
+            .iter()
+            .map(|(m, _)| (m.virt - base, m.len, m.vmo_offset))
+            .collect();
+        spans.sort_unstable();
+        assert_eq!(
+            spans,
+            vec![(0, page * 2, 0), (page * 2, page * 2, page * 6)]
+        );
+        assert!(process.covers(base, page * 4));
+        assert!(!process.covers(base, page * 5));
+        // An unmap straddling both records splits each and leaves their outer halves.
+        assert_eq!(unmap(&mut engine, &mut process, base + page, page * 2), ok);
+        let mut spans: Vec<_> = process
+            .mappings()
+            .iter()
+            .map(|(m, _)| (m.virt - base, m.len, m.vmo_offset))
+            .collect();
+        spans.sort_unstable();
+        assert_eq!(spans, vec![(0, page, 0), (page * 3, page, page * 7)]);
+        // Every surviving record still names the one VMO.
+        let koid = process.mappings()[0].1;
+        assert!(process.mappings().iter().all(|(_, k)| *k == koid));
+        // A live tree (host stand-in root) takes the same path.
+        process.ttbr0 = Some(0x1000);
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::VmarProtect {
+                    process_handle: kumo_abi::INVALID_HANDLE,
+                    virt: base,
+                    len: page,
+                    prot: 0,
+                },
+            ),
+            ok
+        );
+        assert_eq!(unmap(&mut engine, &mut process, base, page * 4), ok);
+        assert!(process.mappings().is_empty());
     }
 
     #[test]

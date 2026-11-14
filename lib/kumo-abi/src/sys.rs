@@ -193,6 +193,19 @@ pub enum Syscall {
     /// too coarse for a register poll) but should not hold the CPU while it waits. Returns 0;
     /// the supervisor gets [`Errno::NotSupported`].
     ThreadYield = 62,
+    /// Register the CALLING thread as a persona shim's host (SH7, PLAN.md §10 R1):
+    /// `(entry, code_base, code_len, stack_top)`. From then on an `svc` this thread executes
+    /// OUTSIDE `[code_base, code_base + code_len)` is a foreign (Linux) syscall: the kernel
+    /// saves the trapping PC, SP and x8, then resumes the thread at `entry` with SP =
+    /// `stack_top` and every other register as the foreign code left it. The kernel writes no
+    /// user memory and interprets no foreign syscall number. `entry` must lie inside the code
+    /// range; `entry` 0 clears. The supervisor is refused with [`Errno::NotSupported`].
+    PersonaShimSet = 63,
+    /// Leave a persona shim call (SH7): resume the foreign code at its saved PC and SP with
+    /// its saved x8 and `x0` = the call's result; every other register is taken as the shim
+    /// left it (the shim restores the foreign values first). Only valid inside a redirected
+    /// call; otherwise [`Errno::BadState`].
+    PersonaReturn = 64,
 }
 
 /// `ProcessKill` flag (SH6-b): kill the target's whole spawn tree, the KUMO stand-in for
@@ -550,6 +563,8 @@ mod tests {
         // SH6: relibc's signal runtime calls this by number.
         assert_eq!(Syscall::FaultHandlerSet as usize, 61);
         assert_eq!(Syscall::ThreadYield as usize, 62);
+        assert_eq!(Syscall::PersonaShimSet as usize, 63);
+        assert_eq!(Syscall::PersonaReturn as usize, 64);
     }
 }
 

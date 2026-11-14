@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
 
-//j864
-//j870
+//j890
+//j892
 //j893
 //j894
 //j895
@@ -16,8 +16,7 @@ use kumo_abi::{
     BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
     GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GPU_LANE_PATH, GROUP_PATH,
     HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, NETSTACK_PATH, PASSWD_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH,
-    TTYD_PATH, WC_PATH,
+    RELIBC_SMOKE_PATH, SHADOW_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -35,7 +34,7 @@ use kumo_rt::{
     STARTUP_TAG_FS, STARTUP_TAG_NET, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
 };
 use kumoza::{parse, DirectoryError, WorkingDirectory};
-use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
+use persona_linux::elf as linux_elf;
 use persona_posix::{FdTable, TtyRpc, TtyRpcTransport, TtyStream, STDIN_FILENO, STDOUT_FILENO};
 use svc_health::{Request as HealthRequest, Response as HealthResponse};
 use ttyd::{Reply as TtyReply, Request as TtyRequest};
@@ -6125,88 +6124,10 @@ extern "C" fn sora_main(
         }
     }
 
-    // M10-a: first `persona-linux` smoke. This is not a native KUMO child: the
-    // payload uses ARM64 Linux syscall numbers (`write` = 64, `exit_group` = 94).
-    // The temporary Stage-A bridge in the kernel translates those numbers only for
-    // non-Sora children until the userspace persona runner owns the trap path.
-    {
-        let _ = linux_arm64::WRITE;
-        let _ = linux_arm64::EXIT_GROUP;
-        let linux_msg = b"M10 linux hello\n";
-        let child_vmo_h = vmo_create(0x2000);
-        if child_vmo_h == u64::MAX {
-            log(b"M10 linux: vmo fail\n");
-        } else if linux_msg.len() != 16 {
-            log(b"M10 linux: len fail\n");
-        } else {
-            let child_vmo = Handle(child_vmo_h as u32);
-            // Payload (9 aarch64 instructions, 36 bytes at VMO offset 0x1100),
-            // verified with `llvm-mc -triple=aarch64 --show-encoding`:
-            //   movz x0, #1                → fd = stdout
-            //   movz x1, #0x1000, lsl #16 → x1 = 0x1000_0000
-            //   movk x1, #0x1000          → buf = 0x1000_1000
-            //   movz x2, #16              → len
-            //   movz x8, #64              → Linux arm64 write
-            //   svc  #0
-            //   movz x0, #0               → status
-            //   movz x8, #94              → Linux arm64 exit_group
-            //   svc  #0
-            let code: [u32; 9] = [
-                0xd2800020, // movz x0, #1
-                0xd2a20001, // movz x1, #0x1000, lsl #16
-                0xf2820001, // movk x1, #0x1000
-                0xd2800202, // movz x2, #16
-                0xd2800808, // movz x8, #64
-                0xd4000001, // svc #0
-                0xd2800000, // movz x0, #0
-                0xd2800bc8, // movz x8, #94
-                0xd4000001, // svc #0
-            ];
-            let mut cb = [0u8; 36];
-            for (i, w) in code.iter().enumerate() {
-                cb[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
-            }
-            let msg_ok = vmo_write(child_vmo, 0x1000, linux_msg.as_ptr(), linux_msg.len()) == 0;
-            let code_ok = vmo_write(child_vmo, 0x1100, cb.as_ptr(), cb.len()) == 0;
-            if !msg_ok || !code_ok {
-                log(b"M10 linux: write fail\n");
-            } else {
-                let child_as_h = process_create(0, 0x2000_0000);
-                if child_as_h == u64::MAX {
-                    log(b"M10 linux: process fail\n");
-                } else {
-                    let child_as = Handle(child_as_h as u32);
-                    if vmar_map(child_as, child_vmo, 0, 0x10000000, 0x2000, 5) != 0 {
-                        log(b"M10 linux: map fail\n");
-                    } else if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
-                        log(b"M10 linux: as fail\n");
-                    } else {
-                        let st = process_run(child_as, 0x10001100, 0x1000FFF0, 0, 0, 0);
-                        if st == 0 {
-                            log(b"M10 linux: run ok\n");
-                        } else {
-                            log(b"M10 linux: run fail\n");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // M10-b: load the same hello path as an initrd-resident ARM64 Linux ELF.
-    // This is the first step from handmade payload toward "one static ELF".
-    if run_elf(
-        initrd,
-        PERSONA_LINUX_HELLO_PATH.as_bytes(),
-        0,
-        0,
-        0,
-        b"M10 elf",
-    ) {
-        debug_write(b"M10-c Check ok\n".as_ptr(), 15);
-    } else {
-        log(b"M10 elf: run fail\n");
-    }
+    //j890
+    // SH7-d2: Linux programs no longer run from Sora's boot path. The shell's `linux` word
+    // launches the persona shim with a filesystem grant, and the shim loads the program and its
+    // interpreter by path (j888's launch bundle and the M10 blocks retired). — TEAL
 
     // Narrow the initrd handle before handing it to user programs. `ls` only needs READ
     // authority; Sora keeps the full bootstrap handle for its own loader duties.
@@ -7505,6 +7426,71 @@ fn eval_command(
             debug_write(b" -> OK: heap grew on target\n".as_ptr(), 28);
         } else {
             debug_write(b" -> FAIL: no growth\n".as_ptr(), 21);
+        }
+        return true;
+    } else if cmd.name == "linux" {
+        //j890
+        // SH7-d2 (PLAN/022, cut X1): run a Linux program. The persona shim is launched like any
+        // program, with argv `[persona-linux-shim, path, args...]` and a private filesystem
+        // session over the image; it then loads the program and its interpreter by path itself,
+        // as Linux `execve` does. Only this word grants the shim files. The verdict line is the
+        // shell's own, from the program's exit status. — TEAL
+        if cmd.args.is_empty() {
+            usage(b"usage: linux <path> [args...]\n");
+            return true;
+        }
+        let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+        slots[0] = b"persona-linux-shim";
+        let mut count = 1;
+        for arg in cmd.args.iter().take(MAX_ARGV - 1) {
+            slots[count] = arg.as_bytes();
+            count += 1;
+        }
+        // SH7-d3b: a program under `/media/<vol>/` runs over a read-only session on that
+        // volume, and its path becomes volume-relative: the volume is the Linux program's
+        // whole filesystem, so its `/lib` and everything else it opens are the volume's.
+        let mut fs = FsGrant::Image;
+        match sora::media_route(cmd.args[0].as_bytes()) {
+            sora::MediaRoute::Elsewhere => {}
+            sora::MediaRoute::Root => {
+                log(b"linux: /media: is a directory\n");
+                return true;
+            }
+            sora::MediaRoute::Volume { name, path } => {
+                // A synchronous autoexec runs before the serve loop reads the stick's offer:
+                // wait for it as the `media` word does (the read-only session below is all
+                // this launch takes).
+                if media().is_none() {
+                    let _ = ensure_media_writable(initrd);
+                }
+                if !media().is_some_and(|media| media.name.as_bytes() == name) {
+                    log(b"linux: /media/");
+                    log(name);
+                    log(b": no such volume\n");
+                    return true;
+                }
+                slots[1] = path;
+                fs = FsGrant::Media(BlockAccess::ReadOnly);
+            }
+        }
+        run_with_startup_input(
+            initrd,
+            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
+            b"linux",
+            Some(&slots[..count]),
+            false,
+            fs,
+            false,
+            false,
+            StdinMode::None,
+            false,
+        );
+        log(b"linux: ");
+        log(cmd.args[0].as_bytes());
+        if LAST_STATUS.load(Ordering::Relaxed) == 0 {
+            log(b" exited 0\n");
+        } else {
+            log(b" failed\n");
         }
         return true;
     } else if cmd.name == "kilo" {

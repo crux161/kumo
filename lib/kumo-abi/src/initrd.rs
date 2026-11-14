@@ -1,7 +1,7 @@
-//j815
-//j824
-//j825
 //j857
+//j888
+//j889
+//j890
 //j893
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
@@ -12,8 +12,10 @@ pub const INITRD_VERSION: u32 = 1;
 /// The most entries an initrd may carry. `ls`, `cat`, `wc` and Sora's `cd` copy the whole entry
 /// table into a fixed [`INITRD_TABLE_MAX`]-byte buffer on a 16 KiB stack, and the image builder
 /// refuses an initrd that would not fit. J563's `bin/identityd`, the 26th entry, overflowed the
-/// 2048 bytes each of them used to hard-code.
-pub const INITRD_MAX_ENTRIES: usize = 48;
+/// 2048 bytes each of them used to hard-code. SH7-d1 (j889): 50, the most whose table still fits
+/// 4096 bytes (16 + 50 × 80 = 4016), for the persona probes; later Linux programs live on the
+/// FAT image, not the initrd.
+pub const INITRD_MAX_ENTRIES: usize = 50;
 pub const INITRD_TABLE_MAX: usize = INITRD_HEADER_LEN + INITRD_MAX_ENTRIES * INITRD_ENTRY_LEN;
 pub const SORA_INIT_PATH: &str = "bin/sora";
 pub const SVC_HEALTH_PATH: &str = "bin/svc-health";
@@ -56,7 +58,11 @@ pub const ACTORCALL_PATH: &str = "bin/actorcall";
 /// The AX4 heapless idle actor (PLAN/021): Sora's `ax4bench` launches 256 copies as one
 /// batch to prove resident capacity, flat census after teardown, and wake latency.
 pub const AX4IDLE_PATH: &str = "bin/ax4idle";
-pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
+/// SH7: the in-process Linux personality runtime (PLAN.md §10 R1); a Linux program runs
+/// inside it.
+pub const PERSONA_LINUX_SHIM_PATH: &str = "bin/persona-linux-shim";
+//j890
+// SH7-d2: the Linux programs the shim runs live on the FAT image (`/bin`, `/lib`), not here.
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.
 pub const HELLO_PATH: &str = "bin/hello";
@@ -431,7 +437,7 @@ mod tests {
 
     #[test]
     fn the_table_limit_fits_a_child_stack_with_room() {
-        assert_eq!(INITRD_TABLE_MAX, 3856);
+        assert_eq!(INITRD_TABLE_MAX, 4016);
         assert!(INITRD_TABLE_MAX <= 4096);
     }
 

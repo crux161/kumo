@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 
-//j840
 //j843
 //j881
 //j886
+//j892
 //j896
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -16,7 +16,7 @@ mod resident_nic;
 
 use drv_blk::{
     decode_connect, BlockAccess, MediaReady, CONTROL_CONNECT_LEN, REQUEST_LEN as BLOCK_REQUEST_LEN,
-    STATUS_IO_ERROR, STATUS_OK,
+    STATUS_BAD_LEN, STATUS_IO_ERROR, STATUS_OK,
 };
 use drv_xhci::{storage_request, StorageRequest};
 use kumo_abi::{Handle, Rights, VmarFlags};
@@ -28,10 +28,10 @@ use kumo_gpt::{
     MbrPartitionTable, Partition, EFI_SYSTEM_PARTITION_TYPE_GUID,
 };
 use kumo_rt::{
-    channel_read, channel_read_with_handle, channel_write, channel_write_with_handle, clock_get,
-    handle_close, handle_duplicate, handle_koid, interrupt_complete, interrupt_create,
-    interrupt_wait, port_bind, port_create, port_unbind, port_wait, process_exit,
-    resource_mint_mmio, sleep_ns, timer_create, vmar_map, vmo_create_contiguous,
+    channel_read_with_handle, channel_write, channel_write_with_handle, clock_get, handle_close,
+    handle_duplicate, handle_koid, interrupt_complete, interrupt_create, interrupt_wait, port_bind,
+    port_create, port_unbind, port_wait, process_exit, resource_mint_mmio, sleep_ns, timer_create,
+    vmar_map, vmar_map_anywhere_at, vmar_unmap, vmo_create_contiguous,
 };
 use kumo_usb_storage::{
     CommandBlockWrapper, CommandStatus, CommandStatusWrapper, DataDirection, MassStorageInterface,
@@ -192,7 +192,10 @@ const BOT_TAG_SYNC: u32 = 0x4b55_0009;
 // guarantees a contained 16-KiB subwindow that does not cross an xHCI 64-KiB data-buffer boundary;
 // phys is again the IOVA under SMMU bypass. — KESTREL
 const STORAGE_DATA_VA: u64 = 0x0000_0000_1500_0000;
-const STORAGE_DATA_LEN: u64 = 4 * PAGE_SIZE;
+/// SH7-d3b: 64 KiB, 128 blocks per READ(10): one bulk TRB, the most that fits inside the 64 KiB
+/// transfer boundary. A backing of twice the window always holds one boundary-free window.
+const STORAGE_DATA_LEN: u64 = 16 * PAGE_SIZE;
+const _: () = assert!(STORAGE_DATA_LEN <= XHCI_DATA_BOUNDARY);
 const STORAGE_ALLOCATION_LEN: u64 = 2 * STORAGE_DATA_LEN;
 const XHCI_DATA_BOUNDARY: u64 = 0x1_0000;
 /// Bounded spins waiting for the reset device's port to re-link and enable after HCRST.
@@ -558,7 +561,7 @@ fn dsb() {
     }
 }
 
-/// Ordinary memory storage reads are copied into for parsing: up to the 16-KiB DMA window, too
+/// Ordinary memory storage reads are copied into for parsing: up to the 64-KiB DMA window, too
 /// large for a driver's 16-KiB stack. Never device-visible, so plain slices into it are sound.
 struct StorageSnapshot(core::cell::UnsafeCell<[u8; STORAGE_DATA_LEN as usize]>);
 
@@ -2256,6 +2259,50 @@ impl BotDisk<'_> {
         self.blocks_read += count as u64;
         Some(storage_snapshot(window, len))
     }
+
+    /// SH7-d3b: READ(10) `count` blocks from `lba` straight into `out`, which is exactly
+    /// `count` blocks long (a client's VMO window), with no snapshot in between.
+    fn read_blocks_to(&mut self, lba: u64, count: u16, out: &mut [u8]) -> bool {
+        let Ok(plan) = self.adapter.plan_read(lba, count) else {
+            log_storage_phase(b"read10-vmo", b"plan-fail");
+            return false;
+        };
+        if plan.byte_length != out.len() {
+            return false;
+        }
+        let Some(window) = self.read_window.window(0, plan.byte_length) else {
+            return false;
+        };
+        let len = bot_command(
+            self.io,
+            self.layout,
+            self.image,
+            self.evt,
+            &mut self.out_ring,
+            self.out_seg,
+            self.out_dci,
+            &mut self.in_ring,
+            self.in_seg,
+            self.in_dci,
+            self.slot_id,
+            self.cbw_buf,
+            self.cbw_phys,
+            window,
+            self.read_phys,
+            self.csw_buf,
+            self.csw_phys,
+            BOT_TAG_READ_VOLUME,
+            &plan.command,
+            b"read10-vmo",
+        );
+        if len != Some(plan.byte_length) {
+            log_storage_phase(b"read10-vmo", b"short");
+            return false;
+        }
+        self.blocks_read += count as u64;
+        window.read_into(0, out);
+        true
+    }
 }
 
 /// The stick as `kumo-fatfs` sees it: one READ(10) per 512-byte block (J543). The probe has
@@ -2696,7 +2743,12 @@ fn serve_block_client(
     // One extra byte exposes oversized frames instead of accepting their truncated prefix.
     // — KESTREL
     let mut frame = [0u8; BLOCK_REQUEST_LEN + SECTOR_SIZE + 1];
-    let n = channel_read(client, frame.as_mut_ptr(), frame.len());
+    let (n, carried) = channel_read_with_handle(client, frame.as_mut_ptr(), frame.len());
+    let n = n as u64;
+    // SH7-d3b: a CMD_READ_VMO carries the client's VMO. It is used for this request alone and
+    // closed when the request is done, whatever it was.
+    let carried = (carried != 0 && carried != u64::MAX).then_some(Handle(carried as u32));
+    let _close_carried = CloseOnDrop(carried);
     if n == 0 || n == u64::MAX {
         // The client's `fatfs` exited: drop the channel and free the slot.
         let _ = port_unbind(port, client);
@@ -2748,6 +2800,24 @@ fn serve_block_client(
                 STATUS_IO_ERROR
             }
         }
+        Ok(StorageRequest::ReadVmo {
+            lba,
+            count,
+            vmo_offset,
+        }) => match carried {
+            None => STATUS_BAD_LEN,
+            Some(vmo) => {
+                let read = service.with_disk(io, layout, image, evt, |disk| {
+                    read_volume_into_vmo(disk, vmo, lba, count, vmo_offset)
+                });
+                if read {
+                    service.clients[index].served += count as u32;
+                    STATUS_OK
+                } else {
+                    STATUS_IO_ERROR
+                }
+            }
+        },
         Ok(StorageRequest::Flush) => {
             if service.with_disk(io, layout, image, evt, |disk| disk.flush()) {
                 service.clients[index].flushes += 1;
@@ -2759,6 +2829,62 @@ fn serve_block_client(
         Err(status) => status,
     };
     let _ = channel_write(client, reply.as_ptr(), reply_len);
+}
+
+/// Close a handle when the scope ends, however it ends.
+struct CloseOnDrop(Option<Handle>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0 {
+            let _ = handle_close(handle);
+        }
+    }
+}
+
+/// SH7-d3b: `count` blocks from `lba` into the client's `vmo` at `vmo_offset`. Maps just that
+/// window of the VMO, reads it in transfers as large as the DMA window allows, and unmaps it.
+fn read_volume_into_vmo(
+    disk: &mut BotDisk,
+    vmo: Handle,
+    lba: u64,
+    count: u16,
+    vmo_offset: u64,
+) -> bool {
+    let bytes = count as u64 * SECTOR_SIZE as u64;
+    let page = vmo_offset & !(PAGE_SIZE - 1);
+    let delta = vmo_offset - page;
+    let Some(map_len) = (delta + bytes)
+        .checked_add(PAGE_SIZE - 1)
+        .map(|end| end & !(PAGE_SIZE - 1))
+    else {
+        return false;
+    };
+    let (status, view) =
+        vmar_map_anywhere_at(vmo, page, map_len, (VmarFlags::READ | VmarFlags::WRITE).0);
+    if status != 0 || view == 0 {
+        log(b"drv-xhci: block read-vmo window map failed\n");
+        return false;
+    }
+    // SAFETY: the kernel just mapped `map_len >= delta + bytes` writable bytes at `view`, this
+    // single-threaded driver holds no other reference to them, and they are unmapped below.
+    let window =
+        unsafe { core::slice::from_raw_parts_mut((view + delta) as *mut u8, bytes as usize) };
+    let step = disk.adapter.max_blocks_per_transfer().max(1);
+    let mut done = 0u16;
+    let mut ok = true;
+    while done < count {
+        let take = step.min(count - done);
+        let from = done as usize * SECTOR_SIZE;
+        let to = from + take as usize * SECTOR_SIZE;
+        if !disk.read_blocks_to(lba + done as u64, take, &mut window[from..to]) {
+            ok = false;
+            break;
+        }
+        done += take;
+    }
+    let _ = vmar_unmap(view, map_len);
+    ok
 }
 
 fn log_mbr_error(error: MbrError) {

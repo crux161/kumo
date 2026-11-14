@@ -1,19 +1,19 @@
 #![no_std]
 #![no_main]
 
-//j168
 //j230
 //j413
 //j414
 //j559
+//j892
 //j690
 
 use drv_blk::{
-    split_write_frame, BlockDevice, Request, CMD_FLUSH, CMD_READ, CMD_WRITE, STATUS_BAD_LBA,
-    STATUS_OK,
+    split_write_frame, BlockDevice, Request, CMD_FLUSH, CMD_READ, CMD_READ_VMO, CMD_WRITE,
+    STATUS_BAD_LBA, STATUS_OK, STATUS_UNSUPPORTED,
 };
 use kumo_abi::{Handle, VmarFlags};
-use kumo_rt::{channel_read, channel_read_with_handle, channel_write, vmar_map, vmo_create};
+use kumo_rt::{channel_read_with_handle, channel_write, vmar_map, vmo_create};
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
 /// allows. Failures are ERR, so a default boot still shows them.
@@ -129,7 +129,11 @@ extern "C" fn main(
     // they are never live at the same time.
     let mut buf = [0u8; 4096];
     loop {
-        let n = channel_read(ch, buf.as_mut_ptr(), buf.len()) as usize;
+        let (n, carried) = channel_read_with_handle(ch, buf.as_mut_ptr(), buf.len());
+        // SH7-d3b: this RAM disk serves CMD_READ_VMO as unsupported; never keep a VMO.
+        if carried != 0 && carried != u64::MAX {
+            let _ = kumo_rt::handle_close(Handle(carried as u32));
+        }
         let request = match Request::decode(&buf[..n]) {
             Some(r) => r,
             None => continue, // empty/partial frame (e.g. a spurious wake)
@@ -159,6 +163,10 @@ extern "C" fn main(
                     Err(s) => s,
                 };
                 buf[0] = status;
+                channel_write(ch, buf.as_ptr(), 1);
+            }
+            CMD_READ_VMO => {
+                buf[0] = STATUS_UNSUPPORTED;
                 channel_write(ch, buf.as_ptr(), 1);
             }
             CMD_FLUSH => {
