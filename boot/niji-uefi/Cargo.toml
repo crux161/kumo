@@ -13,7 +13,9 @@ version.workspace = true
 [dependencies]
 kumo-abi.workspace = true
 niji-loader = { path = "../niji-loader" }
-kumo-sha256 = { workspace = true, optional = true }
+kumo-sha256.workspace = true
+# zstd decoder for the compressed netboot initrd (PROPOSAL/025 Z1); MIT, no dependencies.
+ruzstd = { version = "=0.8.3", default-features = false }
 
 [lib]
 path = "src/lib.rs"
@@ -24,7 +26,7 @@ path = "src/main.rs"
 
 [features]
 ax88-oracle = []
-nvme-oracle = ["dep:kumo-sha256"]
+nvme-oracle = []
 nvme-prepare = ["nvme-oracle"]
 nvme-write-reference = ["nvme-oracle"]
 

@@ -15,8 +15,10 @@ use smoltcp::time::Instant;
 use crate::budget::{FRAME_MAX, MTU};
 use crate::loopback::InjectError;
 
-/// Frames the process may queue for the stack before `push_inbound` refuses.
-pub const INGRESS_SLOTS: usize = 8;
+/// Frames the process may queue for the stack before `push_inbound` refuses: one full RX
+/// credit window, so a turn that drains the frame channel (netstack's `serve_frame`) never
+/// overruns the ring before smoltcp polls. Was 8, sized for one frame per wake.
+pub const INGRESS_SLOTS: usize = crate::budget::RX_CREDIT;
 /// Frames smoltcp may build before `transmit` pushes back.
 pub const EGRESS_SLOTS: usize = 8;
 
@@ -586,7 +588,11 @@ mod tests {
     }
 
     #[test]
-    fn the_ingress_ring_stops_at_its_depth_and_the_lane_credit_outlives_it() {
+    fn the_ingress_ring_holds_one_whole_credit_window() {
+        // A turn that drains the frame channel queues up to one RX credit window before
+        // smoltcp polls; the ring must take all of it, and the window must close exactly
+        // when the ring is full, so a provider inside its credit cannot overrun the ring.
+        assert_eq!(INGRESS_SLOTS, RX_CREDIT);
         let mut storage: [SocketStorage<'_>; 1] = Default::default();
         let mut udp = Udp::new();
         let mut b = Side::new(&mut storage, &mut udp, MAC_B, IP_B, PORT_B);
@@ -601,14 +607,11 @@ mod tests {
                 .push_inbound(&frame)
                 .unwrap_or_else(|e| panic!("frame {i}: {e:?}"));
         }
-        let rx = b
-            .provider
-            .send_rx(&frame)
-            .expect("the lane window is deeper than the ring");
-        cross!(rx, b.lane);
+        assert!(b.provider.send_rx(&frame).is_none(), "the window closes with the ring");
+        assert_eq!(b.provider.counters().rx_drop_no_credit, 1);
         assert_eq!(b.device.push_inbound(&frame), Err(InjectError::Full));
         assert_eq!(b.device.counters().ingress_full, 1);
-        // The stack drains what was queued; the refused frame was the process's to count.
+        // The stack drains the whole window in one poll.
         b.poll();
         assert_eq!(b.device.counters().delivered, INGRESS_SLOTS as u64);
     }

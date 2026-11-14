@@ -412,9 +412,52 @@ pub struct BootConfig<'a> {
     /// Optional explicit serial route. Kept as source text so the loader can diagnose an invalid
     /// value loudly; [`parse_pl011_console`] performs the typed conversion.
     pub console_uart: Option<&'a str>,
+    /// A zstd-compressed copy of the initrd for TFTP and slow media (`initrd_zstd`), with the
+    /// SHA-256 of the *compressed* stream (`initrd_zstd_sha256`, checked before decoding) and
+    /// the decoded length (`initrd_size`). [`BootConfig::initrd_zstd`] yields all three or
+    /// nothing; loaders that predate these keys ignore them and load `initrd` as before.
+    pub initrd_zstd_path: Option<&'a str>,
+    pub initrd_zstd_sha256: Option<[u8; 32]>,
+    pub initrd_size: Option<u64>,
+}
+
+/// The compressed-initrd triple from a manifest: path, compressed-stream SHA-256, decoded size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitrdZstd<'a> {
+    pub path: &'a str,
+    pub sha256: [u8; 32],
+    pub size: u64,
+}
+
+/// 64 hex digits to 32 bytes; `None` for any other length or a non-hex digit.
+pub fn parse_sha256_hex(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 32];
+    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+        out[i] = nibble(pair[0])? << 4 | nibble(pair[1])?;
+    }
+    Some(out)
 }
 
 impl<'a> BootConfig<'a> {
+    /// The compressed initrd, when the manifest names all of its path, digest and size.
+    pub fn initrd_zstd(&self) -> Option<InitrdZstd<'a>> {
+        Some(InitrdZstd {
+            path: self.initrd_zstd_path?,
+            sha256: self.initrd_zstd_sha256?,
+            size: self.initrd_size.filter(|size| *size > 0)?,
+        })
+    }
+
     /// Parse the config text. Returns `None` if the mandatory `kernel` key is absent.
     /// `dtb` defaults to [`DtbSource::Firmware`] (the universal handoff); `dtb = firmware`
     /// is the explicit form and `dtb = esp:<path>` selects an ESP override.
@@ -423,6 +466,9 @@ impl<'a> BootConfig<'a> {
         let mut initrd: Option<&'a str> = None;
         let mut board: Option<&'a str> = None;
         let mut console_uart: Option<&'a str> = None;
+        let mut initrd_zstd_path: Option<&'a str> = None;
+        let mut initrd_zstd_sha256: Option<[u8; 32]> = None;
+        let mut initrd_size: Option<u64> = None;
         let mut dtb = DtbSource::Firmware;
         for raw in text.lines() {
             let line = match raw.split_once('#') {
@@ -442,6 +488,9 @@ impl<'a> BootConfig<'a> {
                 "initrd" => initrd = Some(value),
                 "board" => board = Some(value),
                 "console-uart" | "console_uart" => console_uart = Some(value),
+                "initrd_zstd" => initrd_zstd_path = Some(value),
+                "initrd_zstd_sha256" => initrd_zstd_sha256 = parse_sha256_hex(value),
+                "initrd_size" => initrd_size = value.parse().ok(),
                 "dtb" => {
                     dtb = if value.eq_ignore_ascii_case("firmware") {
                         DtbSource::Firmware
@@ -460,6 +509,9 @@ impl<'a> BootConfig<'a> {
             dtb,
             board,
             console_uart,
+            initrd_zstd_path,
+            initrd_zstd_sha256,
+            initrd_size,
         })
     }
 }
@@ -467,6 +519,37 @@ impl<'a> BootConfig<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_compressed_initrd_needs_path_digest_and_size_together() {
+        extern crate std;
+        use std::format;
+        let digest = "00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF";
+        let full = format!(
+            "kernel = \\k\ninitrd = \\EFI\\KUMO\\initrd.img\n\
+             initrd_zstd = \\EFI\\KUMO\\initrd.img.zst\n\
+             initrd_zstd_sha256 = {digest}\ninitrd_size = 9546999\n"
+        );
+        let cfg = BootConfig::parse(&full).expect("parses");
+        let z = cfg.initrd_zstd().expect("all three keys");
+        assert_eq!(z.path, "\\EFI\\KUMO\\initrd.img.zst");
+        assert_eq!(z.size, 9_546_999);
+        assert_eq!(z.sha256[0], 0x00);
+        assert_eq!(z.sha256[15], 0xff);
+        assert_eq!(z.sha256[31], 0xff);
+        assert_eq!(cfg.initrd, Some("\\EFI\\KUMO\\initrd.img"), "raw path kept");
+
+        for broken in [
+            full.replace("initrd_size = 9546999", "initrd_size = 0"),
+            full.replace("initrd_size = 9546999", "initrd_size = lots"),
+            full.replace(digest, &digest[..63]),
+            full.replace(digest, &format!("{}g", &digest[..63])),
+            full.replace("initrd_zstd = \\EFI\\KUMO\\initrd.img.zst\n", ""),
+        ] {
+            let cfg = BootConfig::parse(&broken).expect("still parses");
+            assert_eq!(cfg.initrd_zstd(), None, "{broken}");
+        }
+    }
 
     #[test]
     fn parses_x13s_style_config_with_esp_dtb_override() {

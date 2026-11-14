@@ -28,6 +28,11 @@ pub const WAIT_CONNECTED: u8 = 4;
 pub const WAIT_TIMEOUT_MAX_MS: u32 = 60_000;
 /// RECVFROM result bit: the datagram was longer than the requested maximum and was cut.
 pub const RESULT_TRUNCATED: u64 = 1 << 63;
+/// RECV_BATCH: set on every reply of a batch except the last; the client keeps reading
+/// replies with the same request id until one arrives without it.
+pub const RESULT_MORE: u64 = 1 << 62;
+/// RECV_BATCH: most datagrams one request may return (its `arg`).
+pub const RECV_BATCH_MAX: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -48,6 +53,11 @@ pub enum Op {
     GetName = 14,
     /// NET12: resolve a dotted name through the launcher-granted resolver.
     Resolve = 15,
+    /// Up to `arg` (1..=RECV_BATCH_MAX) queued UDP datagrams in one turn: one RecvFrom-shaped
+    /// reply each (source address, then the datagram), all with this request's id, every one
+    /// but the last carrying RESULT_MORE. An empty socket answers one WouldBlock. Netstack
+    /// spends one turn per request, so a busy reader stops paying a turn per datagram.
+    RecvBatch = 16,
 }
 
 impl Op {
@@ -68,6 +78,7 @@ impl Op {
             13 => Self::Wait,
             14 => Self::GetName,
             15 => Self::Resolve,
+            16 => Self::RecvBatch,
             _ => return None,
         })
     }
@@ -196,6 +207,9 @@ pub enum Body<'a> {
     },
     RecvFrom {
         max: u16,
+    },
+    RecvBatch {
+        count: u16,
     },
     Shutdown {
         read: bool,
@@ -379,6 +393,13 @@ pub fn decode_request(message: &[u8], handles: usize) -> Result<Request<'_>, Rej
             } else {
                 Body::RecvFrom { max }
             }
+        }
+        Op::RecvBatch => {
+            no_payload()?;
+            if !(1..=RECV_BATCH_MAX).contains(&arg) {
+                return Err(reject(Status::InvalidArgument));
+            }
+            Body::RecvBatch { count: arg as u16 }
         }
         Op::Shutdown => {
             no_payload()?;
@@ -643,6 +664,7 @@ pub const fn op_of(body: &Body<'_>) -> Op {
         Body::SendTo(..) => Op::SendTo,
         Body::Recv { .. } => Op::Recv,
         Body::RecvFrom { .. } => Op::RecvFrom,
+        Body::RecvBatch { .. } => Op::RecvBatch,
         Body::Shutdown { .. } => Op::Shutdown,
         Body::Close => Op::Close,
         Body::Wait { .. } => Op::Wait,
@@ -691,7 +713,7 @@ mod tests {
         sendto.extend_from_slice(b"datagram");
         let wait = WAIT_READABLE as u64 | (250u64 << 32);
         type Case<'a> = (Op, u32, u32, u64, &'a [u8], Body<'a>);
-        let cases: [Case<'_>; 16] = [
+        let cases: [Case<'_>; 17] = [
             (Op::Hello, 0, 0, 0, &[], Body::Hello),
             (Op::Socket, 0, 9, 2, &[], Body::Socket(SocketKind::Tcp)),
             (Op::Socket, 0, 9, 3, &[], Body::Socket(SocketKind::Icmp)),
@@ -710,6 +732,7 @@ mod tests {
             ),
             (Op::Recv, 1, 9, 2048, &[], Body::Recv { max: 2048 }),
             (Op::RecvFrom, 1, 9, 1472, &[], Body::RecvFrom { max: 1472 }),
+            (Op::RecvBatch, 1, 9, 32, &[], Body::RecvBatch { count: 32 }),
             (
                 Op::Shutdown,
                 1,
@@ -795,11 +818,11 @@ mod tests {
         version[4] = 2;
         assert_eq!(reply_status(&version), Reply(Status::BadVersion));
         let mut op = req(Op::Close, 1, 9, 0, &[]);
-        op[6] = 16;
+        op[6] = 17; // the first unassigned op (16 is RECV_BATCH)
         let rejected = decode_request(&op, 0).unwrap_err();
         assert_eq!(
             (rejected.op, rejected.request_id),
-            (16, 5),
+            (17, 5),
             "reply can echo the bad op"
         );
         assert_eq!(rejected.disposition, Reply(Status::BadOp));
@@ -810,7 +833,7 @@ mod tests {
         bad_family[0] = 10;
         let mut flags = req(Op::Close, 1, 9, 0, &[]);
         flags[20] = 4;
-        let cases: [(Vec<u8>, Status); 22] = [
+        let cases: [(Vec<u8>, Status); 24] = [
             (req(Op::Hello, 0, 3, 0, &[]), Status::StaleSession),
             (req(Op::Close, 1, 0, 0, &[]), Status::StaleSession),
             (req(Op::Socket, 1, 9, 1, &[]), Status::BadSocket),
@@ -838,6 +861,8 @@ mod tests {
             (req(Op::SendTo, 1, 9, 0, &[2, 0]), Status::BadLength),
             (req(Op::Recv, 1, 9, 0, &[]), Status::InvalidArgument),
             (req(Op::RecvFrom, 1, 9, 1473, &[]), Status::InvalidArgument),
+            (req(Op::RecvBatch, 1, 9, 0, &[]), Status::InvalidArgument),
+            (req(Op::RecvBatch, 1, 9, 33, &[]), Status::InvalidArgument),
             (req(Op::Shutdown, 1, 9, 4, &[]), Status::InvalidArgument),
             (req(Op::Wait, 1, 9, 8, &[]), Status::InvalidArgument),
             (

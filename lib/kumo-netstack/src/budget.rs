@@ -33,6 +33,16 @@ pub const SOCKET_BUFFER: usize = 4096;
 /// UDP datagram metadata slots per direction.
 pub const UDP_METADATA: usize = 4;
 
+/// Receive queue of a wire UDP socket (the per-slot twin bound to the AX88 interface).
+/// SOCKET_BUFFER holds two full datagrams, so a reader that drains once per wake (a few ms on
+/// opi5) capped wire receive near 370 datagrams/s with most of the stream dropped (the
+/// 2026-11-13 AX88 speed test: 4.36 Mbit/s down, 70.8% loss).
+/// Loopback, TCP and every transmit side keep SOCKET_BUFFER.
+/// It must hold one whole RX credit window: a netstack turn can hand smoltcp that many
+/// frames before the reader runs again (one core).
+pub const WIRE_UDP_RX_BUFFER: usize = (RX_CREDIT + 2) * UDP_PAYLOAD_MAX;
+pub const WIRE_UDP_RX_METADATA: usize = WIRE_UDP_RX_BUFFER / UDP_PAYLOAD_MAX;
+
 /// Wire ICMP (NET8): bytes and metadata slots per direction, one echo identifier per socket.
 pub const ICMP_BUFFER: usize = 2048;
 pub const ICMP_METADATA: usize = 4;
@@ -41,6 +51,8 @@ pub const ICMP_ECHO_HEADER: usize = 8;
 pub const ICMP_ECHO_MAX: usize = ICMP_ECHO_HEADER + UDP_PAYLOAD_MAX;
 
 /// RX frames a provider may have outstanding (credit granted by netstack).
+/// Since netstack drains the frame channel per wake (2026-11-13), this is frames per
+/// netstack turn. 64 was tried on the opi5 and moved no more data than 32.
 pub const RX_CREDIT: usize = 32;
 /// TX frames netstack may have without a TX_DONE (credit offered by the provider).
 pub const TX_CREDIT: usize = 16;
@@ -53,6 +65,8 @@ pub const REQUESTS_PER_TURN: usize = 16;
 pub const LOOPBACK_SLOTS: usize = 16;
 
 const _: () = assert!(UDP_PAYLOAD_MAX == 1472);
+const _: () = assert!(WIRE_UDP_RX_METADATA >= RX_CREDIT && WIRE_UDP_RX_BUFFER >= SOCKET_BUFFER);
+const _: () = assert!(RX_CREDIT <= u16::MAX as usize);
 const _: () = assert!(ICMP_BUFFER >= ICMP_ECHO_MAX);
 const _: () = assert!(FRAME_MAX == 1514);
 const _: () = assert!(SESSIONS * SOCKETS_PER_SESSION >= SOCKETS_TOTAL);

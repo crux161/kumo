@@ -2,6 +2,7 @@
 //j529
 //j538
 //j703
+//j886
 
 use crate::{ContextSize, Error};
 
@@ -16,6 +17,7 @@ const PORTSC_RESET: u32 = 1 << 4;
 const PORTSC_PLS_MASK: u32 = 0xf << 5;
 const PORTSC_POWER: u32 = 1 << 9;
 const PORTSC_WRC: u32 = 1 << 19;
+const PORTSC_PRC: u32 = 1 << 21;
 const PORTSC_CAS: u32 = 1 << 24;
 const PORTSC_WR: u32 = 1 << 31;
 /// Read-only status bits a neutral write saves (Linux `XHCI_PORT_RO`).
@@ -104,6 +106,24 @@ pub const fn port_reset_value(raw: u32) -> u32 {
     port_state_to_neutral(raw) | PORTSC_RESET
 }
 
+/// A neutral PORTSC value that clears a latched Port Reset Change (PRC, bit 21, RW1C) and touches
+/// nothing else.
+pub const fn port_clear_reset_change_value(raw: u32) -> u32 {
+    port_state_to_neutral(raw) | PORTSC_PRC
+}
+
+/// Whether the driver must bus-reset this root port before addressing what is on it.
+///
+/// Every connected port gets exactly one reset from the driver, **enabled or not**. A port the
+/// firmware enumerated stays enabled across HCRST on the RK3588's DWC3, and the device behind it
+/// keeps the address the firmware gave it. Without a bus reset our Address Device (SET_ADDRESS
+/// sent to address 0) reaches nobody and completes with a USB transaction error (cc 4): the
+/// Orange Pi 5 Plus keyboard and USB stick were invisible exactly that way (2026-11-12). Linux
+/// likewise resets a port before addressing its device. — TEAL
+pub const fn needs_bus_reset(status: PortStatus, already_reset: bool) -> bool {
+    status.connected() && !already_reset
+}
+
 /// A neutral PORTSC value that initiates a warm reset (bit 31). — TIMBERDOODLE
 pub const fn port_warm_reset_value(raw: u32) -> u32 {
     port_state_to_neutral(raw) | PORTSC_WR
@@ -160,6 +180,11 @@ impl PortStatus {
         self.raw & PORTSC_RESET != 0
     }
 
+    /// A port reset completed since the last change-bit clear (PRC).
+    pub const fn reset_done(self) -> bool {
+        self.raw & PORTSC_PRC != 0
+    }
+
     /// A warm reset completed since the last change-bit clear.
     pub const fn warm_reset_done(self) -> bool {
         self.raw & PORTSC_WRC != 0
@@ -180,6 +205,7 @@ pub struct RootPortScan {
     first_usb2_ready: Option<(u8, u8)>,
     first_superspeed_ready: Option<(u8, u8)>,
     reset_pending: bool,
+    held_for_reset: bool,
 }
 
 impl RootPortScan {
@@ -189,6 +215,7 @@ impl RootPortScan {
             first_usb2_ready: None,
             first_superspeed_ready: None,
             reset_pending: false,
+            held_for_reset: false,
         }
     }
 
@@ -197,7 +224,7 @@ impl RootPortScan {
         if !status.connected() {
             return;
         }
-        if !status.enabled() {
+        if !status.enabled() || status.reset_in_progress() {
             self.reset_pending = true;
             return;
         }
@@ -211,6 +238,12 @@ impl RootPortScan {
         if status.speed() >= 4 && self.first_superspeed_ready.is_none() {
             self.first_superspeed_ready = Some(ready);
         }
+    }
+
+    /// Treat the pass as still waiting on a reset the caller issued, even if the port's bits
+    /// already read enabled (PED can read 1 from before the reset took effect).
+    pub fn hold_for_reset(&mut self) {
+        self.held_for_reset = true;
     }
 
     /// Lowest-numbered connected + enabled port, as `(port_number, speed)`, of any speed.
@@ -233,6 +266,9 @@ impl RootPortScan {
     /// `05e3:0620` hub on the Orange Pi 5 Plus front panel and skipped the High-Speed hub
     /// behind it, so every USB2 keyboard there was invisible. — TIMBERDOODLE
     pub const fn choice(&self) -> Option<(u8, u8)> {
+        if self.held_for_reset {
+            return None;
+        }
         if self.first_usb2_ready.is_some() {
             return self.first_usb2_ready;
         }
@@ -383,5 +419,45 @@ mod tests {
         let empty = scan(&[0, 0x2a0]);
         assert_eq!(empty.choice(), None);
         assert_eq!(empty.first_ready(), None);
+    }
+
+    #[test]
+    fn every_connected_port_is_reset_once_even_if_enabled() {
+        // 0xe03: connected, enabled, High Speed: what the firmware leaves behind.
+        let firmware_enabled = PortStatus::new(0xe03);
+        assert!(needs_bus_reset(firmware_enabled, false));
+        assert!(!needs_bus_reset(firmware_enabled, true));
+        assert!(
+            !needs_bus_reset(PortStatus::new(0x2a0), false),
+            "nothing connected"
+        );
+    }
+
+    #[test]
+    fn a_resetting_port_is_not_ready() {
+        let mut scan = RootPortScan::new();
+        scan.observe(1, PortStatus::new(0xe03 | PORTSC_RESET));
+        assert_eq!(scan.first_ready(), None);
+        assert_eq!(scan.choice(), None);
+        let mut held = RootPortScan::new();
+        held.observe(1, PortStatus::new(0xe03));
+        held.hold_for_reset();
+        assert_eq!(
+            held.choice(),
+            None,
+            "a pass waiting on our reset picks nothing"
+        );
+        let mut done = RootPortScan::new();
+        done.observe(1, PortStatus::new(0xe03));
+        assert_eq!(done.choice(), Some((1, 3)));
+    }
+
+    #[test]
+    fn clearing_the_reset_change_touches_nothing_else() {
+        let raw = 0xe03 | PORTSC_PRC | PORTSC_WRC | (1 << 17);
+        let v = port_clear_reset_change_value(raw);
+        assert_eq!(v & PORTSC_PRC, PORTSC_PRC);
+        assert_eq!(v & (PORTSC_PED | PORTSC_WRC | (1 << 17) | PORTSC_RESET), 0);
+        assert!(PortStatus::new(raw).reset_done());
     }
 }

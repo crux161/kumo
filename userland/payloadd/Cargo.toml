@@ -1,0 +1,27 @@
+[package]
+name = "payloadd"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# PROPOSAL/025 N2: fetch the payload archive (the network root layer) from the boot server over
+# netstack with windowed TFTP (RFC 2347/2348/7440) into a VMO Sora hands it as cap0. The
+# receive state machine is a host-tested lib; the bin is the netstack client.
+[dependencies]
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi.workspace = true
+kumo-netstack = { path = "../../lib/kumo-netstack" }
+kumo-rt = { path = "../kumo-rt" }
+kumo-sha256.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "payloadd"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

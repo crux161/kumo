@@ -259,7 +259,10 @@ fn serve_frame(port: Handle, s: &mut Service) {
     }
     match message.body {
         Body::TxFrame(frame) => {
-            crate::ax88_record(format_args!("NET7b tx frame len={}\n", frame.len()));
+            crate::record(
+                kumo_abi::sys::log_level::DEBUG,
+                format_args!("NET7b tx frame len={}\n", frame.len()),
+            );
             enqueue(s, frame)
         }
         Body::QueryCounters => {
@@ -328,16 +331,21 @@ pub(super) fn note_complete(actual: usize) -> bool {
     } else {
         TxStatus::DeviceError
     };
-    crate::ax88_record(format_args!(
-        "NET7b tx done actual={} transfer={} {}\n",
-        actual,
-        s.transfer,
-        if actual == s.transfer {
-            "handed"
-        } else {
-            "error"
-        }
-    ));
+    // Per frame (as are `tx frame` and `tx answer`): DEBUG, or a proof console spends the
+    // upload logging (2026-11-13 speed test: ~1 Mbit/s up at loglevel 5 vs ~45 at default).
+    crate::record(
+        kumo_abi::sys::log_level::DEBUG,
+        format_args!(
+            "NET7b tx done actual={} transfer={} {}\n",
+            actual,
+            s.transfer,
+            if actual == s.transfer {
+                "handed"
+            } else {
+                "error"
+            }
+        ),
+    );
     s.in_flight = false;
     s.head = (s.head + 1) % QUEUE;
     s.count -= 1;
@@ -347,7 +355,10 @@ pub(super) fn note_complete(actual: usize) -> bool {
                 kumo_netstack::frame::Body::TxDone { answers, .. } => answers,
                 _ => 0,
             };
-            crate::ax88_record(format_args!("NET7b tx answer={}\n", answers));
+            crate::record(
+                kumo_abi::sys::log_level::DEBUG,
+                format_args!("NET7b tx answer={}\n", answers),
+            );
             let _ = write_message(channel, &done);
         }
     }
@@ -356,31 +367,55 @@ pub(super) fn note_complete(actual: usize) -> bool {
 }
 
 /// Forward one RX aggregate to netstack as RX_FRAMEs within the granted window.
-pub(super) fn forward_rx(bytes: &[u8]) {
+/// What one RX aggregate became.
+#[derive(Clone, Copy, Default)]
+pub(super) struct RxOutcome {
+    pub sent: u32,
+    pub no_credit: u32,
+    /// Packets the chip flagged (CRC, hardware drop, runt, oversize).
+    pub flagged: u32,
+    /// The whole aggregate failed to parse; its frames are lost.
+    pub parse_error: bool,
+}
+
+/// Forward one RX aggregate to netstack as RX_FRAMEs within the granted window.
+pub(super) fn forward_rx(bytes: &[u8]) -> RxOutcome {
+    let mut out = RxOutcome::default();
     let Some(s) = service().as_mut() else {
-        return;
+        return out;
     };
     let Some(channel) = s.channel else {
-        return;
+        return out;
     };
     if !s.hello_sent {
-        return;
+        return out;
     }
     let Ok(aggregate) = kumo_ax88::rx::Aggregate::parse(bytes) else {
         s.provider.note_rx_bad();
-        return;
+        out.parse_error = true;
+        return out;
     };
+    let (mut sent, mut no_credit) = (0u32, 0u32);
     for packet in aggregate.packets() {
         match packet {
             kumo_ax88::rx::Packet::Frame { bytes: frame, .. } => {
                 if let Some(rx) = s.provider.send_rx(frame) {
                     let _ = write_message(channel, &rx);
+                    sent += 1;
+                } else {
+                    no_credit += 1;
                 }
             }
-            kumo_ax88::rx::Packet::Dropped { .. } => s.provider.note_rx_bad(),
+            kumo_ax88::rx::Packet::Dropped { .. } => {
+                s.provider.note_rx_bad();
+                out.flagged += 1;
+            }
             kumo_ax88::rx::Packet::Dummy => {}
         }
     }
+    out.sent = sent;
+    out.no_credit = no_credit;
+    out
 }
 
 /// A link-status change reached the driver; report it without polling.

@@ -26,6 +26,7 @@ use alloc::vec::Vec;
 use kumo_netstack::budget::{
     FRAME_MAX, ICMP_BUFFER, ICMP_ECHO_MAX, ICMP_METADATA, SESSIONS, SOCKETS_PER_SESSION,
     SOCKETS_TOTAL, SOCKET_BUFFER, STREAM_PAYLOAD_MAX, UDP_METADATA, UDP_PAYLOAD_MAX,
+    WIRE_UDP_RX_BUFFER, WIRE_UDP_RX_METADATA,
 };
 use kumo_netstack::ingress::{self, Refusals};
 use kumo_netstack::smoltcp::iface::{
@@ -40,8 +41,8 @@ use kumo_netstack::smoltcp::wire::{
 };
 use kumo_netstack::socket::{
     decode_request, encode_reply, hello_limits, Addr, Body, Disposition, Op, Rejected, Reply,
-    Request, Session, SocketKind, Status, ADDR_LEN, HEADER_LEN, RESULT_TRUNCATED, WAIT_CONNECTED,
-    WAIT_READABLE, WAIT_WRITABLE,
+    Request, Session, SocketKind, Status, ADDR_LEN, HEADER_LEN, RESULT_MORE, RESULT_TRUNCATED,
+    WAIT_CONNECTED, WAIT_READABLE, WAIT_WRITABLE,
 };
 use kumo_netstack::{FrameDevice, InjectError, Loopback};
 
@@ -707,12 +708,22 @@ impl Server {
         );
         let mut sockets = SocketSet::new(storage);
         let mut handles = Vec::with_capacity(SOCKETS_TOTAL);
+        // One slab per generation for every twin's receive queue: 32 separate ~96 KiB
+        // allocations would each claim a heap region, and the growable heap has 32.
+        let mut rx_meta = leak(
+            udp::PacketMetadata::EMPTY,
+            SOCKETS_TOTAL * WIRE_UDP_RX_METADATA,
+        );
+        let mut rx_bytes = leak(0u8, SOCKETS_TOTAL * WIRE_UDP_RX_BUFFER);
         for _ in 0..SOCKETS_TOTAL {
+            let (meta, meta_rest) =
+                core::mem::take(&mut rx_meta).split_at_mut(WIRE_UDP_RX_METADATA);
+            rx_meta = meta_rest;
+            let (bytes, bytes_rest) =
+                core::mem::take(&mut rx_bytes).split_at_mut(WIRE_UDP_RX_BUFFER);
+            rx_bytes = bytes_rest;
             let udp = udp::Socket::new(
-                udp::PacketBuffer::new(
-                    leak(udp::PacketMetadata::EMPTY, UDP_METADATA),
-                    leak(0u8, SOCKET_BUFFER),
-                ),
+                udp::PacketBuffer::new(meta, bytes),
                 udp::PacketBuffer::new(
                     leak(udp::PacketMetadata::EMPTY, UDP_METADATA),
                     leak(0u8, SOCKET_BUFFER),
@@ -1071,6 +1082,24 @@ impl Server {
                     &payload,
                     out,
                 );
+                self.answered(session);
+            }
+            Answer::Batch { socket, replies } => {
+                let last = replies.len().saturating_sub(1);
+                for (i, (result, payload)) in replies.iter().enumerate() {
+                    let more = if i < last { RESULT_MORE } else { 0 };
+                    self.push_reply(
+                        session,
+                        op as u16,
+                        request.request_id,
+                        socket,
+                        Status::Ok,
+                        result | more,
+                        payload,
+                        out,
+                    );
+                }
+                // One admitted request, one answer, however many replies carried it.
                 self.answered(session);
             }
             Answer::Deferred => {}
@@ -2195,6 +2224,39 @@ impl Server {
                 self.stats.datagrams_received += 1;
                 Ok(Answer::payload(socket, result, payload))
             }
+            Body::RecvBatch { count } => {
+                let mut replies = Vec::with_capacity(count as usize);
+                while replies.len() < count as usize {
+                    // Wire first, as for RECVFROM: a wire datagram never waits behind loopback.
+                    let from_wire = if let (Some(wire), Some(handle)) =
+                        (self.wire.as_mut(), self.slots[index].wire_udp)
+                    {
+                        wire.sockets.get_mut::<udp::Socket>(handle).recv().ok()
+                    } else {
+                        None
+                    };
+                    let (data, meta) = match from_wire {
+                        Some(pair) => pair,
+                        None => match self
+                            .sockets
+                            .get_mut::<udp::Socket>(self.slots[index].udp)
+                            .recv()
+                        {
+                            Ok(pair) => pair,
+                            Err(_) => break,
+                        },
+                    };
+                    let mut payload = Vec::with_capacity(ADDR_LEN + data.len());
+                    payload.extend_from_slice(&addr_of(meta.endpoint).encode());
+                    payload.extend_from_slice(data);
+                    replies.push((data.len() as u64, payload));
+                }
+                if replies.is_empty() {
+                    return Err(Status::WouldBlock);
+                }
+                self.stats.datagrams_received += replies.len() as u64;
+                Ok(Answer::Batch { socket, replies })
+            }
             Body::Listen { .. } | Body::Accept | Body::Shutdown { .. } => Err(Status::Unsupported),
             _ => self.dispatch_common(session, index, request, now_ns),
         }
@@ -2574,6 +2636,11 @@ enum Answer {
         socket: u32,
         result: u64,
         payload: Vec<u8>,
+    },
+    /// RECV_BATCH: one reply per datagram, `(result, payload)`, sent in order.
+    Batch {
+        socket: u32,
+        replies: Vec<(u64, Vec<u8>)>,
     },
     Deferred,
 }

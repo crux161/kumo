@@ -51,6 +51,7 @@ members = [
     "userland/gpu-contain",
     "userland/ls",
     "userland/netprobe",
+    "userland/payloadd",
     "userland/lua-repl",
     "userland/threads",
     "userland/kumo-dispatch",
@@ -109,3 +110,11 @@ panic = "abort"
 
 [profile.dev]
 panic = "abort"
+
+# Nijigumo is built in the dev profile, but its compressed-initrd path hashes and decodes
+# ~10 MB before handoff: unoptimized that cost 1.7 s on the opi5 (PROPOSAL/025 Z1).
+[profile.dev.package.ruzstd]
+opt-level = 3
+
+[profile.dev.package.kumo-sha256]
+opt-level = 3
