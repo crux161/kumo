@@ -26,7 +26,7 @@ use kumo_abi::{unpack_argv, Errno, Handle};
 use kumo_netstack::budget::{SOCKETS_PER_SESSION, UDP_PAYLOAD_MAX};
 use kumo_netstack::socket::{
     decode_reply, encode_request, Addr, Op, RequestHeader, Status, ADDR_LEN, HEADER_LEN,
-    WAIT_CONNECTED, WAIT_READABLE, WAIT_WRITABLE,
+    RECV_BATCH_MAX, RESULT_MORE, WAIT_CONNECTED, WAIT_READABLE, WAIT_WRITABLE,
 };
 use kumo_rt::{channel_read, channel_write, debug_write, process_exit, startup, vmo_read};
 
@@ -261,6 +261,37 @@ impl Client {
         payload[ADDR_LEN..ADDR_LEN + data.len()].copy_from_slice(data);
         self.call(Op::SendTo, socket, 0, &payload[..ADDR_LEN + data.len()])
             .status
+    }
+
+    /// RECV_BATCH: ask netstack for up to `count` queued datagrams and hand each body (the
+    /// source address stripped) to `sink`. The first reply comes back through `call`; the
+    /// rest, flagged RESULT_MORE, are already in the channel. Returns how many arrived; 0
+    /// when the socket was empty (WouldBlock).
+    fn recv_batch(&mut self, socket: u32, count: u16, mut sink: impl FnMut(&[u8])) -> usize {
+        let first = self.call(Op::RecvBatch, socket, count as u64, &[]);
+        if first.status != Status::Ok || first.len < ADDR_LEN {
+            return 0;
+        }
+        let id = self.next_id - 1;
+        sink(&self.rx[HEADER_LEN + ADDR_LEN..HEADER_LEN + first.len]);
+        let mut received = 1;
+        let mut more = first.result & RESULT_MORE != 0;
+        while more {
+            let n = channel_read(self.channel, self.rx.as_mut_ptr(), self.rx.len()) as usize;
+            if n == 0 || n > self.rx.len() {
+                break;
+            }
+            let Ok(reply) = decode_reply(&self.rx[..n], 0) else {
+                break;
+            };
+            if reply.request_id != id || reply.payload.len() < ADDR_LEN {
+                break;
+            }
+            more = reply.result & RESULT_MORE != 0;
+            sink(&reply.payload[ADDR_LEN..]);
+            received += 1;
+        }
+        received
     }
 
     /// WAIT for a datagram (2 s), then RECVFROM it and check bytes and source.
@@ -908,20 +939,28 @@ fn speed(client: &mut Client, ip: [u8; 4], port: u16, seconds: u16, retries: u32
         if now > end + 2_000_000_000 {
             break; // the end marker was lost
         }
-        if let Some(len) = speed_recv(client, s, 200, &mut body) {
-            if len >= 5 && body[0] == b'D' {
+        // RECV_BATCH: up to 32 queued datagrams per netstack turn; WAIT only when empty.
+        let mut ended = None;
+        let n = client.recv_batch(s, RECV_BATCH_MAX as u16, |body| {
+            if body.len() >= 5 && body[0] == b'D' {
                 let seq = u32::from_le_bytes([body[1], body[2], body[3], body[4]]) as u64;
                 got += 1;
-                bytes += len as u64;
+                bytes += body.len() as u64;
                 max_seq = max_seq.max(seq + 1);
                 last_at = kumo_rt::clock_get();
                 if first_at == 0 {
                     first_at = last_at;
                 }
-            } else if let Some(n) = speed_field(&body[..len], b"SPD1 DOWNEND", 0) {
-                peer_sent = n;
-                break;
+            } else if let Some(sent) = speed_field(body, b"SPD1 DOWNEND", 0) {
+                ended = Some(sent);
             }
+        });
+        if let Some(sent) = ended {
+            peer_sent = sent;
+            break;
+        }
+        if n == 0 {
+            let _ = client.call(Op::Wait, s, WAIT_READABLE as u64 | (200u64 << 32), &[]);
         }
         let now = kumo_rt::clock_get();
         if now - tick_at >= 1_000_000_000 {

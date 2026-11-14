@@ -215,6 +215,44 @@ fn two_sessions_exchange_exact_datagrams_over_loopback() {
 }
 
 #[test]
+fn recv_batch_returns_queued_datagrams_in_one_turn() {
+    let mut server = Server::new(0);
+    let mut c = Client::open(&mut server);
+    let (rx, tx) = (c.udp(&mut server), c.udp(&mut server));
+    let port = c.bind(&mut server, rx, 0);
+    let sent: Vec<Vec<u8>> = (0..4u8).map(|i| vec![b'a' + i; 3 + i as usize]).collect();
+    for data in &sent {
+        assert_eq!(c.sendto(&mut server, tx, port, data).status, Status::Ok);
+    }
+    // Three of four: three replies, one request id, MORE on all but the last.
+    let out = c.send(&mut server, Op::RecvBatch, rx, 3, &[], 0);
+    assert_eq!(out.len(), 3);
+    let ids: Vec<u32> = out
+        .iter()
+        .map(|o| decode_reply(&o.bytes, 0).unwrap().request_id)
+        .collect();
+    assert!(ids.iter().all(|id| *id == ids[0]));
+    for (i, output) in out.iter().enumerate() {
+        let got = Client::read(output);
+        assert_eq!(got.status, Status::Ok);
+        assert_eq!(&got.payload[ADDR_LEN..], sent[i].as_slice());
+        assert_eq!(got.result & !RESULT_MORE, sent[i].len() as u64);
+        assert_eq!(got.result & RESULT_MORE != 0, i < 2, "MORE on reply {i}");
+    }
+    // The rest: one reply, no MORE. Then an empty socket answers one WouldBlock.
+    let rest = c.call(&mut server, Op::RecvBatch, rx, 32, &[]);
+    assert_eq!(&rest.payload[ADDR_LEN..], sent[3].as_slice());
+    assert_eq!(rest.result & RESULT_MORE, 0);
+    let empty = c.call(&mut server, Op::RecvBatch, rx, 32, &[]);
+    assert_eq!(empty.status, Status::WouldBlock);
+    assert_eq!(server.stats().datagrams_received, 4);
+    // A batch counts as one answered request: the session keeps working.
+    assert_eq!(c.sendto(&mut server, tx, port, b"after").status, Status::Ok);
+    let after = c.recvfrom(&mut server, rx, 64);
+    assert_eq!(&after.payload[ADDR_LEN..], b"after");
+}
+
+#[test]
 fn recvfrom_truncates_and_flags_a_long_datagram() {
     let mut server = Server::new(0);
     let mut c = Client::open(&mut server);

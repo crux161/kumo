@@ -41,8 +41,8 @@ use kumo_netstack::smoltcp::wire::{
 };
 use kumo_netstack::socket::{
     decode_request, encode_reply, hello_limits, Addr, Body, Disposition, Op, Rejected, Reply,
-    Request, Session, SocketKind, Status, ADDR_LEN, HEADER_LEN, RESULT_TRUNCATED, WAIT_CONNECTED,
-    WAIT_READABLE, WAIT_WRITABLE,
+    Request, Session, SocketKind, Status, ADDR_LEN, HEADER_LEN, RESULT_MORE, RESULT_TRUNCATED,
+    WAIT_CONNECTED, WAIT_READABLE, WAIT_WRITABLE,
 };
 use kumo_netstack::{FrameDevice, InjectError, Loopback};
 
@@ -1082,6 +1082,24 @@ impl Server {
                     &payload,
                     out,
                 );
+                self.answered(session);
+            }
+            Answer::Batch { socket, replies } => {
+                let last = replies.len().saturating_sub(1);
+                for (i, (result, payload)) in replies.iter().enumerate() {
+                    let more = if i < last { RESULT_MORE } else { 0 };
+                    self.push_reply(
+                        session,
+                        op as u16,
+                        request.request_id,
+                        socket,
+                        Status::Ok,
+                        result | more,
+                        payload,
+                        out,
+                    );
+                }
+                // One admitted request, one answer, however many replies carried it.
                 self.answered(session);
             }
             Answer::Deferred => {}
@@ -2206,6 +2224,39 @@ impl Server {
                 self.stats.datagrams_received += 1;
                 Ok(Answer::payload(socket, result, payload))
             }
+            Body::RecvBatch { count } => {
+                let mut replies = Vec::with_capacity(count as usize);
+                while replies.len() < count as usize {
+                    // Wire first, as for RECVFROM: a wire datagram never waits behind loopback.
+                    let from_wire = if let (Some(wire), Some(handle)) =
+                        (self.wire.as_mut(), self.slots[index].wire_udp)
+                    {
+                        wire.sockets.get_mut::<udp::Socket>(handle).recv().ok()
+                    } else {
+                        None
+                    };
+                    let (data, meta) = match from_wire {
+                        Some(pair) => pair,
+                        None => match self
+                            .sockets
+                            .get_mut::<udp::Socket>(self.slots[index].udp)
+                            .recv()
+                        {
+                            Ok(pair) => pair,
+                            Err(_) => break,
+                        },
+                    };
+                    let mut payload = Vec::with_capacity(ADDR_LEN + data.len());
+                    payload.extend_from_slice(&addr_of(meta.endpoint).encode());
+                    payload.extend_from_slice(data);
+                    replies.push((data.len() as u64, payload));
+                }
+                if replies.is_empty() {
+                    return Err(Status::WouldBlock);
+                }
+                self.stats.datagrams_received += replies.len() as u64;
+                Ok(Answer::Batch { socket, replies })
+            }
             Body::Listen { .. } | Body::Accept | Body::Shutdown { .. } => Err(Status::Unsupported),
             _ => self.dispatch_common(session, index, request, now_ns),
         }
@@ -2585,6 +2636,11 @@ enum Answer {
         socket: u32,
         result: u64,
         payload: Vec<u8>,
+    },
+    /// RECV_BATCH: one reply per datagram, `(result, payload)`, sent in order.
+    Batch {
+        socket: u32,
+        replies: Vec<(u64, Vec<u8>)>,
     },
     Deferred,
 }
