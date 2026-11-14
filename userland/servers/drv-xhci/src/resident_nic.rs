@@ -1729,7 +1729,9 @@ impl RxWindow {
         self.no_credit += no_credit;
         self.max_frames = self.max_frames.max(frames + no_credit);
         let span = now.saturating_sub(self.start_ns);
-        if span >= 1_000_000_000 {
+        // Only a second that lost frames is worth a console line; a clean one is chatter.
+        let lossy = self.no_credit > 0 || self.flagged > 0 || self.parse_errors > 0;
+        if span >= 1_000_000_000 && lossy {
             ax88_record(format_args!(
                 "NET rx/s transfers={} bytes={} frames={} no_credit={} flagged={} parse_errors={} max_frames_per_transfer={} span_ms={}\n",
                 self.transfers,
@@ -1741,6 +1743,8 @@ impl RxWindow {
                 self.max_frames,
                 span / 1_000_000
             ));
+        }
+        if span >= 1_000_000_000 {
             *self = Self {
                 start_ns: now,
                 ..Self::default()
