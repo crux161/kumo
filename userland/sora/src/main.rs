@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j864
 //j870
 //j888
 //j889
 //j890
+//j892
 
 extern crate alloc;
 
@@ -7097,13 +7097,40 @@ fn eval_command(
             slots[count] = arg.as_bytes();
             count += 1;
         }
+        // SH7-d3b: a program under `/media/<vol>/` runs over a read-only session on that
+        // volume, and its path becomes volume-relative: the volume is the Linux program's
+        // whole filesystem, so its `/lib` and everything else it opens are the volume's.
+        let mut fs = FsGrant::Image;
+        match sora::media_route(cmd.args[0].as_bytes()) {
+            sora::MediaRoute::Elsewhere => {}
+            sora::MediaRoute::Root => {
+                log(b"linux: /media: is a directory\n");
+                return true;
+            }
+            sora::MediaRoute::Volume { name, path } => {
+                // A synchronous autoexec runs before the serve loop reads the stick's offer:
+                // wait for it as the `media` word does (the read-only session below is all
+                // this launch takes).
+                if media().is_none() {
+                    let _ = ensure_media_writable(initrd);
+                }
+                if !media().is_some_and(|media| media.name.as_bytes() == name) {
+                    log(b"linux: /media/");
+                    log(name);
+                    log(b": no such volume\n");
+                    return true;
+                }
+                slots[1] = path;
+                fs = FsGrant::Media(BlockAccess::ReadOnly);
+            }
+        }
         run_with_startup_input(
             initrd,
             kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
             b"linux",
             Some(&slots[..count]),
             false,
-            FsGrant::Image,
+            fs,
             false,
             false,
             StdinMode::None,

@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j545
 //j549
 //j559
 //j864
 //j891
+//j892
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -24,11 +24,12 @@ use fatfs::{
     dispatch_shared_bulk, BulkWindow, FatServer, SharedServer, Transport, MAX_SESSIONS,
     REPLY_BUF_BYTES, REQUEST_BUF_BYTES, SESSION_READ_ONLY, SESSION_READ_WRITE,
 };
-use kumo_abi::{Handle, VmarFlags};
+use kumo_abi::{Handle, Rights, VmarFlags};
 use kumo_fatfs::{FatVolume, SectorReader, SectorWriter, SECTOR_SIZE};
 use kumo_rt::{
-    channel_read, channel_read_with_handle, channel_write, handle_close, handle_koid, port_bind,
-    port_create, port_unbind, port_wait, vmar_map, vmar_map_anywhere_at, vmar_unmap,
+    channel_read, channel_read_with_handle, channel_write, channel_write_with_handle, handle_close,
+    handle_duplicate, handle_koid, port_bind, port_create, port_unbind, port_wait, vmar_map,
+    vmar_map_anywhere_at, vmar_unmap,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
@@ -177,6 +178,22 @@ struct ChannelBlocks {
 impl BlockTransport for ChannelBlocks {
     fn exchange(&mut self, request: &[u8], reply: &mut [u8]) -> Option<usize> {
         if channel_write(self.channel, request.as_ptr(), request.len()) != 0 {
+            return None;
+        }
+        let n = channel_read(self.channel, reply.as_mut_ptr(), reply.len());
+        (n != 0 && n != u64::MAX && n <= reply.len() as u64).then_some(n as usize)
+    }
+
+    /// SH7-d3b: the request carries a copy of the client's VMO, with the rights to write and
+    /// map it and nothing more; the block driver closes it when the request is done.
+    fn exchange_with_vmo(&mut self, request: &[u8], vmo: u32, reply: &mut [u8]) -> Option<usize> {
+        let raw = handle_duplicate(
+            Handle(vmo),
+            Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::TRANSFER.0),
+        );
+        let copy = valid(raw)?;
+        if channel_write_with_handle(self.channel, request.as_ptr(), request.len(), copy) != 0 {
+            let _ = handle_close(copy);
             return None;
         }
         let n = channel_read(self.channel, reply.as_mut_ptr(), reply.len());

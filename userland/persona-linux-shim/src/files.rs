@@ -1,5 +1,6 @@
 //j890
 //j891
+//j892
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -175,10 +176,11 @@ pub fn vfs_read_vmo(handle: u32, offset: u64, vmo: Handle, vmo_offset: u64, len:
         .encode_into(&mut frame) else {
             return -errno::EINVAL;
         };
-        // The rights VmoCreate gave, minus DUPLICATE: fatfs may write and map it, not copy it.
+        // The rights VmoCreate gave. DUPLICATE stays (SH7-d3b): a block-backed fatfs hands a
+        // copy to the block driver, which writes the sectors into it directly.
         let raw = handle_duplicate(
             vmo,
-            Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::TRANSFER.0),
+            Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0),
         );
         if raw == 0 || raw == u64::MAX {
             read_vmo_trouble(b"duplicate", raw);

@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j545
 //j547
 //j548
 //j861
 //j891
+//j892
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -662,6 +662,29 @@ pub trait SectorReader {
         }
         true
     }
+
+    /// Read `count` consecutive sectors from `lba` straight into the VMO `vmo` at byte
+    /// `vmo_offset` (SH7-d3b): a block driver that can write a client's VMO itself, so the bytes
+    /// never pass through the filesystem. `None` means this backing cannot (the caller then
+    /// uses [`Self::read_sectors`]); `Some(false)` is a failed read.
+    fn read_sectors_to_vmo(
+        &mut self,
+        _lba: u32,
+        _count: u32,
+        _vmo: u32,
+        _vmo_offset: u64,
+    ) -> Option<bool> {
+        None
+    }
+}
+
+/// SH7-d3b: where the bytes of a read's output buffer live in a VMO: `out[0]` is byte
+/// `base` of VMO `vmo`. Given to [`FatVolume::read_file_at_sink`], it lets the sector-aligned
+/// interior of a run go to [`SectorReader::read_sectors_to_vmo`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmoSink {
+    pub vmo: u32,
+    pub base: u64,
 }
 
 /// Where a reader last stood in a file's cluster chain (SH7-d3a): the chain index of a cluster
@@ -1038,6 +1061,22 @@ impl FatVolume {
         offset: u64,
         out: &mut [u8],
     ) -> usize {
+        self.read_file_at_sink(reader, entry, cursor, offset, out, None)
+    }
+
+    /// [`Self::read_file_at_cursor`] whose output also lives in a VMO (SH7-d3b): the
+    /// sector-aligned interior of each run is offered to
+    /// [`SectorReader::read_sectors_to_vmo`] first, and read into `out` only when the backing
+    /// declines.
+    pub fn read_file_at_sink<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        entry: &DirEntry,
+        cursor: &mut ChainCursor,
+        offset: u64,
+        out: &mut [u8],
+        sink: Option<VmoSink>,
+    ) -> usize {
         let size = entry.size as u64;
         if offset >= size || out.is_empty() || entry.first_cluster < 2 {
             return 0;
@@ -1099,9 +1138,22 @@ impl FatVolume {
                 let within = (pos % sector) as usize;
                 let whole = (run_end - pos) / sector;
                 if within == 0 && whole > 0 {
-                    // The sector-aligned interior goes straight into `out`.
+                    // The sector-aligned interior goes straight into `out`, or straight into
+                    // the VMO behind it when the backing can write it.
                     let bytes = (whole * sector) as usize;
-                    if !reader.read_sectors(lba, &mut out[done..done + bytes]) {
+                    let direct = sink.and_then(|sink| {
+                        reader.read_sectors_to_vmo(
+                            lba,
+                            whole as u32,
+                            sink.vmo,
+                            sink.base + done as u64,
+                        )
+                    });
+                    let read = match direct {
+                        Some(read) => read,
+                        None => reader.read_sectors(lba, &mut out[done..done + bytes]),
+                    };
+                    if !read {
                         return done;
                     }
                     pos += bytes as u64;
@@ -2639,6 +2691,97 @@ mod tests {
         assert_eq!(counting.fat_reads, 1);
         // One run read for the whole sectors, one bounce for the 40-byte tail.
         assert_eq!(counting.calls, 1 + 1 + 1);
+    }
+
+    #[test]
+    fn a_sink_sends_aligned_interiors_to_the_vmo_and_edges_to_the_buffer() {
+        extern crate std;
+        /// A backing that writes "VMO 9" itself, and declines any other VMO.
+        struct VmoDisk<'a> {
+            disk: &'a mut WritableDisk,
+            vmo: std::vec::Vec<u8>,
+            direct_sectors: u32,
+        }
+        impl SectorReader for VmoDisk<'_> {
+            fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+                self.disk.read_sector(lba, buf)
+            }
+            fn read_sectors_to_vmo(
+                &mut self,
+                lba: u32,
+                count: u32,
+                vmo: u32,
+                vmo_offset: u64,
+            ) -> Option<bool> {
+                if vmo != 9 {
+                    return None;
+                }
+                for index in 0..count {
+                    let mut sector = [0u8; SECTOR_SIZE];
+                    if !self.disk.read_sector(lba + index, &mut sector) {
+                        return Some(false);
+                    }
+                    let at = vmo_offset as usize + index as usize * SECTOR_SIZE;
+                    self.vmo[at..at + SECTOR_SIZE].copy_from_slice(&sector);
+                }
+                self.direct_sectors += count;
+                Some(true)
+            }
+        }
+        let (mut disk, volume, entries, data) = fragmented_volume();
+        for (entry, bytes) in entries.iter().zip(data.iter()) {
+            for (offset, len) in [(0u64, 2600usize), (300, 1500), (512, 1024), (1, 2)] {
+                let mut backing = VmoDisk {
+                    disk: &mut disk,
+                    vmo: std::vec![0xEE; 8192],
+                    direct_sectors: 0,
+                };
+                // `out` is the window of VMO 9 starting at byte 100: what the server maps.
+                let mut out = std::vec![0xEEu8; len];
+                let sink = VmoSink { vmo: 9, base: 100 };
+                let n = volume.read_file_at_sink(
+                    &mut backing,
+                    entry,
+                    &mut ChainCursor::new(),
+                    offset,
+                    &mut out,
+                    Some(sink),
+                );
+                assert_eq!(n, len);
+                // Assemble what the client sees: edges from `out`, interiors from the VMO.
+                let expect = &bytes[offset as usize..offset as usize + len];
+                let direct = backing.direct_sectors as usize * SECTOR_SIZE;
+                let mut seen = 0usize;
+                for (index, want) in expect.iter().enumerate() {
+                    let from_vmo = backing.vmo[100 + index];
+                    let byte = if out[index] == 0xEE && from_vmo != 0xEE {
+                        seen += 1;
+                        from_vmo
+                    } else {
+                        out[index]
+                    };
+                    assert_eq!(byte, *want, "offset {offset} len {len} byte {index}");
+                }
+                assert!(seen <= direct);
+                if len >= 2 * SECTOR_SIZE {
+                    assert!(
+                        backing.direct_sectors > 0,
+                        "an aligned interior went direct"
+                    );
+                }
+                // A VMO the backing declines: everything lands in `out`.
+                let mut out = std::vec![0u8; len];
+                let n = volume.read_file_at_sink(
+                    &mut backing,
+                    entry,
+                    &mut ChainCursor::new(),
+                    offset,
+                    &mut out,
+                    Some(VmoSink { vmo: 3, base: 0 }),
+                );
+                assert_eq!((n, &out[..]), (len, expect));
+            }
+        }
     }
 
     #[test]

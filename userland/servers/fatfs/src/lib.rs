@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j863
 //j865
 //j866
 //j869
 //j891
+//j892
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -25,6 +25,7 @@ pub mod block;
 
 use kumo_fatfs::{
     ChainCursor, DirEntry, DirLocation, FatVolume, FatWriteError, SectorReader, SectorWriter,
+    VmoSink,
 };
 use kumo_vfs::{
     encode_open_ok, encode_read_vmo_ok, encode_stat_ok, encode_status, encode_write_ok,
@@ -871,8 +872,13 @@ fn read_vmo<R: SectorReader, W: BulkWindow>(
     }
     let entry = file.entry;
     let cursor = &mut file.cursor;
+    // SH7-d3b: the backing may write the client's VMO itself for whole sectors.
+    let sink = Some(VmoSink {
+        vmo: args.vmo,
+        base: args.vmo_offset,
+    });
     let landed = window.fill(args.vmo, args.vmo_offset, want, &mut |out| {
-        volume.read_file_at_cursor(reader, &entry, cursor, args.offset, out)
+        volume.read_file_at_sink(reader, &entry, cursor, args.offset, out, sink)
     });
     match landed {
         Some(count) => write_frame(reply, &encode_read_vmo_ok(count as u32)),

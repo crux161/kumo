@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j802
 //j803
 //j805
 //j806
 //j807
+//j892
 //! One owner per process: polled Identify, then a read-only I/O pair whose completions
 //! arrive by INTx (NV6). A proof owner runs the NV6 sequence and exits; a serve owner
 //! (NV7) offers the namespace's FAT32 volume to Sora and serves it read-only until Sora
@@ -19,7 +19,7 @@
 extern crate alloc;
 use drv_blk::{
     decode_connect, volume_request, BlockAccess, MediaReady, VolumeRequest, CONTROL_CONNECT_LEN,
-    REQUEST_LEN, STATUS_IO_ERROR, STATUS_OK, STATUS_READ_ONLY,
+    REQUEST_LEN, STATUS_IO_ERROR, STATUS_OK, STATUS_READ_ONLY, STATUS_UNSUPPORTED,
 };
 use drv_nvme::{
     exercise_with, Error, Memory, Proof, RegisterIo, Startup, ACK, DMA_BYTES, MMIO_BYTES,
@@ -829,7 +829,13 @@ fn serve(
         };
         let client = Handle(clients[i].handle);
         let mut frame = [0u8; REQUEST_LEN + SECTOR_SIZE + 1];
-        let n = channel_read(client, frame.as_mut_ptr(), frame.len());
+        let (n, carried) = channel_read_with_handle(client, frame.as_mut_ptr(), frame.len());
+        let n = n as u64;
+        // SH7-d3b: CMD_READ_VMO carries a VMO this driver does not use (it answers
+        // STATUS_UNSUPPORTED); never keep it.
+        if carried != 0 && carried != u64::MAX {
+            let _ = handle_close(Handle(carried as u32));
+        }
         if n == 0 || n > frame.len() as u64 {
             let _ = port_unbind(port, client);
             let _ = handle_close(client);
@@ -893,6 +899,10 @@ fn serve(
                     &alloc::format!("NV9 FLUSH session={} slot={} completed\n", s.session, i),
                 );
                 STATUS_OK
+            }
+            Ok(VolumeRequest::ReadVmo { .. }) => {
+                clients[i].refused += 1;
+                STATUS_UNSUPPORTED
             }
             Ok(VolumeRequest::Write(lba, data)) => {
                 if let Err(e) = pair.write_irq(io, &mut line, s, memory, lba, data, &mut stats) {

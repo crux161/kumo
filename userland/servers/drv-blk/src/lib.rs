@@ -1,9 +1,9 @@
 #![no_std]
-//j414
 //j545
 //j550
 //j803
 //j864
+//j892
 
 //! `drv-blk` — a minimal ramdisk block device over a VMO.
 //!
@@ -24,6 +24,16 @@ pub const CMD_WRITE: u8 = 0x01;
 /// in RAM); it exists so a filesystem client can request a barrier without special-casing the
 /// backend. Carries no data; `lba`/`count` are ignored.
 pub const CMD_FLUSH: u8 = 0x02;
+/// Command byte: read `count` blocks straight into the VMO the message carries (SH7-d3b).
+/// The frame is [`READ_VMO_REQUEST_LEN`] bytes: the request header, then the byte offset in
+/// the VMO where block `lba` lands. The reply is one status byte; the server closes the VMO.
+/// A driver that cannot answers [`STATUS_UNSUPPORTED`], and the client reads block by block.
+pub const CMD_READ_VMO: u8 = 0x03;
+/// Wire length of a [`CMD_READ_VMO`] frame: `[header: REQUEST_LEN][vmo_offset: u64 LE]`.
+pub const READ_VMO_REQUEST_LEN: usize = REQUEST_LEN + 8;
+/// Most blocks one [`CMD_READ_VMO`] asks for (64 KiB): one USB bulk transfer's worth, and a
+/// bound on the window a client can make a driver map.
+pub const READ_VMO_MAX_BLOCKS: u16 = 128;
 
 /// Response status: success.
 pub const STATUS_OK: u8 = 0x00;
@@ -35,6 +45,9 @@ pub const STATUS_BAD_LEN: u8 = 0x02;
 pub const STATUS_READ_ONLY: u8 = 0x03;
 /// Response status: the device failed the transfer (a USB read that did not complete).
 pub const STATUS_IO_ERROR: u8 = 0x04;
+/// Response status: this driver does not implement the command (SH7-d3b: [`CMD_READ_VMO`] on
+/// a driver without it). The client falls back to what every driver serves.
+pub const STATUS_UNSUPPORTED: u8 = 0x05;
 
 /// A block device backed by a contiguous VMO.
 pub struct BlockDevice {
@@ -175,6 +188,22 @@ impl Request {
     }
 }
 
+/// Encode a [`CMD_READ_VMO`] frame: `count` blocks from `lba` into the carried VMO at
+/// `vmo_offset` (SH7-d3b).
+pub fn encode_read_vmo(lba: u64, count: u16, vmo_offset: u64) -> [u8; READ_VMO_REQUEST_LEN] {
+    let mut frame = [0u8; READ_VMO_REQUEST_LEN];
+    frame[..REQUEST_LEN].copy_from_slice(
+        &Request {
+            cmd: CMD_READ_VMO,
+            lba,
+            count,
+        }
+        .encode(),
+    );
+    frame[REQUEST_LEN..].copy_from_slice(&vmo_offset.to_le_bytes());
+    frame
+}
+
 /// Split a write frame `[header: REQUEST_LEN][data: count*BLOCK_SIZE]` into its request and
 /// data slice. The server calls this to recover the payload that rides with a [`CMD_WRITE`]
 /// request in one message. Returns:
@@ -224,6 +253,12 @@ pub enum VolumeRequest<'a> {
     Read(u64),
     Write(u64, &'a [u8]),
     Flush,
+    /// SH7-d3b: `count` blocks from device `lba` into the carried VMO at `vmo_offset`.
+    ReadVmo {
+        lba: u64,
+        count: u16,
+        vmo_offset: u64,
+    },
 }
 
 /// Validate the complete frame before any device transaction or write touches the media. A
@@ -238,6 +273,27 @@ pub fn volume_request(
     let request = Request::decode(frame).ok_or(STATUS_BAD_LEN)?;
     match request.cmd {
         CMD_FLUSH if frame.len() == REQUEST_LEN => return Ok(VolumeRequest::Flush),
+        CMD_READ_VMO if frame.len() == READ_VMO_REQUEST_LEN => {
+            if request.count == 0 || request.count > READ_VMO_MAX_BLOCKS {
+                return Err(STATUS_BAD_LEN);
+            }
+            let end = request
+                .lba
+                .checked_add(request.count as u64)
+                .ok_or(STATUS_BAD_LBA)?;
+            if end > block_count {
+                return Err(STATUS_BAD_LBA);
+            }
+            return Ok(VolumeRequest::ReadVmo {
+                lba: first_lba.checked_add(request.lba).ok_or(STATUS_BAD_LBA)?,
+                count: request.count,
+                vmo_offset: u64::from_le_bytes(
+                    frame[REQUEST_LEN..]
+                        .try_into()
+                        .map_err(|_| STATUS_BAD_LEN)?,
+                ),
+            });
+        }
         CMD_READ if frame.len() == REQUEST_LEN => {}
         CMD_WRITE if frame.len() == REQUEST_LEN + BLOCK_SIZE as usize => {}
         _ => return Err(STATUS_BAD_LEN),
@@ -648,6 +704,58 @@ mod tests {
         );
         // A volume's read-only policy still overrides an explicit writer. — KESTREL
         assert_eq!(volume_request(&frame, 2048, 4, true), Err(STATUS_READ_ONLY));
+    }
+
+    #[test]
+    fn read_vmo_names_a_run_inside_the_partition_and_nothing_else() {
+        let frame = encode_read_vmo(2, 2, 0x1234);
+        assert_eq!(
+            volume_request(&frame, 2048, 4, true),
+            Ok(VolumeRequest::ReadVmo {
+                lba: 2050,
+                count: 2,
+                vmo_offset: 0x1234
+            })
+        );
+        // The run must end inside the volume, be 1..=128 blocks, and the frame exact.
+        assert_eq!(
+            volume_request(&encode_read_vmo(3, 2, 0), 2048, 4, false),
+            Err(STATUS_BAD_LBA)
+        );
+        assert_eq!(
+            volume_request(&encode_read_vmo(u64::MAX, 2, 0), 2048, 4, false),
+            Err(STATUS_BAD_LBA)
+        );
+        assert_eq!(
+            volume_request(&encode_read_vmo(0, 0, 0), 2048, 4, false),
+            Err(STATUS_BAD_LEN)
+        );
+        assert_eq!(
+            volume_request(
+                &encode_read_vmo(0, READ_VMO_MAX_BLOCKS + 1, 0),
+                2048,
+                1 << 20,
+                false
+            ),
+            Err(STATUS_BAD_LEN)
+        );
+        assert_eq!(
+            volume_request(
+                &encode_read_vmo(0, READ_VMO_MAX_BLOCKS, 0),
+                2048,
+                1 << 20,
+                false
+            ),
+            Ok(VolumeRequest::ReadVmo {
+                lba: 2048,
+                count: READ_VMO_MAX_BLOCKS,
+                vmo_offset: 0
+            })
+        );
+        assert_eq!(
+            volume_request(&frame[..frame.len() - 1], 2048, 4, false),
+            Err(STATUS_BAD_LEN)
+        );
     }
 
     #[test]

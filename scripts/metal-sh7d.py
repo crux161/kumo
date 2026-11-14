@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j891
+#j892
 """SH7-d metal: the persona-linux programs on the Orange Pi 5 Plus, one PXE boot.
 
     linux /bin/m10-hello   static Linux ELF through the in-process shim (SH7-b)
@@ -8,6 +9,9 @@
     linux /bin/greet       NEEDED libgreet.so, found by musl in /lib (SH7-d2)
     linux /bin/fileprobe   the Linux file surface (SH7-d2)
     linux /bin/bigread     bulk read/mmap/pread of a 6 MiB file through vfs ReadVmo (SH7-d3a)
+    --stick: linux /media/KUMO/bin/bigread, the same probe from the USB stick, whose fatfs
+             session hands the client's VMO to drv-xhci (SH7-d3b; the stick carries the files
+             build/verification/sh7/sh7d3/stick stages)
 
 The metal half of scripts/persona-smoke.py. Reuses scripts/metal-sh3e.py's board machinery
 (import only), like the other metal suites. Prerequisites, per the opi5 serial-loop recipe:
@@ -67,14 +71,14 @@ def load_board():
     return module
 
 
-def phase_times(text):
-    """Seconds between bigread's phase lines, from tio's `[HH:MM:SS.mmm]` stamps."""
+def phase_times(text, run):
+    """Seconds between the `run`-th bigread's phase lines, from tio's `[HH:MM:SS.mmm]` stamps."""
     stamps = []
     for marker in PHASES:
-        match = re.search(r"^\[(\d\d:\d\d:\d\d\.\d+)\] " + re.escape(marker), text, re.M)
-        if match is None:
+        found = re.findall(r"^\[(\d\d:\d\d:\d\d\.\d+)\] " + re.escape(marker), text, re.M)
+        if len(found) <= run:
             return None
-        stamps.append(datetime.strptime(match.group(1), "%H:%M:%S.%f"))
+        stamps.append(datetime.strptime(found[run], "%H:%M:%S.%f"))
     return {
         "read_s": (stamps[1] - stamps[0]).total_seconds(),
         "mmap_s": (stamps[2] - stamps[1]).total_seconds(),
@@ -86,7 +90,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", type=Path, default=ROOT / "build/verification/sh7/sh7d-metal")
     parser.add_argument("--timeout", type=float, default=240.0)
+    parser.add_argument("--stick", action="store_true", help="also run bigread from /media/KUMO")
+    parser.add_argument(
+        "--enter",
+        action="store_true",
+        help="the board waits at the UEFI front page with Reset highlighted: send one Enter "
+        "instead of the usual wake-up (which pokes and steers the menu)",
+    )
     args = parser.parse_args()
+    boot, expected = BOOT, list(EXPECTED)
+    if args.stick:
+        boot = boot.replace(
+            b"echo SH7D ends\n", b"linux /media/KUMO/bin/bigread\necho SH7D ends\n"
+        )
+        # The verdict appears once per run; it is counted below instead.
+        expected.remove("bigread: OK (0 failures)")
+        expected.append("linux: /media/KUMO/bin/bigread exited 0")
 
     board = load_board()
     if shutil.which("tio") is None:
@@ -105,11 +124,15 @@ def main():
     board.stage_tree(tftp)
 
     manifest = {"pxehost": str(board.PXEHOST)}
-    board.stage_boot(tftp, BOOT)
+    board.stage_boot(tftp, boot)
     pxehost = board.start_pxehost(tftp, work / "pxehost.log")
     tio_pid, master = board.start_tio(work / "boot.log")
     try:
-        board.wake_board(work / "boot.log")
+        if args.enter:
+            time.sleep(1.0)
+            board.send_raw(b"\r")
+        else:
+            board.wake_board(work / "boot.log")
         board.wait_for("SH7D ends", work / "boot.log", args.timeout)
         # The login prompt after autoexec must come AFTER the end marker (a stale pre-reset
         # prompt would otherwise pass); prompts lack newlines, so read the raw capture.
@@ -122,16 +145,24 @@ def main():
                 raise RuntimeError("no login prompt after SH7D ends")
             time.sleep(0.2)
         text = board.log_whole(work / "boot.log")
-        board.validate(text, EXPECTED, "SH7D begins", "SH7D ends", login_text=raw)
+        board.validate(text, expected, "SH7D begins", "SH7D ends", login_text=raw)
         window = text[text.index("SH7D begins"):text.index("SH7D ends")]
+        if args.stick and window.count("bigread: OK (0 failures)") != 2:
+            raise RuntimeError("bigread did not pass both from the image and from the stick")
         if "TOWER" in window:
             raise RuntimeError("a TOWER inside the SH7D window")
         unsupported = sorted(set(re.findall(r"syscall (\d+) unsupported", window)))
         manifest["unsupported_syscalls"] = unsupported
-        manifest["bigread"] = phase_times(text)
+        manifest["bigread"] = phase_times(text, 0)
+        if args.stick:
+            manifest["bigread_stick"] = phase_times(text, 1)
         manifest["boot"] = "PASS"
         manifest["passed"] = True
-        print(f"boot: PASS bigread={manifest['bigread']} unsupported={unsupported}", flush=True)
+        print(
+            f"boot: PASS bigread={manifest['bigread']} "
+            f"stick={manifest.get('bigread_stick')} unsupported={unsupported}",
+            flush=True,
+        )
     except BaseException as error:
         manifest["passed"] = False
         manifest["error"] = str(error)

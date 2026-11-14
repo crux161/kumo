@@ -1,6 +1,7 @@
 //j539
 //j540
 //j831
+//j892
 
 //! Volatile-only access to memory the controller writes.
 //!
@@ -121,11 +122,26 @@ impl DmaBuf {
     }
 
     /// Zero every byte with volatile stores, so the fill cannot be moved past the doorbell that
-    /// hands the buffer to the device.
+    /// hands the buffer to the device. The aligned middle is written a doubleword at a time
+    /// (SH7-d3b: a 64 KiB storage window zeroed bytewise over uncached memory cost more than
+    /// the USB transfer).
     pub fn zero(self) {
-        for index in 0..self.len {
+        let head = self.ptr.align_offset(8).min(self.len);
+        let mut index = 0;
+        while index < head {
             // SAFETY: `index < len`; the constructor's contract covers the span.
             unsafe { self.ptr.add(index).write_volatile(0) };
+            index += 1;
+        }
+        while index + 8 <= self.len {
+            // SAFETY: `index + 8 <= len`, and `ptr + index` is 8-aligned past the head.
+            unsafe { (self.ptr.add(index) as *mut u64).write_volatile(0) };
+            index += 8;
+        }
+        while index < self.len {
+            // SAFETY: `index < len`.
+            unsafe { self.ptr.add(index).write_volatile(0) };
+            index += 1;
         }
     }
 
@@ -145,9 +161,24 @@ impl DmaBuf {
             out.len(),
             self.len
         );
-        for (index, byte) in out.iter_mut().enumerate() {
-            // SAFETY: bounds checked above.
-            *byte = unsafe { self.ptr.add(offset + index).read_volatile() };
+        // SAFETY (all three loops): bounds checked above; the middle loop's loads are 8-aligned
+        // and end inside the span. Volatile loads of a doubleword (SH7-d3b), not bytes, for the
+        // aligned middle: the same values, an eighth of the uncached accesses.
+        let base = unsafe { self.ptr.add(offset) };
+        let head = base.align_offset(8).min(out.len());
+        let mut index = 0;
+        while index < head {
+            out[index] = unsafe { base.add(index).read_volatile() };
+            index += 1;
+        }
+        while index + 8 <= out.len() {
+            let word = unsafe { (base.add(index) as *const u64).read_volatile() };
+            out[index..index + 8].copy_from_slice(&word.to_ne_bytes());
+            index += 8;
+        }
+        while index < out.len() {
+            out[index] = unsafe { base.add(index).read_volatile() };
+            index += 1;
         }
     }
 
@@ -376,6 +407,30 @@ mod tests {
 
     fn buf_over(bytes: &mut [u8]) -> DmaBuf {
         unsafe { DmaBuf::new(bytes.as_mut_ptr(), 0x8000_0000, bytes.len()) }
+    }
+
+    #[test]
+    fn word_wise_zero_and_read_match_bytewise_at_every_alignment() {
+        // A 64-byte span at each of 8 starting alignments; every sub-range read equals the bytes.
+        let mut backing = [0u8; 80];
+        for start in 0..8 {
+            for (index, byte) in backing.iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(37) ^ 0x5a;
+            }
+            let expect = backing;
+            let buf = unsafe { DmaBuf::new(backing.as_mut_ptr().add(start), 0, 64) };
+            for offset in 0..20 {
+                for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 44] {
+                    let mut out = [0u8; 44];
+                    buf.read_into(offset, &mut out[..len]);
+                    assert_eq!(&out[..len], &expect[start + offset..start + offset + len]);
+                }
+            }
+            buf.window(3, 50).unwrap().zero();
+            assert_eq!(&backing[..start + 3], &expect[..start + 3]);
+            assert!(backing[start + 3..start + 53].iter().all(|byte| *byte == 0));
+            assert_eq!(&backing[start + 53..], &expect[start + 53..]);
+        }
     }
 
     #[test]
