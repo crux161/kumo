@@ -636,6 +636,448 @@ fn peer(client: &mut Client, ip: [u8; 4], port: u16, count: u16, retries: u32) {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// `speed <ip> <port> [seconds] [retries]`: a local speed test against
+// `scripts/net-speed-peer.py` on the Mac. Latency (20 echoed pings), then download (the
+// peer streams 1472-byte datagrams, pacing itself on the per-second receive reports sent
+// back from here), then upload (as fast as netstack's credits allow; the peer reports what
+// arrived). Every line goes to the kernel console through `debug_write`, so the live
+// per-second figures show on HDMI and serial even when the probe runs as a `bg` job.
+// Control messages are ASCII and start with `SPD1 `; data datagrams start with `D` (down)
+// or `U` (up), then a little-endian u32 sequence number, padded to 1472 bytes.
+// ---------------------------------------------------------------------------------------
+
+const SPEED_PINGS: u32 = 20;
+const SPEED_DATAGRAM: usize = UDP_PAYLOAD_MAX;
+
+/// One console line built from parts (debug_write: HDMI + serial, independent of stdout).
+fn say(parts: &[&[u8]]) {
+    let mut buf = [0u8; 200];
+    let mut at = 0;
+    for part in parts.iter().chain([&b"\n"[..]].iter()) {
+        let take = part.len().min(buf.len() - at);
+        buf[at..at + take].copy_from_slice(&part[..take]);
+        at += take;
+    }
+    debug_write(buf.as_ptr(), at);
+}
+
+/// `value / 10^scale` printed with `scale` decimals, e.g. fixed(2741, 2) = "27.41".
+struct Fixed([u8; 24], usize);
+
+fn fixed(value: u64, scale: u32) -> Fixed {
+    let div = 10u64.pow(scale);
+    let whole = dec(value / div);
+    let mut out = [0u8; 24];
+    let mut at = whole.bytes().len();
+    out[..at].copy_from_slice(whole.bytes());
+    if scale > 0 {
+        out[at] = b'.';
+        at += 1;
+        let mut frac = value % div;
+        let mut digits = [b'0'; 8];
+        for i in (0..scale as usize).rev() {
+            digits[i] = b'0' + (frac % 10) as u8;
+            frac /= 10;
+        }
+        out[at..at + scale as usize].copy_from_slice(&digits[..scale as usize]);
+        at += scale as usize;
+    }
+    Fixed(out, at)
+}
+
+impl Fixed {
+    fn bytes(&self) -> &[u8] {
+        &self.0[..self.1]
+    }
+}
+
+/// Megabits per second ×100 for `bytes` over `ns`.
+fn mbit100(bytes: u64, ns: u64) -> u64 {
+    if ns == 0 {
+        return 0;
+    }
+    (bytes as u128 * 8 * 100 * 1_000_000_000 / (ns as u128 * 1_000_000)) as u64
+}
+
+/// Loss in hundredths of a percent.
+fn loss100(got: u64, sent: u64) -> u64 {
+    if sent == 0 || got >= sent {
+        return 0;
+    }
+    (sent - got) * 10_000 / sent
+}
+
+fn speed_send(client: &mut Client, s: u32, to: Addr, parts: &[&[u8]]) -> Status {
+    let mut buf = [0u8; 64];
+    let mut at = 0;
+    for part in parts {
+        buf[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    client.sendto_addr(s, to, &buf[..at])
+}
+
+/// Receive one datagram within `ms`; returns its body length (copied into `body`).
+/// RECVFROM first and WAIT only on an empty socket (`WouldBlock`), so a busy download
+/// costs one netstack round trip per datagram, not two.
+fn speed_recv(
+    client: &mut Client,
+    s: u32,
+    ms: u64,
+    body: &mut [u8; UDP_PAYLOAD_MAX],
+) -> Option<usize> {
+    let mut got = client.call(Op::RecvFrom, s, UDP_PAYLOAD_MAX as u64, &[]);
+    if got.status == Status::WouldBlock {
+        let wait = client.call(Op::Wait, s, WAIT_READABLE as u64 | (ms.max(1) << 32), &[]);
+        if wait.status != Status::Ok {
+            return None;
+        }
+        got = client.call(Op::RecvFrom, s, UDP_PAYLOAD_MAX as u64, &[]);
+    }
+    let reply = client.payload(&got);
+    if got.status != Status::Ok || reply.len() < ADDR_LEN {
+        return None;
+    }
+    let n = reply.len() - ADDR_LEN;
+    body[..n].copy_from_slice(&reply[ADDR_LEN..]);
+    Some(n)
+}
+
+/// The decimal number after `prefix` in an ASCII control message.
+fn speed_field(msg: &[u8], prefix: &[u8], nth: usize) -> Option<u64> {
+    if !msg.starts_with(prefix) {
+        return None;
+    }
+    let rest = &msg[prefix.len()..];
+    let field = rest
+        .split(|b| *b == b' ')
+        .filter(|f| !f.is_empty())
+        .nth(nth)?;
+    let mut v = 0u64;
+    for &b in field {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(v)
+}
+
+fn speed(client: &mut Client, ip: [u8; 4], port: u16, seconds: u16, retries: u32) {
+    let seconds = seconds.clamp(1, 60) as u64;
+    let to = Addr { ip, port };
+    let s = client.udp_socket();
+    let local = client.bind_any(s, 0);
+    let ipd = [
+        dec(ip[0] as u64),
+        dec(ip[1] as u64),
+        dec(ip[2] as u64),
+        dec(ip[3] as u64),
+    ];
+    let peer_name: [&[u8]; 8] = [
+        ipd[0].bytes(),
+        b".",
+        ipd[1].bytes(),
+        b".",
+        ipd[2].bytes(),
+        b".",
+        ipd[3].bytes(),
+        b"",
+    ];
+    say(&[
+        b"speed: ax88 speed test, local udp ",
+        dec(local as u64).bytes(),
+        b" -> ",
+        peer_name[0],
+        b".",
+        peer_name[2],
+        b".",
+        peer_name[4],
+        b".",
+        peer_name[6],
+        b":",
+        dec(port as u64).bytes(),
+        b", ",
+        dec(seconds).bytes(),
+        b" s per direction",
+    ]);
+    let mut body = [0u8; UDP_PAYLOAD_MAX];
+
+    // 1. Reach the peer: HELLO until OK, retrying while the wire comes up.
+    let secs = dec(seconds);
+    let mut tries = 0u32;
+    loop {
+        let status = speed_send(client, s, to, &[b"SPD1 HELLO ", secs.bytes()]);
+        if status == Status::Ok {
+            if let Some(n) = speed_recv(client, s, 500, &mut body) {
+                if body[..n].starts_with(b"SPD1 OK") {
+                    break;
+                }
+            }
+        } else if status != Status::NetUnreachable && status != Status::WouldBlock {
+            say(&[b"speed: FAIL hello -> ", status_name(status)]);
+            client.fail(&[b"speed hello"]);
+            return;
+        } else {
+            let _ = client.call(Op::Wait, s, WAIT_CONNECTED as u64 | (500u64 << 32), &[]);
+        }
+        tries += 1;
+        if tries > retries {
+            say(&[b"speed: FAIL peer never answered (is scripts/net-speed-peer.py running?)"]);
+            client.fail(&[b"speed hello timeout"]);
+            return;
+        }
+        if tries % 10 == 0 {
+            say(&[
+                b"speed: waiting for the wire / peer, try ",
+                dec(tries as u64).bytes(),
+            ]);
+        }
+    }
+    say(&[
+        b"speed: peer answered after ",
+        dec(tries as u64 + 1).bytes(),
+        b" tries",
+    ]);
+
+    // 2. Latency.
+    let (mut rtt_min, mut rtt_max, mut rtt_sum, mut jitter_sum) = (u64::MAX, 0u64, 0u64, 0u64);
+    let (mut answered, mut last_rtt) = (0u64, 0u64);
+    for i in 0..SPEED_PINGS {
+        let n = dec(i as u64);
+        let start = kumo_rt::clock_get();
+        let _ = speed_send(client, s, to, &[b"SPD1 PING ", n.bytes()]);
+        let deadline = start + 1_000_000_000;
+        while kumo_rt::clock_get() < deadline {
+            let left_ms = (deadline - kumo_rt::clock_get()) / 1_000_000;
+            let Some(len) = speed_recv(client, s, left_ms, &mut body) else {
+                break;
+            };
+            if speed_field(&body[..len], b"SPD1 PONG", 0) == Some(i as u64) {
+                let rtt = kumo_rt::clock_get() - start;
+                rtt_min = rtt_min.min(rtt);
+                rtt_max = rtt_max.max(rtt);
+                rtt_sum += rtt;
+                if answered > 0 {
+                    jitter_sum += rtt.abs_diff(last_rtt);
+                }
+                last_rtt = rtt;
+                answered += 1;
+                break;
+            }
+        }
+    }
+    if answered == 0 {
+        say(&[b"speed: FAIL no ping answered"]);
+        client.fail(&[b"speed ping"]);
+        return;
+    }
+    let avg = rtt_sum / answered;
+    let jitter = if answered > 1 {
+        jitter_sum / (answered - 1)
+    } else {
+        0
+    };
+    say(&[
+        b"speed: latency  min ",
+        fixed(rtt_min / 10_000, 2).bytes(),
+        b" ms  avg ",
+        fixed(avg / 10_000, 2).bytes(),
+        b" ms  max ",
+        fixed(rtt_max / 10_000, 2).bytes(),
+        b" ms  jitter ",
+        fixed(jitter / 10_000, 2).bytes(),
+        b" ms  (",
+        dec(answered).bytes(),
+        b"/",
+        dec(SPEED_PINGS as u64).bytes(),
+        b")",
+    ]);
+
+    // 3. Download: peer -> kumo.
+    let _ = speed_send(client, s, to, &[b"SPD1 DOWN ", secs.bytes()]);
+    let start = kumo_rt::clock_get();
+    let end = start + seconds * 1_000_000_000;
+    let (mut got, mut bytes, mut max_seq, mut peer_sent) = (0u64, 0u64, 0u64, 0u64);
+    let (mut tick_at, mut tick_got, mut tick_bytes, mut second) = (start, 0u64, 0u64, 0u64);
+    let mut first_at = 0u64;
+    let mut last_at = start;
+    loop {
+        let now = kumo_rt::clock_get();
+        if now > end + 2_000_000_000 {
+            break; // the end marker was lost
+        }
+        if let Some(len) = speed_recv(client, s, 200, &mut body) {
+            if len >= 5 && body[0] == b'D' {
+                let seq = u32::from_le_bytes([body[1], body[2], body[3], body[4]]) as u64;
+                got += 1;
+                bytes += len as u64;
+                max_seq = max_seq.max(seq + 1);
+                last_at = kumo_rt::clock_get();
+                if first_at == 0 {
+                    first_at = last_at;
+                }
+            } else if let Some(n) = speed_field(&body[..len], b"SPD1 DOWNEND", 0) {
+                peer_sent = n;
+                break;
+            }
+        }
+        let now = kumo_rt::clock_get();
+        if now - tick_at >= 1_000_000_000 {
+            second += 1;
+            let span = now - tick_at;
+            let (dg, db) = (got - tick_got, bytes - tick_bytes);
+            say(&[
+                b"speed: down  t=",
+                dec(second).bytes(),
+                b"s  ",
+                fixed(mbit100(db, span), 2).bytes(),
+                b" Mbit/s  ",
+                dec(dg * 1_000_000_000 / span).bytes(),
+                b" dgrams/s  total ",
+                fixed(bytes / 10_000, 2).bytes(),
+                b" MB  loss ",
+                fixed(loss100(got, max_seq), 2).bytes(),
+                b"%",
+            ]);
+            let gotd = dec(got);
+            let _ = speed_send(client, s, to, &[b"SPD1 STAT ", gotd.bytes()]);
+            tick_at = now;
+            tick_got = got;
+            tick_bytes = bytes;
+        }
+    }
+    let sent = peer_sent.max(max_seq);
+    let span = if first_at != 0 { last_at - first_at } else { 0 };
+    let down = mbit100(bytes, span);
+    let down_loss = loss100(got, sent);
+    say(&[
+        b"speed: down  DONE ",
+        fixed(down, 2).bytes(),
+        b" Mbit/s  received ",
+        dec(got).bytes(),
+        b"/",
+        dec(sent).bytes(),
+        b" datagrams (",
+        fixed(bytes / 10_000, 2).bytes(),
+        b" MB)  loss ",
+        fixed(down_loss, 2).bytes(),
+        b"%",
+    ]);
+
+    // Drain stragglers so the upload phase starts clean.
+    while speed_recv(client, s, 50, &mut body).is_some() {}
+
+    // 4. Upload: kumo -> peer, as fast as netstack's credits allow.
+    let _ = speed_send(client, s, to, &[b"SPD1 UP ", secs.bytes()]);
+    let mut data = [0u8; SPEED_DATAGRAM];
+    data[0] = b'U';
+    let start = kumo_rt::clock_get();
+    let end = start + seconds * 1_000_000_000;
+    let (mut seq, mut up_bytes, mut blocked) = (0u64, 0u64, 0u64);
+    let (mut tick_at, mut tick_seq, mut second) = (start, 0u64, 0u64);
+    loop {
+        let now = kumo_rt::clock_get();
+        if now >= end {
+            break;
+        }
+        data[1..5].copy_from_slice(&(seq as u32).to_le_bytes());
+        match client.sendto_addr(s, to, &data) {
+            Status::Ok => {
+                seq += 1;
+                up_bytes += data.len() as u64;
+            }
+            Status::WouldBlock => {
+                blocked += 1;
+                let _ = client.call(Op::Wait, s, WAIT_WRITABLE as u64 | (20u64 << 32), &[]);
+            }
+            other => {
+                say(&[b"speed: FAIL upload send -> ", status_name(other)]);
+                client.fail(&[b"speed upload"]);
+                return;
+            }
+        }
+        let now = kumo_rt::clock_get();
+        if now - tick_at >= 1_000_000_000 {
+            second += 1;
+            let span = now - tick_at;
+            say(&[
+                b"speed: up    t=",
+                dec(second).bytes(),
+                b"s  ",
+                fixed(mbit100((seq - tick_seq) * SPEED_DATAGRAM as u64, span), 2).bytes(),
+                b" Mbit/s sent  ",
+                dec((seq - tick_seq) * 1_000_000_000 / span).bytes(),
+                b" dgrams/s  backpressure waits ",
+                dec(blocked).bytes(),
+            ]);
+            tick_at = now;
+            tick_seq = seq;
+        }
+    }
+    let up_span = kumo_rt::clock_get() - start;
+    let sentd = dec(seq);
+    let mut peer_got = None;
+    for _ in 0..5 {
+        let _ = speed_send(client, s, to, &[b"SPD1 UPEND ", sentd.bytes()]);
+        let deadline = kumo_rt::clock_get() + 500_000_000;
+        while kumo_rt::clock_get() < deadline {
+            let Some(len) = speed_recv(client, s, 100, &mut body) else {
+                continue;
+            };
+            let msg = &body[..len];
+            if let (Some(r), Some(b), Some(us)) = (
+                speed_field(msg, b"SPD1 UPRESULT", 0),
+                speed_field(msg, b"SPD1 UPRESULT", 1),
+                speed_field(msg, b"SPD1 UPRESULT", 2),
+            ) {
+                peer_got = Some((r, b, us));
+                break;
+            }
+        }
+        if peer_got.is_some() {
+            break;
+        }
+    }
+    let sent_rate = mbit100(up_bytes, up_span);
+    let (up, up_loss, peer_count) = match peer_got {
+        Some((r, b, us)) => (mbit100(b, us * 1000), loss100(r, seq), r),
+        None => (0, 10_000, 0),
+    };
+    say(&[
+        b"speed: up    DONE ",
+        fixed(up, 2).bytes(),
+        b" Mbit/s at the peer (sent ",
+        fixed(sent_rate, 2).bytes(),
+        b")  peer received ",
+        dec(peer_count).bytes(),
+        b"/",
+        dec(seq).bytes(),
+        b"  loss ",
+        fixed(up_loss, 2).bytes(),
+        b"%",
+    ]);
+    if peer_got.is_none() {
+        client.fail(&[b"speed upload result never arrived"]);
+    }
+
+    say(&[
+        b"speed: RESULT  ping ",
+        fixed(avg / 10_000, 2).bytes(),
+        b" ms  down ",
+        fixed(down, 2).bytes(),
+        b" Mbit/s  up ",
+        fixed(up, 2).bytes(),
+        b" Mbit/s  loss down/up ",
+        fixed(down_loss, 2).bytes(),
+        b"%/",
+        fixed(up_loss, 2).bytes(),
+        b"%",
+    ]);
+    let _ = speed_send(client, s, to, &[b"SPD1 BYE"]);
+}
+
 /// NET10: the wire-TCP campaign against the peer script, one phase per port:
 /// `<port>` client exchange, `<port>+1` server exchange, `<port>+2` refusal,
 /// `<port>+3` reset, `<port>+4` timeout and backpressure, `<port>+5` churn.
@@ -2139,6 +2581,7 @@ extern "C" fn main(
         || mode == b"peer"
         || mode == b"tcpwire"
         || mode == b"dhcp"
+        || mode == b"speed"
     {
         args.next().and_then(parse_ipv4)
     } else {
@@ -2231,6 +2674,15 @@ extern "C" fn main(
                 count.unwrap_or(120),
             )
         }
+        b"speed" if wire_ip.is_some_and(|ip| ip != [0; 4]) && port.is_some_and(|p| p != 0) => {
+            speed(
+                &mut client,
+                wire_ip.unwrap_or([0; 4]),
+                port.unwrap_or(0),
+                count.unwrap_or(5),
+                retries,
+            )
+        }
         b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
         b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
         b"tcperrors" => tcp_errors(&mut client),
@@ -2238,7 +2690,7 @@ extern "C" fn main(
         b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries] | tcpwire <ip> <port> [retries] | dhcp <ip> <echo-port> [seconds] | dns tcp|notcp",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries] | tcpwire <ip> <port> [retries] | dhcp <ip> <echo-port> [seconds] | dns tcp|notcp | speed <ip> <port> [seconds] [retries]",
             ]);
             process_exit(2);
         }
