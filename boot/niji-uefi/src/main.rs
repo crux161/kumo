@@ -638,7 +638,14 @@ unsafe fn boot_and_jump(
     kprint!(con_out, "\r\n--- platform discovery ---\r\n");
 
     let root = match unsafe { open_payload_source(image_handle, boot_services) } {
-        Some(source) => {
+        Some(mut source) => {
+            if let PayloadSource::Tftp {
+                con_out: ref mut out,
+                ..
+            } = source
+            {
+                *out = con_out;
+            }
             match source {
                 PayloadSource::Esp(_) => kprint!(con_out, "payloads     : ESP filesystem\r\n"),
                 PayloadSource::Tftp { server_ip, .. } => kprint!(
@@ -867,6 +874,8 @@ enum PayloadSource {
     Tftp {
         pxe: *mut EfiPxeBaseCodeProtocol,
         server_ip: [u8; 16],
+        /// Console for the per-file fetch lines, so a long transfer is not a silent pause.
+        con_out: *mut EfiSimpleTextOutputProtocol,
     },
 }
 
@@ -967,7 +976,11 @@ unsafe fn open_tftp_source(
     if !found {
         return None;
     }
-    Some(PayloadSource::Tftp { pxe, server_ip })
+    Some(PayloadSource::Tftp {
+        pxe,
+        server_ip,
+        con_out: ptr::null_mut(),
+    })
 }
 
 /// Rewrite an ESP path (`\EFI\KUMO\initrd.img`) as the TFTP filename the server expects
@@ -996,6 +1009,7 @@ unsafe fn read_tftp_file(
     boot_services: *mut EfiBootServices,
     pxe: *mut EfiPxeBaseCodeProtocol,
     server_ip: &[u8; 16],
+    con_out: *mut EfiSimpleTextOutputProtocol,
     path: &str,
     pages: bool,
 ) -> Option<(*mut c_void, usize)> {
@@ -1051,6 +1065,18 @@ unsafe fn read_tftp_file(
         }
     }
 
+    // Ask for full-MTU blocks. Left null, the PXE ROM's RRQ carries no blksize and the transfer
+    // runs at RFC 1350's 512 bytes; the firmware still adds its own windowsize (4 on EDK2).
+    // A server may answer smaller, or ignore the option and fall back to 512.
+    let mut block_size = TFTP_BLOCK_SIZE;
+    kprint!(
+        con_out,
+        "tftp         : {} ({} bytes, blksize {}) ...\r\n",
+        path,
+        size,
+        block_size
+    );
+    let started = counter_ticks();
     let mut read_size = size;
     let status = unsafe {
         ((*pxe).mtftp)(
@@ -1059,7 +1085,7 @@ unsafe fn read_tftp_file(
             buffer,
             false,
             &mut read_size,
-            ptr::null_mut(),
+            &mut block_size,
             server_ip,
             name.as_ptr(),
             ptr::null(),
@@ -1067,12 +1093,63 @@ unsafe fn read_tftp_file(
         )
     };
     if status != EFI_SUCCESS {
+        kprint!(
+            con_out,
+            "tftp         : {} FAILED (status {:#x})\r\n",
+            path,
+            status
+        );
         if !pages {
             unsafe { ((*boot_services).free_pool)(buffer) };
         }
         return None;
     }
+    if let Some(ms) = elapsed_ms(started) {
+        kprint!(
+            con_out,
+            "tftp         : {} bytes in {} ms ({} KiB/s)\r\n",
+            read_size,
+            ms,
+            read_size * 1000 / 1024 / ms.max(1)
+        );
+    }
     Some((buffer, read_size as usize))
+}
+
+/// TFTP block size Nijigumo asks for: a 1500-byte Ethernet MTU less the IPv4 (20), UDP (8)
+/// and TFTP (4) headers — the same value the EDK2 PXE ROM asks for when fetching Nijigumo.
+const TFTP_BLOCK_SIZE: usize = 1468;
+
+/// The architectural counter (`CNTVCT_EL0`) and its frequency, for the TFTP timing line.
+#[cfg(target_arch = "aarch64")]
+fn counter_ticks() -> (u64, u64) {
+    let (ticks, freq): (u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "isb",
+            "mrs {t}, cntvct_el0",
+            "mrs {f}, cntfrq_el0",
+            t = out(reg) ticks,
+            f = out(reg) freq,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (ticks, freq)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn counter_ticks() -> (u64, u64) {
+    (0, 0)
+}
+
+/// Milliseconds since `start`, or `None` where there is no counter to read.
+fn elapsed_ms(start: (u64, u64)) -> Option<u64> {
+    let (then, freq) = start;
+    if freq == 0 {
+        return None;
+    }
+    let (now, _) = counter_ticks();
+    Some(now.wrapping_sub(then) / (freq / 1000).max(1))
 }
 
 /// Open `path` on `root`, allocate a `LoaderData` pool, and read the whole file
@@ -1084,8 +1161,12 @@ unsafe fn read_esp_file(
 ) -> Option<(*mut c_void, usize)> {
     let root = match root {
         PayloadSource::Esp(root) => root,
-        PayloadSource::Tftp { pxe, server_ip } => {
-            return unsafe { read_tftp_file(boot_services, pxe, &server_ip, path, false) };
+        PayloadSource::Tftp {
+            pxe,
+            server_ip,
+            con_out,
+        } => {
+            return unsafe { read_tftp_file(boot_services, pxe, &server_ip, con_out, path, false) };
         }
     };
     let path16 = ascii_to_utf16::<96>(path);
@@ -1133,8 +1214,12 @@ unsafe fn read_esp_file_pages(
 ) -> Option<(*mut c_void, usize)> {
     let root = match root {
         PayloadSource::Esp(root) => root,
-        PayloadSource::Tftp { pxe, server_ip } => {
-            return unsafe { read_tftp_file(boot_services, pxe, &server_ip, path, true) };
+        PayloadSource::Tftp {
+            pxe,
+            server_ip,
+            con_out,
+        } => {
+            return unsafe { read_tftp_file(boot_services, pxe, &server_ip, con_out, path, true) };
         }
     };
     let path16 = ascii_to_utf16::<96>(path);
