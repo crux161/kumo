@@ -31,6 +31,7 @@
 
 //j471
 //j493
+//j897
 
 use core::cell::UnsafeCell;
 use kumo_abi::KoId;
@@ -287,57 +288,29 @@ fn emit_diagnosis(esr: u64, elr: u64, far: u64, sp: u64, emit: fn(&[u8])) {
     }
     emit(b"\r\n");
 
-    // The region map describes the *kernel's* address space. Running an EL0 fault through it
-    // reports three addresses as "below every known region" — true, useless, and actively
-    // misleading once the out-of-arena stack warning fires at a user stack pointer and blames the
-    // allocator. Userspace faults get told what they are instead.
-    if crate::diag::is_from_el0(esr) {
-        emit(b"  where: userspace (EL0) - the kernel region map does not describe these\r\n");
-        emit(b"  ELR ");
-        emit(&hex64(elr));
-        emit(b"  FAR ");
-        emit(&hex64(far));
-        emit(b"  SP  ");
-        emit(&hex64(sp));
-        emit(
-            b"\r\n  hint: an EL0 SP just above its own mapping is a stack laid out upside down\r\n",
-        );
-        return;
-    }
-
-    let map = crate::diag::current_map();
-    for (label, addr) in [(b"  ELR " as &[u8], elr), (b"  FAR ", far), (b"  SP  ", sp)] {
-        emit(label);
-        emit_placement(&map, addr, emit);
-        emit(b"\r\n");
-    }
-    // `place` reports geography; only this path knows SP is meant to be a stack. Kernel thread
-    // stacks are heap-allocated, so an SP outside the heap and the boot stack means the allocator
-    // handed out a block it does not own — a named finding rather than an address to go decode.
-    if !crate::diag::kernel_stack_is_sane(&map, sp) {
-        emit(b"  !!! kernel SP is outside the heap and the boot stack !!!\r\n");
-        emit(b"  !!! a thread stack was allocated out of range - suspect the free list !!!\r\n");
-    }
-}
-
-fn emit_placement(map: &crate::diag::RegionMap, addr: u64, emit: fn(&[u8])) {
-    use crate::diag::Placement;
-    emit(&hex64(addr));
-    match crate::diag::place(map, addr) {
-        Placement::Inside { region, offset } => {
-            emit(b" in ");
-            emit(region.name().as_bytes());
-            emit(b" +");
-            emit(&hex64(offset));
-        }
-        Placement::Past { region, distance } => {
-            emit(b" UNMAPPED - ");
-            emit(&hex64(distance));
-            emit(b" past ");
-            emit(region.name().as_bytes());
-            emit(b" end");
-        }
-        Placement::Nowhere => emit(b" UNMAPPED - below every known region"),
+    // Every `Cause::Fault` is built by the HAL's EL0 fault hook (`usermode::fault_hook`): a TOWER
+    // fault is a userspace fault by construction, whatever its exception class. The kernel's region
+    // map (image, heap, stacks) describes none of these addresses. j897: this used to be decided
+    // from ESR's class, which names the exception level only for aborts (0x20/0x24); a user `brk`
+    // (EC 0x3C), undefined instruction, alignment or FP trap fell through to the kernel map and
+    // fired "kernel SP outside the heap - suspect the free list" at an ordinary user stack.
+    emit(b"  where: userspace (EL0) - the kernel region map does not describe these\r\n");
+    emit(b"  ELR ");
+    emit(&hex64(elr));
+    emit(b"  FAR ");
+    emit(&hex64(far));
+    emit(b"  SP  ");
+    emit(&hex64(sp));
+    emit(b"\r\n");
+    if (esr >> 26) & 0x3f == 0x3c {
+        // A BRK is a trap the program raised itself, not a bad access: LLVM lowers `llvm.trap`
+        // (C `abort()`, `core::intrinsics::abort`, a failed runtime check) to `brk #1`.
+        emit(b"  hint: brk #0x");
+        emit(&hex64(esr & 0xffff)[14..]);
+        emit(b" is a trap the program raised itself (#1 = llvm.trap: abort() or a failed\r\n");
+        emit(b"        runtime check) - LR names the caller that decided to stop\r\n");
+    } else if crate::diag::is_from_el0(esr) {
+        emit(b"  hint: an EL0 SP just above its own mapping is a stack laid out upside down\r\n");
     }
 }
 
@@ -631,6 +604,51 @@ mod tests {
 
         assert!(banner < repaint);
         assert!(repaint < qr_diag);
+    }
+
+    /// j897: CRUX's sdk-smoke TOWER, verbatim. A user `brk #1` (EC 0x3C, which names no
+    /// exception level) used to run through the kernel region map and blame the allocator.
+    #[test]
+    fn user_brk_is_reported_as_userspace_not_the_free_list() {
+        use std::sync::Mutex;
+        static BUF: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
+        fn capture(bytes: &[u8]) {
+            BUF.lock().unwrap().extend_from_slice(bytes);
+        }
+
+        BUF.lock().unwrap().clear();
+        emit_diagnosis(0xf200_0001, 0x24_dca4, 0, 0x1000_fee0, capture);
+        let text = BUF.lock().unwrap().clone();
+        assert!(find_bytes(&text, b"what: BRK instruction").is_some());
+        assert!(find_bytes(&text, b"where: userspace (EL0)").is_some());
+        assert!(find_bytes(
+            &text,
+            b"hint: brk #0x0001 is a trap the program raised itself"
+        )
+        .is_some());
+        assert!(find_bytes(&text, b"SP  0x000000001000fee0").is_some());
+        for wrong in [
+            &b"suspect the free list"[..],
+            b"kernel SP",
+            b"below every known region",
+        ] {
+            assert!(find_bytes(&text, wrong).is_none());
+        }
+
+        // A TOWER fault is EL0 by construction (only the HAL's EL0 fault hook builds one), so
+        // even an ESR whose class reads "from the current EL" gets no kernel-map verdict.
+        BUF.lock().unwrap().clear();
+        emit_diagnosis(0x9600_0007, 0x1000, 0x2000, 0x1000_fee0, capture);
+        let text = BUF.lock().unwrap().clone();
+        assert!(find_bytes(&text, b"where: userspace (EL0)").is_some());
+        assert!(find_bytes(&text, b"suspect the free list").is_none());
+        assert!(find_bytes(&text, b"hint:").is_none());
+
+        // A user data abort keeps its stack-layout hint.
+        BUF.lock().unwrap().clear();
+        emit_diagnosis(0x9200_0047, 0x1000, 0x2000, 0x1001_0000, capture);
+        let text = BUF.lock().unwrap().clone();
+        assert!(find_bytes(&text, b"hint: an EL0 SP just above its own mapping").is_some());
     }
 
     #[test]
