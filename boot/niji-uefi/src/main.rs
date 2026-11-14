@@ -31,6 +31,8 @@ mod ax88_oracle;
 #[cfg(feature = "nvme-oracle")]
 mod nvme_oracle;
 
+extern crate alloc;
+
 use core::ffi::c_void;
 use core::fmt;
 use core::mem::{size_of, MaybeUninit};
@@ -634,6 +636,7 @@ unsafe fn boot_and_jump(
         kprint!(con_out, "boot services: UNAVAILABLE - cannot probe\r\n");
         return;
     }
+    pool_alloc::enable(boot_services);
 
     kprint!(con_out, "\r\n--- platform discovery ---\r\n");
 
@@ -836,6 +839,8 @@ unsafe fn boot_and_jump(
         // changed ExitBootServices snapshot. The getter performs no GCD writes. — KESTREL
         let ram = unsafe { framebuffer_ram(system_table, raw_map, (*boot_ptr).framebuffer, false) };
         unsafe { stamp_framebuffer_ram(boot_ptr, ram.is_some()) };
+        // Nothing may allocate from the firmware pool past this point.
+        pool_alloc::disable();
         let status = unsafe { ((*boot_services).exit_boot_services)(image_handle, map_key) };
         if status == EFI_SUCCESS {
             exited = true;
@@ -1812,11 +1817,26 @@ unsafe fn load_kernel(
 /// `BootInfo.initrd` into the first physical VMO (PLAN §8.4), and physical VMOs require
 /// a page-aligned base — a pool allocation's `+0x18` would be rejected. Absence is
 /// honest, not fatal.
+///
+/// When the boot manifest names a zstd copy (`initrd_zstd` + `initrd_zstd_sha256` +
+/// `initrd_size`, PROPOSAL/025 Z1) that copy is fetched instead: about a fifth of the bytes
+/// over TFTP. Its SHA-256 is checked before the decoder sees a byte, the decoded length
+/// must equal the declared size, and any failure falls back to the raw initrd.
 unsafe fn load_initrd(
     boot_services: *mut EfiBootServices,
     root: PayloadSource,
     con_out: *mut EfiSimpleTextOutputProtocol,
 ) -> (Range, *mut c_void) {
+    if let Some((buffer, len)) = unsafe { load_initrd_zstd(boot_services, root, con_out) } {
+        kprint!(
+            con_out,
+            "initrd       : {} @ {:#x} ({} bytes, page-aligned, from zstd)\r\n",
+            INITRD_ESP_PATH,
+            buffer as u64,
+            len
+        );
+        return (Range::new(buffer as u64, len as u64), buffer);
+    }
     match unsafe { read_esp_file_pages(boot_services, root, INITRD_ESP_PATH) } {
         Some((buffer, len)) => {
             kprint!(
@@ -1837,6 +1857,185 @@ unsafe fn load_initrd(
             (Range::empty(), ptr::null_mut())
         }
     }
+}
+
+/// Initrds larger than this are refused before any allocation (a corrupt manifest must not
+/// ask the firmware for gigabytes).
+const INITRD_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The compressed path of [`load_initrd`]: `Some((pages, len))` on a verified decode, `None`
+/// (after saying why) whenever the raw initrd should be loaded instead.
+unsafe fn load_initrd_zstd(
+    boot_services: *mut EfiBootServices,
+    root: PayloadSource,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+) -> Option<(*mut c_void, usize)> {
+    let (conf_buf, conf_len) = unsafe { read_esp_file(boot_services, root, BOOT_CONFIG_ESP_PATH) }?;
+    let conf = unsafe { core::slice::from_raw_parts(conf_buf as *const u8, conf_len) };
+    let zstd = core::str::from_utf8(conf)
+        .ok()
+        .and_then(BootConfig::parse)
+        .and_then(|cfg| cfg.initrd_zstd());
+    // Copy the path out before the manifest's pool buffer is freed.
+    let mut path_buf = [0u8; 96];
+    let picked = zstd.and_then(|z| {
+        let n = z.path.len();
+        (n <= path_buf.len()).then(|| {
+            path_buf[..n].copy_from_slice(z.path.as_bytes());
+            (n, z.sha256, z.size)
+        })
+    });
+    unsafe { ((*boot_services).free_pool)(conf_buf) };
+    let (path_len, sha256, size) = picked?;
+    let path = core::str::from_utf8(&path_buf[..path_len]).ok()?;
+    if size > INITRD_MAX_BYTES {
+        kprint!(
+            con_out,
+            "initrd zstd  : declared size {} refused; raw initrd\r\n",
+            size
+        );
+        return None;
+    }
+
+    let (zbuf, zlen) = match unsafe { read_esp_file(boot_services, root, path) } {
+        Some(found) => found,
+        None => {
+            kprint!(con_out, "initrd zstd  : {} not found; raw initrd\r\n", path);
+            return None;
+        }
+    };
+    let compressed = unsafe { core::slice::from_raw_parts(zbuf as *const u8, zlen) };
+    let started = counter_ticks();
+    if kumo_sha256::digest(compressed) != sha256 {
+        kprint!(con_out, "initrd zstd  : SHA-256 mismatch; raw initrd\r\n");
+        unsafe { ((*boot_services).free_pool)(zbuf) };
+        return None;
+    }
+    let hashed = elapsed_ms(started);
+
+    let mut address: u64 = 0;
+    let page_count = size.div_ceil(EFI_PAGE_SIZE).max(1) as usize;
+    let status = unsafe {
+        ((*boot_services).allocate_pages)(
+            EFI_ALLOCATE_ANY_PAGES,
+            efi_memory_type::LOADER_DATA,
+            page_count,
+            &mut address,
+        )
+    };
+    if status != EFI_SUCCESS || address == 0 {
+        kprint!(
+            con_out,
+            "initrd zstd  : {} pages refused; raw initrd\r\n",
+            page_count
+        );
+        unsafe { ((*boot_services).free_pool)(zbuf) };
+        return None;
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, size as usize) };
+    let decode_started = counter_ticks();
+    let decoded = ruzstd::decoding::FrameDecoder::new().decode_all(compressed, out);
+    let decode_ms = elapsed_ms(decode_started);
+    unsafe { ((*boot_services).free_pool)(zbuf) };
+    match decoded {
+        Ok(n) if n as u64 == size => {
+            kprint!(
+                con_out,
+                "initrd zstd  : {} -> {} bytes, sha256 ok ({} ms), decoded in {} ms, heap peak {} KiB\r\n",
+                zlen,
+                n,
+                hashed.unwrap_or(0),
+                decode_ms.unwrap_or(0),
+                pool_alloc::peak() / 1024
+            );
+            Some((address as *mut c_void, n))
+        }
+        Ok(n) => {
+            kprint!(
+                con_out,
+                "initrd zstd  : decoded {} bytes, manifest says {}; raw initrd\r\n",
+                n,
+                size
+            );
+            None
+        }
+        Err(_) => {
+            kprint!(con_out, "initrd zstd  : decode failed; raw initrd\r\n");
+            None
+        }
+    }
+    // The pages of a failed decode stay LoaderData; the raw path allocates its own. A boot
+    // that reaches that fallback has bigger questions than 10 MB of leaked loader pages.
+}
+
+/// The heap `ruzstd` needs (its window and tables), served from the firmware pool while boot
+/// services exist. Only the zstd initrd path allocates; [`disable`] runs before
+/// ExitBootServices, after which an allocation fails (null) instead of touching a pool the
+/// firmware no longer owns.
+mod pool_alloc {
+    use super::{efi_memory_type, EfiBootServices, EFI_SUCCESS};
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::ffi::c_void;
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    static BOOT_SERVICES: AtomicPtr<EfiBootServices> = AtomicPtr::new(core::ptr::null_mut());
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn enable(boot_services: *mut EfiBootServices) {
+        BOOT_SERVICES.store(boot_services, Ordering::SeqCst);
+    }
+
+    pub fn disable() {
+        BOOT_SERVICES.store(core::ptr::null_mut(), Ordering::SeqCst);
+    }
+
+    /// Highest simultaneous bytes requested since boot.
+    pub fn peak() -> usize {
+        PEAK.load(Ordering::Relaxed)
+    }
+
+    struct Pool;
+
+    // Each block is over-allocated by `align + 8`; the pool pointer is stored in the 8 bytes
+    // just below the aligned address handed out, so `dealloc` can free it.
+    unsafe impl GlobalAlloc for Pool {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let bs = BOOT_SERVICES.load(Ordering::SeqCst);
+            if bs.is_null() {
+                return core::ptr::null_mut();
+            }
+            let align = layout.align().max(8);
+            let Some(total) = layout.size().checked_add(align + 8) else {
+                return core::ptr::null_mut();
+            };
+            let mut raw: *mut c_void = core::ptr::null_mut();
+            let status =
+                unsafe { ((*bs).allocate_pool)(efi_memory_type::LOADER_DATA, total, &mut raw) };
+            if status != EFI_SUCCESS || raw.is_null() {
+                return core::ptr::null_mut();
+            }
+            let aligned = (raw as usize + 8 + align - 1) & !(align - 1);
+            unsafe { *((aligned - 8) as *mut usize) = raw as usize };
+            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK.fetch_max(live, Ordering::Relaxed);
+            aligned as *mut u8
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            let bs = BOOT_SERVICES.load(Ordering::SeqCst);
+            if bs.is_null() || ptr.is_null() {
+                return; // after ExitBootServices the pool is gone; nothing to hand back
+            }
+            let raw = unsafe { *((ptr as usize - 8) as *const usize) } as *mut c_void;
+            unsafe { ((*bs).free_pool)(raw) };
+        }
+    }
+
+    #[cfg(not(test))]
+    #[global_allocator]
+    static POOL: Pool = Pool;
 }
 
 /// A pool allocation for the `BootInfo` so it survives ExitBootServices.

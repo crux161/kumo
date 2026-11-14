@@ -12,6 +12,8 @@ argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "pa
 imager = { path = "../imager" }
 kumo-abi.workspace = true
 kumo-identity = { path = "../lib/kumo-identity" }
+# SHA-256 of the staged initrd.img.zst for the boot manifest (PROPOSAL/025 Z1).
+kumo-sha256.workspace = true
 # Echo off at /dev/tty while a password is typed.
 libc = "0.2"
 
