@@ -2,6 +2,7 @@
 #j870
 #j872
 #j874
+#j891
 """SH3-e: the cargo-shaped metal suite on the Orange Pi 5 Plus, two PXE boots.
 
 Boot 1 (std::fs and C on the mounted volume, cross-process locks):
@@ -111,6 +112,26 @@ def stage_boot(tftp, script):
     axh = load_harness()
     initrd = tftp / "EFI/KUMO/initrd.img"
     axh.stage(initrd, axh.Case("sh3e-metal", script, (), ready=0))
+    restage_zstd(tftp / "EFI/KUMO")
+
+
+def restage_zstd(kumo):
+    """j891: since PROPOSAL/025 Z1 Nijigumo boots `initrd.img.zst` when the manifest names it,
+    so the staged raw initrd alone would never be seen. Over TFTP the compressed copy is the
+    one worth keeping: recompress the staged initrd and rewrite the three manifest keys the
+    way `xtask image` writes them (sha256 of the compressed bytes, the raw length)."""
+    import hashlib
+    conf = kumo / "nijigumo.conf"
+    text = conf.read_text()
+    if "initrd_zstd" not in text:
+        return
+    raw = (kumo / "initrd.img").read_bytes()
+    zst = kumo / "initrd.img.zst"
+    subprocess.run(["zstd", "-19", "-q", "-f", "-o", str(zst), str(kumo / "initrd.img")], check=True)
+    digest = hashlib.sha256(zst.read_bytes()).hexdigest()
+    text = re.sub(r"(?m)^initrd_zstd_sha256 = .*$", f"initrd_zstd_sha256 = {digest}", text)
+    text = re.sub(r"(?m)^initrd_size = .*$", f"initrd_size = {len(raw)}", text)
+    conf.write_text(text)
 
 
 def start_pxehost(tftp, log_path):

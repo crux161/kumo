@@ -3,6 +3,7 @@
 #j888
 #j889
 #j890
+#j891
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -60,6 +61,7 @@ def main():
         b"linux /bin/vmprobe\n"
         b"linux /bin/greet\n"
         b"linux /bin/fileprobe\n"
+        b"linux /bin/bigread\n"
         b"echo AXH persona ends\n",
         (
             "M10 elf linux hi",
@@ -72,6 +74,8 @@ def main():
             "linux: /bin/greet exited 0",
             "fileprobe: OK (0 failures)",
             "linux: /bin/fileprobe exited 0",
+            "bigread: OK (0 failures)",
+            "linux: /bin/bigread exited 0",
         ),
         ready=0,
     )

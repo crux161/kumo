@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j866
 #j867
 #j868
 #j869
 #j870
+#j891
 """AXH: build, boot and check native NET2 loopback/recovery; restore the default image.
 
 No NIC, credentials or board access. Artifacts remain under build/verification. POST is
@@ -191,6 +191,17 @@ def stage(initrd, case):
     return sha(out)
 
 
+def raw_initrd_only(kumo):
+    """j891: since PROPOSAL/025 Z1 Nijigumo boots `initrd.img.zst` when the manifest names it,
+    so a staged `initrd.img` alone is never seen. Drop the compressed copy and its keys: the
+    loader then reads the staged raw initrd, as it did before Z1."""
+    conf = kumo / "nijigumo.conf"
+    lines = conf.read_text().splitlines(keepends=True)
+    kept = [line for line in lines if not line.split("=")[0].strip() in ("initrd_zstd", "initrd_zstd_sha256", "initrd_size")]
+    conf.write_text("".join(kept))
+    (kumo / "initrd.img.zst").unlink(missing_ok=True)
+
+
 def validate(case, text):
     begin, end = f"AXH {case.name} begins", f"AXH {case.name} ends"
     for marker in (begin, end, "autoexec: done", "INDRA login:", *case.expected):
@@ -236,6 +247,7 @@ def boot(root, source, case, work, qemu, firmware, timeout):
     work.mkdir()
     shutil.copytree(source, work / "esp")
     initrd_hash = stage(work / "esp/EFI/KUMO/initrd.img", case)
+    raw_initrd_only(work / "esp/EFI/KUMO")
     (work / "autoexec.txt").write_bytes(case.script)
     shutil.copyfile(firmware / "edk2-arm-vars.fd", work / "vars.fd")
     serial = work / "serial.log"

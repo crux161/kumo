@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j514
 //j545
 //j549
 //j559
 //j864
+//j891
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -21,14 +21,14 @@
 
 use fatfs::block::{BlockSectors, BlockTransport};
 use fatfs::{
-    dispatch_shared, FatServer, SharedServer, Transport, MAX_SESSIONS, REPLY_BUF_BYTES,
-    REQUEST_BUF_BYTES, SESSION_READ_ONLY, SESSION_READ_WRITE,
+    dispatch_shared_bulk, BulkWindow, FatServer, SharedServer, Transport, MAX_SESSIONS,
+    REPLY_BUF_BYTES, REQUEST_BUF_BYTES, SESSION_READ_ONLY, SESSION_READ_WRITE,
 };
 use kumo_abi::{Handle, VmarFlags};
 use kumo_fatfs::{FatVolume, SectorReader, SectorWriter, SECTOR_SIZE};
 use kumo_rt::{
     channel_read, channel_read_with_handle, channel_write, handle_close, handle_koid, port_bind,
-    port_create, port_unbind, port_wait, vmar_map,
+    port_create, port_unbind, port_wait, vmar_map, vmar_map_anywhere_at, vmar_unmap,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
@@ -83,6 +83,70 @@ impl SectorReader for MappedSectors {
             );
         }
         true
+    }
+
+    /// A run of sectors is one copy out of the mapped image (SH7-d3a).
+    fn read_sectors(&mut self, lba: u32, out: &mut [u8]) -> bool {
+        let Some(offset) = (lba as u64)
+            .checked_mul(SECTOR_SIZE as u64)
+            .and_then(|o| o.checked_add(self.base))
+        else {
+            return false;
+        };
+        if out.len() % SECTOR_SIZE != 0
+            || offset
+                .checked_add(out.len() as u64)
+                .is_none_or(|end| end > self.len)
+        {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (VMO_VA + offset) as *const u8,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        true
+    }
+}
+
+/// SH7-d3a: the `ReadVmo` window. Maps just the pages of the client's VMO that one request
+/// names, wherever the kernel places them, and unmaps them before the reply. The client's VMO
+/// handle is closed after every request that carried one.
+struct VmoWindow;
+
+impl BulkWindow for VmoWindow {
+    fn fill(
+        &mut self,
+        vmo: u32,
+        vmo_offset: u64,
+        len: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> usize,
+    ) -> Option<usize> {
+        let page = vmo_offset & !0xFFF;
+        let delta = vmo_offset - page;
+        let map_len = (delta + len as u64).checked_add(0xFFF)? & !0xFFF;
+        let (status, view) = vmar_map_anywhere_at(
+            Handle(vmo),
+            page,
+            map_len,
+            (VmarFlags::READ | VmarFlags::WRITE).0,
+        );
+        if status != 0 || view == 0 {
+            log_info(b"fatfs: ReadVmo window could not be mapped\n");
+            return None;
+        }
+        // SAFETY: the kernel just mapped `map_len >= delta + len` writable bytes at `view`,
+        // and nothing else in this process refers to them.
+        let window = unsafe { core::slice::from_raw_parts_mut((view + delta) as *mut u8, len) };
+        let landed = fill(window);
+        let _ = vmar_unmap(view, map_len);
+        Some(landed)
+    }
+
+    fn release(&mut self, vmo: u32) {
+        let _ = handle_close(Handle(vmo));
     }
 }
 
@@ -192,22 +256,33 @@ fn serve_mount(control: Handle, blocks: Handle, block_count: u64) -> ! {
             let Some((channel, _)) = sessions[index] else {
                 continue;
             };
-            let n = channel_read(channel, request_buf.as_mut_ptr(), request_buf.len());
+            let (n, carried) =
+                channel_read_with_handle(channel, request_buf.as_mut_ptr(), request_buf.len());
+            let n = n as u64;
             if n == 0 || n > request_buf.len() as u64 {
+                if carried != 0 && carried != u64::MAX {
+                    let _ = handle_close(Handle(carried as u32));
+                }
                 let _ = port_unbind(port, channel);
                 let _ = handle_close(channel);
                 sessions[index] = None;
                 server.close_session(index);
                 log_info(b"fatfs: session closed\n");
             } else {
-                let reply_len = dispatch_shared(
+                let vmo = valid(carried).map_or(0, |handle| handle.0);
+                let reply_len = dispatch_shared_bulk(
                     &volume,
                     &mut disk,
                     &mut server,
                     index,
                     &request_buf[..n as usize],
+                    vmo,
+                    &mut VmoWindow,
                     &mut reply_buf,
                 );
+                if vmo != 0 {
+                    VmoWindow.release(vmo);
+                }
                 if reply_len != 0 {
                     let _ = channel_write(channel, reply_buf.as_ptr(), reply_len);
                 }
@@ -224,7 +299,7 @@ fn serve_blocks(channel: Handle, blocks: Handle, block_count: u64) -> ! {
     };
     log_info(b"fatfs: serving blocks\n");
     let mut transport = ChannelTransport { channel };
-    FatServer::new().serve(&volume, &mut disk, &mut transport);
+    FatServer::new().serve_bulk(&volume, &mut disk, &mut transport, &mut VmoWindow);
     kumo_rt::process_exit(0)
 }
 
@@ -246,6 +321,18 @@ impl Transport for ChannelTransport {
 
     fn send(&mut self, frame: &[u8]) {
         let _ = channel_write(self.channel, frame.as_ptr(), frame.len());
+    }
+
+    fn recv_with_handle(&mut self, buf: &mut [u8]) -> Option<(usize, u32)> {
+        let (n, raw) = channel_read_with_handle(self.channel, buf.as_mut_ptr(), buf.len());
+        let handle = valid(raw).map_or(0, |handle| handle.0);
+        if n == 0 {
+            if handle != 0 {
+                let _ = handle_close(Handle(handle));
+            }
+            return None;
+        }
+        Some((n, handle))
     }
 }
 
@@ -306,7 +393,7 @@ extern "C" fn main(
     log_info(b"fatfs: serving\n");
 
     let mut transport = ChannelTransport { channel };
-    FatServer::new().serve(&volume, &mut disk, &mut transport);
+    FatServer::new().serve_bulk(&volume, &mut disk, &mut transport, &mut VmoWindow);
 
     // The peer closed its end: this instance's whole reason to exist is gone.
     kumo_rt::process_exit(0)

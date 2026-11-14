@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j862
 //j863
 //j865
 //j866
 //j869
+//j891
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -23,13 +23,15 @@ extern crate alloc;
 
 pub mod block;
 
-use kumo_fatfs::{DirEntry, DirLocation, FatVolume, FatWriteError, SectorReader, SectorWriter};
+use kumo_fatfs::{
+    ChainCursor, DirEntry, DirLocation, FatVolume, FatWriteError, SectorReader, SectorWriter,
+};
 use kumo_vfs::{
-    encode_open_ok, encode_stat_ok, encode_status, encode_write_ok, DirReplyWriter, Request,
-    LOCK_EX, LOCK_SH, LOCK_UN, MAX_WRITE_DATA, OPEN_CREATE, OPEN_READ, OPEN_WRITE,
-    STAT_KIND_DIRECTORY, STAT_KIND_FILE, VFS_ACCESS_DENIED, VFS_BAD_HANDLE, VFS_BAD_REQUEST,
-    VFS_EXISTS, VFS_IO_ERROR, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_EMPTY, VFS_NOT_FOUND,
-    VFS_NOT_SUPPORTED, VFS_NO_SPACE, VFS_OK, VFS_WOULD_BLOCK, WRITE_HEADER_LEN,
+    encode_open_ok, encode_read_vmo_ok, encode_stat_ok, encode_status, encode_write_ok,
+    DirReplyWriter, Request, LOCK_EX, LOCK_SH, LOCK_UN, MAX_WRITE_DATA, OPEN_CREATE, OPEN_READ,
+    OPEN_WRITE, STAT_KIND_DIRECTORY, STAT_KIND_FILE, VFS_ACCESS_DENIED, VFS_BAD_HANDLE,
+    VFS_BAD_REQUEST, VFS_EXISTS, VFS_IO_ERROR, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_EMPTY,
+    VFS_NOT_FOUND, VFS_NOT_SUPPORTED, VFS_NO_SPACE, VFS_OK, VFS_WOULD_BLOCK, WRITE_HEADER_LEN,
 };
 
 /// Maximum number of open file handles in this first fixed table.
@@ -63,6 +65,9 @@ pub struct OpenFile {
     writable: bool,
     /// Advisory lock held through this open handle (SH3): 0, `LOCK_SH`, or `LOCK_EX`.
     lock: u8,
+    /// Where this handle's last read left the cluster chain (SH7-d3a). Reset whenever the
+    /// volume changes, so it never outlives the chain it points into.
+    cursor: ChainCursor,
 }
 
 impl OpenTable {
@@ -80,6 +85,7 @@ impl OpenTable {
                     readable: options & OPEN_READ != 0,
                     writable: options & OPEN_WRITE != 0,
                     lock: 0,
+                    cursor: ChainCursor::new(),
                 });
                 return Some((index + 1) as u32);
             }
@@ -103,6 +109,13 @@ impl OpenTable {
         let index = usize::try_from(handle).ok()?.checked_sub(1)?;
         self.slots.get_mut(index)?.as_mut()
     }
+
+    /// Forget every handle's chain cursor (SH7-d3a): the volume is about to change.
+    pub fn reset_cursors(&mut self) {
+        for file in self.slots.iter_mut().flatten() {
+            file.cursor = ChainCursor::new();
+        }
+    }
 }
 
 impl Default for OpenTable {
@@ -121,6 +134,47 @@ pub trait Transport {
 
     /// Send one reply frame.
     fn send(&mut self, frame: &[u8]);
+
+    /// Receive one request frame and the handle its message carried (0 = none). A transport
+    /// that moves no handles keeps the default.
+    fn recv_with_handle(&mut self, buf: &mut [u8]) -> Option<(usize, u32)> {
+        self.recv(buf).map(|n| (n, 0))
+    }
+}
+
+/// The server side of [`Request::ReadVmo`] (SH7-d3a): access to the VMO a request carried. The
+/// resident binary maps a window of it; tests use a buffer. The library never closes `vmo`;
+/// the serve loop calls [`BulkWindow::release`] for every handle a message carried.
+pub trait BulkWindow {
+    /// Map `len` bytes of `vmo` from `vmo_offset` writable, let `fill` write into them, and
+    /// unmap. Returns what `fill` returned, or `None` when the window could not be mapped.
+    fn fill(
+        &mut self,
+        vmo: u32,
+        vmo_offset: u64,
+        len: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> usize,
+    ) -> Option<usize>;
+
+    /// Drop a handle a request carried.
+    fn release(&mut self, vmo: u32);
+}
+
+/// No VMO access: `ReadVmo` answers [`VFS_BAD_REQUEST`].
+pub struct NoWindow;
+
+impl BulkWindow for NoWindow {
+    fn fill(
+        &mut self,
+        _vmo: u32,
+        _vmo_offset: u64,
+        _len: usize,
+        _fill: &mut dyn FnMut(&mut [u8]) -> usize,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn release(&mut self, _vmo: u32) {}
 }
 
 /// FAT vfs server state. The open table is connection-local soft state; file
@@ -147,16 +201,41 @@ impl FatServer {
         request_buf: &mut [u8],
         reply_buf: &mut [u8],
     ) -> bool {
-        let Some(n) = transport.recv(request_buf) else {
+        self.serve_once_bulk(
+            volume,
+            reader,
+            transport,
+            &mut NoWindow,
+            request_buf,
+            reply_buf,
+        )
+    }
+
+    /// [`Self::serve_once`] for a transport that carries VMOs (SH7-d3a).
+    pub fn serve_once_bulk<R: SectorReader + SectorWriter, T: Transport, W: BulkWindow>(
+        &mut self,
+        volume: &FatVolume,
+        reader: &mut R,
+        transport: &mut T,
+        window: &mut W,
+        request_buf: &mut [u8],
+        reply_buf: &mut [u8],
+    ) -> bool {
+        let Some((n, vmo)) = transport.recv_with_handle(request_buf) else {
             return false;
         };
-        let reply_len = dispatch(
+        let reply_len = dispatch_bulk(
             volume,
             reader,
             &mut self.open_files,
             &request_buf[..n],
+            vmo,
+            window,
             reply_buf,
         );
+        if vmo != 0 {
+            window.release(vmo);
+        }
         if reply_len != 0 {
             transport.send(&reply_buf[..reply_len]);
         }
@@ -170,9 +249,27 @@ impl FatServer {
         reader: &mut R,
         transport: &mut T,
     ) {
+        self.serve_bulk(volume, reader, transport, &mut NoWindow)
+    }
+
+    /// [`Self::serve`] for a transport that carries VMOs (SH7-d3a).
+    pub fn serve_bulk<R: SectorReader + SectorWriter, T: Transport, W: BulkWindow>(
+        &mut self,
+        volume: &FatVolume,
+        reader: &mut R,
+        transport: &mut T,
+        window: &mut W,
+    ) {
         let mut request_buf = [0u8; REQUEST_BUF_BYTES];
         let mut reply_buf = [0u8; REPLY_BUF_BYTES];
-        while self.serve_once(volume, reader, transport, &mut request_buf, &mut reply_buf) {}
+        while self.serve_once_bulk(
+            volume,
+            reader,
+            transport,
+            window,
+            &mut request_buf,
+            &mut reply_buf,
+        ) {}
     }
 }
 
@@ -414,12 +511,44 @@ pub fn dispatch_shared<R: SectorReader + SectorWriter>(
     request: &[u8],
     reply: &mut [u8],
 ) -> usize {
+    dispatch_shared_bulk(
+        volume,
+        io,
+        server,
+        session,
+        request,
+        0,
+        &mut NoWindow,
+        reply,
+    )
+}
+
+/// [`dispatch_shared`] with the VMO the request's message carried (SH7-d3a); the caller
+/// releases `vmo` afterwards.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_shared_bulk<R: SectorReader + SectorWriter, W: BulkWindow>(
+    volume: &FatVolume,
+    io: &mut R,
+    server: &mut SharedServer,
+    session: usize,
+    request: &[u8],
+    vmo: u32,
+    window: &mut W,
+    reply: &mut [u8],
+) -> usize {
     if session >= MAX_SESSIONS {
         return write_status(reply, VFS_BAD_REQUEST);
     }
     let decoded = Request::decode(request);
-    if server.access[session] == SESSION_READ_ONLY && decoded.as_ref().is_some_and(request_writes) {
+    let writes = decoded.as_ref().is_some_and(request_writes);
+    if server.access[session] == SESSION_READ_ONLY && writes {
         return write_status(reply, VFS_ACCESS_DENIED);
+    }
+    if writes {
+        // Any session's mutation can move any file's chain.
+        for table in server.sessions.iter_mut() {
+            table.reset_cursors();
+        }
     }
     match decoded {
         Some(Request::Open { path }) => open(
@@ -445,10 +574,29 @@ pub fn dispatch_shared<R: SectorReader + SectorWriter>(
         }) => read(
             volume,
             io,
-            &server.sessions[session],
+            &mut server.sessions[session],
             handle,
             offset,
             len,
+            reply,
+        ),
+        Some(Request::ReadVmo {
+            handle,
+            offset,
+            len,
+            vmo_offset,
+        }) => read_vmo(
+            volume,
+            io,
+            &mut server.sessions[session],
+            ReadVmoArgs {
+                handle,
+                offset,
+                len,
+                vmo,
+                vmo_offset,
+            },
+            window,
             reply,
         ),
         Some(Request::Write {
@@ -552,7 +700,25 @@ pub fn dispatch<R: SectorReader + SectorWriter>(
     request: &[u8],
     reply: &mut [u8],
 ) -> usize {
-    match Request::decode(request) {
+    dispatch_bulk(volume, reader, open_files, request, 0, &mut NoWindow, reply)
+}
+
+/// [`dispatch`] with the VMO the request's message carried (SH7-d3a); the caller releases
+/// `vmo` afterwards.
+pub fn dispatch_bulk<R: SectorReader + SectorWriter, W: BulkWindow>(
+    volume: &FatVolume,
+    reader: &mut R,
+    open_files: &mut OpenTable,
+    request: &[u8],
+    vmo: u32,
+    window: &mut W,
+    reply: &mut [u8],
+) -> usize {
+    let decoded = Request::decode(request);
+    if decoded.as_ref().is_some_and(request_writes) {
+        open_files.reset_cursors();
+    }
+    match decoded {
         Some(Request::Open { path }) => open(volume, reader, open_files, path, OPEN_READ, reply),
         Some(Request::OpenOptions { path, options }) => {
             open(volume, reader, open_files, path, options, reply)
@@ -562,6 +728,25 @@ pub fn dispatch<R: SectorReader + SectorWriter>(
             offset,
             len,
         }) => read(volume, reader, open_files, handle, offset, len, reply),
+        Some(Request::ReadVmo {
+            handle,
+            offset,
+            len,
+            vmo_offset,
+        }) => read_vmo(
+            volume,
+            reader,
+            open_files,
+            ReadVmoArgs {
+                handle,
+                offset,
+                len,
+                vmo,
+                vmo_offset,
+            },
+            window,
+            reply,
+        ),
         Some(Request::Write {
             handle,
             offset,
@@ -621,7 +806,7 @@ fn open<R: SectorReader + SectorWriter>(
 fn read<R: SectorReader>(
     volume: &FatVolume,
     reader: &mut R,
-    open_files: &OpenTable,
+    open_files: &mut OpenTable,
     handle: u32,
     offset: u64,
     len: u32,
@@ -630,7 +815,7 @@ fn read<R: SectorReader>(
     if reply.is_empty() {
         return 0;
     }
-    let Some(file) = open_files.get(handle) else {
+    let Some(file) = open_files.get_mut(handle) else {
         return write_status(reply, VFS_BAD_HANDLE);
     };
     if !file.readable {
@@ -639,8 +824,60 @@ fn read<R: SectorReader>(
 
     reply[0] = VFS_OK;
     let cap = (len as usize).min(reply.len().min(READ_REPLY_BYTES) - 1);
-    let n = volume.read_file_at(reader, &file.entry, offset, &mut reply[1..1 + cap]);
+    let n = volume.read_file_at_cursor(
+        reader,
+        &file.entry,
+        &mut file.cursor,
+        offset,
+        &mut reply[1..1 + cap],
+    );
     1 + n
+}
+
+/// What one [`Request::ReadVmo`] names, plus the handle its message carried.
+struct ReadVmoArgs {
+    handle: u32,
+    offset: u64,
+    len: u32,
+    vmo: u32,
+    vmo_offset: u64,
+}
+
+/// SH7-d3a: read up to `len` file bytes straight into the carried VMO's window. Bytes past the
+/// end of the file are not written (the reply's count says how many landed); a read at or past
+/// the end maps nothing and answers 0.
+fn read_vmo<R: SectorReader, W: BulkWindow>(
+    volume: &FatVolume,
+    reader: &mut R,
+    open_files: &mut OpenTable,
+    args: ReadVmoArgs,
+    window: &mut W,
+    reply: &mut [u8],
+) -> usize {
+    if args.vmo == 0 {
+        return write_status(reply, VFS_BAD_REQUEST);
+    }
+    let Some(file) = open_files.get_mut(args.handle) else {
+        return write_status(reply, VFS_BAD_HANDLE);
+    };
+    if !file.readable {
+        return write_status(reply, VFS_ACCESS_DENIED);
+    }
+    let want = (file.entry.size as u64)
+        .saturating_sub(args.offset)
+        .min(args.len as u64) as usize;
+    if want == 0 {
+        return write_frame(reply, &encode_read_vmo_ok(0));
+    }
+    let entry = file.entry;
+    let cursor = &mut file.cursor;
+    let landed = window.fill(args.vmo, args.vmo_offset, want, &mut |out| {
+        volume.read_file_at_cursor(reader, &entry, cursor, args.offset, out)
+    });
+    match landed {
+        Some(count) => write_frame(reply, &encode_read_vmo_ok(count as u32)),
+        None => write_status(reply, VFS_BAD_REQUEST),
+    }
 }
 
 fn write<R: SectorReader + SectorWriter>(
@@ -1027,11 +1264,12 @@ fn write_frame(reply: &mut [u8], frame: &[u8]) -> usize {
 mod tests {
     use super::*;
     use alloc::collections::VecDeque;
+    use alloc::vec;
     use alloc::vec::Vec;
     use kumo_fatfs::{attr, FatError, SECTOR_SIZE};
     use kumo_vfs::{
-        parse_dir_reply, parse_open_reply, parse_write_reply, read_payload, DirRecord, OPEN_CREATE,
-        OPEN_READ, OPEN_WRITE, VFS_BAD_REQUEST,
+        parse_dir_reply, parse_open_reply, parse_read_vmo_reply, parse_write_reply, read_payload,
+        DirRecord, OPEN_CREATE, OPEN_READ, OPEN_WRITE, VFS_BAD_REQUEST,
     };
 
     const SEC: u16 = 512;
@@ -1430,6 +1668,197 @@ mod tests {
             .unwrap();
         let reply_len = dispatch(&volume, &mut disk, &mut reopened, &request[..n], &mut reply);
         assert_eq!(read_payload(&reply[..reply_len]), Ok(&b"cloud!"[..]));
+    }
+
+    /// A test [`BulkWindow`]: VMO handle 7 is a 64 KiB buffer; any other handle cannot be
+    /// mapped. Records the windows it mapped and the handles released.
+    struct BufferWindow {
+        vmo: Vec<u8>,
+        mapped: Vec<(u64, usize)>,
+    }
+
+    impl BulkWindow for BufferWindow {
+        fn fill(
+            &mut self,
+            vmo: u32,
+            vmo_offset: u64,
+            len: usize,
+            fill: &mut dyn FnMut(&mut [u8]) -> usize,
+        ) -> Option<usize> {
+            let start = vmo_offset as usize;
+            if vmo != 7 || start + len > self.vmo.len() {
+                return None;
+            }
+            self.mapped.push((vmo_offset, len));
+            Some(fill(&mut self.vmo[start..start + len]))
+        }
+
+        fn release(&mut self, _vmo: u32) {}
+    }
+
+    #[test]
+    fn read_vmo_lands_file_bytes_in_the_window_and_reports_the_count() {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut table = OpenTable::new();
+        let mut request = [0u8; REQUEST_BUF_BYTES];
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let mut window = BufferWindow {
+            vmo: vec![0xEE; 64 * 1024],
+            mapped: Vec::new(),
+        };
+
+        // A file larger than one inline read: 3000 bytes over several clusters.
+        let n = Request::open_options(b"/BIG.BIN", OPEN_READ | OPEN_WRITE | OPEN_CREATE)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        let (handle, _) = parse_open_reply(&reply[..reply_len]).unwrap();
+        let data: Vec<u8> = (0..3000u32).map(|i| (i * 31 + i / 256) as u8).collect();
+        let n = Request::set_len(handle, 3000)
+            .encode_into(&mut request)
+            .unwrap();
+        dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        for (index, piece) in data.chunks(MAX_WRITE_DATA).enumerate() {
+            let n = Request::write(handle, (index * MAX_WRITE_DATA) as u64, piece)
+                .encode_into(&mut request)
+                .unwrap();
+            let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+            assert_eq!(
+                parse_write_reply(&reply[..reply_len]),
+                Ok(piece.len() as u32)
+            );
+        }
+
+        let read_vmo = |offset: u64, len: u32, vmo_offset: u64, request: &mut [u8]| {
+            Request::ReadVmo {
+                handle,
+                offset,
+                len,
+                vmo_offset,
+            }
+            .encode_into(request)
+            .unwrap()
+        };
+        // The whole file, asked for with room to spare: 3000 bytes land at 0x1000.
+        let n = read_vmo(0, 8192, 0x1000, &mut request);
+        let reply_len = dispatch_bulk(
+            &volume,
+            &mut disk,
+            &mut table,
+            &request[..n],
+            7,
+            &mut window,
+            &mut reply,
+        );
+        assert_eq!(parse_read_vmo_reply(&reply[..reply_len]), Ok(3000));
+        assert_eq!(&window.vmo[0x1000..0x1000 + 3000], &data[..]);
+        assert_eq!(
+            window.vmo[0x1000 + 3000],
+            0xEE,
+            "nothing past the file is written"
+        );
+        assert_eq!(
+            window.mapped,
+            vec![(0x1000, 3000)],
+            "only what the file has is mapped"
+        );
+
+        // A middle piece, then a read at the end of the file maps nothing.
+        let n = read_vmo(777, 1000, 0, &mut request);
+        let reply_len = dispatch_bulk(
+            &volume,
+            &mut disk,
+            &mut table,
+            &request[..n],
+            7,
+            &mut window,
+            &mut reply,
+        );
+        assert_eq!(parse_read_vmo_reply(&reply[..reply_len]), Ok(1000));
+        assert_eq!(&window.vmo[..1000], &data[777..1777]);
+        let n = read_vmo(3000, 10, 0, &mut request);
+        let reply_len = dispatch_bulk(
+            &volume,
+            &mut disk,
+            &mut table,
+            &request[..n],
+            7,
+            &mut window,
+            &mut reply,
+        );
+        assert_eq!(parse_read_vmo_reply(&reply[..reply_len]), Ok(0));
+        assert_eq!(window.mapped.len(), 2);
+
+        // No VMO, or one that cannot be mapped: a bad request, not a fault.
+        let n = read_vmo(0, 10, 0, &mut request);
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_eq!(&reply[..reply_len], &[VFS_BAD_REQUEST]);
+        let reply_len = dispatch_bulk(
+            &volume,
+            &mut disk,
+            &mut table,
+            &request[..n],
+            9,
+            &mut window,
+            &mut reply,
+        );
+        assert_eq!(&reply[..reply_len], &[VFS_BAD_REQUEST]);
+        let n = Request::ReadVmo {
+            handle: 99,
+            offset: 0,
+            len: 1,
+            vmo_offset: 0,
+        }
+        .encode_into(&mut request)
+        .unwrap();
+        let reply_len = dispatch_bulk(
+            &volume,
+            &mut disk,
+            &mut table,
+            &request[..n],
+            7,
+            &mut window,
+            &mut reply,
+        );
+        assert_eq!(&reply[..reply_len], &[VFS_BAD_HANDLE]);
+    }
+
+    #[test]
+    fn a_mutation_resets_every_cursor_so_reads_follow_the_new_chain() {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut table = OpenTable::new();
+        let mut request = [0u8; REQUEST_BUF_BYTES];
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let n = Request::open_options(b"/F.BIN", OPEN_READ | OPEN_WRITE | OPEN_CREATE)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        let (handle, _) = parse_open_reply(&reply[..reply_len]).unwrap();
+        let n = Request::set_len(handle, 2048)
+            .encode_into(&mut request)
+            .unwrap();
+        dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        // Read near the end: the handle's cursor now points deep into the chain.
+        let n = Request::read(handle, 1800, 16)
+            .encode_into(&mut request)
+            .unwrap();
+        dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_ne!(table.get(handle).unwrap().cursor, ChainCursor::new());
+        // Shrink and regrow: the old clusters are freed, and the cursor with them.
+        for len in [100, 2048] {
+            let n = Request::set_len(handle, len)
+                .encode_into(&mut request)
+                .unwrap();
+            dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+            assert_eq!(table.get(handle).unwrap().cursor, ChainCursor::new());
+        }
+        let n = Request::read(handle, 1800, 16)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_eq!(read_payload(&reply[..reply_len]), Ok(&[0u8; 16][..]));
     }
 
     #[test]

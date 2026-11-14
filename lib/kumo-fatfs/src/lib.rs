@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j543
 //j545
 //j547
 //j548
 //j861
+//j891
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -646,6 +646,51 @@ pub trait SectorReader {
     /// Read the sector at logical block address `lba` into `buf`. Returns
     /// `false` on failure (the read engine then stops, returning what it has).
     fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool;
+
+    /// Read the `out.len() / SECTOR_SIZE` consecutive sectors starting at `lba` into `out`
+    /// (SH7-d3a). `out.len()` is a whole number of sectors. A backing that can move many
+    /// sectors at once (a mapped image, a multi-sector block request) overrides this; the
+    /// default is one [`Self::read_sector`] per sector.
+    fn read_sectors(&mut self, lba: u32, out: &mut [u8]) -> bool {
+        for (index, sector) in out.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+            let Ok(sector) = <&mut [u8; SECTOR_SIZE]>::try_from(sector) else {
+                return false;
+            };
+            if !self.read_sector(lba + index as u32, sector) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Where a reader last stood in a file's cluster chain (SH7-d3a): the chain index of a cluster
+/// and its number. A read that starts at or after that index resumes there instead of walking
+/// the chain from its first cluster, which made reading a large file quadratic. It is only a
+/// hint: the owner resets it whenever the volume changes, and a cursor past the target is
+/// ignored.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChainCursor {
+    index: u32,
+    /// 0 = not set.
+    cluster: u32,
+}
+
+impl ChainCursor {
+    pub const fn new() -> ChainCursor {
+        ChainCursor {
+            index: 0,
+            cluster: 0,
+        }
+    }
+}
+
+/// One cached FAT sector for a chain walk: a contiguous file's links share a sector 128 at a
+/// time, so the walk reads each FAT sector once instead of once per link.
+struct FatSectorCache {
+    lba: u32,
+    valid: bool,
+    buf: [u8; SECTOR_SIZE],
 }
 
 /// Mutable half of a FAT backing capability. Writes are whole-sector so every
@@ -970,6 +1015,143 @@ impl FatVolume {
     /// and returns how many were written. Offsets at or past EOF return 0. This
     /// is the read primitive the vfs protocol's `Read { offset, len }` maps onto.
     pub fn read_file_at<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        entry: &DirEntry,
+        offset: u64,
+        out: &mut [u8],
+    ) -> usize {
+        self.read_file_at_cursor(reader, entry, &mut ChainCursor::new(), offset, out)
+    }
+
+    /// [`Self::read_file_at`] that resumes the chain walk at `cursor` and leaves it at the last
+    /// cluster read (SH7-d3a). Runs of consecutive clusters are read with one
+    /// [`SectorReader::read_sectors`] call per run (head and tail partial sectors through a
+    /// bounce sector), and the walk caches its FAT sector. Every link is checked against the
+    /// volume's cluster range, and the walk stops after as many links as the volume has
+    /// clusters, so a corrupt or looping chain ends the read early instead of hanging it.
+    pub fn read_file_at_cursor<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        entry: &DirEntry,
+        cursor: &mut ChainCursor,
+        offset: u64,
+        out: &mut [u8],
+    ) -> usize {
+        let size = entry.size as u64;
+        if offset >= size || out.is_empty() || entry.first_cluster < 2 {
+            return 0;
+        }
+        let limit = self.cluster_limit();
+        if entry.first_cluster >= limit {
+            return 0;
+        }
+        let want = (size - offset).min(out.len() as u64);
+        let end = offset + want;
+        let sector = SECTOR_SIZE as u64;
+        let cluster_bytes = self.bpb.sectors_per_cluster as u64 * sector;
+        let target = (offset / cluster_bytes) as u32;
+        let mut cache = FatSectorCache {
+            lba: 0,
+            valid: false,
+            buf: [0; SECTOR_SIZE],
+        };
+        let max_links = limit.saturating_sub(2);
+        let (mut index, mut cluster) =
+            if cursor.cluster >= 2 && cursor.cluster < limit && cursor.index <= target {
+                (cursor.index, cursor.cluster)
+            } else {
+                (0, entry.first_cluster)
+            };
+        while index < target {
+            match self.next_link_cached(reader, &mut cache, cluster) {
+                Some(FatEntry::Next(next)) if next >= 2 && next < limit && index < max_links => {
+                    cluster = next;
+                    index += 1;
+                }
+                _ => return 0,
+            }
+        }
+
+        let mut pos = offset;
+        let mut bounce = [0u8; SECTOR_SIZE];
+        loop {
+            // Extend a run of consecutive clusters from `cluster` until it covers `end` or
+            // the chain jumps.
+            let run_start = index as u64 * cluster_bytes;
+            let mut run_len = 1u32;
+            while run_start + run_len as u64 * cluster_bytes < end {
+                let last = cluster + run_len - 1;
+                match self.next_link_cached(reader, &mut cache, last) {
+                    Some(FatEntry::Next(next))
+                        if next == last + 1 && next < limit && index + run_len < max_links =>
+                    {
+                        run_len += 1
+                    }
+                    _ => break,
+                }
+            }
+            let run_end = (run_start + run_len as u64 * cluster_bytes).min(end);
+            let first_lba = self.bpb.cluster_to_sector(cluster);
+            while pos < run_end {
+                let done = (pos - offset) as usize;
+                let lba = first_lba + ((pos - run_start) / sector) as u32;
+                let within = (pos % sector) as usize;
+                let whole = (run_end - pos) / sector;
+                if within == 0 && whole > 0 {
+                    // The sector-aligned interior goes straight into `out`.
+                    let bytes = (whole * sector) as usize;
+                    if !reader.read_sectors(lba, &mut out[done..done + bytes]) {
+                        return done;
+                    }
+                    pos += bytes as u64;
+                } else {
+                    if !reader.read_sector(lba, &mut bounce) {
+                        return done;
+                    }
+                    let take = ((run_end - pos) as usize).min(SECTOR_SIZE - within);
+                    out[done..done + take].copy_from_slice(&bounce[within..within + take]);
+                    pos += take as u64;
+                }
+            }
+            index += run_len - 1;
+            cluster += run_len - 1;
+            *cursor = ChainCursor { index, cluster };
+            if pos >= end {
+                return want as usize;
+            }
+            match self.next_link_cached(reader, &mut cache, cluster) {
+                Some(FatEntry::Next(next)) if next >= 2 && next < limit && index < max_links => {
+                    cluster = next;
+                    index += 1;
+                }
+                _ => return (pos - offset) as usize,
+            }
+        }
+    }
+
+    /// [`Self::next_link`] through a one-sector FAT cache (SH7-d3a).
+    fn next_link_cached<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        cache: &mut FatSectorCache,
+        cluster: u32,
+    ) -> Option<FatEntry> {
+        let fat_sector = self.bpb.fat_start_sector() + cluster / FAT_ENTRIES_PER_SECTOR;
+        if !cache.valid || cache.lba != fat_sector {
+            if !reader.read_sector(fat_sector, &mut cache.buf) {
+                cache.valid = false;
+                return None;
+            }
+            cache.lba = fat_sector;
+            cache.valid = true;
+        }
+        fat_entry(&cache.buf, cluster % FAT_ENTRIES_PER_SECTOR)
+    }
+
+    /// The pre-SH7-d3a cluster-at-a-time read, kept for the tests that compare the two.
+    #[cfg(test)]
+    fn read_file_at_slow<R: SectorReader>(
         &self,
         reader: &mut R,
         entry: &DirEntry,
@@ -2300,6 +2482,194 @@ mod tests {
         let mut out = [0u8; 700];
         assert_eq!(volume.read_file(&mut disk, &reopened, &mut out), 700);
         assert_eq!(out, data);
+    }
+
+    /// SH7-d3a: two files grown in turns, so each chain alternates clusters, plus a third grown
+    /// in one piece, so its chain is one run. Returns the disk and the three entries.
+    fn fragmented_volume() -> (WritableDisk, FatVolume, [DirEntry; 3], [[u8; 2600]; 3]) {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut a = volume.create_file(&mut disk, b"/A.BIN").unwrap();
+        let mut b = volume.create_file(&mut disk, b"/B.BIN").unwrap();
+        let mut data = [[0u8; 2600]; 3];
+        for (file, bytes) in data.iter_mut().enumerate() {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = (index * 7 + file * 13 + index / 251) as u8;
+            }
+        }
+        let mut grown = 0usize;
+        while grown < 2600 {
+            let step = (2600 - grown).min(SECTOR_SIZE);
+            for (entry, bytes) in [(&mut a, &data[0]), (&mut b, &data[1])] {
+                volume
+                    .set_file_len(&mut disk, entry, (grown + step) as u64)
+                    .unwrap();
+                volume
+                    .write_file_at(&mut disk, entry, grown as u64, &bytes[grown..grown + step])
+                    .unwrap();
+            }
+            grown += step;
+        }
+        let mut c = volume.create_file(&mut disk, b"/C.BIN").unwrap();
+        volume.set_file_len(&mut disk, &mut c, 2600).unwrap();
+        volume
+            .write_file_at(&mut disk, &mut c, 0, &data[2])
+            .unwrap();
+        volume.flush(&mut disk).unwrap();
+        let entries = [
+            volume.resolve_path(&mut disk, b"/A.BIN").unwrap(),
+            volume.resolve_path(&mut disk, b"/B.BIN").unwrap(),
+            volume.resolve_path(&mut disk, b"/C.BIN").unwrap(),
+        ];
+        (disk, volume, entries, data)
+    }
+
+    #[test]
+    fn cursor_reads_match_the_cluster_walk_everywhere() {
+        let (mut disk, volume, entries, data) = fragmented_volume();
+        // The first two chains really are fragmented, the third is one run.
+        let next = |disk: &mut WritableDisk, cluster| volume.next_link(disk, cluster);
+        assert_ne!(
+            next(&mut disk, entries[0].first_cluster),
+            Some(FatEntry::Next(entries[0].first_cluster + 1))
+        );
+        assert_eq!(
+            next(&mut disk, entries[2].first_cluster),
+            Some(FatEntry::Next(entries[2].first_cluster + 1))
+        );
+        for (entry, bytes) in entries.iter().zip(data.iter()) {
+            for offset in [0u64, 1, 511, 512, 513, 1000, 1024, 2047, 2599, 2600, 3000] {
+                for len in [0usize, 1, 100, 511, 512, 513, 1536, 2600, 4096] {
+                    let mut slow = [0xAAu8; 4096];
+                    let mut fast = [0xAAu8; 4096];
+                    let a = volume.read_file_at_slow(&mut disk, entry, offset, &mut slow[..len]);
+                    let mut cursor = ChainCursor::new();
+                    let b = volume.read_file_at_cursor(
+                        &mut disk,
+                        entry,
+                        &mut cursor,
+                        offset,
+                        &mut fast[..len],
+                    );
+                    assert_eq!((a, &slow[..]), (b, &fast[..]), "offset {offset} len {len}");
+                    let expect = (bytes.len() as u64).saturating_sub(offset).min(len as u64);
+                    assert_eq!(b as u64, expect);
+                    let start = offset.min(bytes.len() as u64) as usize;
+                    assert_eq!(&fast[..b], &bytes[start..start + b]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_kept_cursor_reads_forward_and_back_correctly() {
+        let (mut disk, volume, entries, data) = fragmented_volume();
+        for (entry, bytes) in entries.iter().zip(data.iter()) {
+            let mut cursor = ChainCursor::new();
+            let mut out = [0u8; 2600];
+            // Forward in odd steps, so pieces straddle sectors and clusters.
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let take = (bytes.len() - at).min(333);
+                let n = volume.read_file_at_cursor(
+                    &mut disk,
+                    entry,
+                    &mut cursor,
+                    at as u64,
+                    &mut out[at..at + take],
+                );
+                assert_eq!(n, take);
+                at += take;
+            }
+            assert_eq!(&out[..], &bytes[..]);
+            // Backward: a cursor past the target is ignored, not trusted.
+            let mut piece = [0u8; 40];
+            assert_eq!(
+                volume.read_file_at_cursor(&mut disk, entry, &mut cursor, 3, &mut piece),
+                40
+            );
+            assert_eq!(&piece[..], &bytes[3..43]);
+        }
+    }
+
+    #[test]
+    fn a_sequential_cursor_read_reads_each_fat_sector_once_per_piece() {
+        struct Counting<'a> {
+            disk: &'a mut WritableDisk,
+            fat: core::ops::Range<u32>,
+            fat_reads: usize,
+            calls: usize,
+        }
+        impl SectorReader for Counting<'_> {
+            fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+                self.calls += 1;
+                if self.fat.contains(&lba) {
+                    self.fat_reads += 1;
+                }
+                self.disk.read_sector(lba, buf)
+            }
+            fn read_sectors(&mut self, lba: u32, out: &mut [u8]) -> bool {
+                self.calls += 1;
+                for (index, sector) in out.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+                    let sector: &mut [u8; SECTOR_SIZE] = sector.try_into().unwrap();
+                    if !self.disk.read_sector(lba + index as u32, sector) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+        let (mut disk, volume, entries, data) = fragmented_volume();
+        let fat_start = volume.bpb.fat_start_sector();
+        let fat = fat_start..fat_start + volume.bpb.sectors_per_fat;
+        let mut counting = Counting {
+            disk: &mut disk,
+            fat,
+            fat_reads: 0,
+            calls: 0,
+        };
+        // The contiguous file: one FAT sector and one bulk read cover all of it.
+        let mut out = [0u8; 2600];
+        let mut cursor = ChainCursor::new();
+        assert_eq!(
+            volume.read_file_at_cursor(&mut counting, &entries[2], &mut cursor, 0, &mut out),
+            2600
+        );
+        assert_eq!(&out[..], &data[2][..]);
+        assert_eq!(counting.fat_reads, 1);
+        // One run read for the whole sectors, one bounce for the 40-byte tail.
+        assert_eq!(counting.calls, 1 + 1 + 1);
+    }
+
+    #[test]
+    fn a_looping_chain_ends_a_cursor_read_instead_of_hanging_it() {
+        let (mut disk, volume, entries, _) = fragmented_volume();
+        // Point C's second cluster back at its first.
+        let first = entries[2].first_cluster;
+        let fat_lba = volume.bpb.fat_start_sector() + (first + 1) / FAT_ENTRIES_PER_SECTOR;
+        let slot = ((first + 1) % FAT_ENTRIES_PER_SECTOR) as usize * 4;
+        let mut sector = [0u8; SECTOR_SIZE];
+        assert!(disk.read_sector(fat_lba, &mut sector));
+        sector[slot..slot + 4].copy_from_slice(&first.to_le_bytes());
+        assert!(disk.write_sector(fat_lba, &sector));
+        let mut long = entries[2];
+        long.size = u32::MAX;
+        let mut out = [0u8; 4096];
+        let n = volume.read_file_at_cursor(
+            &mut disk,
+            &long,
+            &mut ChainCursor::new(),
+            1 << 30,
+            &mut out,
+        );
+        assert_eq!(n, 0);
+        // From the start it reads the loop over and over, but only as many links as the
+        // volume has clusters: a buffer larger than the whole volume is never filled.
+        extern crate std;
+        let cluster_bytes = volume.bpb.sectors_per_cluster as usize * SECTOR_SIZE;
+        let mut big = std::vec![0u8; (volume.cluster_limit() as usize + 4) * cluster_bytes];
+        let n = volume.read_file_at_cursor(&mut disk, &long, &mut ChainCursor::new(), 0, &mut big);
+        assert!(n < big.len(), "{n}");
     }
 
     #[test]

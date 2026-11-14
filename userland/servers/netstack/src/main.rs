@@ -470,10 +470,7 @@ fn pump_frame(frame: &mut Option<Frame>, server: &mut Server) {
         }
         // Per frame, so DEBUG: at NOTICE a proof image's console spent the upload logging it
         // (0.7 Mbit/s instead of ~45 in the 2026-11-13 speed test).
-        kumo_rt::log_write(
-            log_level::DEBUG,
-            b"netstack: frame tx handed to provider\n",
-        );
+        kumo_rt::log_write(log_level::DEBUG, b"netstack: frame tx handed to provider\n");
     }
     // Every RX_FRAME the lane accepted holds one credit until it is either consumed by the
     // wire stack or refused at ingress (unknown ethertype, fragment, full ring...). Refused

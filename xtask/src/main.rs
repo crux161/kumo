@@ -1,8 +1,8 @@
-//j857
 //j871
 //j888
 //j889
 //j890
+//j891
 
 use std::env;
 use std::fmt;
@@ -1136,6 +1136,14 @@ impl FatLayout {
     }
 }
 
+/// The file SH7-d3a's `bigread` reads: 6 MiB and a bit (so neither its size nor its last page
+/// is round), byte `i` = `(i >> 9) ^ (i * 7)` truncated to 8 bits (the probe recomputes it).
+fn bigread_data() -> Vec<u8> {
+    (0..(6 << 20) + 1234u64)
+        .map(|i| ((i >> 9) ^ (i * 7)) as u8)
+        .collect()
+}
+
 /// The 1000-byte file SH7-d2's `fileprobe` reads: byte `i` is `\n` when `i % 50 == 49`, else
 /// `a + (i * 7) % 26` (the probe recomputes it).
 fn fileprobe_text() -> Vec<u8> {
@@ -1283,6 +1291,9 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 .collect();
             linux_files.push(("/bin/m10-hello", persona_linux_hello.as_slice()));
             linux_files.push(("/etc/fileprobe.txt", fileprobe_txt.as_slice()));
+            // SH7-d3a: the bulk-read probe's file.
+            let big = bigread_data();
+            linux_files.push(("/etc/big.bin", big.as_slice()));
             let fat32_img = build_fat32_image(std_smoke.as_slice(), &linux_files);
             let payloadd = build_native_bin(&workspace_root()?, "payloadd")?;
             let files: Vec<(&str, &[u8])> = vec![
@@ -2006,7 +2017,7 @@ fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
 /// filesystem grant, as Linux `execve` and musl's loader expect. Each file is checked against the
 /// digest persona/MANIFEST records, so the image carries exactly the bytes that manifest and musl's
 /// COPYRIGHT describe. — TEAL
-const PERSONA_PAYLOADS: [(&str, &str, &str); 7] = [
+const PERSONA_PAYLOADS: [(&str, &str, &str); 8] = [
     (
         "persona/hello-dyn",
         "/bin/hello-dyn",
@@ -2036,6 +2047,11 @@ const PERSONA_PAYLOADS: [(&str, &str, &str); 7] = [
         "persona/fileprobe",
         "/bin/fileprobe",
         "e10a14f0a7b1b9b4d8de4c3a25278ba0a2ebff1596f3ce75871359cd2e5436f3",
+    ),
+    (
+        "persona/bigread",
+        "/bin/bigread",
+        "cbc27a4eff02d33406e84b6df75e38eda2322883828b272bd1e3686d61c672f1",
     ),
     (
         "persona/musl/COPYRIGHT",

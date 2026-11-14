@@ -1,4 +1,5 @@
 //j890
+//j891
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -8,17 +9,23 @@
 //! channels. This slice is **read-only**: a write or create open answers `EROFS`, and says so.
 //! — TEAL
 
-use kumo_abi::Handle;
-use kumo_rt::{channel_read, channel_write, log_write};
+use kumo_abi::{Handle, Rights};
+use kumo_rt::{
+    channel_read, channel_write, channel_write_with_handle, handle_close, handle_duplicate,
+    log_write, vmar_map_anywhere, vmo_create,
+};
 use kumo_vfs::{
-    parse_dir_reply, parse_open_reply, parse_stat_reply, read_payload, Request, VfsError,
-    STAT_KIND_DIRECTORY, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_FOUND,
+    parse_dir_reply, parse_open_reply, parse_read_vmo_reply, parse_stat_reply, read_payload,
+    Request, VfsError, READ_VMO_MAX, STAT_KIND_DIRECTORY, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_FOUND,
 };
 
 use crate::errno;
 
 /// What one vfs `Read` answers at most (the fatfs reply ceiling).
 const READ_CHUNK: u64 = 256;
+/// SH7-d3a: a read larger than one inline reply goes through this much private VMO at a time:
+/// fatfs writes the file bytes into it (`ReadVmo`), and the shim copies them to the program.
+const BOUNCE_BYTES: u64 = 1024 * 1024;
 const PATH_MAX: usize = kumo_vfs::MAX_PATH;
 const MAX_FDS: usize = 64;
 
@@ -83,6 +90,9 @@ struct Session {
     stdin_carry: [u8; 256],
     stdin_carry_at: usize,
     stdin_carry_len: usize,
+    /// The bulk-read bounce VMO and where the shim mapped it (0 until the first large read).
+    bounce: Handle,
+    bounce_at: u64,
 }
 
 static mut SESSION: Session = Session {
@@ -93,6 +103,8 @@ static mut SESSION: Session = Session {
     stdin_carry: [0; 256],
     stdin_carry_at: 0,
     stdin_carry_len: 0,
+    bounce: Handle(0),
+    bounce_at: 0,
 };
 
 fn session() -> &'static mut Session {
@@ -141,9 +153,130 @@ fn status_errno(error: VfsError) -> i64 {
     }
 }
 
-/// Read up to `out.len()` bytes of vfs file `handle` at `offset`, in reply-sized pieces.
+/// SH7-d3a: read up to `len` bytes of vfs file `handle` from `offset` straight into `vmo` at
+/// `vmo_offset`, [`READ_VMO_MAX`] per request. Each request carries a duplicate of `vmo`,
+/// which fatfs maps for that request alone and closes. Returns how many bytes landed (short
+/// only at end of file), or a negative errno.
+pub fn vfs_read_vmo(handle: u32, offset: u64, vmo: Handle, vmo_offset: u64, len: u64) -> i64 {
+    let fs = session().fs;
+    if fs.0 == 0 {
+        return -errno::EIO;
+    }
+    let mut done = 0u64;
+    while done < len {
+        let want = (len - done).min(READ_VMO_MAX as u64) as u32;
+        let mut frame = [0u8; kumo_vfs::READ_VMO_REQUEST_LEN];
+        let Some(n) = (Request::ReadVmo {
+            handle,
+            offset: offset + done,
+            len: want,
+            vmo_offset: vmo_offset + done,
+        })
+        .encode_into(&mut frame) else {
+            return -errno::EINVAL;
+        };
+        // The rights VmoCreate gave, minus DUPLICATE: fatfs may write and map it, not copy it.
+        let raw = handle_duplicate(
+            vmo,
+            Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::TRANSFER.0),
+        );
+        if raw == 0 || raw == u64::MAX {
+            read_vmo_trouble(b"duplicate", raw);
+            return -errno::ENOMEM;
+        }
+        let carried = Handle(raw as u32);
+        let status = channel_write_with_handle(fs, frame.as_ptr(), n, carried);
+        if status != 0 {
+            read_vmo_trouble(b"send", status as u64);
+            let _ = handle_close(carried);
+            return -errno::EIO;
+        }
+        let mut reply = [0u8; kumo_vfs::READ_VMO_REPLY_LEN];
+        let got = channel_read(fs, reply.as_mut_ptr(), reply.len());
+        if got == 0 || got == u64::MAX {
+            read_vmo_trouble(b"reply", got);
+            return -errno::EIO;
+        }
+        let count = match parse_read_vmo_reply(&reply[..got as usize]) {
+            Ok(count) => count as u64,
+            Err(error) => {
+                read_vmo_trouble(b"status", reply[0] as u64);
+                return status_errno(error);
+            }
+        };
+        done += count;
+        if count < want as u64 {
+            break;
+        }
+    }
+    done as i64
+}
+
+/// Say which step of a `ReadVmo` failed, with its status, once per step kind is plenty: the
+/// caller's errno says the rest.
+fn read_vmo_trouble(step: &[u8], value: u64) {
+    let mut line = [0u8; 80];
+    let head = b"persona-linux: ReadVmo ";
+    let mut len = 0;
+    for part in [head as &[u8], step, b" failed: 0x"] {
+        line[len..len + part.len()].copy_from_slice(part);
+        len += part.len();
+    }
+    for shift in (0..16).rev() {
+        line[len] = b"0123456789abcdef"[((value >> (shift * 4)) & 0xf) as usize];
+        len += 1;
+    }
+    line[len] = b'\n';
+    let _ = log_write(kumo_abi::sys::log_level::NOTICE, &line[..len + 1]);
+}
+
+/// The bounce VMO, created and mapped on first use.
+fn bounce() -> Option<(Handle, u64)> {
+    let s = session();
+    if s.bounce.0 == 0 {
+        let raw = vmo_create(BOUNCE_BYTES);
+        if raw == 0 || raw == u64::MAX {
+            return None;
+        }
+        let vmo = Handle(raw as u32);
+        match vmar_map_anywhere(vmo, BOUNCE_BYTES, 1 | 2) {
+            (0, at) if at != 0 => {
+                s.bounce = vmo;
+                s.bounce_at = at;
+            }
+            _ => {
+                let _ = handle_close(vmo);
+                return None;
+            }
+        }
+    }
+    Some((s.bounce, s.bounce_at))
+}
+
+/// Read up to `out.len()` bytes of vfs file `handle` at `offset`. A small read is inline
+/// replies; a large one (SH7-d3a) goes through the bounce VMO a megabyte at a time.
 /// Returns how many bytes arrived (short only at end of file), or a negative errno.
 pub fn vfs_pread(handle: u32, size: u64, offset: u64, out: &mut [u8]) -> i64 {
+    if out.len() as u64 > READ_CHUNK {
+        if let Some((vmo, at)) = bounce() {
+            let mut done = 0usize;
+            while done < out.len() && offset + (done as u64) < size {
+                let want = ((out.len() - done) as u64).min(BOUNCE_BYTES);
+                let got = vfs_read_vmo(handle, offset + done as u64, vmo, 0, want);
+                if got < 0 {
+                    return if done > 0 { done as i64 } else { got };
+                }
+                // SAFETY: the bounce mapping holds BOUNCE_BYTES >= got bytes.
+                let landed = unsafe { core::slice::from_raw_parts(at as *const u8, got as usize) };
+                out[done..done + got as usize].copy_from_slice(landed);
+                done += got as usize;
+                if (got as u64) < want {
+                    break;
+                }
+            }
+            return done as i64;
+        }
+    }
     let mut done = 0usize;
     let mut reply = [0u8; 1 + READ_CHUNK as usize];
     while done < out.len() && offset + (done as u64) < size {

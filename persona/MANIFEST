@@ -9,6 +9,7 @@
 # libgreet.so  : gcc -O2 -fPIC -shared -o libgreet.so libgreet.c && strip libgreet.so  (SH7-d2, j890)
 # greet        : gcc -O2 -o greet greet.c -L. -lgreet && strip greet  (SH7-d2: NEEDED libgreet.so, found in /lib by musl)
 # fileprobe    : gcc -O2 -o fileprobe fileprobe.c && strip fileprobe  (SH7-d2: the Linux file surface)
+# bigread      : gcc -O2 -o bigread bigread.c && strip bigread  (SH7-d3a, j891: bulk read/pread/mmap of /etc/big.bin)
 # musl/ld-musl-aarch64.so.1 : /lib/ld-musl-aarch64.so.1 from musl-1.2.5-r13 (musl's libc.so and dynamic loader)
 # musl/COPYRIGHT : https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5 (MIT; covers ld-musl-aarch64.so.1)
 #
@@ -17,5 +18,6 @@
 02f75bff61ab33904b62ff58a6e2199c468cdfec1fb5a8ffcbc95f787674c806  greet
 fd6a3056417ccd32ab30d26fa68f11128c4769040556d58a7eb7043680879c8a  libgreet.so
 e10a14f0a7b1b9b4d8de4c3a25278ba0a2ebff1596f3ce75871359cd2e5436f3  fileprobe
+cbc27a4eff02d33406e84b6df75e38eda2322883828b272bd1e3686d61c672f1  bigread
 42fb025bc758b76e60e7b3b0fcdcfab93b6ba1694b363244c2e8e6f51847e28c  musl/ld-musl-aarch64.so.1
 f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af  musl/COPYRIGHT

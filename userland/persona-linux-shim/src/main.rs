@@ -4,6 +4,7 @@
 //j888
 //j889
 //j890
+//j891
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -417,18 +418,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> i64
         return -errno::ENOMEM;
     };
     if let Some((handle, size)) = file {
-        let view = match vmar_map_anywhere(vmo, len, MAP_R | MAP_W) {
-            (0, view) if view != 0 => view,
-            _ => {
-                let _ = kumo_rt::handle_close(vmo);
-                return -errno::ENOMEM;
-            }
-        };
+        // SH7-d3a: fatfs writes the file range straight into the mapping's own VMO.
         let want = len.min(size.saturating_sub(offset));
-        // SAFETY: `view` is this fresh, writable mapping of `len >= want` bytes.
-        let out = unsafe { core::slice::from_raw_parts_mut(view as *mut u8, want as usize) };
-        let read = files::vfs_pread(handle, size, offset, out);
-        let _ = vmar_unmap(view, len);
+        let read = files::vfs_read_vmo(handle, offset, vmo, 0, want);
         if read < 0 || read as u64 != want {
             let _ = kumo_rt::handle_close(vmo);
             return if read < 0 { read } else { -errno::EIO };
@@ -639,6 +631,10 @@ fn read_image(path: &[u8]) -> Image {
     let Some(vmo) = vmo(map_len) else {
         fail_path("no memory to read", path);
     };
+    // SH7-d3a: the whole file lands in the VMO first, then it is mapped.
+    if files::vfs_read_vmo(handle, 0, vmo, 0, size) != size as i64 {
+        fail_path("short read", path);
+    }
     let map_at = match vmar_map_anywhere(vmo, map_len, MAP_R | MAP_W) {
         (0, at) if at != 0 => at,
         _ => fail_path("cannot map to read", path),
@@ -646,9 +642,6 @@ fn read_image(path: &[u8]) -> Image {
     let _ = kumo_rt::handle_close(vmo);
     // SAFETY: `map_at` is this fresh mapping of `map_len >= size` bytes.
     let out = unsafe { core::slice::from_raw_parts_mut(map_at as *mut u8, size as usize) };
-    if files::vfs_pread(handle, size, 0, out) != size as i64 {
-        fail_path("short read", path);
-    }
     files::close_handle(handle);
     Image {
         bytes: out,
