@@ -6264,6 +6264,11 @@ extern "C" fn sora_main(
                 }
             }
             let raw_source = port_wait(port);
+            // PROPOSAL/025: mount a finished payload fetch as soon as any wake sees it (one
+            // 4-byte read while a fetch runs; nothing at all otherwise).
+            if PAYLOAD_VMO.load(Ordering::Relaxed) != 0 {
+                let _ = payload_layer();
+            }
             if actor_event(raw_source)
                 || ax2_event(raw_source)
                 || ax4_event(
@@ -7357,6 +7362,15 @@ fn eval_command(
         } else {
             run_program_granted(initrd, &cmd.args, true);
         }
+    } else if cmd.name == "payload" {
+        // PROPOSAL/025: `payload fetch <server-ip> [retries]` starts payloadd and returns at
+        // once (safe in autoexec: the NIC comes up only after autoexec ends); `payload`
+        // reports, mounting a finished fetch. — TIMBERDOODLE
+        match cmd.args.first().map(|a| a.as_str()) {
+            Some("fetch") => payload_fetch(initrd, &cmd.args[1..]),
+            None => payload_status(),
+            _ => usage(b"usage: payload [fetch <server-ip> [retries]]\n"),
+        }
     } else if cmd.name == "netpolicy" {
         // netpolicy [static | dhcp [server_port client_port]]: choose how the resident
         // netstack configures the wire interface. This is the NET11 policy surface: the
@@ -8005,6 +8019,242 @@ fn run_program_background(initrd: Handle, argv: &[alloc::string::String], grant_
     log(b"bg: started ");
     log(name);
     log(b"\n");
+}
+
+// === PROPOSAL/025 N1/N2: the payload layer (the network root) ===============================
+//
+// `payload fetch` creates a VMO one page larger than the pinned payload, hands it to payloadd
+// as cap0 (CAP0_OVERRIDE) with the network grant, and returns. payloadd writes the archive and,
+// once its own SHA-256 matches, `DONE` in the extra page. Sora mounts lazily: on the first
+// program lookup the boot set cannot answer, or on `payload`. Mounting kills the fetcher (no
+// writer may outlive the check), re-hashes the VMO against the boot set's pin itself, and
+// keeps only a read-only duplicate. Programs found there run like boot-set programs; the boot
+// set always wins a name both carry.
+
+/// Set only around payloadd's launch: the handle its cap0 receives instead of the initrd.
+static CAP0_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+static PAYLOAD_VMO: AtomicU32 = AtomicU32::new(0);
+static PAYLOAD_PROCESS: AtomicU32 = AtomicU32::new(0);
+static PAYLOAD_LAYER: AtomicU32 = AtomicU32::new(0);
+static PAYLOAD_SIZE: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_PIN: Shared<[u8; 32]> = Shared(core::cell::UnsafeCell::new([0; 32]));
+static PAYLOAD_STARTED_NS: AtomicU64 = AtomicU64::new(0);
+
+const PAYLOAD_DONE: &[u8; 4] = b"DONE";
+
+struct PayloadPin {
+    name: [u8; 64],
+    name_len: usize,
+    size: u64,
+    sha256: [u8; 32],
+}
+
+/// `etc/payload`: `name = <tftp path>`, `size = <bytes>`, `sha256 = <64 hex>`.
+fn read_payload_pin(initrd: Handle) -> Option<PayloadPin> {
+    let (off, len) = find_initrd_file(initrd, kumo_abi::PAYLOAD_PIN_PATH.as_bytes())?;
+    let mut text = [0u8; 512];
+    let n = (len as usize).min(text.len());
+    let mut done = 0;
+    while done < n {
+        let take = (n - done).min(kumo_abi::sys::VMO_TRANSFER_MAX);
+        if vmo_read(initrd, off + done as u64, text[done..].as_mut_ptr(), take) != 0 {
+            return None;
+        }
+        done += take;
+    }
+    let text = core::str::from_utf8(&text[..n]).ok()?;
+    let mut pin = PayloadPin {
+        name: [0; 64],
+        name_len: 0,
+        size: 0,
+        sha256: [0; 32],
+    };
+    let mut have_sha = false;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "name" if value.len() <= pin.name.len() => {
+                pin.name[..value.len()].copy_from_slice(value.as_bytes());
+                pin.name_len = value.len();
+            }
+            "size" => pin.size = value.parse().ok()?,
+            "sha256" if value.len() == 64 => {
+                for (i, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+                    let hex = core::str::from_utf8(pair).ok()?;
+                    pin.sha256[i] = u8::from_str_radix(hex, 16).ok()?;
+                }
+                have_sha = true;
+            }
+            _ => {}
+        }
+    }
+    (pin.name_len > 0 && pin.size > 0 && have_sha).then_some(pin)
+}
+
+fn payload_fetch(initrd: Handle, args: &[alloc::string::String]) {
+    if PAYLOAD_LAYER.load(Ordering::Relaxed) != 0 || PAYLOAD_VMO.load(Ordering::Relaxed) != 0 {
+        log(b"payload: already fetched or fetching\n");
+        return;
+    }
+    let Some(server) = args.first() else {
+        usage(b"usage: payload fetch <server-ip> [retries]\n");
+        return;
+    };
+    let Some(pin) = read_payload_pin(initrd) else {
+        log(b"payload: no pin (etc/payload) in the boot set\n");
+        fail_status(1);
+        return;
+    };
+    let Some(vmo) = syscall_handle(vmo_create(pin.size + 4096)) else {
+        log(b"payload: VMO refused\n");
+        fail_status(1);
+        return;
+    };
+    let mut size_text = [0u8; 20];
+    let size_arg = dec_into(pin.size, &mut size_text);
+    let mut sha_text = [0u8; 64];
+    for (i, b) in pin.sha256.iter().enumerate() {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        sha_text[2 * i] = HEX[usize::from(b >> 4)];
+        sha_text[2 * i + 1] = HEX[usize::from(b & 15)];
+    }
+    let retries = args.get(1).map_or(&b"1200"[..], |r| r.as_bytes());
+    let argv: [&[u8]; 6] = [
+        b"payloadd",
+        server.as_bytes(),
+        &pin.name[..pin.name_len],
+        size_arg,
+        &sha_text,
+        retries,
+    ];
+    CAP0_OVERRIDE.store(vmo.0, Ordering::Relaxed);
+    let child = run_with_startup_input(
+        initrd,
+        kumo_abi::PAYLOADD_PATH.as_bytes(),
+        b"payloadd",
+        Some(&argv),
+        true,
+        FsGrant::None,
+        false,
+        false,
+        StdinMode::Interactive,
+        true,
+    );
+    CAP0_OVERRIDE.store(0, Ordering::Relaxed);
+    let Some(child) = child else {
+        let _ = handle_close(vmo);
+        log(b"payload: payloadd did not start\n");
+        fail_status(1);
+        return;
+    };
+    // payloadd reports on the kernel console; nobody reads its stdout.
+    let _ = handle_close(child.stdin);
+    let _ = handle_close(child.stdout);
+    PAYLOAD_PIN.set(pin.sha256);
+    PAYLOAD_SIZE.store(pin.size, Ordering::Relaxed);
+    PAYLOAD_PROCESS.store(child.process.map_or(0, |p| p.0), Ordering::Relaxed);
+    PAYLOAD_STARTED_NS.store(kumo_rt::clock_get(), Ordering::Relaxed);
+    PAYLOAD_VMO.store(vmo.0, Ordering::Relaxed);
+    log(b"payload: fetch started (");
+    log_dec(pin.size);
+    log(b" bytes pinned)\n");
+}
+
+fn dec_into(mut value: u64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return &buf[at..];
+        }
+    }
+}
+
+/// The mounted payload layer, mounting a finished fetch first. `None` while nothing is
+/// fetched, the fetch is still running, or it failed verification.
+fn payload_layer() -> Option<Handle> {
+    let mounted = PAYLOAD_LAYER.load(Ordering::Relaxed);
+    if mounted != 0 {
+        return Some(Handle(mounted));
+    }
+    let vmo = Handle(PAYLOAD_VMO.load(Ordering::Relaxed));
+    if vmo.0 == 0 {
+        return None;
+    }
+    let size = PAYLOAD_SIZE.load(Ordering::Relaxed);
+    let mut mark = [0u8; 4];
+    if vmo_read(vmo, size, mark.as_mut_ptr(), 4) != 0 || &mark != PAYLOAD_DONE {
+        return None; // still fetching (or failed; payloadd said why on the console)
+    }
+    // No writer may outlive the check: the fetcher is done, so end it for certain.
+    let process = PAYLOAD_PROCESS.swap(0, Ordering::Relaxed);
+    if process != 0 {
+        let _ = process_kill(Handle(process));
+        let _ = handle_close(Handle(process));
+    }
+    let started = kumo_rt::clock_get();
+    let mut hasher = kumo_sha256::Sha256::new();
+    let mut chunk = [0u8; 256];
+    let mut at = 0u64;
+    while at < size {
+        let take = ((size - at) as usize).min(chunk.len());
+        if vmo_read(vmo, at, chunk.as_mut_ptr(), take) != 0 {
+            break;
+        }
+        hasher.update(&chunk[..take]);
+        at += take as u64;
+    }
+    let pin = PAYLOAD_PIN.get();
+    PAYLOAD_VMO.store(0, Ordering::Relaxed);
+    if at != size || hasher.finish() != pin {
+        let _ = handle_close(vmo);
+        log(b"payload: REFUSED - the fetched archive does not match the boot set's pin\n");
+        return None;
+    }
+    let layer = handle_duplicate(vmo, Rights::READ | Rights::DUPLICATE | Rights::TRANSFER);
+    let _ = handle_close(vmo);
+    let layer = Handle(layer as u32);
+    if layer.0 == 0 || u64::from(layer.0) == u64::MAX {
+        log(b"payload: read-only duplicate refused\n");
+        return None;
+    }
+    PAYLOAD_LAYER.store(layer.0, Ordering::Relaxed);
+    let since = started.saturating_sub(PAYLOAD_STARTED_NS.load(Ordering::Relaxed));
+    log(b"payload: mounted ");
+    log_dec(size);
+    log(b" bytes, sha256 verified in ");
+    log_dec((kumo_rt::clock_get() - started) / 1_000_000);
+    log(b" ms (");
+    log_dec(since / 1_000_000);
+    log(b" ms after fetch start)\n");
+    Some(layer)
+}
+
+/// `payload`: mount a finished fetch, then say where the layer stands.
+fn payload_status() {
+    if payload_layer().is_some() {
+        log(b"payload: mounted (");
+        log_dec(PAYLOAD_SIZE.load(Ordering::Relaxed));
+        log(b" bytes); its programs run by name\n");
+    } else if PAYLOAD_VMO.load(Ordering::Relaxed) != 0 {
+        log(b"payload: fetching\n");
+    } else {
+        log(b"payload: not present (no fetch, or it was refused)\n");
+    }
+}
+
+/// A program's archive and entry: the boot set first, then the payload layer.
+fn find_program(initrd: Handle, path: &[u8]) -> Option<(Handle, u64, u64)> {
+    if let Some((off, len)) = find_initrd_file(initrd, path) {
+        return Some((initrd, off, len));
+    }
+    let layer = payload_layer()?;
+    find_initrd_file(layer, path).map(|(off, len)| (layer, off, len))
 }
 
 /// `wait`: drain the background job's output to the console until it exits.
@@ -12243,7 +12493,14 @@ fn run_with_startup_input_with_env(
         Some(pairs) => env_transfer_handle(pairs),
         None => 0,
     };
-    let initrd_child_raw = if grant_initrd {
+    let cap0_override = Handle(CAP0_OVERRIDE.load(Ordering::Relaxed));
+    let initrd_child_raw = if grant_initrd && cap0_override.0 != 0 {
+        // `payload fetch`: the child's cap0 is the writable payload VMO, not the initrd.
+        handle_duplicate(
+            cap0_override,
+            Rights::READ | Rights::WRITE | Rights::TRANSFER,
+        )
+    } else if grant_initrd {
         handle_duplicate(initrd, Rights::READ | Rights::TRANSFER)
     } else {
         0
@@ -12996,7 +13253,8 @@ fn run_elf_threads_status(
         flags
     }
 
-    let (elf_off, elf_len) = match find_initrd_file(initrd, path) {
+    // PROPOSAL/025 N1: the boot set first, then the mounted payload layer.
+    let (initrd, elf_off, elf_len) = match find_program(initrd, path) {
         Some(file) => file,
         None => {
             log(name);
@@ -14148,7 +14406,7 @@ fn run_initrd_elf_with_channel(
         flags
     }
 
-    let (elf_off, elf_len) = match find_initrd_file(initrd, path) {
+    let (initrd, elf_off, elf_len) = match find_program(initrd, path) {
         Some(file) => file,
         None => {
             log(b"svc-health: missing\n");

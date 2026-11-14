@@ -50,6 +50,7 @@ members = [
     "userland/gpu-contain",
     "userland/ls",
     "userland/netprobe",
+    "userland/payloadd",
     "userland/lua-repl",
     "userland/threads",
     "userland/kumo-dispatch",

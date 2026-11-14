@@ -43,6 +43,11 @@ pub const IDENTITYD_PATH: &str = "bin/identityd";
 pub const NETSTACK_PATH: &str = "bin/netstack";
 /// The NET2b socket-contract probe, launched as `net netprobe <mode>`.
 pub const NETPROBE_PATH: &str = "bin/netprobe";
+/// PROPOSAL/025 N2: fetches the payload archive (the network root layer) into a VMO.
+pub const PAYLOADD_PATH: &str = "bin/payloadd";
+/// The boot set's pin for the payload archive: `name`, `size` and `sha256` lines. Sora
+/// verifies a fetched payload against it before mounting anything.
+pub const PAYLOAD_PIN_PATH: &str = "etc/payload";
 /// The AX2 call/reply probe (PLAN/021): one binary, five roles selected by argv. Sora's
 /// `ax2bench` launches it as `ping`/`pong`/`die`/`never`/`hold`.
 pub const ACTORCALL_PATH: &str = "bin/actorcall";

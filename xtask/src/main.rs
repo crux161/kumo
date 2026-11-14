@@ -1079,7 +1079,8 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let autoexec = build_autoexec();
             let shadow = identity::shadow_file()?;
             let fat32_img = build_fat32_image(std_smoke.as_slice());
-            build_initrd(&[
+            let payloadd = build_native_bin(&workspace_root()?, "payloadd")?;
+            let files: Vec<(&str, &[u8])> = vec![
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
                 (TTYD_PATH, ttyd.as_slice()),
@@ -1128,7 +1129,9 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (PASSWD_PATH, identity::PASSWD.as_bytes()),
                 (GROUP_PATH, identity::GROUP.as_bytes()),
                 (SHADOW_PATH, shadow.as_bytes()),
-            ])?
+                (kumo_abi::PAYLOADD_PATH, payloadd.as_slice()),
+            ];
+            split_payload(out_dir, plan, files)?
         }
         ImageArch::X86_64 => {
             let hello = build_x86_hello_image(&workspace_root()?)?;
@@ -1151,6 +1154,89 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
         byte_len: initrd.len() as u64,
         fingerprint: fnv1a64(&initrd),
     }))
+}
+
+/// PROPOSAL/025 N3, opt-in (`KUMO_PAYLOAD_SPLIT=1`): these move out of the boot initrd into
+/// `EFI/KUMO/payload.img`, which `payload fetch` brings over the AX88 after boot. Nothing the
+/// boot itself launches is here; the default build keeps everything in the boot set.
+const PAYLOAD_DEFERRED: &[&str] = &[
+    KILO_PATH,
+    BMP_VIEW_PATH,
+    "share/images/sample.bmp",
+    STD_SMOKE_PATH,
+    SDK_SMOKE_PATH,
+    RELIBC_SMOKE_PATH,
+    THREADS_PATH,
+    ARGS_PATH,
+];
+const PAYLOAD_ESP_PATH: &str = "EFI/KUMO/payload.img";
+
+/// Build the boot initrd from `files`, splitting off the payload archive when asked. The split
+/// writes payload.img beside the initrd, pins it in the boot set (`etc/payload`: name, size,
+/// SHA-256) and replaces the autoexec with one that runs only boot-set programs.
+/// `KUMO_PAYLOAD_SERVER=<ip>` adds `payload fetch <ip>` plus the J845 late-wave trigger.
+fn split_payload(
+    out_dir: &Path,
+    plan: &ImagePlan,
+    files: Vec<(&str, &[u8])>,
+) -> Result<Vec<u8>, String> {
+    let payload_path = out_dir
+        .join(plan.hardware.to_string())
+        .join(PAYLOAD_ESP_PATH);
+    if payload_path.exists() {
+        fs::remove_file(&payload_path)
+            .map_err(|err| format!("remove {}: {err}", payload_path.display()))?;
+    }
+    match env::var("KUMO_PAYLOAD_SPLIT").as_deref() {
+        Ok("1") => {}
+        Ok("0") | Err(_) => return build_initrd(&files),
+        Ok(_) => return Err("KUMO_PAYLOAD_SPLIT must be 0 or 1".into()),
+    }
+    let (payload, boot): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|(path, _)| PAYLOAD_DEFERRED.contains(path));
+    let payload_img = build_initrd(&payload)?;
+    if let Some(parent) = payload_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    }
+    fs::write(&payload_path, &payload_img)
+        .map_err(|err| format!("write {}: {err}", payload_path.display()))?;
+    let sha: String = kumo_sha256::digest(&payload_img)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let pin = format!(
+        "name = {PAYLOAD_ESP_PATH}\nsize = {}\nsha256 = {sha}\n",
+        payload_img.len()
+    );
+    let mut autoexec = String::from(
+        "# KUMO autoexec (payload split): boot-set programs only; the rest arrive with `payload`\n\
+         echo kumo autoexec online\n\
+         ls\n\
+         run hello\n",
+    );
+    if let Ok(server) = env::var("KUMO_PAYLOAD_SERVER") {
+        // The fetch returns at once; the fast-failing ping is J845's late-wave trigger (the
+        // NIC starts only after a foreground autoexec child exits).
+        autoexec.push_str(&format!(
+            "payload fetch {server}\nnet netprobe ping {server} 1 1\n"
+        ));
+    }
+    let mut boot: Vec<(&str, &[u8])> = boot
+        .into_iter()
+        .filter(|(path, _)| *path != AUTOEXEC_PATH)
+        .collect();
+    boot.push((AUTOEXEC_PATH, autoexec.as_bytes()));
+    boot.push((kumo_abi::PAYLOAD_PIN_PATH, pin.as_bytes()));
+    let boot_img = build_initrd(&boot)?;
+    println!(
+        "payload split: boot initrd {} bytes ({} entries), payload {} bytes ({} entries)",
+        boot_img.len(),
+        boot.len(),
+        payload_img.len(),
+        payload.len()
+    );
+    Ok(boot_img)
 }
 
 fn net_restart_proof_enabled(value: Option<&str>, board: &str) -> Result<bool, String> {

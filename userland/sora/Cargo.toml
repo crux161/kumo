@@ -27,6 +27,8 @@ kumo-identity = { path = "../../lib/kumo-identity" }
 kumo-ipc.workspace = true
 kumo-vfs = { path = "../../lib/kumo-vfs" }
 kumo-rt = { path = "../kumo-rt" }
+# PROPOSAL/025: verify a fetched payload layer against the boot set's pin before mounting.
+kumo-sha256.workspace = true
 kumo-xhci = { path = "../../lib/kumo-xhci" }
 kumoza = { path = "../kumoza" }
 linked_list_allocator = "0.10.6"
