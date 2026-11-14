@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j857
 //j859
 //j864
 //j870
 //j893
+//j894
 
 extern crate alloc;
 
@@ -2745,16 +2745,86 @@ fn thermal_tsadc_in_dtb(dtb_vmo: Handle, dtb_phys: u64) -> bool {
     drv_thermal::tsadc_in_dtb(bytes)
 }
 
-/// T0 of the thermal cut (build/verification/thermal/thermal-cut.md, ratified 2026-11-14): start
-/// drv-thermal where the live DTB has the RK3588 TS-ADC. x0 is the sensor's own WRITE child
-/// Resource; the bootstrap channel then carries one READ-only grant each for the CRU's first
-/// page (clock/gate/reset checks), the two pad blocks and the PWM12-15 page (diagnostics for
-/// T1), then `G`. Sora keeps the other end for the `thermal` word. No CRU, pad or PWM write
-/// reach leaves Sora. — TEAL
+//j894
+/// Root-only pad setup: prime PWM12 high, then mux just B5/B6 and pull B6 up. Drop every
+/// temporary mapping before launch; the driver receives no IOC capability. — KESTREL
+fn prepare_thermal_fan(root: Handle) -> bool {
+    use drv_thermal::{
+        fan, Clocks, Regs, BUS_IOC_BASE, BUS_IOC_GPIO3B_IOMUX_SEL_H, CRU_BASE, PAGE_LEN, PWM_BASE,
+        VCCIO3_5_IOC_BASE, VCCIO3_5_IOC_GPIO3B_P,
+    };
+    struct Io(u64);
+    impl Regs for Io {
+        fn read(&mut self, offset: u32) -> u32 {
+            unsafe { ((self.0 + u64::from(offset)) as *const u32).read_volatile() }
+        }
+        fn write(&mut self, offset: u32, value: u32) {
+            unsafe { ((self.0 + u64::from(offset)) as *mut u32).write_volatile(value) }
+        }
+    }
+    const VAS: [u64; 4] = [0x3b00_0000, 0x3b01_0000, 0x3b02_0000, 0x3b03_0000];
+    let mut mapped = 0;
+    let ready = (|| {
+        for (i, base) in [CRU_BASE, PWM_BASE, BUS_IOC_BASE, VCCIO3_5_IOC_BASE]
+            .iter()
+            .enumerate()
+        {
+            let Some(vmo) = syscall_handle(resource_mint_mmio(root, *base, PAGE_LEN)) else {
+                log(b"thermal: supervisor MMIO mint failed; fan pads kept\n");
+                return false;
+            };
+            let flags = if i == 0 {
+                VmarFlags::READ | VmarFlags::DEVICE
+            } else {
+                VmarFlags::READ | VmarFlags::WRITE | VmarFlags::DEVICE
+            };
+            let result = vmar_map(Handle(0), vmo, 0, VAS[i], PAGE_LEN, flags.0);
+            let _ = handle_close(vmo);
+            if result != 0 {
+                log(b"thermal: supervisor MMIO map failed; fan pads kept\n");
+                return false;
+            }
+            mapped += 1;
+        }
+        let clocks = Clocks::read(|o| Io(VAS[0]).read(o));
+        if !clocks.pwm3_live() || clocks.pwm3_hz() != Some(fan::CLOCK_HZ) {
+            log(b"thermal: PWM clocks not ready; fan pads kept\n");
+            return false;
+        }
+        fan::start_full(&mut Io(VAS[1]));
+        if Io(VAS[1]).read(drv_thermal::pwm::duty(0)) != fan::PERIOD
+            || Io(VAS[1]).read(drv_thermal::pwm::period(0)) != fan::PERIOD
+            || Io(VAS[1]).read(drv_thermal::pwm::ctrl(0)) != fan::CTRL_RUN
+        {
+            log(b"thermal: full-duty prime failed; fan pads kept\n");
+            return false;
+        }
+        let mux = Io(VAS[2]).read(BUS_IOC_GPIO3B_IOMUX_SEL_H);
+        let pull = Io(VAS[3]).read(VCCIO3_5_IOC_GPIO3B_P);
+        Io(VAS[3]).write(VCCIO3_5_IOC_GPIO3B_P, fan::PULL_WRITE);
+        Io(VAS[2]).write(BUS_IOC_GPIO3B_IOMUX_SEL_H, fan::IOMUX_WRITE);
+        let mux_after = Io(VAS[2]).read(BUS_IOC_GPIO3B_IOMUX_SEL_H);
+        let pull_after = Io(VAS[3]).read(VCCIO3_5_IOC_GPIO3B_P);
+        let ok =
+            mux_after == ((mux & !0x0ff0) | 0x0bb0) && pull_after == ((pull & !0x3000) | 0x3000);
+        if ok {
+            log(b"thermal: PWM12 primed 100%, pins 16/18 muxed, tach pull-up verified\n");
+        } else {
+            log(b"thermal: fan pad readback mismatch; PWM12 kept at 100%\n");
+        }
+        ok
+    })();
+    for va in VAS.iter().take(mapped) {
+        let _ = kumo_rt::vmar_unmap(*va, PAGE_LEN);
+    }
+    ready
+}
+
+/// Launch the sensor and fan driver with a read-only CRU child and the owned PWM page.
+/// Shared IOC write authority is used only by prepare_thermal_fan above. — KESTREL
 fn launch_thermal(initrd: Handle, root: Handle, dtb_vmo: Handle, dtb_phys: u64) {
     use drv_thermal::{
-        BOOT_BUS_IOC, BOOT_CRU, BOOT_GO, BOOT_PWM, BOOT_VCCIO3_5_IOC, BUS_IOC_BASE, CRU_BASE,
-        CRU_LEN, PAGE_LEN, PWM_BASE, TSADC_BASE, TSADC_LEN, VCCIO3_5_IOC_BASE,
+        BOOT_CRU, BOOT_GO, BOOT_PWM, CRU_BASE, CRU_LEN, PAGE_LEN, PWM_BASE, TSADC_BASE, TSADC_LEN,
     };
     if !thermal_tsadc_in_dtb(dtb_vmo, dtb_phys) {
         log(b"drv-thermal: no TS-ADC in the live DTB; not launched\n");
@@ -2772,13 +2842,15 @@ fn launch_thermal(initrd: Handle, root: Handle, dtb_vmo: Handle, dtb_phys: u64) 
         log(b"drv-thermal: resource or channel setup failed\n");
         return;
     }
+    let fan_ready = prepare_thermal_fan(root);
     let sora_end = Handle(sora_end as u32);
     for (tag, base, len) in [
         (BOOT_CRU, CRU_BASE, CRU_LEN),
-        (BOOT_BUS_IOC, BUS_IOC_BASE, PAGE_LEN),
-        (BOOT_VCCIO3_5_IOC, VCCIO3_5_IOC_BASE, PAGE_LEN),
         (BOOT_PWM, PWM_BASE, PAGE_LEN),
     ] {
+        if tag == BOOT_PWM && !fan_ready {
+            continue;
+        }
         let raw = resource_create_child(root, base, len, 0, 0);
         if syscall_handle(raw).is_none() {
             let mut line = drv_thermal::Line::<160>::new();
@@ -2791,12 +2863,33 @@ fn launch_thermal(initrd: Handle, root: Handle, dtb_vmo: Handle, dtb_phys: u64) 
             );
             log(line.as_bytes());
         }
-        let grant = read_only_grant(raw);
+        let grant = if tag == BOOT_PWM {
+            syscall_handle(raw).unwrap_or(Handle(0))
+        } else {
+            read_only_grant(raw)
+        };
         if grant.0 == 0 && syscall_handle(raw).is_some() {
             log(b"drv-thermal: read-only grant setup failed\n");
         }
         if grant.0 != 0 && channel_write_with_handle(sora_end, [tag].as_ptr(), 1, grant) != 0 {
             let _ = handle_close(grant);
+        }
+    }
+    // Local proof images alone carry this marker; no arbitrary fan duty enters the protocol.
+    if let Some((offset, len)) = initrd_find(initrd, b"etc/thermal-test") {
+        let mut mode = [0u8; 6];
+        if len <= mode.len() as u64
+            && vmo_read(initrd, offset, mode.as_mut_ptr(), len as usize) == 0
+        {
+            let tag = match &mode[..len as usize] {
+                b"cycle\n" => Some(drv_thermal::BOOT_TEST_CYCLE),
+                b"panic\n" => Some(drv_thermal::BOOT_TEST_PANIC),
+                b"exit\n" => Some(drv_thermal::BOOT_TEST_EXIT),
+                _ => None,
+            };
+            if let Some(tag) = tag {
+                let _ = channel_write(sora_end, [tag].as_ptr(), 1);
+            }
         }
     }
     let go_sent = channel_write(sora_end, [BOOT_GO].as_ptr(), 1) == 0;
@@ -2875,6 +2968,12 @@ fn thermal_status() {
             &mut line,
             format_args!(" fan {}% {} rpm", status.duty_permille / 10, status.rpm),
         );
+    }
+    if status.flags & drv_thermal::FLAG_FAILSAFE != 0 {
+        let _ = core::fmt::Write::write_str(&mut line, " [failsafe]");
+    }
+    if status.flags & drv_thermal::FLAG_STALL != 0 {
+        let _ = core::fmt::Write::write_str(&mut line, " [stall]");
     }
     if status.flags & drv_thermal::FLAG_CLOCK_FAULT != 0 {
         let _ = core::fmt::Write::write_str(&mut line, " [clock fault]");

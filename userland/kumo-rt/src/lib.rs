@@ -1,9 +1,13 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
+//j894
 
 extern crate alloc;
 
 use kumo_abi::{Handle, Status};
+
+mod exit_hook;
+pub use exit_hook::set_exit_hook;
 
 pub mod heap;
 pub mod sys;
@@ -91,6 +95,7 @@ impl core::fmt::Write for BootLine {
 #[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    exit_hook::run();
     // A panic is a slice-ending failure, and a silent exit(1) turns it into an anonymous
     // ABEND in the TOWER report. Name it on the kernel log before ending, best-effort. — TIMBERDOODLE
     use core::fmt::Write;

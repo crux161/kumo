@@ -1,7 +1,8 @@
 //j893
-//! drv-thermal: the RK3588 TS-ADC (temperature) driver, and later the fan curve.
+//j894
+//! drv-thermal: RK3588 TS-ADC sensors, PWM fan curve and tach capture.
 //!
-//! T0 (j893) reads the seven on-die sensors and reports them; the fan is not touched. The pure
+//! T0 (j893) reads the seven sensors; T1 (j894) adds fan control in [`fan`]. The pure
 //! parts live here so the host can test them: the code-to-temperature table, the clock and reset
 //! checks, the TS-ADC start sequence, the live-DTB gate Sora launches by, and the status record
 //! the shell's `thermal` word reads. Every number comes from the RK3588 TRM part 1 (chapter 2
@@ -9,6 +10,8 @@
 //! `build/verification/thermal/thermal-cut.md` (rev 2, CRUX 2026-11-14). — TEAL
 
 #![no_std]
+
+pub mod fan;
 
 use core::fmt::{self, Write};
 
@@ -295,6 +298,10 @@ pub const BOOT_BUS_IOC: u8 = b'I';
 pub const BOOT_VCCIO3_5_IOC: u8 = b'V';
 pub const BOOT_PWM: u8 = b'P';
 pub const BOOT_GO: u8 = b'G';
+/// Proof-image requests only: bounded duty/fault cycle or panic-after-floor.
+pub const BOOT_TEST_CYCLE: u8 = b'T';
+pub const BOOT_TEST_PANIC: u8 = b'!';
+pub const BOOT_TEST_EXIT: u8 = b'E';
 
 /// The shell's request byte; the reply is one [`STATUS_LEN`]-byte record.
 pub const STATUS_REQUEST: u8 = b'S';
@@ -311,8 +318,7 @@ pub const FLAG_FAILSAFE: u8 = 1 << 2;
 pub const FLAG_STALL: u8 = 1 << 3;
 pub const FLAG_CLOCK_FAULT: u8 = 1 << 4;
 
-/// The record the `thermal` word prints. T0 fills temperatures and `samples`; duty and rpm stay
-/// zero until T1 drives the fan.
+/// The record the `thermal` word prints: seven temperatures, fan duty/RPM, flags and sample count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
     pub flags: u8,

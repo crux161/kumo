@@ -2,20 +2,17 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j893
+//j894
 
-//! drv-thermal T0 (j893): read the RK3588 TS-ADC once a second, log it, and answer the shell's
-//! `thermal` word. x0 is the TS-ADC child Resource (WRITE: the start sequence writes three
-//! hi-word-masked words); x1 is the bootstrap channel, whose tagged messages carry the read-only
-//! CRU, pad and PWM views and which then carries status requests. The fan is not touched; the
-//! pad and PWM reads are diagnostics for T1. — TEAL
-
+//! j894: seven sensors, PWM12 fan curve and PWM13 tach. Shared IOC authority stays in Sora.
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 use drv_thermal::{
-    notice_due, pwm, start_auto, Clocks, Found, Line, Regs, Sample, Status, BOOT_BUS_IOC, BOOT_CRU,
-    BOOT_GO, BOOT_PWM, BOOT_VCCIO3_5_IOC, BUS_IOC_BASE, BUS_IOC_GPIO3B_IOMUX_SEL_H, CRU_BASE,
-    CRU_LEN, FLAG_CLOCK_FAULT, FLAG_SENSOR_OK, PAGE_LEN, PWM_BASE, REPORT_EVERY_SAMPLES,
-    SAMPLE_PERIOD_NS, STATUS_REQUEST, TSADC_BASE, TSADC_LEN, VCCIO3_5_IOC_BASE,
-    VCCIO3_5_IOC_GPIO3B_P,
+    fan::{self, Controller, State, Tach},
+    notice_due, pwm, start_auto, Clocks, Found, Line, Regs, Sample, Status, BOOT_CRU, BOOT_GO,
+    BOOT_PWM, BOOT_TEST_CYCLE, BOOT_TEST_EXIT, BOOT_TEST_PANIC, CRU_BASE, CRU_LEN,
+    FLAG_CLOCK_FAULT, FLAG_FAILSAFE, FLAG_FAN_DRIVEN, FLAG_SENSOR_OK, FLAG_STALL, PAGE_LEN,
+    PWM_BASE, REPORT_EVERY_SAMPLES, SAMPLE_PERIOD_NS, STATUS_REQUEST, TSADC_BASE, TSADC_LEN,
 };
 use kumo_abi::sys::log_level;
 use kumo_abi::{Handle, VmarFlags};
@@ -25,8 +22,6 @@ kumo_rt::entry!(main);
 /// Fixed driver-private mappings, one page each, inside the child's 0..512 MiB VMAR.
 const TSADC_VA: u64 = 0x1000_0000;
 const CRU_VA: u64 = 0x1001_0000;
-const BUS_IOC_VA: u64 = 0x1002_0000;
-const VCCIO_VA: u64 = 0x1003_0000;
 const PWM_VA: u64 = 0x1004_0000;
 
 /// After the start sequence the first round needs seven conversions; poll for it this often,
@@ -98,8 +93,7 @@ impl Regs for Tsadc {
 #[derive(Default)]
 struct Grants {
     cru: Option<Handle>,
-    bus_ioc: Option<Handle>,
-    vccio: Option<Handle>,
+    proof: u8,
     pwm: Option<Handle>,
 }
 
@@ -115,8 +109,18 @@ fn read_grants(channel: Handle) -> Option<Grants> {
         let slot = match tag[0] {
             BOOT_GO => return Some(grants),
             BOOT_CRU => &mut grants.cru,
-            BOOT_BUS_IOC => &mut grants.bus_ioc,
-            BOOT_VCCIO3_5_IOC => &mut grants.vccio,
+            BOOT_TEST_CYCLE => {
+                grants.proof = 1;
+                continue;
+            }
+            BOOT_TEST_EXIT => {
+                grants.proof = 3;
+                continue;
+            }
+            BOOT_TEST_PANIC => {
+                grants.proof = 2;
+                continue;
+            }
             BOOT_PWM => &mut grants.pwm,
             _ => {
                 if let Some(handle) = handle {
@@ -129,60 +133,28 @@ fn read_grants(channel: Handle) -> Option<Grants> {
     }
 }
 
-/// Log what T1 will change, as found: the fan pins' mux and pulls and PWM12/13's registers. The
-/// PWM block is read only when the CRU says its clocks run (a gated APB block can hang the bus).
-fn report_fan_side(grants: &Grants, clocks: &Clocks) {
-    let iomux = grants
-        .bus_ioc
-        .filter(|h| map(*h, BUS_IOC_BASE, PAGE_LEN, BUS_IOC_VA, false))
-        .map(|_| read32(BUS_IOC_VA, BUS_IOC_GPIO3B_IOMUX_SEL_H));
-    let pull = grants
-        .vccio
-        .filter(|h| map(*h, VCCIO3_5_IOC_BASE, PAGE_LEN, VCCIO_VA, false))
-        .map(|_| read32(VCCIO_VA, VCCIO3_5_IOC_GPIO3B_P));
-    match (iomux, pull) {
-        (Some(iomux), Some(pull)) => log(
-            log_level::INFO,
-            format_args!(
-                "drv-thermal: fan pads GPIO3B_IOMUX_SEL_H=0x{iomux:08x} (B5 func {} B6 func {}) \
-                 GPIO3B_P=0x{pull:08x} (B6 pull {})\n",
-                (iomux >> 4) & 0xf,
-                (iomux >> 8) & 0xf,
-                match (pull >> 12) & 0b11 {
-                    0b11 => "up",
-                    0b01 => "down",
-                    _ => "off",
-                }
-            ),
-        ),
-        _ => log(
-            log_level::INFO,
-            format_args!("drv-thermal: fan pads not readable\n"),
-        ),
+struct Pwm;
+impl Regs for Pwm {
+    fn read(&mut self, offset: u32) -> u32 {
+        read32(PWM_VA, offset)
     }
-    if !clocks.pwm3_live() {
-        log(
-            log_level::INFO,
-            format_args!("drv-thermal: PWM block 3 clocks off; PWM12/13 not read\n"),
-        );
-        return;
+    fn write(&mut self, offset: u32, value: u32) {
+        unsafe { ((PWM_VA + u64::from(offset)) as *mut u32).write_volatile(value) };
     }
-    if grants
-        .pwm
-        .is_some_and(|h| map(h, PWM_BASE, PAGE_LEN, PWM_VA, false))
-    {
-        log(
-            log_level::INFO,
-            format_args!(
-                "drv-thermal: PWM version=0x{:08x} pwm12 ctrl=0x{:08x} period={} duty={} \
-                 pwm13 ctrl=0x{:08x} intsts=0x{:08x}\n",
-                read32(PWM_VA, pwm::VERSION),
-                read32(PWM_VA, pwm::ctrl(0)),
-                read32(PWM_VA, pwm::period(0)),
-                read32(PWM_VA, pwm::duty(0)),
-                read32(PWM_VA, pwm::ctrl(1)),
-                read32(PWM_VA, pwm::INTSTS),
-            ),
+}
+static PWM_MAPPED: AtomicBool = AtomicBool::new(false);
+
+fn full_on_exit() {
+    if PWM_MAPPED.load(Ordering::Acquire) && Clocks::read(|o| read32(CRU_VA, o)).pwm3_live() {
+        fan::set_duty(&mut Pwm, fan::FULL);
+        let ok = read32(PWM_VA, pwm::duty(0)) == fan::PERIOD;
+        let _ = kumo_rt::log_write(
+            log_level::NOTICE,
+            if ok {
+                b"thermal: exit fail-safe 100%, PWM duty readback=960\n"
+            } else {
+                b"thermal: exit fail-safe PWM readback failed\n"
+            },
         );
     }
 }
@@ -248,52 +220,165 @@ fn start_sensor(resource: Handle, clocks: &Clocks) -> bool {
     true
 }
 
-fn temperatures_line(status: &Status) -> Line<200> {
-    let mut line = Line::<200>::new();
+fn temperatures_line(status: &Status) -> Line<240> {
+    let mut line = Line::<240>::new();
     let _ = status.write_temperatures(&mut line);
+    let state = if status.flags & FLAG_CLOCK_FAULT != 0 {
+        "clock fault"
+    } else if status.flags & FLAG_STALL != 0 {
+        "stall"
+    } else if status.flags & FLAG_FAILSAFE != 0 {
+        "sensor fault"
+    } else {
+        "auto"
+    };
+    let _ = write!(
+        line,
+        " fan {}% {} rpm {state}",
+        status.duty_permille / 10,
+        status.rpm
+    );
     line
 }
 
 struct Driver {
     channel: Option<Handle>,
     sensor: bool,
+    cru: bool,
+    pwm: bool,
+    controller: Controller,
+    proof: u8,
     status: Status,
     last_noticed: Option<i16>,
 }
 
 impl Driver {
     fn sample(&mut self) {
-        if !self.sensor {
-            return;
-        }
-        let sample = Sample::read(&mut Tsadc);
-        self.status.set_sample(&sample);
-        self.status.samples = self.status.samples.wrapping_add(1);
-        if sample.complete() {
-            self.status.flags |= FLAG_SENSOR_OK;
+        let clocks = self.cru.then(|| Clocks::read(|o| read32(CRU_VA, o)));
+        let sensor_live = self.sensor && clocks.is_some_and(|c| c.tsadc_ready());
+        let sample = if sensor_live {
+            Sample::read(&mut Tsadc)
         } else {
-            self.status.flags &= !FLAG_SENSOR_OK;
+            Sample::default()
+        };
+        let running = sensor_live && Found::read(&mut Tsadc).usable();
+        let pwm_live = self.pwm && clocks.is_some_and(|c| c.pwm3_live());
+        let config_ok = pwm_live
+            && read32(PWM_VA, pwm::ctrl(0)) == fan::CTRL_RUN
+            && read32(PWM_VA, pwm::period(0)) == fan::PERIOD
+            && read32(PWM_VA, pwm::ctrl(1)) == fan::CTRL_CAPTURE;
+        let clocks_ok =
+            sensor_live && config_ok && clocks.is_some_and(|c| c.pwm3_hz() == Some(fan::CLOCK_HZ));
+        let tach = if pwm_live {
+            fan::read_tach(&mut Pwm)
+        } else {
+            Tach::default()
+        };
+        self.status.samples = self.status.samples.wrapping_add(1);
+        let n = self.status.samples;
+        let old_duty = self.status.duty_permille;
+        let old_flags = self.status.flags;
+        self.status.set_sample(&sample);
+        self.status.rpm = tach.rpm;
+        let mut input = sample;
+        let mut sensor_ok = running;
+        let mut input_tach = tach;
+        // Bounded proof-image inputs exercise the production controller, with real capture and
+        // PWM readback. Real faults and >=75 C always override the proof. — KESTREL
+        if self.proof == 1
+            && n <= 55
+            && clocks_ok
+            && sample.complete()
+            && sample.max().is_some_and(|m| m < fan::RAMP_END_MC)
+        {
+            let mc = match n {
+                1..=4 => 75_000,
+                5..=9 => 62_500,
+                _ => 50_000,
+            };
+            input = Sample {
+                millicelsius: [Some(mc); 7],
+            };
+            if (17..=20).contains(&n) {
+                sensor_ok = false;
+            }
+            if (21..=25).contains(&n) {
+                input_tach = Tach::default();
+            }
         }
+        if self.proof == 1 && n == 56 {
+            self.controller = Controller::new(kumo_rt::clock_get());
+        }
+        let policy_clocks_ok = clocks_ok && !(self.proof == 1 && (30..=33).contains(&n));
+        let output = self.controller.step(
+            kumo_rt::clock_get(),
+            input,
+            sensor_ok,
+            policy_clocks_ok,
+            input_tach,
+        );
+        self.status.flags = if running && sample.complete() && output.state != State::SensorFault {
+            FLAG_SENSOR_OK
+        } else {
+            0
+        };
+        if pwm_live {
+            self.status.flags |= FLAG_FAN_DRIVEN;
+        }
+        if output.state != State::Auto {
+            self.status.flags |= FLAG_FAILSAFE;
+        }
+        if output.state == State::Stall {
+            self.status.flags |= FLAG_STALL;
+        }
+        if output.state == State::ClockFault {
+            self.status.flags |= FLAG_CLOCK_FAULT;
+        }
+        self.status.duty_permille = output.duty;
+        if pwm_live {
+            fan::set_duty(&mut Pwm, output.duty);
+            if read32(PWM_VA, pwm::duty(0)) != u32::from(output.duty) * fan::PERIOD / 1000 {
+                fan::set_duty(&mut Pwm, fan::FULL);
+                self.status.duty_permille = fan::FULL;
+                self.status.flags |= FLAG_FAILSAFE | FLAG_CLOCK_FAULT;
+            }
+        }
+        let changed =
+            old_flags != self.status.flags || old_duty.abs_diff(self.status.duty_permille) >= 50;
         let max = self.status.max();
-        if notice_due(self.last_noticed, max) {
-            self.last_noticed = max;
+        if changed
+            || output.retry
+            || notice_due(self.last_noticed, max)
+            || (self.proof != 0 && n <= 60)
+            || n % REPORT_EVERY_SAMPLES == 0
+        {
             let line = temperatures_line(&self.status);
             log(
-                log_level::NOTICE,
+                if changed || notice_due(self.last_noticed, max) {
+                    log_level::NOTICE
+                } else {
+                    log_level::INFO
+                },
                 format_args!(
                     "thermal: {}\n",
                     core::str::from_utf8(line.as_bytes()).unwrap_or("?")
                 ),
             );
-        } else if self.status.samples % REPORT_EVERY_SAMPLES == 0 {
-            let line = temperatures_line(&self.status);
-            log(
-                log_level::INFO,
-                format_args!(
-                    "thermal: {}\n",
-                    core::str::from_utf8(line.as_bytes()).unwrap_or("?")
-                ),
-            );
+            if self.proof != 0 && pwm_live {
+                log(log_level::INFO, format_args!("thermal proof: sample={n} duty={} rpm={} state={} pwm_period={} pwm_duty={} capture_h={} capture_l={}\n",
+                    self.status.duty_permille, self.status.rpm, output.state.name(),
+                    read32(PWM_VA,pwm::period(0)),read32(PWM_VA,pwm::duty(0)),
+                    read32(PWM_VA,pwm::period(1)),read32(PWM_VA,pwm::duty(1))));
+            }
+            if changed || notice_due(self.last_noticed, max) {
+                self.last_noticed = max;
+            }
+        }
+        if self.proof == 3 && n == 8 {
+            kumo_rt::process_exit(0);
+        }
+        if self.proof == 2 && n == 8 {
+            panic!("thermal fail-safe proof");
         }
     }
 
@@ -377,56 +462,59 @@ extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
         );
         kumo_rt::process_exit(1);
     };
-    let mut status = Status::default();
     let clocks = grants
         .cru
         .filter(|h| map(*h, CRU_BASE, CRU_LEN, CRU_VA, false))
-        .map(|_| Clocks::read(|offset| read32(CRU_VA, offset)));
-    let sensor = match clocks {
-        Some(clocks) => {
-            let up = start_sensor(resource, &clocks);
-            report_fan_side(&grants, &clocks);
-            up
-        }
-        None => {
-            log(
-                log_level::ERR,
-                format_args!("drv-thermal: no CRU view; sensor left untouched\n"),
-            );
-            false
-        }
-    };
+        .map(|_| Clocks::read(|o| read32(CRU_VA, o)));
+    let pwm = clocks.is_some_and(|c| c.pwm3_live() && c.pwm3_hz() == Some(fan::CLOCK_HZ))
+        && grants
+            .pwm
+            .is_some_and(|h| map(h, PWM_BASE, PAGE_LEN, PWM_VA, true));
+    if pwm {
+        PWM_MAPPED.store(true, Ordering::Release);
+        kumo_rt::set_exit_hook(Some(full_on_exit));
+        fan::start_full(&mut Pwm);
+        fan::start_capture(&mut Pwm);
+        log(
+            log_level::NOTICE,
+            format_args!("thermal: PWM12 25kHz, startup 100%; PWM13 tach capture\n"),
+        );
+    }
+    let sensor = clocks.is_some_and(|c| start_sensor(resource, &c));
     if !sensor {
-        status.flags |= FLAG_CLOCK_FAULT;
+        log(
+            log_level::ERR,
+            format_args!("drv-thermal: no live sensor; fan stays full\n"),
+        );
+    }
+    if sensor {
+        for _ in 0..FIRST_SAMPLE_POLLS {
+            if Sample::read(&mut Tsadc).complete() {
+                break;
+            }
+            let _ = kumo_rt::sleep_ns(FIRST_SAMPLE_POLL_NS);
+        }
     }
     let mut driver = Driver {
         channel: Some(channel),
         sensor,
-        status,
+        cru: clocks.is_some(),
+        pwm,
+        controller: Controller::new(kumo_rt::clock_get()),
+        proof: grants.proof,
+        status: Status {
+            duty_permille: fan::FULL,
+            ..Status::default()
+        },
         last_noticed: None,
     };
-    if sensor {
-        let mut first = Sample::read(&mut Tsadc);
-        let mut polls = 0;
-        while !first.complete() && polls < FIRST_SAMPLE_POLLS {
-            let _ = kumo_rt::sleep_ns(FIRST_SAMPLE_POLL_NS);
-            first = Sample::read(&mut Tsadc);
-            polls += 1;
-        }
-        driver.status.set_sample(&first);
-        driver.status.samples = 1;
+    driver.sample();
+    if driver.status.flags & FLAG_SENSOR_OK != 0 {
         let line = temperatures_line(&driver.status);
-        let text = core::str::from_utf8(line.as_bytes()).unwrap_or("?");
-        if first.complete() {
-            driver.status.flags |= FLAG_SENSOR_OK;
-            kumo_rt::boot_ok_fmt(format_args!("drv-thermal: TS-ADC online, {text}\n"));
-        } else {
-            log(
-                log_level::ERR,
-                format_args!("drv-thermal: TS-ADC incomplete after start: {text}\n"),
-            );
-        }
-        driver.last_noticed = driver.status.max();
+        kumo_rt::boot_ok_fmt(format_args!(
+            "drv-thermal: TS-ADC online, {}\n",
+            core::str::from_utf8(line.as_bytes()).unwrap_or("?")
+        ));
     }
     driver.serve()
 }

@@ -1,8 +1,8 @@
-//j859
 //j871
 //j873
 //j881
 //j884
+//j894
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -1532,6 +1532,7 @@ mod tests {
     all(target_arch = "x86_64", target_os = "none")
 ))]
 pub fn process_exit(code: u64) -> ! {
+    crate::exit_hook::run();
     syscall(Syscall::ProcessExit, code, 0, 0, 0);
     loop {
         core::hint::spin_loop();
@@ -1543,6 +1544,7 @@ pub fn process_exit(code: u64) -> ! {
     all(target_arch = "x86_64", target_os = "none")
 )))]
 pub fn process_exit(_code: u64) -> ! {
+    crate::exit_hook::run();
     loop {
         core::hint::spin_loop();
     }
