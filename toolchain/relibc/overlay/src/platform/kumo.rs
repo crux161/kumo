@@ -1,8 +1,8 @@
-//j873
 //j875
 //j877
 //j881
 //j884
+//j897
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -345,7 +345,14 @@ enum FdSlot {
     Epoll {
         set: u8,
     },
+    /// `/dev/null` (j897): reads are end-of-file, writes are consumed whole. It needs no
+    /// grant and names no capability, so a program launched without a stream (std fills
+    /// a closed fd 0..2 from /dev/null before main, and aborts if it cannot) still starts.
+    Null,
 }
+
+/// The one device path this backend answers itself, with or without a filesystem grant.
+const DEV_NULL: &[u8] = b"/dev/null";
 
 /// One watched descriptor of an epoll set: the channel it names (bound to the set's port
 /// when readable interest was registered) and the koid `PortWait` reports for it.
@@ -2802,7 +2809,8 @@ impl Sys {
             Some(FdSlot::File { .. })
             | Some(FdSlot::Socket { .. })
             | Some(FdSlot::Dir { .. })
-            | Some(FdSlot::Epoll { .. }) => {
+            | Some(FdSlot::Epoll { .. })
+            | Some(FdSlot::Null) => {
                 return Err(Errno(ENOTTY));
             }
             Some(FdSlot::Input(_)) | Some(FdSlot::Output(_)) => {}
@@ -3166,6 +3174,11 @@ impl Pal for Sys {
                     fill_stat(buf, 0o140000, 0o666, 1, 0); // S_IFSOCK
                     return Ok(());
                 }
+                FdSlot::Null => {
+                    // j897: Linux's /dev/null is character device 1:3, mode 0666.
+                    fill_stat(buf, 0o020000, 0o666, 1, 0); // S_IFCHR
+                    return Ok(());
+                }
                 FdSlot::Epoll { .. } => {
                     // An epoll instance is an anonymous inode, as on Linux.
                     fill_stat(buf, 0o020000, 0o600, 1, 0); // S_IFCHR
@@ -3179,6 +3192,10 @@ impl Pal for Sys {
                 }
             }
         };
+        if path == DEV_NULL {
+            fill_stat(buf, 0o020000, 0o666, 1, 0); // S_IFCHR (j897)
+            return Ok(());
+        }
         let mut resolved = [0u8; VFS_MAX_PATH];
         let path = at_path(fildes, path, &mut resolved)?;
         let mut request = [0u8; 3 + VFS_MAX_PATH];
@@ -3261,6 +3278,7 @@ impl Pal for Sys {
                     Ok(0)
                 }
                 FdSlot::Closed => Err(Errno(EBADF)),
+                FdSlot::Null => Ok(0), // j897: no flag changes what /dev/null does
                 _ => Err(Errno(EINVAL)),
             },
             // fdopendir sets FD_CLOEXEC; there is no exec on kumo, so the flag is
@@ -3608,6 +3626,8 @@ impl Pal for Sys {
                 return Err(Errno(ESPIPE));
             }
             FdSlot::Dir { .. } | FdSlot::Epoll { .. } => return Err(Errno(EINVAL)),
+            // j897: Linux answers any seek on /dev/null with 0.
+            FdSlot::Null => return Ok(0),
             FdSlot::File { offset, size, .. } => (offset, size),
         };
         let base = match whence {
@@ -3811,6 +3831,24 @@ impl Pal for Sys {
         if path.is_empty() {
             return Err(Errno(ENAMETOOLONG));
         }
+        // j897: /dev/null is answered here, before any path reaches the filesystem
+        // server, so it opens in a process that holds no filesystem grant at all.
+        if path == DEV_NULL {
+            const O_DIRECTORY_BITS: c_int = O_DIRECTORY | 0x4000;
+            if oflag & O_DIRECTORY_BITS != 0 {
+                return Err(Errno(ENOTDIR));
+            }
+            // POSIX's lowest-free-descriptor rule, from 0: unlike files (fd_alloc keeps
+            // 0..2 for granted streams), the null device is exactly what belongs in an
+            // ungranted std stream, and std's start-up relies on landing there.
+            let fildes = (0..FD_SLOTS as c_int)
+                .find(|&fd| matches!(fd_slot(fd), Some(FdSlot::Closed)))
+                .ok_or(Errno(EMFILE))?;
+            if let Some(slot) = fd_slot(fildes) {
+                *slot = FdSlot::Null;
+            }
+            return Ok(fildes);
+        }
         let mut resolved = [0u8; VFS_MAX_PATH];
         let path = at_path(dirfd, path, &mut resolved)?;
         // O_DIRECTORY (SH3-d2c): directories are opened as path records, not server
@@ -4001,6 +4039,7 @@ impl Pal for Sys {
         }
         let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
         let (handle, offset, size) = match *slot {
+            FdSlot::Null => return Ok(0), // j897: always end-of-file
             // A channel read parks until a message arrives, and answers 0 once the writer
             // is gone — which is exactly POSIX end-of-file, so it needs no translation.
             FdSlot::Input(handle) => {
@@ -4074,6 +4113,9 @@ impl Pal for Sys {
             return Err(Errno(EINVAL));
         }
         let offset = offset as u64;
+        if matches!(fd_slot(fildes).map(|slot| *slot), Some(FdSlot::Null)) {
+            return Ok(0); // j897
+        }
         let Some(FdSlot::File { handle, size, .. }) = fd_slot(fildes).map(|slot| *slot) else {
             return Err(Errno(EBADF));
         };
@@ -4220,6 +4262,14 @@ impl Pal for Sys {
                                 if handle != 0 =>
                             {
                                 handle
+                            }
+                            // j897: std's Stdio::null(). The child gets no channel for
+                            // that stream, and its own start-up seats /dev/null there.
+                            Some(FdSlot::Null) => {
+                                if let Some((_, previous)) = stdio[to as usize].take() {
+                                    close_handle(previous);
+                                }
+                                continue;
                             }
                             _ => return Err(Errno(EOPNOTSUPP)),
                         };
@@ -4450,6 +4500,7 @@ impl Pal for Sys {
                 stream_send(info, buf)
             }
             Some(FdSlot::Socket { .. }) => Err(Errno(ENOTCONN)),
+            Some(FdSlot::Null) => Ok(buf.len()), // j897: consumed whole
             _ => Err(Errno(EBADF)),
         }
     }
@@ -4464,6 +4515,9 @@ impl Pal for Sys {
             return Err(Errno(EINVAL));
         }
         let mut offset = offset as u64;
+        if matches!(fd_slot(fildes).map(|slot| *slot), Some(FdSlot::Null)) {
+            return Ok(buf.len()); // j897
+        }
         let Some(FdSlot::File { handle, mut size, .. }) = fd_slot(fildes).map(|slot| *slot) else {
             return Err(Errno(EBADF));
         };

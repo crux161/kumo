@@ -1,5 +1,6 @@
 #!/bin/sh
 #j857
+#j897
 # SH0 (PLAN/022): build the multi-file, multi-crate sdk-smoke against the prebuilt
 # sysroot, with no -Z build-std. The sysroot carries the link contract (start.o,
 # link.ld, the kumo shim, relibc's libc.a), so the consumer's whole Rust toolchain
@@ -29,10 +30,18 @@ export RUSTFLAGS="--sysroot=$SYSROOT \
 -C link-arg=-z -C link-arg=muldefs"
 export CARGO_TARGET_DIR="$TARGET_DIR"
 
+out="$TARGET_DIR/aarch64-unknown-kumo/release/sdk-smoke"
+# j897: libc.a reaches the link as a bare argument cargo does not fingerprint, so a newer
+# relibc would otherwise leave the old binary in place. The release binary is only an
+# uplift (hard link) of deps/sdk_smoke-<hash>, which cargo re-uplifts without relinking,
+# so the deps artifact goes too; with it missing, cargo rebuilds and relinks the crate.
+if [ -f "$out" ] && [ "$SYSROOT/share/kumo/libc.a" -nt "$out" ]; then
+    rm -f "$out" "$TARGET_DIR"/aarch64-unknown-kumo/release/deps/sdk_smoke-*
+fi
+
 cd "$CRATE"
 cargo +"$TOOLCHAIN" build --release \
     --target "$ROOT/targets/aarch64-unknown-kumo.json" -Zjson-target-spec
 
-out="$TARGET_DIR/aarch64-unknown-kumo/release/sdk-smoke"
 [ -f "$out" ] || fail "sdk-smoke binary missing at $out"
 printf 'KUMO sdk-smoke: %s\n' "$out"

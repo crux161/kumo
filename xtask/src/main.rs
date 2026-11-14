@@ -1,8 +1,8 @@
-//j824
 //j825
 //j857
 //j871
 //j893
+//j897
 
 use std::env;
 use std::fmt;
@@ -1668,7 +1668,14 @@ fn build_sdk_smoke_image(root: &Path) -> Result<Vec<u8>, String> {
     // SH0 (PLAN/022): the consumer proof builds against the prebuilt sysroot with no
     // -Z build-std. A clean checkout grows the sysroot first; the driver is idempotent.
     let sysroot = root.join("build/sysroot/aarch64-unknown-kumo");
-    if !sysroot.join("manifest.json").is_file() {
+    // j897: the sysroot carries a copy of relibc's libc.a, and the image build rebuilds
+    // relibc first. A copy that no longer matches is reinstalled, or a relibc fix never
+    // reaches sdk-smoke (it kept aborting at std start-up after /dev/null landed).
+    let built_libc = fs::read(root.join("target/kumo-sysroot/lib/libc.a")).ok();
+    let installed_libc = fs::read(sysroot.join("share/kumo/libc.a")).ok();
+    if !sysroot.join("manifest.json").is_file()
+        || (built_libc.is_some() && built_libc != installed_libc)
+    {
         run_tool(root, "sh", &["scripts/rust-sysroot.sh"])?;
     }
     run_tool(root, "sh", &["scripts/kumo-rust-build.sh"])?;
