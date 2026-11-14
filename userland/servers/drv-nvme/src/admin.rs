@@ -2,6 +2,7 @@
 //j801
 //j802
 //j803
+//j895
 //! One outstanding polled command per queue: NV4a Identify on the admin queue, and
 //! the queue engine NV5 reuses for its I/O pair. One PRP page, legacy 4-byte doorbell
 //! stride. D5 cooperative raw DMA, no containment. — TIMBERDOODLE
@@ -276,7 +277,28 @@ impl Queue {
         if self.poisoned {
             return Err(Error::State);
         }
-        let result = self.submit_inner(io, s, memory, words, output);
+        let result = self.submit_inner(io, s, memory, words, output, false);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Admin health reads may return a completed device status without poisoning the queue.
+    /// Identity/phase/timeout failures remain fatal. Existing strict submit semantics stay intact.
+    /// The caller must not decode data for a failed command. — KESTREL
+    pub fn submit_admin_status(
+        &mut self,
+        io: &mut impl AdminIo,
+        s: Startup,
+        memory: Memory,
+        words: [u32; 16],
+        output: &mut [u8],
+    ) -> Result<Completion, Error> {
+        if self.qid != 0 || self.poisoned {
+            return Err(Error::State);
+        }
+        let result = self.submit_inner(io, s, memory, words, output, true);
         if result.is_err() {
             self.poisoned = true;
         }
@@ -290,6 +312,7 @@ impl Queue {
         memory: Memory,
         words: [u32; 16],
         output: &mut [u8],
+        allow_status: bool,
     ) -> Result<Completion, Error> {
         s.validate()?;
         if !memory.valid() || memory.session != s.session {
@@ -323,11 +346,15 @@ impl Queue {
                 if e.cid != cid || e.sqhd != self.tail {
                     return Err(Error::Completion);
                 }
-                if e.failed() {
+                if e.failed() && !allow_status {
                     return Err(Error::Command);
                 }
-                for (i, out) in output.chunks_exact_mut(4).enumerate() {
-                    out.copy_from_slice(&io.dma_read32(DATA + i as u64 * 4).to_le_bytes());
+                if !e.failed() {
+                    for (i, out) in output.chunks_exact_mut(4).enumerate() {
+                        out.copy_from_slice(&io.dma_read32(DATA + i as u64 * 4).to_le_bytes());
+                    }
+                } else {
+                    output.fill(0);
                 }
                 self.release(io)?;
                 return Ok(Completion {
@@ -629,6 +656,56 @@ mod tests {
             self.acquired = true;
         }
     }
+    #[test]
+    fn completed_admin_rejection_releases_cq_and_allows_a_fresh_command() {
+        let mut fake = Fake::new();
+        fake.wrong = 4;
+        let mut q = Queue::new();
+        let mut out = [0xaa; 512];
+        let words = Identify::Controller
+            .command(0, memory().physical + DATA)
+            .unwrap();
+        let c = q
+            .submit_admin_status(&mut fake, startup(), memory(), words, &mut out)
+            .unwrap();
+        assert_ne!(c.status >> 1, 0);
+        assert!(!q.poisoned());
+        assert_eq!(q.outstanding(), 0);
+        assert_eq!(fake.cq_heads, std::vec![1]);
+        assert!(out.iter().all(|v| *v == 0));
+        fake.wrong = 0;
+        q.submit_admin_status(&mut fake, startup(), memory(), words, &mut out)
+            .unwrap();
+        assert_eq!(&out[..4], &0x12345678u32.to_le_bytes());
+        assert_eq!(fake.cq_heads, std::vec![1, 2]);
+    }
+    #[test]
+    fn status_mode_does_not_hide_wrong_cid_or_timeout() {
+        for wrong in [1, 2, 3] {
+            let mut fake = Fake::new();
+            fake.wrong = wrong;
+            let mut q = Queue::new();
+            let words = Identify::Controller
+                .command(0, memory().physical + DATA)
+                .unwrap();
+            assert!(q
+                .submit_admin_status(&mut fake, startup(), memory(), words, &mut [0; 512])
+                .is_err());
+            assert!(q.poisoned());
+            assert!(fake.cq_heads.is_empty());
+        }
+        let mut fake = Fake::new();
+        fake.timeout = true;
+        let mut q = Queue::new();
+        let words = Identify::Controller
+            .command(0, memory().physical + DATA)
+            .unwrap();
+        assert!(q
+            .submit_admin_status(&mut fake, startup(), memory(), words, &mut [0; 512])
+            .is_err());
+        assert!(q.poisoned());
+    }
+
     #[test]
     fn encode_exact_identify_prp_and_reserved_fields() {
         for (kind, nsid, cns) in [

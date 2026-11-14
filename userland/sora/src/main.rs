@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j859
 //j864
 //j870
 //j893
 //j894
+//j895
 
 extern crate alloc;
 
@@ -2914,6 +2914,66 @@ fn launch_thermal(initrd: Handle, root: Handle, dtb_vmo: Handle, dtb_phys: u64) 
         return;
     }
     THERMAL_CHANNEL.store(sora_end.0, Ordering::Relaxed);
+}
+
+//j895
+/// A dedicated reply channel bounds this read without leaving stale replies on NVMe storage
+/// control. SMART owns no queue/MMIO capability and cannot change a temperature limit. — KESTREL
+fn smart_status() {
+    use drv_nvme::smart::{Health, REQUEST, REQUEST_WAIT_NS, STATUS_BYTES};
+    let Some(owner) = nvme_owner().filter(|o| !o.stopping && !o.shutdown_ready) else {
+        log(b"smart: nvme unavailable (no resident owner)\n");
+        fail_status(1);
+        return;
+    };
+    let (left, right) = channel_create_pair();
+    let handles = [
+        syscall_handle(left),
+        syscall_handle(right),
+        syscall_handle(port_create()),
+        syscall_handle(timer_create(REQUEST_WAIT_NS)),
+    ];
+    let [Some(reader), Some(writer), Some(port), Some(timer)] = handles else {
+        for h in handles.into_iter().flatten() {
+            let _ = handle_close(h);
+        }
+        log(b"smart: request setup failed\n");
+        fail_status(1);
+        return;
+    };
+    let mut frame = [0u8; STATUS_BYTES + 1];
+    let mut got = 0;
+    let sent = channel_write_with_handle(owner.control, [REQUEST].as_ptr(), 1, writer) == 0;
+    if !sent {
+        let _ = handle_close(writer);
+    }
+    if sent && port_bind(port, reader) == 0 && port_bind(port, timer) == 0 {
+        if port_wait(port) == handle_koid(reader) {
+            got = channel_read(reader, frame.as_mut_ptr(), frame.len());
+        }
+    }
+    let _ = port_unbind(port, reader);
+    let _ = port_unbind(port, timer);
+    for h in [reader, port, timer] {
+        let _ = handle_close(h);
+    }
+    let health = (got as usize == STATUS_BYTES)
+        .then(|| Health::decode(&frame[..STATUS_BYTES]))
+        .flatten()
+        .filter(|h| h.session == owner.startup.session);
+    let Some(health) = health else {
+        log(b"smart: nvme unavailable (no valid reply within 2s)\n");
+        fail_status(1);
+        return;
+    };
+    let now = kumo_rt::clock_get();
+    let mut line = drv_thermal::Line::<512>::new();
+    let _ = health.write_status(&mut line, now);
+    let _ = core::fmt::Write::write_str(&mut line, "\n");
+    log(line.as_bytes());
+    if !health.fresh(now) {
+        fail_status(1);
+    }
 }
 
 /// The `thermal` word: one status request to drv-thermal, answered within half a second or
@@ -7650,6 +7710,12 @@ fn eval_command(
             usage(b"usage: net <program> [args...]\n");
         } else {
             run_program_granted(initrd, &cmd.args, true);
+        }
+    } else if cmd.name == "smart" {
+        if cmd.args.is_empty() {
+            smart_status();
+        } else {
+            usage(b"usage: smart\n");
         }
     } else if cmd.name == "thermal" {
         //j893 thermal: the seven TS-ADC sensors (and, from T1, the fan) as drv-thermal last read

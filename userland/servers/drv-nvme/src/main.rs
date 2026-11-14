@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j802
 //j803
 //j805
 //j806
 //j807
+//j895
 //! One owner per process: polled Identify, then a read-only I/O pair whose completions
 //! arrive by INTx (NV6). A proof owner runs the NV6 sequence and exits; a serve owner
 //! (NV7) offers the namespace's FAT32 volume to Sora and serves it read-only until Sora
@@ -128,7 +128,14 @@ fn identify(
     s: Startup,
     memory: Memory,
     queue: &mut drv_nvme::admin::Queue,
-) -> Result<(drv_nvme::admin::Controller, drv_nvme::admin::Namespace), Error> {
+) -> Result<
+    (
+        drv_nvme::admin::Controller,
+        drv_nvme::admin::Namespace,
+        drv_nvme::smart::Limits,
+    ),
+    Error,
+> {
     use drv_nvme::admin::{first_namespace, Controller, Identify, Namespace};
     let mut data = [0u8; 4096];
     let c = queue.identify(io, s, memory, Identify::Controller, &mut data)?;
@@ -143,6 +150,7 @@ fn identify(
         ),
     );
     let controller = Controller::decode(&data)?;
+    let limits = drv_nvme::smart::Limits::decode(&data)?;
     if controller.vid != s.id as u16 || (s.vs >= 0x10200 && controller.version != s.vs) {
         return Err(Error::Identity);
     }
@@ -172,7 +180,7 @@ fn identify(
         ),
     );
     log(kumo_abi::sys::log_level::NOTICE, &alloc::format!("{ns}\n"));
-    Ok((controller, ns))
+    Ok((controller, ns, limits))
 }
 
 /// The NVMe INTx line: one interrupt object and a private port. Each wait binds a
@@ -312,7 +320,7 @@ fn write_proof(
         write::{pattern, TestExtent, TEST_LBA},
     };
     let mut admin = Queue::new();
-    let (controller, ns) = identify(io, s, memory, &mut admin)?;
+    let (controller, ns, _) = identify(io, s, memory, &mut admin)?;
     let mut line = Irq::bind(resource, s.irq)?;
     let mut stats = Stats::default();
     quiet(&mut admin, io, &mut line, QUIET_NS, &mut stats)?;
@@ -429,7 +437,7 @@ fn media(io: &mut Registers, s: Startup, memory: Memory, resource: Handle) -> Re
     use drv_nvme::intx::{mask, quiet, unmask, Stats, QUIET_NS};
     use drv_nvme::io::{IoPair, IO_CQ, IO_SQ};
     let mut admin = drv_nvme::admin::Queue::new();
-    let (_, ns) = identify(io, s, memory, &mut admin)?;
+    let (_, ns, _) = identify(io, s, memory, &mut admin)?;
     let size = ns.lba_bytes as usize;
     let mut line = Irq::bind(resource, s.irq)?;
     let mut stats = Stats::default();
@@ -627,7 +635,7 @@ fn serve(
     use drv_nvme::io::IoPair;
     use drv_nvme::volume::{discover, Verdict, MAX_ENTRY_BYTES};
     let mut admin = drv_nvme::admin::Queue::new();
-    let (controller, ns) = identify(io, s, memory, &mut admin)?;
+    let (controller, ns, limits) = identify(io, s, memory, &mut admin)?;
     if ns.lba_bytes as usize != SECTOR_SIZE {
         return Err(Error::Data);
     }
@@ -781,6 +789,40 @@ fn serve(
                     ),
                 );
                 break;
+            }
+            if len == 1 && tag[0] == drv_nvme::smart::REQUEST {
+                if let Some(reply) = syscall_handle(raw) {
+                    // The single owner finishes every I/O before returning to this loop.
+                    // Mask vector 0 for the polled Admin CQ and drain late INTx deliveries
+                    // around it. The shared data page has no concurrent user. — KESTREL
+                    let result = (|| {
+                        pair.quiet(io, &mut line, drv_nvme::intx::QUIET_NS, &mut stats)?;
+                        mask(io)?;
+                        let (health, completion) =
+                            drv_nvme::smart::read(io, &mut admin, s, memory, limits)?;
+                        pair.quiet(io, &mut line, drv_nvme::intx::QUIET_NS, &mut stats)?;
+                        unmask(io)?;
+                        log(kumo_abi::sys::log_level::NOTICE, &alloc::format!(
+                            "NVME SMART session={} cid={} status=0x{:x} sampled_ns={} composite_k={} critical_warning=0x{:02x} elapsed={}us io_entries={}\n",
+                            s.session, completion.cid, completion.status >> 1, health.sampled_ns,
+                            health.log.composite, health.log.critical_warning, completion.elapsed_ns/1000, stats.entries));
+                        Ok::<_, Error>(health)
+                    })();
+                    let health = match result {
+                        Ok(health) => health,
+                        Err(e) => {
+                            let frame =
+                                drv_nvme::smart::Health::failure(s.session, limits, e).encode();
+                            let _ = channel_write(reply, frame.as_ptr(), frame.len());
+                            let _ = handle_close(reply);
+                            return Err(e); // Existing poison/disable/custody path; no DMA reuse on uncertainty.
+                        }
+                    };
+                    let frame = health.encode();
+                    let _ = channel_write(reply, frame.as_ptr(), frame.len());
+                    let _ = handle_close(reply);
+                }
+                continue;
             }
             let Some(client) = syscall_handle(raw) else {
                 continue;

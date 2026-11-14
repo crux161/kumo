@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_code)]
-//j802
 //j803
 //j805
 //j806
 //j807
+//j895
 //! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a), one I/O pair (NV5), its
 //! INTx-driven completions (NV6) and the resident read-only volume service (NV7).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
@@ -20,6 +20,7 @@ pub mod admin;
 pub mod intx;
 pub mod io;
 pub mod shutdown;
+pub mod smart;
 pub mod volume;
 pub mod write;
 pub const DEPTH: u16 = 32;
