@@ -26,6 +26,7 @@ use alloc::vec::Vec;
 use kumo_netstack::budget::{
     FRAME_MAX, ICMP_BUFFER, ICMP_ECHO_MAX, ICMP_METADATA, SESSIONS, SOCKETS_PER_SESSION,
     SOCKETS_TOTAL, SOCKET_BUFFER, STREAM_PAYLOAD_MAX, UDP_METADATA, UDP_PAYLOAD_MAX,
+    WIRE_UDP_RX_BUFFER, WIRE_UDP_RX_METADATA,
 };
 use kumo_netstack::ingress::{self, Refusals};
 use kumo_netstack::smoltcp::iface::{
@@ -707,12 +708,22 @@ impl Server {
         );
         let mut sockets = SocketSet::new(storage);
         let mut handles = Vec::with_capacity(SOCKETS_TOTAL);
+        // One slab per generation for every twin's receive queue: 32 separate ~96 KiB
+        // allocations would each claim a heap region, and the growable heap has 32.
+        let mut rx_meta = leak(
+            udp::PacketMetadata::EMPTY,
+            SOCKETS_TOTAL * WIRE_UDP_RX_METADATA,
+        );
+        let mut rx_bytes = leak(0u8, SOCKETS_TOTAL * WIRE_UDP_RX_BUFFER);
         for _ in 0..SOCKETS_TOTAL {
+            let (meta, meta_rest) =
+                core::mem::take(&mut rx_meta).split_at_mut(WIRE_UDP_RX_METADATA);
+            rx_meta = meta_rest;
+            let (bytes, bytes_rest) =
+                core::mem::take(&mut rx_bytes).split_at_mut(WIRE_UDP_RX_BUFFER);
+            rx_bytes = bytes_rest;
             let udp = udp::Socket::new(
-                udp::PacketBuffer::new(
-                    leak(udp::PacketMetadata::EMPTY, UDP_METADATA),
-                    leak(0u8, SOCKET_BUFFER),
-                ),
+                udp::PacketBuffer::new(meta, bytes),
                 udp::PacketBuffer::new(
                     leak(udp::PacketMetadata::EMPTY, UDP_METADATA),
                     leak(0u8, SOCKET_BUFFER),

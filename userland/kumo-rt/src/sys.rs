@@ -434,6 +434,38 @@ pub fn channel_read_with_handle(channel: Handle, buf: *mut u8, cap: usize) -> (u
     (ret as usize, handle)
 }
 
+/// Non-blocking [`channel_read_with_handle`]: `None` when the inbox is empty
+/// (`CHANNEL_READ_NONBLOCK` answers `Errno::ShouldWait` instead of parking). Other errors
+/// come back as `Some((status as u32 as usize, _))`, larger than any buffer; callers check
+/// the length against their capacity.
+#[cfg(target_arch = "aarch64")]
+pub fn channel_try_read_with_handle(
+    channel: Handle,
+    buf: *mut u8,
+    cap: usize,
+) -> Option<(usize, u64)> {
+    let ret: u64;
+    let handle: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::ChannelRead as u64,
+            in("x0") channel.0 as u64,
+            in("x1") buf as u64,
+            in("x2") cap as u64,
+            in("x3") kumo_abi::sys::CHANNEL_READ_NONBLOCK,
+            lateout("x0") ret,
+            lateout("x1") handle,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    if ret == kumo_abi::Errno::ShouldWait.status() as u32 as u64 {
+        return None;
+    }
+    Some((ret as usize, handle))
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub fn channel_read_with_handle(channel: Handle, buf: *mut u8, cap: usize) -> (usize, u64) {
     let mut ret = Syscall::ChannelRead as u64;

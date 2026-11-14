@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use kumo_abi::sys::log_level;
 use kumo_abi::Handle;
 use kumo_ipc::MAX_INLINE_BYTES;
-use kumo_netstack::budget::{FRAMES_PER_TURN, FRAME_MAX, SESSIONS};
+use kumo_netstack::budget::{FRAMES_PER_TURN, FRAME_MAX, RX_CREDIT, SESSIONS};
 use kumo_netstack::frame::{decode, encode, Body, Lane, HEADER_LEN};
 use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid, port_bind,
@@ -277,12 +277,57 @@ fn close_frame(frame: &mut Option<Frame>, server: &mut Server, port: Handle) {
 }
 
 /// One message from the frame channel: decode, enforce the Lane, apply to the wire stack.
+/// Drain the frame channel: every pending message, at most one RX credit window per wake.
+/// Port wakes coalesce per source, so a reader that takes one message per wake paces the
+/// whole wire to its wake rate. On the opi5 that was ~325-420 frames/s, which emptied the
+/// provider's 32-frame credit window and dropped ~75% of a 15 Mbit/s download in drv-xhci
+/// (`no_credit`, 2026-11-13 speed test). Draining lets the end-of-turn `pump_frame` return
+/// the whole batch's credits at once. Reads are non-blocking, so a coalesced wake that finds
+/// the channel already drained returns instead of parking netstack on an empty channel.
 fn serve_frame(frame: &mut Option<Frame>, server: &mut Server, port: Handle, now: u64) {
+    let mut bytes = [0u8; FRAME_MAX + HEADER_LEN];
+    for turn in 0..RX_CREDIT {
+        let Some(f) = frame.as_ref() else {
+            return;
+        };
+        let Some((n, raw)) = read_frame_message(f.channel, &mut bytes, turn == 0) else {
+            return;
+        };
+        if n > bytes.len() {
+            log(log_level::WARNING, b"netstack: frame channel read failed\n");
+            return;
+        }
+        serve_frame_message(frame, server, port, now, &mut bytes, n, raw);
+    }
+}
+
+/// One frame-channel message: `Some((len, handle))`, or `None` when nothing is pending.
+/// aarch64 reads with `CHANNEL_READ_NONBLOCK`; elsewhere the first read of a wake blocks as
+/// before and the drain stops there.
+fn read_frame_message(channel: Handle, bytes: &mut [u8], first: bool) -> Option<(usize, u64)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = first;
+        kumo_rt::channel_try_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len())
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        first.then(|| channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len()))
+    }
+}
+
+fn serve_frame_message(
+    frame: &mut Option<Frame>,
+    server: &mut Server,
+    port: Handle,
+    now: u64,
+    bytes: &mut [u8; FRAME_MAX + HEADER_LEN],
+    n: usize,
+    raw: u64,
+) {
     let Some(f) = frame.as_mut() else {
         return;
     };
-    let mut bytes = [0u8; FRAME_MAX + HEADER_LEN];
-    let (n, raw) = channel_read_with_handle(f.channel, bytes.as_mut_ptr(), bytes.len());
     if n == 0 {
         log(log_level::NOTICE, b"netstack: frame channel closed\n");
         close_frame(frame, server, port);
@@ -423,8 +468,10 @@ fn pump_frame(frame: &mut Option<Frame>, server: &mut Server) {
             );
             break;
         }
+        // Per frame, so DEBUG: at NOTICE a proof image's console spent the upload logging it
+        // (0.7 Mbit/s instead of ~45 in the 2026-11-13 speed test).
         kumo_rt::log_write(
-            log_level::NOTICE,
+            log_level::DEBUG,
             b"netstack: frame tx handed to provider\n",
         );
     }

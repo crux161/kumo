@@ -260,6 +260,8 @@ pub(super) struct NicResident {
     status_reports: u32,
     rx_completions: u32,
     rx_frames: u32,
+    /// Frame-channel RX over the current one-second window (speed-test visibility).
+    rx_window: RxWindow,
     hid_idle_cc: Option<u8>,
     /// Wall-clock split of the last start: Configure Endpoint with its readback, then the
     /// two CLEAR_FEATURE(ENDPOINT_HALT) requests.
@@ -429,6 +431,7 @@ impl NicResident {
             status_reports: 0,
             rx_completions: 0,
             rx_frames: 0,
+            rx_window: RxWindow::default(),
             hid_idle_cc,
             last_start_ns: (0, 0),
             proof: Proof::default(),
@@ -814,7 +817,8 @@ impl NicResident {
                 let snapshot = unsafe { &mut *RX_SNAPSHOT.0.get() };
                 self.rx.buffer.read_into(0, &mut snapshot[..actual]);
                 if crate::frame_chan::active() {
-                    crate::frame_chan::forward_rx(&snapshot[..actual]);
+                    let (sent, no_credit) = crate::frame_chan::forward_rx(&snapshot[..actual]);
+                    self.rx_window.note(actual, sent, no_credit);
                     return;
                 }
                 if ax88_link::RX_ENABLED {
@@ -852,7 +856,11 @@ impl NicResident {
         };
         self.tx.buffer.write_from(0, &out[..n]);
         self.tx.len = n as u32;
-        crate::ax88_record(format_args!("NET7b tx submit transfer={}\n", n));
+        // Per frame, so DEBUG: at NOTICE a proof console spent the upload logging it.
+        crate::record(
+            kumo_abi::sys::log_level::DEBUG,
+            format_args!("NET7b tx submit transfer={}\n", n),
+        );
         crate::frame_chan::note_submitted(n);
         if self.arm(NicLane::Tx, io, layout).is_err() {
             crate::frame_chan::note_complete(usize::MAX);
@@ -1687,5 +1695,49 @@ struct Hex<'a>(&'a [u8]);
 impl core::fmt::Display for Hex<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+/// One second of frame-channel RX: bulk-IN completions, their bytes, frames handed to
+/// netstack, frames dropped because netstack's RX credit window was full, and the largest
+/// aggregate seen. Printed once per window while frames flow, so a speed test shows which
+/// stage limits receive.
+#[derive(Default)]
+struct RxWindow {
+    start_ns: u64,
+    transfers: u32,
+    bytes: u64,
+    frames: u32,
+    no_credit: u32,
+    max_frames: u32,
+}
+
+impl RxWindow {
+    fn note(&mut self, bytes: usize, frames: u32, no_credit: u32) {
+        let now = clock_get();
+        if self.start_ns == 0 {
+            self.start_ns = now;
+        }
+        self.transfers += 1;
+        self.bytes += bytes as u64;
+        self.frames += frames;
+        self.no_credit += no_credit;
+        self.max_frames = self.max_frames.max(frames + no_credit);
+        let span = now.saturating_sub(self.start_ns);
+        if span >= 1_000_000_000 {
+            ax88_record(format_args!(
+                "NET rx/s transfers={} bytes={} frames={} no_credit={} max_frames_per_transfer={} span_ms={}\n",
+                self.transfers,
+                self.bytes,
+                self.frames,
+                self.no_credit,
+                self.max_frames,
+                span / 1_000_000
+            ));
+            *self = Self {
+                start_ns: now,
+                ..Self::default()
+            };
+        }
     }
 }

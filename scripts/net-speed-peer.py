@@ -138,6 +138,9 @@ class Peer:
                 print(f'mac:  answered {self.summary["pings"]} pings (latency is timed on kumo)', flush=True)
             secs = arg[0] if arg else 5
             print(f'mac:  download phase: streaming to kumo for {secs} s, pacing from {self.args.start_mbit} Mbit/s', flush=True)
+            with self.lock:
+                self.down_sent = 0
+                self.down_stat = (0, 0)
             self.down_thread = threading.Thread(target=self.download, args=(secs,), daemon=True)
             self.down_thread.start()
         elif cmd == 'STAT':
