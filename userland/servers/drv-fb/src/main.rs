@@ -4,18 +4,11 @@
 
 extern crate alloc;
 
-//j674
-//j675
-//j684
-//j685
-//j686
-//j687
-//j690
 //j695
 //j696
 //j700
 //j711
-//j711
+//j901
 
 mod clock_probe;
 mod display_probe;
@@ -300,11 +293,13 @@ extern "C" fn main(
     } else {
         Handle(0)
     };
-    let vop_view_mapped = display_probe::report(bootinfo, power, Handle(display_raw as u32));
+    let (vop_view_mapped, live_if_en) =
+        display_probe::report(bootinfo, power, Handle(display_raw as u32));
     let cru_mapped = clock_probe::report_clock_probe(clock_grant, Handle(clock_raw as u32));
     let tx_mapped = hdmi_probe::report(
         bootinfo,
         power,
+        live_if_en,
         Handle(hdmi_raw as u32),
         Handle(phy_raw as u32),
         Handle(grf_raw as u32),

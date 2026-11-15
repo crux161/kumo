@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j899
 #j900
+#j901
 """gpu-client's boot session outcome on the Orange Pi 5 Plus, over N PXE boots.
 
 Per boot it records whether drv-fb's R1 refused the firmware's live display mode (the
@@ -70,6 +71,11 @@ def boot_once(board, tftp, log, timeout):
     gpu_tower = bool(launch) and any(
         f"victim koid=0x{int(launch[1], 16):016x}" in t[:300] for t in towers
     )
+    # j901: drv-fb (the console and display owner) must never die, whatever the firmware drove.
+    fb = re.search(r"drv-fb: proc koid=0x([0-9a-f]+)", text)
+    fb_tower = bool(fb) and any(
+        f"victim koid=0x{int(fb[1], 16):016x}" in t[:300] for t in towers
+    )
     return {
         "r1_refused": "display: R1 refused" in text,
         # j900: the firmware's HDMI1/DP0 mirror switched off before R1's comparison.
@@ -80,6 +86,8 @@ def boot_once(board, tftp, log, timeout):
         "cause": cause[1] if cause else None,
         "towers": len(towers),
         "gpu_client_tower": gpu_tower,
+        "drv_fb_tower": fb_tower,
+        "hdmi0_not_driven": "firmware does not drive HDMI0" in text,
     }
 
 
@@ -109,7 +117,11 @@ def main():
         results.append(result)
         print(f"boot {index}: {result}", flush=True)
     (work / "manifest.json").write_text(json.dumps(results, indent=2) + "\n")
-    bad = [r for r in results if r["outcome"] in ("failed", "none") or r["gpu_client_tower"]]
+    bad = [
+        r
+        for r in results
+        if r["outcome"] in ("failed", "none") or r["gpu_client_tower"] or r["drv_fb_tower"]
+    ]
     if bad:
         sys.exit(f"{len(bad)} boot(s) ended badly; see {work}")
     print("gpu-client session suite green", flush=True)

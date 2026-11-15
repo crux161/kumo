@@ -1,5 +1,6 @@
 //j600
 //j602
+//j901
 
 //! D0d: read-only identification of the RK3588 HDMI0 transmitter and its combo PHY.
 //!
@@ -49,6 +50,15 @@ pub fn hdmi_accessible(power: Power) -> bool {
     power.gate_status & PD_VO1 == 0
         && power.idle_ack & BIU_VO1_ACK_STS == 0
         && power.idle_status & BIU_VO1_ACK_STS == 0
+}
+
+/// j901: whether the firmware drives HDMI0 at all, from the VOP's live `SYS_DSP_INFACE_EN`:
+/// `hdmiedp0_mode` [3:2] is 0 (off), 1 (eDP) or 2/3 (HDMI). With the combo port off or in eDP
+/// mode the HDMI0 TX controller is not running, and reading it raises a synchronous external
+/// abort: on 2026-11-14 the firmware drove HDMI1 alone (if_en 0x00080020) and drv-fb died at
+/// HDMI0 TX +0x814. No reading (`None`) is no evidence, so it counts as not driven.
+pub fn hdmi0_driven(if_en: Option<u32>) -> bool {
+    if_en.is_some_and(|word| (word >> 2) & 0b11 >= 2)
 }
 
 /// All three tagged bootstrap records must carry a resource handle before any read.
@@ -1018,5 +1028,21 @@ mod tests {
         assert_eq!(s.tx.ipi_format(), 5);
         s.tx.frame_composer = 1 << 3;
         assert!(s.tx.measure_override());
+    }
+}
+
+#[cfg(test)]
+mod hdmi0_route_tests {
+    use super::hdmi0_driven;
+
+    #[test]
+    fn only_an_hdmi_mode_combo0_counts_as_driven() {
+        assert!(hdmi0_driven(Some(0x0002_0008))); // HDMI0 alone (KUMO's table)
+        assert!(hdmi0_driven(Some(0x000a_2029))); // the firmware's three-output mirror
+        assert!(hdmi0_driven(Some(0x0000_000c))); // HDMI mode value 3
+        assert!(!hdmi0_driven(Some(0x0008_0020))); // HDMI1 alone (the crashing boot)
+        assert!(!hdmi0_driven(Some(0x0000_0004))); // combo 0 in eDP mode
+        assert!(!hdmi0_driven(Some(0)));
+        assert!(!hdmi0_driven(None)); // VOP not read
     }
 }

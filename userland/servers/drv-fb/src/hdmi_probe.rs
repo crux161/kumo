@@ -2,6 +2,7 @@
 //j601
 //j602
 //j606
+//j901
 
 //! D0d live adapter: read-only mappings of the HDMI0 TX, combo PHY and PHY GRF.
 //! No device write, no DDC/EDID transaction and no clock/PMU mutation exists here.
@@ -93,6 +94,7 @@ fn map(resource: Handle, base: u64, len: u64, map_len: u64, va: u64, label: &str
 pub fn report(
     boot: &BootInfo,
     power: Option<Power>,
+    if_en: Option<u32>,
     hdmi: Handle,
     phy: Handle,
     grf: Handle,
@@ -103,7 +105,7 @@ pub fn report(
         boot.has_framebuffer() && boot.framebuffer.is_plausible(),
     ) {
         match power {
-            Some(power) => tx_mapped = probe(power, hdmi, phy, grf),
+            Some(power) => tx_mapped = probe(power, if_en, hdmi, phy, grf),
             None => log(format_args!(
                 "display: no PMU observation; D0d probe skipped\n"
             )),
@@ -117,7 +119,7 @@ pub fn report(
     tx_mapped
 }
 
-fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) -> bool {
+fn probe(power: Power, if_en: Option<u32>, hdmi: Handle, phy: Handle, grf: Handle) -> bool {
     log(format_args!(
         "display: D0d read-only HDMI0 TX/PHY identity probe\n"
     ));
@@ -136,6 +138,20 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) -> bool {
         log(format_args!(
             "display: HDMI0/VO1 down or bus idle; zero HDMI/PHY reads\n"
         ));
+        return false;
+    }
+    // j901: VO1's power domain is shared with HDMI1, so "up" does not mean HDMI0 runs. When
+    // the firmware drives HDMI1 alone, an HDMI0 TX read is a synchronous external abort.
+    if !rk3588_hdmi::hdmi0_driven(if_en) {
+        match if_en {
+            Some(word) => log(format_args!(
+                "display: firmware does not drive HDMI0 (if_en={:#010x}); zero HDMI0/PHY0 reads\n",
+                word
+            )),
+            None => log(format_args!(
+                "display: VOP interface enable not read; zero HDMI0/PHY0 reads\n"
+            )),
+        }
         return false;
     }
     if !rk3588_hdmi::records_present([hdmi.0, phy.0, grf.0]) {
