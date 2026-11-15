@@ -2,6 +2,7 @@
 //j608
 //j614
 //j881
+//j900
 
 //! R1 (DESIGN/020 Amendment D0): KUMO rebuilds the HDMI0 mode's VOP2 and TX program from its
 //! own mode table, after scrubbing it to TRM reset values with VP2 in standby.
@@ -328,15 +329,82 @@ fn put(hw: &mut impl Hardware, block: Block, offset: u32, value: u32) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Blanked {
     pub scrub_readback: [u32; SCRUBBED.len()],
+    /// j900: the firmware's mirror fields R1 switched off before comparing (`None` when the
+    /// firmware drove HDMI0 alone), in [`MIRROR`] order.
+    pub detached: Option<[u32; 3]>,
 }
 
-/// Refuse unless KUMO's image equals the live program; then blank (standby, interface off),
-/// scrub every scrubbed word to its TRM reset value and commit. On `Err`, nothing was written.
+/// j900: the firmware sometimes mirrors its console from VP2 to HDMI1 and DP0 as well as HDMI0
+/// (seen on the opi5: `SYS_DSP_INFACE_EN` 0x000a2029, `DSP_INFACE_CTRL` 0x00660000, VP2
+/// `CLK_CTRL` 0xa against KUMO's 0x00020008/0x00060000/0x2). These fields, and only these, may
+/// differ from KUMO's image before R1; R1 switches them off (CRUX, 2026-11-14) and then compares
+/// as before. In order: `SYS_DSP_INFACE_EN` dp0_mode_en [0], hdmiedp1_mode [5:4], dp0_port_sel
+/// [13:12], hdmiedp1_port_sel [19:18]; `DSP_INFACE_CTRL` hdmiedp1_dclk_sel [21:20],
+/// hdmiedp1_pix_clk_sel [22]; VP2 `CLK_CTRL` dclk_out_sel [3:2]. The kernel's checked-register
+/// table reaches the same fields (`MIRROR_*` in kumo-hal-aarch64's display_register.rs).
+pub const MIRROR: [(u32, u32); 3] = [
+    (DSP_INFACE_EN, 0x000c_3031),
+    (DSP_INFACE_CTRL, 0x0070_0000),
+    (VP2_CLK_CTRL, 0x0000_000c),
+];
+
+fn mirror_mask(block: Block, offset: u32) -> u32 {
+    if block != Block::Vop {
+        return 0;
+    }
+    MIRROR
+        .iter()
+        .find(|(at, _)| *at == offset)
+        .map_or(0, |(_, mask)| *mask)
+}
+
+/// The mirror fields set live, when they are the ONLY difference between the live hardware and
+/// KUMO's image. `None` when the firmware drove HDMI0 alone, or when anything else differs
+/// (then R1's ordinary comparison refuses, with nothing written).
+pub fn mirrored(hw: &mut impl Hardware, program: &Program) -> Option<[u32; 3]> {
+    let mut found = [0; 3];
+    for word in program.words.iter().chain(program.checks.iter()) {
+        let mask = mirror_mask(word.block, word.offset);
+        let live = hw.read(word.block, word.offset);
+        if (live ^ word.value) & !mask != 0 {
+            return None;
+        }
+        if let Some(slot) = MIRROR
+            .iter()
+            .position(|(at, _)| mask != 0 && *at == word.offset)
+        {
+            found[slot] = (live ^ word.value) & mask;
+        }
+    }
+    (found != [0; 3]).then_some(found)
+}
+
+/// Switch the mirror off: write KUMO's own word to each of the three registers, interface
+/// enable first so HDMI1 and DP0 stop being fed before their clocks change. The interface
+/// registers apply immediately (`regdone_imd_en`, which [`blank`] checks first) and
+/// `CLK_CTRL`'s dividers are immediate by the TRM. HDMI0's fields are rewritten with the values
+/// they already hold.
+pub fn detach_mirror(hw: &mut impl Hardware, program: &Program) -> Option<[u32; 3]> {
+    let found = mirrored(hw, program)?;
+    for (offset, _) in MIRROR {
+        if let Some(word) = program.words.iter().find(|w| w.offset == offset) {
+            put(hw, word.block, word.offset, word.value);
+        }
+    }
+    Some(found)
+}
+
+/// Refuse unless KUMO's image equals the live program — after switching off the firmware's
+/// HDMI1/DP0 mirror when that is the only difference (j900); then blank (standby, interface
+/// off), scrub every scrubbed word to its TRM reset value and commit. On `Err`, nothing was
+/// written, except a detached mirror whose rewrite did not read back (the checked write
+/// refused it), which is reported as the remaining mismatch.
 pub fn blank(hw: &mut impl Hardware, program: &Program, plan: Plan) -> Result<Blanked, Outcome> {
     let pol = hw.read(Block::Vop, DSP_INFACE_POL);
     if pol & REGDONE_IMD_EN == 0 {
         return Err(Outcome::NotImmediate { pol });
     }
+    let detached = detach_mirror(hw, program);
     let mismatched = mismatches(hw, program);
     if mismatched != 0 {
         return Err(Outcome::Refused { mismatched });
@@ -356,7 +424,10 @@ pub fn blank(hw: &mut impl Hardware, program: &Program, plan: Plan) -> Result<Bl
         let word = program.words[index];
         *slot = hw.read(word.block, word.offset);
     }
-    Ok(Blanked { scrub_readback })
+    Ok(Blanked {
+        scrub_readback,
+        detached,
+    })
 }
 
 /// Write KUMO's image, commit it and leave standby (the last write).
@@ -576,6 +647,90 @@ mod tests {
             ),
             (1600, 24, 80, 96, 900, 1, 3, 96)
         );
+    }
+
+    /// j900: the firmware's mirrored state, as read on the opi5 when R1 used to refuse.
+    fn mirrored_metal() -> Fake {
+        let mut fake = Fake::metal();
+        fake.regs
+            .insert(key(Block::Vop, DSP_INFACE_EN), 0x000a_2029);
+        fake.regs
+            .insert(key(Block::Vop, DSP_INFACE_CTRL), 0x0066_0000);
+        fake.regs.insert(key(Block::Vop, VP2_CLK_CTRL), 0x0000_000a);
+        fake.regs
+            .insert(key(Block::Vop, DSP_INFACE_POL), 0x1000_0300);
+        fake
+    }
+
+    #[test]
+    fn the_firmwares_mirror_is_switched_off_and_r1_proceeds() {
+        let program = Program::build(DMT_1600X900_60_RB, gop()).unwrap();
+        // KUMO's image holds none of the mirror fields.
+        for (offset, mask) in MIRROR {
+            let word = program.words.iter().find(|w| w.offset == offset).unwrap();
+            assert_eq!(word.value & mask, 0);
+        }
+        let mut fake = mirrored_metal();
+        assert_eq!(
+            mirrored(&mut fake, &program),
+            Some([0x0008_2021, 0x0060_0000, 0x0000_0008])
+        );
+        let blanked = blank(&mut fake, &program, PLAN).unwrap();
+        assert_eq!(
+            blanked.detached,
+            Some([0x0008_2021, 0x0060_0000, 0x0000_0008])
+        );
+        // The three detach writes come first, interface enable first, each KUMO's own word.
+        let writes = fake.writes();
+        assert_eq!(
+            &writes[..3],
+            &[
+                (Block::Vop, DSP_INFACE_EN, 0x0002_0008),
+                (Block::Vop, DSP_INFACE_CTRL, 0x0006_0000),
+                (Block::Vop, VP2_CLK_CTRL, 0x0000_0002),
+            ]
+        );
+        // Then the ordinary sequence, to the same rebuilt image.
+        let mut fake = mirrored_metal();
+        assert!(matches!(
+            run(&mut fake, &program, PLAN),
+            Outcome::Rebuilt { mismatched: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn anything_beyond_the_mirror_still_refuses_with_nothing_written() {
+        let program = Program::build(DMT_1600X900_60_RB, gop()).unwrap();
+        // A single-output firmware: nothing to detach.
+        assert_eq!(mirrored(&mut Fake::metal(), &program), None);
+        // The mirror plus a different mode timing: not KUMO's table, so no detach either.
+        let mut fake = mirrored_metal();
+        fake.regs
+            .insert(key(Block::Vop, VP2_HTOTAL_HS_END), 0x0708_0051);
+        assert_eq!(mirrored(&mut fake, &program), None);
+        assert!(matches!(
+            blank(&mut fake, &program, PLAN),
+            Err(Outcome::Refused { .. })
+        ));
+        assert!(fake.writes().is_empty());
+        // DP1 (not a mirror field) enabled beside the mirror: refused, nothing written.
+        let mut fake = mirrored_metal();
+        fake.regs
+            .insert(key(Block::Vop, DSP_INFACE_EN), 0x000a_202b);
+        assert!(matches!(
+            blank(&mut fake, &program, PLAN),
+            Err(Outcome::Refused { .. })
+        ));
+        assert!(fake.writes().is_empty());
+        // HDMI0 itself routed elsewhere: refused, nothing written.
+        let mut fake = mirrored_metal();
+        fake.regs
+            .insert(key(Block::Vop, DSP_INFACE_EN), 0x0009_2029);
+        assert!(matches!(
+            blank(&mut fake, &program, PLAN),
+            Err(Outcome::Refused { .. })
+        ));
+        assert!(fake.writes().is_empty());
     }
 
     #[test]

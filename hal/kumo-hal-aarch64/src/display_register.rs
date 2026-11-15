@@ -1,4 +1,5 @@
 //j614
+//j900
 
 //! DESIGN/022 D1d-a: protect all VOP/MMU pages, delegate only reviewed D0/D1 fields.
 //! Register facts: RK3588 TRM Part 2 ch. 7. Sequence/presentation policy stays in drv-fb.
@@ -32,10 +33,23 @@ enum Rule {
 
 /// No offset or mask comes from the caller. Masked command registers must never be RMW'd:
 /// their upper half is a write-enable mask, not persistent register state. — KESTREL
+///
+/// j900: the firmware sometimes mirrors its console from VP2 to HDMI1 and DP0 as well. Three
+/// rows also reach those outputs' fields, so the display holder can switch the mirror off before
+/// R1 (CRUX, 2026-11-14): `SYS_DSP_INFACE_EN` dp0_mode_en [0], hdmiedp1_mode [5:4],
+/// dp0_port_sel [13:12], hdmiedp1_port_sel [19:18]; `DSP_INFACE_CTRL` hdmiedp1_dclk_sel [21:20]
+/// and hdmiedp1_pix_clk_sel [22]; VP2 `CLK_CTRL` dclk_out_sel [3:2]. Still fields, still
+/// read-modify-write, and no DP1, MIPI, RGB, bypass or security field. — TEAL
+pub const MIRROR_INTERFACE_ENABLE: u32 = 0x000c_3031;
+pub const MIRROR_INTERFACE_CONTROL: u32 = 0x0070_0000;
+pub const MIRROR_VP2_CLOCK: u32 = 0x0000_000c;
+
 fn register(index: u32) -> Option<(u64, Rule)> {
     let (offset, rule) = match index {
-        x if x == R::Vp2Clock as u32 => (0x0e0c, Rule::Fields(0x3)),
-        x if x == R::InterfaceControl as u32 => (0x002c, Rule::Fields(0x0007_0000)),
+        x if x == R::Vp2Clock as u32 => (0x0e0c, Rule::Fields(0x3 | MIRROR_VP2_CLOCK)),
+        x if x == R::InterfaceControl as u32 => {
+            (0x002c, Rule::Fields(0x0007_0000 | MIRROR_INTERFACE_CONTROL))
+        }
         x if x == R::HorizontalTotal as u32 => (0x0e48, Rule::Fields(0x1fff_1fff)),
         x if x == R::HorizontalActive as u32 => (0x0e4c, Rule::Fields(0x1fff_1fff)),
         x if x == R::VerticalTotal as u32 => (0x0e50, Rule::Fields(0x1fff_1fff)),
@@ -46,7 +60,9 @@ fn register(index: u32) -> Option<(u64, Rule)> {
         x if x == R::RegionActive as u32 => (0x1c20, Rule::Fields(0x1fff_1fff)),
         x if x == R::RegionDisplay as u32 => (0x1c24, Rule::Fields(0x1fff_1fff)),
         x if x == R::RegionOffset as u32 => (0x1c28, Rule::Fields(0x1fff_1fff)),
-        x if x == R::InterfaceEnable as u32 => (0x0028, Rule::Fields(0x0003_000c)),
+        x if x == R::InterfaceEnable as u32 => {
+            (0x0028, Rule::Fields(0x0003_000c | MIRROR_INTERFACE_ENABLE))
+        }
         x if x == R::Vp2Control as u32 => (0x0e00, Rule::Fields(0x8800_000f)),
         x if x == R::Commit as u32 => (0x0000, Rule::Command(0x0004_8004)),
         x if x == R::FrameInterruptEnable as u32 => (0x00c0, Rule::EnableFrame),
@@ -295,6 +311,43 @@ mod tests {
             }
         }
         assert!(valid(BASE, R::FrameInterruptEnable as u32, 0x10000));
+    }
+
+    /// j900: the mirror rows reach exactly HDMI1's and DP0's fields beside HDMI0's, and the
+    /// firmware's mirrored words switch back to KUMO's single-output words in one write each.
+    #[test]
+    fn mirror_fields_are_reachable_and_nothing_beyond_them() {
+        let cases = [
+            (
+                R::InterfaceEnable,
+                0x0028,
+                0x000f_303d,
+                0x000a_2029,
+                0x0002_0008,
+            ),
+            (
+                R::InterfaceControl,
+                0x002c,
+                0x0077_0000,
+                0x0066_0000,
+                0x0006_0000,
+            ),
+            (R::Vp2Clock, 0x0e0c, 0x0000_000f, 0x0000_000a, 0x0000_0002),
+        ];
+        for (selector, offset, mask, mirrored, single) in cases {
+            let index = selector as u32;
+            assert!(
+                matches!(register(index), Some((p, Rule::Fields(m))) if p == BASE + offset && m == mask)
+            );
+            // DP1, MIPI and RGB enables, and every bit outside the mask, stay unreachable.
+            assert!(!valid(BASE, index, !mask));
+            let mut io = Io::default();
+            io.regs.insert(BASE + offset, mirrored);
+            assert_eq!(write(DTB, BASE, index, single, &mut io), Some(true));
+            assert!(io.events.contains(&Event::Write(BASE + offset, single)));
+        }
+        assert!(!valid(BASE, R::InterfaceEnable as u32, 1 << 1)); // dp1_mode_en
+        assert!(!valid(BASE, R::InterfaceEnable as u32, 0x700)); // rgb_mode
     }
 
     #[test]

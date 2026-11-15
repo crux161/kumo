@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j899
+#j900
 """gpu-client's boot session outcome on the Orange Pi 5 Plus, over N PXE boots.
 
 Per boot it records whether drv-fb's R1 refused the firmware's live display mode (the
@@ -71,6 +72,9 @@ def boot_once(board, tftp, log, timeout):
     )
     return {
         "r1_refused": "display: R1 refused" in text,
+        # j900: the firmware's HDMI1/DP0 mirror switched off before R1's comparison.
+        "mirror_detached": "R1 switched off the firmware's VP2 mirror" in text,
+        "r1_rebuilt": "display: R1 rebuilt from KUMO's table" in text,
         "presenter_cancelled": "native diagnostic cancelled" in text,
         "outcome": outcome,
         "cause": cause[1] if cause else None,

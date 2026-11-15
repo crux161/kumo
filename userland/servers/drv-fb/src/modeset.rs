@@ -1,8 +1,8 @@
-//j685
 //j686
 //j790
 //j837
 //j881
+//j900
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -540,6 +540,13 @@ fn begin(
         }
         Err(Outcome::Rebuilt { .. }) => return None,
     };
+    // j900: say when the firmware's HDMI1/DP0 mirror was switched off before the comparison.
+    if let Some([if_en, if_ctrl, vp2_clock]) = blanked.detached {
+        log(format_args!(
+            "display: R1 switched off the firmware's VP2 mirror (HDMI1/DP0): cleared if_en {:#010x} if_ctrl {:#010x} vp2 clock {:#x}; HDMI0 only\n",
+            if_en, if_ctrl, vp2_clock
+        ));
+    }
     let s = blanked.scrub_readback;
     log(format_args!(
         "display: R1 blank: VP2 standby, HDMI0 interface off, scrubbed to reset values (readback clk/ifctrl/timing x4/esmart x6: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}); rebuilding in {} ms\n",
