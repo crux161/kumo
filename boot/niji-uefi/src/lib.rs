@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j783
 //j800
 //j804
 //j810
 //j905
+//j910
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
@@ -162,10 +162,12 @@ impl GopMode {
     }
 }
 
-/// The firmware's VGA fallback. The RK3588 firmware leaves HDMI here when it did not get
-/// the sink's EDID, with the HDMI transmitter still holding the earlier timing (KUMO's D0d
-/// reported the disagreement on several boots).
-pub const GOP_VGA_FALLBACK: (u32, u32) = (640, 480);
+/// The smallest firmware mode Nijigumo keeps, by area (1280x720 qualifies). Below it the
+/// firmware's choice is a fallback, not the sink's preferred mode: the RK3588 firmware leaves
+/// HDMI at 640x480 VGA when it did not get the sink's EDID (KUMO's D0d saw it on several boots),
+/// and the NUC7i5DNHE's Intel GOP left 800x600 — a 100x37 console — on its first metal boot
+/// (j908). j910 raised the floor from "above 640x480" to this.
+pub const GOP_KEEP_FLOOR: (u32, u32) = (1024, 768);
 /// The largest mode a fallback is replaced with. With no EDID to go by, 1080p is the CEA-861
 /// mode HDMI sinks most widely accept; anything larger risks an out-of-range sink.
 pub const GOP_FALLBACK_MAX: (u32, u32) = (1920, 1080);
@@ -173,27 +175,23 @@ pub const GOP_FALLBACK_MAX: (u32, u32) = (1920, 1080);
 /// What Nijigumo does with the firmware's GOP mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GopChoice {
-    /// The firmware's mode is linear and above the VGA fallback: its choice (normally the
+    /// The firmware's mode is linear and at least [`GOP_KEEP_FLOOR`]: its choice (normally the
     /// sink's EDID-preferred mode) stands.
     KeepFirmware,
-    /// The firmware's mode is the fallback or not linear, and nothing better is offered.
+    /// The firmware's mode is below the floor or not linear, and nothing better is offered.
     KeepNoBetter,
     /// Switch to this mode: the largest linear one within [`GOP_FALLBACK_MAX`], and larger
     /// than the current one when that is linear.
     Switch(GopMode),
 }
 
-/// Choose the boot mode. The firmware's choice is kept unless it is the VGA fallback (or not
-/// linear); then the largest linear mode within [`GOP_FALLBACK_MAX`] replaces it, the lowest
-/// mode number winning a tie. A mode the firmware reports as current is never re-set.
+/// Choose the boot mode. The firmware's choice is kept unless it is below [`GOP_KEEP_FLOOR`]
+/// (or not linear); then the largest linear mode within [`GOP_FALLBACK_MAX`] that is larger
+/// than the current one replaces it, the lowest mode number winning a tie. A mode the firmware
+/// reports as current is never re-set.
 pub fn choose_gop_mode(current: GopMode, offered: &[GopMode]) -> GopChoice {
-    let fallback = GopMode {
-        number: current.number,
-        width: GOP_VGA_FALLBACK.0,
-        height: GOP_VGA_FALLBACK.1,
-        pixel_format: current.pixel_format,
-    };
-    if current.is_linear() && current.area() > fallback.area() {
+    let keep_floor = u64::from(GOP_KEEP_FLOOR.0) * u64::from(GOP_KEEP_FLOOR.1);
+    if current.is_linear() && current.area() >= keep_floor {
         return GopChoice::KeepFirmware;
     }
     let floor = if current.is_linear() {
@@ -993,15 +991,47 @@ mod gop_mode_tests {
     }
 
     #[test]
-    fn firmware_mode_above_vga_is_kept() {
-        // opi5's usual 1600x900, QEMU OVMF's 800x600 and a laptop panel's native mode.
+    fn firmware_mode_at_or_above_the_floor_is_kept() {
+        // opi5's usual 1600x900, OVMF's 1280x800, 720p, the floor itself, the X13s panel and a
+        // 4K sink's native mode (larger than the fallback cap, but the firmware chose it).
         for current in [
             mode(3, 1600, 900, BGR),
-            mode(1, 800, 600, BGR),
+            mode(7, 1280, 800, BGR),
+            mode(2, 1280, 720, BGR),
+            mode(8, 1024, 768, BGR),
+            mode(9, 1920, 1200, BGR),
             mode(6, 3840, 2160, BGR),
         ] {
             assert_eq!(choose_gop_mode(current, &list()), GopChoice::KeepFirmware);
         }
+    }
+
+    #[test]
+    fn a_mode_below_the_floor_is_raised_like_the_vga_fallback() {
+        // j910: the NUC7i5DNHE's Intel GOP left 800x600 on its first metal boot.
+        assert_eq!(
+            choose_gop_mode(mode(1, 800, 600, BGR), &list()),
+            GopChoice::Switch(mode(4, 1920, 1080, BGR))
+        );
+        // A 1024x600 netbook panel and 960x640 sit under the floor's area too.
+        assert_eq!(
+            choose_gop_mode(mode(10, 1024, 600, BGR), &list()),
+            GopChoice::Switch(mode(4, 1920, 1080, BGR))
+        );
+        // Nothing larger within the cap: the low mode stays.
+        let low = [
+            mode(1, 800, 600, BGR),
+            mode(0, 640, 480, BGR),
+            mode(6, 3840, 2160, BGR),
+        ];
+        assert_eq!(choose_gop_mode(low[0], &low), GopChoice::KeepNoBetter);
+        // The floor decides what is kept, not what is reachable: an upgrade that still falls
+        // short of it is taken when that is all the sink offers.
+        let near = [mode(1, 800, 600, BGR), mode(2, 1000, 700, BGR)];
+        assert_eq!(
+            choose_gop_mode(near[0], &near),
+            GopChoice::Switch(mode(2, 1000, 700, BGR))
+        );
     }
 
     #[test]
