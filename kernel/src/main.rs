@@ -8,6 +8,7 @@
 
 //j447
 //j825
+//j904
 
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
@@ -85,10 +86,13 @@ mod boot {
     }
 }
 
-// x86_64 freestanding entry: booted by GRUB (Multiboot) or `qemu-system-x86_64 -kernel`
-// (Multiboot1). The loader enters `_start` in 32-bit protected mode with `eax = boot
-// magic` and `ebx = *multiboot_info`; the trampoline builds an identity-mapped long
-// mode and tail-calls Rust with `(rdi = mbi, rsi = magic, rdx = kernel_stack_top)`.
+// x86_64 freestanding entries. Two loaders, one kernel image:
+// - GRUB (Multiboot2) or `qemu-system-x86_64 -kernel` (Multiboot1) enter `_start` in 32-bit
+//   protected mode with `eax = boot magic` and `ebx = *multiboot_info`; the trampoline builds
+//   an identity-mapped long mode and calls Rust with `(rdi = mbi, rsi = magic,
+//   rdx = kernel_stack_top)`. Both Multiboot headers name `_start` explicitly.
+// - Nijigumo (UEFI, PLAN/025 X1) enters the ELF entry `_start_bootinfo` already in long
+//   mode on the firmware's identity page tables, with `rdi = *BootInfo` (the arm64 ABI).
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod boot_x86 {
     use core::panic::PanicInfo;
@@ -105,7 +109,7 @@ mod boot_x86 {
         ".long 0x00010003",                 // flags: AOUT_KLUDGE | ALIGN | MEMINFO
         ".long -(0x1BADB002 + 0x00010003)", // checksum
         ".long mb_header",                  // header_addr
-        ".long 0x100000",                   // load_addr (start of the image)
+        ".long __kernel_start",             // load_addr (start of the image, 16 MiB)
         ".long __load_end",                 // load_end_addr (end of file data)
         ".long __bss_end",                  // bss_end_addr (loader zeroes up to here)
         ".long _start",                     // entry_addr
@@ -129,7 +133,7 @@ mod boot_x86 {
         ".short 0",
         ".long 24",
         ".long mb2_header",
-        ".long 0x100000",
+        ".long __kernel_start",
         ".long __load_end",
         ".long __bss_end",
         // Enter the common 32-bit trampoline.
@@ -213,6 +217,33 @@ mod boot_x86 {
         "3:",
         "  hlt",
         "  jmp 3b",
+        // ---- 64-bit Nijigumo entry (ELF e_entry) -------------------------------------
+        // Firmware's GDT selectors are unknown, so load the same GDT the trampoline uses and
+        // reload CS with a far return before any Rust runs. RDI (BootInfo*) is preserved.
+        ".section .text._start_bootinfo, \"ax\"",
+        ".code64",
+        ".globl _start_bootinfo",
+        "_start_bootinfo:",
+        "  cli",
+        "  cld",
+        "  movq $boot_stack_top, %rsp",
+        "  lgdt gdt64_ptr64(%rip)",
+        "  pushq $0x08",
+        "  leaq 4f(%rip), %rax",
+        "  pushq %rax",
+        "  lretq",
+        "4:",
+        "  movw $0x10, %ax",
+        "  movw %ax, %ss",
+        "  movw %ax, %ds",
+        "  movw %ax, %es",
+        "  movw %ax, %fs",
+        "  movw %ax, %gs",
+        "  movq $boot_stack_top, %rsi", // rsi = TSS RSP0 for future ring-3 transitions
+        "  call x86_kernel_entry_bootinfo",
+        "5:",
+        "  hlt",
+        "  jmp 5b",
         // ---- 64-bit GDT: null, ring0 code (L=1), ring0 data ---------------------------
         ".section .rodata",
         ".align 8",
@@ -224,6 +255,10 @@ mod boot_x86 {
         "gdt64_ptr:",
         "  .word gdt64_end - gdt64 - 1",
         "  .long gdt64",
+        // 64-bit `lgdt` reads a 10-byte pseudo-descriptor (8-byte base).
+        "gdt64_ptr64:",
+        "  .word gdt64_end - gdt64 - 1",
+        "  .quad gdt64",
         // ---- boot scratch: page tables, stack, saved handoff registers ---------------
         ".section .bss",
         ".align 4096",
@@ -242,6 +277,14 @@ mod boot_x86 {
     #[no_mangle]
     extern "C" fn x86_kernel_entry(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         kernel::x86_first_light(mbi, magic, kernel_stack_top)
+    }
+
+    #[no_mangle]
+    extern "C" fn x86_kernel_entry_bootinfo(
+        boot: *const kumo_abi::BootInfo,
+        kernel_stack_top: u64,
+    ) -> ! {
+        kernel::x86_first_light_bootinfo(boot, kernel_stack_top)
     }
 
     #[panic_handler]

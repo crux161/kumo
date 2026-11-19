@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#j904
 # netboot-smoke.sh - boot the generated AMD64 netboot tree end-to-end in QEMU and assert
 # KUMO's serial POST, without the physical test machine.
 #
@@ -18,7 +19,7 @@ BIOS_NBP="boot/grub/i386-pc/core.0"
 
 command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "error: qemu-system-x86_64 not found" >&2; exit 1; }
 if [ ! -s "$TREE/$BIOS_NBP" ]; then
-  echo "error: $TREE/$BIOS_NBP missing (regenerate with scripts/refresh-netboot.sh; needs i686-elf-grub)" >&2
+  echo "error: $TREE/$BIOS_NBP missing (regenerate with scripts/refresh-netboot.sh --target nuc; needs i686-elf-grub)" >&2
   exit 1
 fi
 

@@ -1,5 +1,7 @@
 //! Safe, host-testable Multiboot2 handoff parsing and Multiboot1/2 memory-map normalization.
 
+//j904
+
 use alloc::vec::Vec;
 use kumo_abi::{MemRegion, MemRegionKind, Range};
 
@@ -225,6 +227,22 @@ fn push_firmware_region(
     firmware_kind: u32,
     accessible_limit: u64,
 ) -> Result<(), MemoryMapError> {
+    let kind = match firmware_kind {
+        1 => MemRegionKind::Usable,
+        3 | 4 => MemRegionKind::Acpi,
+        _ => MemRegionKind::Reserved,
+    };
+    push_kind_region(parsed, start, len, kind, accessible_limit)
+}
+
+/// Clip one region to `accessible_limit`; usable RAM below 1 MiB is recorded as reserved.
+fn push_kind_region(
+    parsed: &mut Vec<MemRegion>,
+    start: u64,
+    len: u64,
+    kind: MemRegionKind,
+    accessible_limit: u64,
+) -> Result<(), MemoryMapError> {
     let end = start
         .checked_add(len)
         .ok_or(MemoryMapError::AddressOverflow)?
@@ -232,11 +250,6 @@ fn push_firmware_region(
     if len == 0 || start >= accessible_limit || start >= end {
         return Ok(());
     }
-    let kind = match firmware_kind {
-        1 => MemRegionKind::Usable,
-        3 | 4 => MemRegionKind::Acpi,
-        _ => MemRegionKind::Reserved,
-    };
     if kind == MemRegionKind::Usable && start < LEGACY_LOW_MEMORY_END {
         push_region(
             parsed,
@@ -342,6 +355,46 @@ pub fn normalize_memory_map(
         cursor = entry_end;
     }
 
+    normalize_parsed_regions(parsed)
+}
+
+/// Normalize a UEFI loader's BootInfo region list (PLAN/025 X1) through the same policy as the
+/// Multiboot maps: clip to `accessible_limit`, force usable RAM below 1 MiB reserved, and let
+/// the most restrictive kind win on overlap. `reserved` adds ranges the loader still reports
+/// as usable but that stay live past the handoff (the firmware's page-table frames until the
+/// kernel's own CR3). Loader kinds are kept: Nijigumo marks the kernel, initrd and BootInfo
+/// `Bootloader`, which the frame allocator never hands out.
+pub fn normalize_boot_regions(
+    regions: &[MemRegion],
+    reserved: &[Range],
+    accessible_limit: u64,
+) -> Result<Vec<MemRegion>, MemoryMapError> {
+    if regions.is_empty() {
+        return Err(MemoryMapError::Empty);
+    }
+    let mut parsed = Vec::with_capacity(regions.len() + reserved.len());
+    for region in regions {
+        let kind = match region.kind {
+            MemRegionKind::Unknown => MemRegionKind::Reserved,
+            kind => kind,
+        };
+        push_kind_region(
+            &mut parsed,
+            region.range.start,
+            region.range.len,
+            kind,
+            accessible_limit,
+        )?;
+    }
+    for range in reserved {
+        push_kind_region(
+            &mut parsed,
+            range.start,
+            range.len,
+            MemRegionKind::Reserved,
+            accessible_limit,
+        )?;
+    }
     normalize_parsed_regions(parsed)
 }
 
@@ -574,6 +627,68 @@ mod tests {
         assert_eq!(
             normalize_memory_map(&wrapping, 1 << 30),
             Err(MemoryMapError::AddressOverflow)
+        );
+    }
+
+    fn region(start: u64, len: u64, kind: MemRegionKind) -> MemRegion {
+        MemRegion {
+            range: Range::new(start, len),
+            kind,
+            _reserved: 0,
+        }
+    }
+
+    #[test]
+    fn boot_regions_keep_loader_kinds_and_clip_to_the_window() {
+        let regions = [
+            region(0, 0xa_0000, MemRegionKind::Usable),
+            region(0x10_0000, 0x90_0000, MemRegionKind::Bootloader),
+            region(0xa0_0000, 0x3f60_0000, MemRegionKind::Usable),
+            region(0x4000_0000, 0x400_0000, MemRegionKind::Usable),
+            region(0xfee0_0000, 0x1000, MemRegionKind::Mmio),
+        ];
+        let low = normalize_boot_regions(&regions, &[], 1 << 30).unwrap();
+        assert_eq!(
+            low,
+            vec![
+                region(0, 0xa_0000, MemRegionKind::Reserved),
+                region(0x10_0000, 0x90_0000, MemRegionKind::Bootloader),
+                region(0xa0_0000, 0x3f60_0000, MemRegionKind::Usable),
+            ]
+        );
+        let all = normalize_boot_regions(&regions, &[], 1 << 39).unwrap();
+        // Adjacent usable regions coalesce across the 1 GiB line once nothing clips them.
+        assert!(all.contains(&region(0xa0_0000, 0x4360_0000, MemRegionKind::Usable)));
+        assert!(all.contains(&region(0xfee0_0000, 0x1000, MemRegionKind::Mmio)));
+    }
+
+    #[test]
+    fn boot_regions_reserve_a_frame_inside_usable_ram() {
+        let regions = [region(0x10_0000, 0x40_0000, MemRegionKind::Usable)];
+        let reserved = [Range::new(0x20_0000, 0x1000), Range::new(0x30_0000, 0x2000)];
+        let map = normalize_boot_regions(&regions, &reserved, 1 << 39).unwrap();
+        assert_eq!(
+            map,
+            vec![
+                region(0x10_0000, 0x10_0000, MemRegionKind::Usable),
+                region(0x20_0000, 0x1000, MemRegionKind::Reserved),
+                region(0x20_1000, 0xf_f000, MemRegionKind::Usable),
+                region(0x30_0000, 0x2000, MemRegionKind::Reserved),
+                region(0x30_2000, 0x1f_e000, MemRegionKind::Usable),
+            ]
+        );
+    }
+
+    #[test]
+    fn boot_regions_need_usable_memory() {
+        assert_eq!(
+            normalize_boot_regions(&[], &[], 1 << 39),
+            Err(MemoryMapError::Empty)
+        );
+        let only_loader = [region(0x10_0000, 0x1000, MemRegionKind::Bootloader)];
+        assert_eq!(
+            normalize_boot_regions(&only_loader, &[], 1 << 39),
+            Err(MemoryMapError::NoUsableMemory)
         );
     }
 }

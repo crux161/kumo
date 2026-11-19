@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j800
 //j801
 //j804
 //j805
 //j810
+//j904
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -41,7 +41,11 @@ use core::panic::PanicInfo;
 use core::ptr;
 
 use kumo_abi::{BootInfo, Framebuffer, FramebufferFormat, MemRegion, Range, RawSlice};
-use niji_loader::elf::{parse_elf64, EM_AARCH64};
+use niji_loader::elf::parse_elf64;
+#[cfg(target_arch = "aarch64")]
+use niji_loader::elf::EM_AARCH64 as KERNEL_MACHINE;
+#[cfg(target_arch = "x86_64")]
+use niji_loader::elf::EM_X86_64 as KERNEL_MACHINE;
 use niji_loader::{summarize_platform, validate_boot_info};
 use niji_uefi::{
     build_boot_info, choose_gop_mode, efi_memory_type, efi_memory_type_is_firmware_owned,
@@ -57,6 +61,9 @@ const EFI_SUCCESS: EfiStatus = 0;
 const EFI_FILE_MODE_READ: u64 = 0x0000_0000_0000_0001;
 const EFI_PAGE_SIZE: u64 = 4096;
 const EFI_ALLOCATE_ANY_PAGES: u32 = 0;
+/// `AllocateAddress`: the x86 kernel is identity-linked at a fixed physical address (PLAN/025).
+#[cfg(target_arch = "x86_64")]
+const EFI_ALLOCATE_ADDRESS: u32 = 2;
 const MAX_DTB_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Staged asset paths on the ESP (backslash-separated, as UEFI expects).
@@ -127,6 +134,22 @@ const EFI_DTB_TABLE_GUID: EfiGuid = guid(
     0xf19c,
     0x41a5,
     [0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0],
+);
+/// `EFI_ACPI_20_TABLE_GUID` — the ACPI 2.0+ RSDP in the configuration table.
+#[cfg(target_arch = "x86_64")]
+const EFI_ACPI_20_TABLE_GUID: EfiGuid = guid(
+    0x8868_e871,
+    0xe4f1,
+    0x11d3,
+    [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81],
+);
+/// `ACPI_TABLE_GUID` — the ACPI 1.0 RSDP, used only when no 2.0 entry exists.
+#[cfg(target_arch = "x86_64")]
+const EFI_ACPI_10_TABLE_GUID: EfiGuid = guid(
+    0xeb9d_2d30,
+    0x2d88,
+    0x11d3,
+    [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
 );
 /// `EFI_PXE_BASE_CODE_PROTOCOL_GUID` — present on the device handle of an image the firmware
 /// downloaded over PXE. It is how a netbooted loader reaches the TFTP server it came from, which
@@ -567,7 +590,10 @@ pub extern "efiapi" fn efi_main(
     let con_out = unsafe { con_out_of(system_table) };
 
     kprint!(con_out, "\r\nNIJIGUMO Boot Loader v0.1.0\r\n");
+    #[cfg(target_arch = "aarch64")]
     kprint!(con_out, "BOOTAA64.EFI loaded\r\n");
+    #[cfg(target_arch = "x86_64")]
+    kprint!(con_out, "BOOTX64.EFI loaded\r\n");
     // Report the Exception Level before handoff. EDK2-on-RPi enters the OS at EL2 while
     // the X13s firmware enters at EL1; the kernel's high-VA TTBR1 jump assumes EL1, so an
     // EL2 handoff faults at the `br` with no console up yet. Make the level visible here,
@@ -617,6 +643,22 @@ struct KernelLoad {
     phys: Range,
     virt: Range,
     boot_ttbr1: u64,
+    /// x86: the image waits in a staging buffer until boot services are gone (PLAN/025 X1).
+    #[cfg(target_arch = "x86_64")]
+    deferred: Option<DeferredMove>,
+}
+
+/// An x86 kernel whose linked span is firmware boot-services memory: staged elsewhere, then
+/// copied to its linked address after ExitBootServices, when that memory is the OS's. This is
+/// what GRUB's relocator does for Multiboot; the checks below make it refuse rather than
+/// overwrite anything still live (ACPI/runtime memory, the loader's stack, the firmware page
+/// tables, the descriptor tables).
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct DeferredMove {
+    staged: u64,
+    linked: u64,
+    len: u64,
 }
 
 /// Discover the platform, load the kernel + initrd + DTB, assemble & validate the
@@ -709,12 +751,19 @@ unsafe fn boot_and_jump(
         }
     };
 
+    // The x86 kernel finds ACPI through BootInfo; UEFI machines have no legacy RSDP scan area.
+    #[cfg(target_arch = "x86_64")]
+    let acpi_rsdp = unsafe { firmware_acpi_rsdp(system_table, con_out) };
+    #[cfg(not(target_arch = "x86_64"))]
+    let acpi_rsdp = 0;
+
     let seed = UefiHandoffSeed {
         dtb: dtb_addr,
         framebuffer,
         kernel_phys: kernel.phys,
         kernel_virt: kernel.virt,
         initrd,
+        acpi_rsdp,
         ..UefiHandoffSeed::empty()
     };
     unsafe { boot_ptr.write(build_boot_info(seed)) };
@@ -749,6 +798,17 @@ unsafe fn boot_and_jump(
     if let Some((regions_ptr, regions_len, _key, raw_map)) =
         unsafe { snapshot_memory(boot_services, &bufs) }
     {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(moved) = kernel.deferred {
+            if let Some(hazard) = unsafe { deferred_move_hazard(moved, raw_map) } {
+                kprint!(
+                    con_out,
+                    "kernel move  : refused ({}); returning to firmware.\r\n",
+                    hazard
+                );
+                return;
+            }
+        }
         unsafe { (*boot_ptr).mem_regions = RawSlice::from_raw_parts(regions_ptr, regions_len) };
         let ram = unsafe { framebuffer_ram(system_table, raw_map, (*boot_ptr).framebuffer, true) };
         unsafe { stamp_framebuffer_ram(boot_ptr, ram.is_some()) };
@@ -828,6 +888,8 @@ unsafe fn boot_and_jump(
     // ExitBootServices: refill mem_regions from the FINAL map, then exit on the key
     // that map produced. Retry if the map shifts under us.
     let mut exited = false;
+    #[cfg(target_arch = "x86_64")]
+    let mut final_map = None;
     for _ in 0..8 {
         let (regions_ptr, regions_len, map_key, raw_map) =
             match unsafe { snapshot_memory(boot_services, &bufs) } {
@@ -844,6 +906,10 @@ unsafe fn boot_and_jump(
         let status = unsafe { ((*boot_services).exit_boot_services)(image_handle, map_key) };
         if status == EFI_SUCCESS {
             exited = true;
+            #[cfg(target_arch = "x86_64")]
+            {
+                final_map = Some(raw_map);
+            }
             break;
         }
     }
@@ -853,6 +919,27 @@ unsafe fn boot_and_jump(
             "ExitBootServices failed; returning to firmware.\r\n"
         );
         return;
+    }
+
+    // x86: a staged kernel moves to its linked span now that boot-services memory is free.
+    // The final map is rechecked first; the move reads only the LoaderData staging copy.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(moved) = kernel.deferred {
+        match final_map {
+            Some(map) => {
+                if let Some(hazard) = unsafe { deferred_move_hazard(moved, map) } {
+                    com1_halt(hazard);
+                }
+            }
+            None => com1_halt("no final memory map"),
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(
+                moved.staged as *const u8,
+                moved.linked as *mut u8,
+                moved.len as usize,
+            )
+        };
     }
 
     // Boot services are gone — no more UEFI console. The kernel's Stage-A console takes
@@ -1460,6 +1547,61 @@ unsafe fn load_dtb(
 /// Scan the UEFI configuration table for [`EFI_DTB_TABLE_GUID`] and, if its blob carries valid
 /// FDT magic, return `(phys_addr, totalsize)` read from the FDT header. The firmware owns this
 /// memory; the caller must copy it into loader-owned storage before `ExitBootServices`.
+/// The ACPI RSDP from the EFI configuration table: the 2.0 entry if present, else 1.0. The
+/// pointer is checksum-validated before it is handed to the kernel; zero means "none".
+#[cfg(target_arch = "x86_64")]
+unsafe fn firmware_acpi_rsdp(
+    system_table: *mut EfiSystemTable,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+) -> u64 {
+    const MAX_CONFIG_TABLES: usize = 1024;
+    const RSDP_V2_LEN: usize = 36;
+
+    if system_table.is_null() {
+        return 0;
+    }
+    let count = unsafe { (*system_table).number_of_table_entries };
+    let tables = unsafe { (*system_table).configuration_table } as *const EfiConfigurationTable;
+    if count > MAX_CONFIG_TABLES || tables.is_null() {
+        kprint!(con_out, "ACPI RSDP    : configuration table rejected\r\n");
+        return 0;
+    }
+    for (wanted, name) in [
+        (EFI_ACPI_20_TABLE_GUID, "ACPI 2.0"),
+        (EFI_ACPI_10_TABLE_GUID, "ACPI 1.0"),
+    ] {
+        for index in 0..count {
+            let entry = unsafe { &*tables.add(index) };
+            if entry.vendor_guid != wanted || entry.vendor_table.is_null() {
+                continue;
+            }
+            let address = entry.vendor_table as u64;
+            let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, RSDP_V2_LEN) };
+            match niji_loader::acpi::Rsdp::parse(bytes) {
+                Ok(rsdp) => {
+                    kprint!(
+                        con_out,
+                        "ACPI RSDP    : {:#x} ({} table, revision {})\r\n",
+                        address,
+                        name,
+                        rsdp.revision
+                    );
+                    return address;
+                }
+                Err(err) => kprint!(
+                    con_out,
+                    "ACPI RSDP    : {} entry {:#x} invalid ({:?})\r\n",
+                    name,
+                    address,
+                    err
+                ),
+            }
+        }
+    }
+    kprint!(con_out, "ACPI RSDP    : absent\r\n");
+    0
+}
+
 unsafe fn firmware_dtb(
     system_table: *mut EfiSystemTable,
     con_out: *mut EfiSimpleTextOutputProtocol,
@@ -1568,19 +1710,28 @@ unsafe fn firmware_dtb(
     None
 }
 
+#[cfg(target_arch = "aarch64")]
 const PT_DESC_VALID: u64 = 1 << 0;
+#[cfg(target_arch = "aarch64")]
 const PT_DESC_TABLE_OR_PAGE: u64 = 1 << 1;
+#[cfg(target_arch = "aarch64")]
 const PT_DESC_AF: u64 = 1 << 10;
+#[cfg(target_arch = "aarch64")]
 const PT_DESC_SH_INNER: u64 = 3 << 8;
+#[cfg(target_arch = "aarch64")]
 const PT_DESC_UXN: u64 = 1 << 54;
+#[cfg(target_arch = "aarch64")]
 const PT_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+#[cfg(target_arch = "aarch64")]
 const BOOT_MAIR_WB_INDEX: u64 = 7;
 
+#[cfg(target_arch = "aarch64")]
 struct BootPageTables {
     next: u64,
     end: u64,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl BootPageTables {
     unsafe fn alloc(&mut self) -> Option<u64> {
         if self.next >= self.end {
@@ -1593,14 +1744,17 @@ impl BootPageTables {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 unsafe fn table_desc(table: u64, index: usize) -> u64 {
     unsafe { ((table + index as u64 * 8) as *const u64).read_volatile() }
 }
 
+#[cfg(target_arch = "aarch64")]
 unsafe fn write_table_desc(table: u64, index: usize, desc: u64) {
     unsafe { ((table + index as u64 * 8) as *mut u64).write_volatile(desc) };
 }
 
+#[cfg(target_arch = "aarch64")]
 unsafe fn ensure_boot_table(tables: &mut BootPageTables, parent: u64, index: usize) -> Option<u64> {
     let existing = unsafe { table_desc(parent, index) };
     if existing & PT_DESC_VALID != 0 {
@@ -1613,6 +1767,7 @@ unsafe fn ensure_boot_table(tables: &mut BootPageTables, parent: u64, index: usi
 
 /// Construct the temporary TTBR1 tree used only for the first virtual jump into the
 /// high-linked kernel. The kernel replaces this tree with its permanent map during M1.
+#[cfg(target_arch = "aarch64")]
 unsafe fn build_boot_ttbr1(
     boot_services: *mut EfiBootServices,
     virt_base: u64,
@@ -1699,7 +1854,7 @@ unsafe fn load_kernel(
             return None;
         }
     };
-    if image.machine != EM_AARCH64 {
+    if image.machine != KERNEL_MACHINE {
         kprint!(
             con_out,
             "kernel       : wrong machine {:#x}\r\n",
@@ -1714,16 +1869,37 @@ unsafe fn load_kernel(
     // Linked virtual addresses remain fixed; physical placement changes only the
     // backing pages installed into the temporary TTBR1 map.
     let pages = ((image.load_span() + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE) as usize;
-    let mut load_addr: u64 = 0;
+    // x86_64 (PLAN/025 X1): the kernel is identity-linked at a fixed physical address and has
+    // no relocations, so its pages must be exactly the linked ones. GRUB's Multiboot loader has
+    // the same requirement. If firmware owns any page of the span, this fails loudly; the fix
+    // then is a higher-half link (X1b), not a silent move.
+    #[cfg(target_arch = "x86_64")]
+    let (allocate_type, mut load_addr) = {
+        if image.virt_base != image.load_base || image.load_base & (EFI_PAGE_SIZE - 1) != 0 {
+            kprint!(
+                con_out,
+                "kernel       : x86 image must be identity-linked and page-aligned (virt {:#x}, phys {:#x})\r\n",
+                image.virt_base,
+                image.load_base
+            );
+            unsafe { ((*boot_services).free_pool)(buffer) };
+            return None;
+        }
+        (EFI_ALLOCATE_ADDRESS, image.load_base)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let (allocate_type, mut load_addr) = (EFI_ALLOCATE_ANY_PAGES, 0u64);
     // Allocate the kernel into EfiLoaderCode, not EfiLoaderData: strict UEFI (Qualcomm's
     // SC8280XP firmware) maps loader *data* pages non-executable, so a `br` into the
     // copied kernel faults on instruction fetch and never runs its first instruction —
     // the X13s "red flash, no green" symptom. Lax firmware (the Pi's EDK2, QEMU/AAVMF)
     // maps data executable and masks the bug. EfiLoaderCode is what GRUB and the Linux
     // EFI stub use for loaded kernels.
+    #[cfg(target_arch = "x86_64")]
+    let mut deferred: Option<DeferredMove> = None;
     let status = unsafe {
         ((*boot_services).allocate_pages)(
-            EFI_ALLOCATE_ANY_PAGES,
+            allocate_type,
             efi_memory_type::LOADER_CODE,
             pages,
             &mut load_addr,
@@ -1732,10 +1908,54 @@ unsafe fn load_kernel(
     if status != EFI_SUCCESS {
         kprint!(
             con_out,
-            "kernel       : AllocatePages ({} pages) failed ({:#x})\r\n",
+            "kernel       : AllocatePages ({} pages at {:#x}) failed ({:#x})\r\n",
             pages,
+            load_addr,
             status
         );
+        #[cfg(target_arch = "x86_64")]
+        {
+            let movable = unsafe {
+                report_span_owners(boot_services, con_out, image.load_base, image.load_span())
+            };
+            let mut staged = 0u64;
+            let status = if movable {
+                unsafe {
+                    ((*boot_services).allocate_pages)(
+                        EFI_ALLOCATE_ANY_PAGES,
+                        efi_memory_type::LOADER_DATA,
+                        pages,
+                        &mut staged,
+                    )
+                }
+            } else {
+                kprint!(
+                    con_out,
+                    "kernel       : linked span holds firmware memory the OS must keep\r\n"
+                );
+                !0
+            };
+            if status == EFI_SUCCESS {
+                kprint!(
+                    con_out,
+                    "kernel       : span is boot-services memory; staged at {:#x}, moves to {:#x} after ExitBootServices\r\n",
+                    staged,
+                    image.load_base
+                );
+                deferred = Some(DeferredMove {
+                    staged,
+                    linked: image.load_base,
+                    len: image.load_span(),
+                });
+                load_addr = staged;
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    let staged_ok = deferred.is_some();
+    #[cfg(not(target_arch = "x86_64"))]
+    let staged_ok = false;
+    if status != EFI_SUCCESS && !staged_ok {
         unsafe { ((*boot_services).free_pool)(buffer) };
         return None;
     }
@@ -1786,6 +2006,7 @@ unsafe fn load_kernel(
         }
     };
     let entry_phys = load_addr.wrapping_add(entry_offset);
+    #[cfg(target_arch = "aarch64")]
     let boot_ttbr1 = match unsafe {
         build_boot_ttbr1(boot_services, image.virt_base, load_addr, image.virt_span())
     } {
@@ -1795,6 +2016,9 @@ unsafe fn load_kernel(
             return None;
         }
     };
+    // x86 enters on the firmware's identity map; the kernel builds its own CR3 in M1.
+    #[cfg(not(target_arch = "aarch64"))]
+    let boot_ttbr1 = 0;
     kprint!(
         con_out,
         "kernel       : {} phys {:#x}..{:#x} -> virt {:#x} entry {:#x} (trampoline {:#x})\r\n",
@@ -1805,11 +2029,18 @@ unsafe fn load_kernel(
         image.entry,
         entry_phys
     );
+    // A deferred x86 image is reported at the address it will run from, not its staging copy.
+    #[cfg(target_arch = "x86_64")]
+    let run_addr = deferred.map_or(load_addr, |moved| moved.linked);
+    #[cfg(not(target_arch = "x86_64"))]
+    let run_addr = load_addr;
     Some(KernelLoad {
         entry_virt: image.entry,
-        phys: Range::new(load_addr, image.load_span()),
+        phys: Range::new(run_addr, image.load_span()),
         virt: Range::new(image.virt_base, image.virt_span()),
         boot_ttbr1,
+        #[cfg(target_arch = "x86_64")]
+        deferred,
     })
 }
 
@@ -2273,6 +2504,219 @@ const fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> b
         return true;
     };
     a_start < b_end && b_start < a_end
+}
+
+/// Print every firmware memory descriptor overlapping `[start, start + len)` that is not free
+/// conventional memory: why a fixed-address kernel placement was refused (PLAN/025 X1).
+/// Returns true when the span is fully described and every owner is boot-services memory,
+/// which becomes the OS's at ExitBootServices: the image can be staged and moved then.
+#[cfg(target_arch = "x86_64")]
+unsafe fn report_span_owners(
+    boot_services: *mut EfiBootServices,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+    start: u64,
+    len: u64,
+) -> bool {
+    let Some(bufs) = (unsafe { prepare_memory_buffers(boot_services) }) else {
+        return false;
+    };
+    let mut movable = false;
+    if let Some((_, _, _, map)) = unsafe { snapshot_memory(boot_services, &bufs) } {
+        movable = true;
+        for (efi_type, phys, desc_end) in unsafe { efi_descriptors(map) } {
+            if efi_type != efi_memory_type::CONVENTIONAL
+                && phys < start.saturating_add(len)
+                && start < desc_end
+            {
+                kprint!(
+                    con_out,
+                    "  span owner : {} at {:#x}..{:#x}\r\n",
+                    efi_type_name(efi_type),
+                    phys,
+                    desc_end
+                );
+                movable &= is_boot_services_type(efi_type);
+            }
+        }
+        movable &= unsafe { span_fully_described(map, start, len) };
+    }
+    unsafe { release_memory_buffers(boot_services, bufs) };
+    movable
+}
+
+/// `(type, start, end)` of each raw EFI memory descriptor.
+#[cfg(target_arch = "x86_64")]
+unsafe fn efi_descriptors(map: EfiMemoryMapView) -> impl Iterator<Item = (u32, u64, u64)> {
+    (0..map.count).map(move |index| {
+        let base = unsafe { map.descriptors.add(index * map.descriptor_size) };
+        let efi_type = unsafe { ptr::read_unaligned(base as *const u32) };
+        let phys = unsafe { ptr::read_unaligned(base.add(8) as *const u64) };
+        let pages = unsafe { ptr::read_unaligned(base.add(24) as *const u64) };
+        (
+            efi_type,
+            phys,
+            phys.saturating_add(pages.saturating_mul(EFI_PAGE_SIZE)),
+        )
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn is_boot_services_type(efi_type: u32) -> bool {
+    efi_type == efi_memory_type::BOOT_SERVICES_CODE
+        || efi_type == efi_memory_type::BOOT_SERVICES_DATA
+}
+
+#[cfg(target_arch = "x86_64")]
+fn efi_type_name(efi_type: u32) -> &'static str {
+    match efi_type {
+        0 => "Reserved",
+        1 => "LoaderCode",
+        2 => "LoaderData",
+        3 => "BootServicesCode",
+        4 => "BootServicesData",
+        5 => "RuntimeServicesCode",
+        6 => "RuntimeServicesData",
+        7 => "Conventional",
+        8 => "Unusable",
+        9 => "ACPIReclaim",
+        10 => "ACPINVS",
+        11 => "MMIO",
+        12 => "MMIOPortSpace",
+        13 => "PalCode",
+        14 => "Persistent",
+        _ => "Unknown",
+    }
+}
+
+/// True when every byte of `[start, start + len)` lies in some descriptor (a hole is not RAM).
+#[cfg(target_arch = "x86_64")]
+unsafe fn span_fully_described(map: EfiMemoryMapView, start: u64, len: u64) -> bool {
+    let end = start.saturating_add(len);
+    let mut cursor = start;
+    // Descriptors are not guaranteed sorted; sweep until no descriptor extends the cursor.
+    loop {
+        let before = cursor;
+        for (_, phys, desc_end) in unsafe { efi_descriptors(map) } {
+            if phys <= cursor && cursor < desc_end {
+                cursor = desc_end;
+            }
+        }
+        if cursor >= end {
+            return true;
+        }
+        if cursor == before {
+            return false;
+        }
+    }
+}
+
+/// Why `moved` cannot be copied to its linked span right now, or `None` when it can. Run on
+/// the provisional map before ExitBootServices (so a refusal can still return to firmware) and
+/// again on the final map after it, immediately before the copy.
+#[cfg(target_arch = "x86_64")]
+unsafe fn deferred_move_hazard(moved: DeferredMove, map: EfiMemoryMapView) -> Option<&'static str> {
+    let (start, end) = (moved.linked, moved.linked.saturating_add(moved.len));
+    let overlaps = |a: u64, b: u64| a < end && start < b;
+    if !unsafe { span_fully_described(map, start, moved.len) } {
+        return Some("linked span is not all RAM");
+    }
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)) };
+    for (efi_type, phys, desc_end) in unsafe { efi_descriptors(map) } {
+        if !overlaps(phys, desc_end) {
+            continue;
+        }
+        if efi_type != efi_memory_type::CONVENTIONAL && !is_boot_services_type(efi_type) {
+            return Some("linked span holds memory the OS must keep");
+        }
+        if phys <= rsp && rsp < desc_end {
+            return Some("linked span holds the loader's stack");
+        }
+    }
+    let mut pseudo = [0u8; 10];
+    unsafe { core::arch::asm!("sgdt [{}]", in(reg) pseudo.as_mut_ptr(), options(nostack)) };
+    let gdt = u64::from_le_bytes(pseudo[2..10].try_into().unwrap_or([0; 8]));
+    let gdt_len = u64::from(u16::from_le_bytes([pseudo[0], pseudo[1]])) + 1;
+    unsafe { core::arch::asm!("sidt [{}]", in(reg) pseudo.as_mut_ptr(), options(nostack)) };
+    let idt = u64::from_le_bytes(pseudo[2..10].try_into().unwrap_or([0; 8]));
+    let idt_len = u64::from(u16::from_le_bytes([pseudo[0], pseudo[1]])) + 1;
+    if overlaps(gdt, gdt + gdt_len) || overlaps(idt, idt + idt_len) {
+        return Some("linked span holds the firmware GDT/IDT");
+    }
+    if unsafe { page_tables_overlap(start, end) } {
+        return Some("linked span holds the firmware page tables");
+    }
+    None
+}
+
+/// Whether any frame of the 4-level page-table tree under CR3 lies in `[start, end)`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn page_tables_overlap(start: u64, end: u64) -> bool {
+    const PRESENT: u64 = 1;
+    const HUGE: u64 = 1 << 7;
+    const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+    let inside = |frame: u64| start < frame.saturating_add(4096) && frame < end;
+    let read =
+        |table: u64, index: usize| unsafe { ptr::read_volatile((table as *const u64).add(index)) };
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)) };
+    let root = cr3 & ADDRESS;
+    if inside(root) {
+        return true;
+    }
+    for pml4_index in 0..512 {
+        let pml4e = read(root, pml4_index);
+        if pml4e & PRESENT == 0 {
+            continue;
+        }
+        let pdpt = pml4e & ADDRESS;
+        if inside(pdpt) {
+            return true;
+        }
+        for pdpt_index in 0..512 {
+            let pdpte = read(pdpt, pdpt_index);
+            if pdpte & PRESENT == 0 || pdpte & HUGE != 0 {
+                continue;
+            }
+            let pd = pdpte & ADDRESS;
+            if inside(pd) {
+                return true;
+            }
+            for pd_index in 0..512 {
+                let pde = read(pd, pd_index);
+                if pde & PRESENT != 0 && pde & HUGE == 0 && inside(pde & ADDRESS) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// After ExitBootServices there is no firmware console: report a refused move on COM1, the
+/// same port the kernel's console uses, then stop.
+#[cfg(target_arch = "x86_64")]
+fn com1_halt(reason: &str) -> ! {
+    const COM1: u16 = 0x3f8;
+    for byte in b"\r\nNijigumo: kernel move refused after ExitBootServices: "
+        .iter()
+        .chain(reason.as_bytes())
+        .chain(b"\r\n")
+    {
+        for _ in 0..100_000 {
+            let status: u8;
+            unsafe {
+                core::arch::asm!("in al, dx", out("al") status, in("dx") COM1 + 5, options(nomem, nostack))
+            };
+            if status & 0x20 != 0 {
+                break;
+            }
+        }
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") COM1, in("al") *byte, options(nomem, nostack))
+        };
+    }
+    spin_forever()
 }
 
 /// Release a temporary memory-map snapshot before the final handoff buffers are prepared.
@@ -2819,8 +3263,9 @@ unsafe fn jump_to_kernel(
     }
 }
 
-/// P10: x86_64 kernel handoff — exit UEFI boot services, preserve the firmware
-/// identity map, and jump to the kernel entry with BootInfo in RDI.
+/// x86_64 kernel handoff (PLAN/025 X1): boot services are gone; keep the firmware identity
+/// map and enter `_start_bootinfo` with BootInfo in RDI. Interrupts stay masked: the
+/// firmware's IDT is not the kernel's, and the kernel installs its own before unmasking.
 #[cfg(target_arch = "x86_64")]
 unsafe fn jump_to_kernel(
     entry: u64,
@@ -2831,6 +3276,8 @@ unsafe fn jump_to_kernel(
 ) -> ! {
     unsafe {
         core::arch::asm!(
+            "cli",
+            "cld",
             "jmp {entry}",
             entry = in(reg) entry,
             in("rdi") boot,

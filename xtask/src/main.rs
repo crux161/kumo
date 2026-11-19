@@ -1,8 +1,8 @@
-//j889
 //j890
 //j891
 //j893
 //j897
+//j904
 
 use std::env;
 use std::fmt;
@@ -149,6 +149,7 @@ fn run() -> Result<(), String> {
         }
         "x86-smoke" => run_x86_qemu_smoke(&root),
         "x86-uefi-smoke" => run_x86_uefi_smoke(&root),
+        "x86-niji-smoke" => run_x86_niji_smoke(&root),
         "x86-initrd" => {
             let initrd = build_x86_multiboot_initrd(&root)?;
             println!("{}", initrd.display());
@@ -2944,10 +2945,20 @@ fn run_qemu_serial_smoke(files: &Arm64QemuBootFiles) -> Result<(), String> {
     Ok(())
 }
 
+/// The x86 smokes read the kernel's INFO-level checkpoint lines from COM1. Since J559 the
+/// default console level is WARNING (INFO goes to dmesg only), which left every x86 smoke
+/// blind, so they build a verbose kernel unless the caller already chose a level.
+fn x86_smoke_console_level() {
+    if env::var_os("KUMO_CONSOLE_LOGLEVEL").is_none() {
+        env::set_var("KUMO_CONSOLE_LOGLEVEL", "7");
+    }
+}
+
 fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     if !command_exists("qemu-system-x86_64") {
         return Err("qemu-system-x86_64 is required for the x86 smoke".to_owned());
     }
+    x86_smoke_console_level();
 
     let build_script = root.join("scripts/x86-multiboot.sh");
     run_tool(root, "bash", &[path_arg(&build_script)?, "build"])?;
@@ -3098,6 +3109,7 @@ fn run_x86_uefi_smoke(root: &Path) -> Result<(), String> {
         );
     }
 
+    x86_smoke_console_level();
     let (ovmf_code, ovmf_vars_template) = find_ovmf_firmware()?;
     let out_dir = root.join("target/x86-uefi-smoke");
     fs::create_dir_all(&out_dir).map_err(|err| format!("create {}: {err}", out_dir.display()))?;
@@ -3216,6 +3228,148 @@ fn run_x86_uefi_smoke(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// PLAN/025 X1: OVMF boots Nijigumo from the `generic-uefi-x86_64` ESP (served as a read-only
+/// QEMU FAT drive), Nijigumo hands the x86 kernel a BootInfo, and first light completes with
+/// ACPI found through BootInfo. No GRUB, no Multiboot.
+fn run_x86_niji_smoke(root: &Path) -> Result<(), String> {
+    if !command_exists("qemu-system-x86_64") {
+        return Err("qemu-system-x86_64 is required for the x86 Nijigumo smoke".to_owned());
+    }
+    x86_smoke_console_level();
+    let (ovmf_code, ovmf_vars_template) = find_ovmf_firmware()?;
+    image(root, Arch::X86_64, HardwareTarget::GenericUefiX86_64, None)?;
+    let esp = root.join("build/images/generic-uefi-x86_64");
+    if !esp.join("EFI/BOOT/BOOTX64.EFI").is_file() {
+        return Err(format!("{} has no EFI/BOOT/BOOTX64.EFI", esp.display()));
+    }
+
+    let out_dir = root.join("target/x86-niji-smoke");
+    fs::create_dir_all(&out_dir).map_err(|err| format!("create {}: {err}", out_dir.display()))?;
+    let ovmf_vars = out_dir.join("OVMF_VARS.fd");
+    fs::copy(&ovmf_vars_template, &ovmf_vars).map_err(|err| {
+        format!(
+            "copy OVMF variables {} to {}: {err}",
+            ovmf_vars_template.display(),
+            ovmf_vars.display()
+        )
+    })?;
+    let code_drive = format!(
+        "if=pflash,unit=0,format=raw,readonly=on,file={}",
+        ovmf_code.display()
+    );
+    let vars_drive = format!("if=pflash,unit=1,format=raw,file={}", ovmf_vars.display());
+    // Read-only vvfat behind a snapshot overlay: the disk looks writable to firmware, but any
+    // write (NvVars and the like) lands in a throwaway temp file, never in the staged ESP.
+    let esp_drive = format!("format=raw,snapshot=on,file=fat:{}", esp.display());
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(["-machine", "q35", "-drive"])
+        .arg(&code_drive)
+        .args(["-drive"])
+        .arg(&vars_drive)
+        .args(["-drive"])
+        .arg(&esp_drive)
+        .args([
+            "-net",
+            "none",
+            "-cpu",
+            "max,+x2apic",
+            "-m",
+            "1088",
+            "-display",
+            "none",
+            "-serial",
+            "stdio",
+            "-monitor",
+            "none",
+            "-no-reboot",
+        ])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("spawn qemu-system-x86_64 Nijigumo smoke: {err}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "x86 Nijigumo smoke stdout unavailable".to_owned())?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = stdout;
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut transcript = Vec::new();
+    let reached_first_light = read_serial_until(
+        &rx,
+        &mut transcript,
+        "x86 UEFI/Nijigumo first-light proof",
+        &[b"x86_64 MUREX core online, first light reached; HALTING."],
+        Duration::from_secs(60),
+    );
+    let smoke_result = match reached_first_light {
+        Ok(()) => validate_x86_niji_smoke_transcript(&transcript),
+        Err(err) => Err(format!(
+            "{err}\nx86 Nijigumo transcript:\n{}",
+            String::from_utf8_lossy(&transcript)
+        )),
+    };
+
+    stop_qemu_child(&mut child);
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    smoke_result.map_err(|err| {
+        if stderr.is_empty() {
+            err
+        } else {
+            format!("{err}\nqemu stderr:\n{stderr}")
+        }
+    })?;
+
+    println!(
+        "KUMO x86 Nijigumo smoke green: OVMF -> Nijigumo BOOTX64.EFI -> BootInfo carried the initrd, firmware memory map and ACPI RSDP; first light completed"
+    );
+    Ok(())
+}
+
+fn validate_x86_niji_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
+    validate_x86_first_light_transcript(transcript, "Nijigumo/UEFI", "NIJIGUMO")?;
+    let text = String::from_utf8_lossy(transcript);
+    for marker in [
+        "BOOTX64.EFI loaded",
+        "ACPI RSDP    : 0x",
+        "handoff      : VALID",
+        "NIJIGUMO PAGE TABLES Check     firmware CR3",
+        "via Nijigumo   OK",
+    ] {
+        if !text.contains(marker) {
+            return Err(format!(
+                "x86 Nijigumo smoke transcript missing {marker:?}:\n{text}"
+            ));
+        }
+    }
+    if text.contains("GNU GRUB") || text.contains("multiboot:") {
+        return Err(format!(
+            "x86 Nijigumo smoke went through a Multiboot loader:\n{text}"
+        ));
+    }
+    Ok(())
+}
+
 fn find_ovmf_firmware() -> Result<(PathBuf, PathBuf), String> {
     let code_override = env::var_os("KUMO_OVMF_CODE").map(PathBuf::from);
     let vars_override = env::var_os("KUMO_OVMF_VARS").map(PathBuf::from);
@@ -3300,12 +3454,25 @@ fn validate_x86_uefi_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
 }
 
 fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
+    validate_x86_first_light_transcript(transcript, "Multiboot/GRUB", "MULTIBOOT")
+}
+
+/// The x86 first-light checkpoints every loader must reach. `entry` names the loader in the
+/// banner and `source` prefixes the handoff checks (PLAN/025: Multiboot or Nijigumo).
+fn validate_x86_first_light_transcript(
+    transcript: &[u8],
+    entry: &str,
+    source: &str,
+) -> Result<(), String> {
     let text = String::from_utf8_lossy(transcript);
+    let banner = format!("[MUREX] KUMO x86_64 first light ({entry})");
+    let initrd = format!("{source} INITRD   Check     1 module  KUMORD01");
+    let bootinfo = format!("{source} BOOTINFO Check     ABIv3");
     for marker in [
-        "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
-        "MULTIBOOT INITRD   Check     1 module  KUMORD01",
+        banner.as_str(),
+        initrd.as_str(),
         "bin/hello",
-        "MULTIBOOT BOOTINFO Check     ABIv3",
+        bootinfo.as_str(),
         "phys<512G   OK",
         "M1 MEMORY PLAN     Check",
         "kernel+initrd excluded",
@@ -3778,7 +3945,10 @@ mod fat32_image_tests {
 
 #[cfg(test)]
 mod x86_smoke_tests {
-    use super::{validate_x86_smoke_transcript, validate_x86_uefi_smoke_transcript};
+    use super::{
+        validate_x86_niji_smoke_transcript, validate_x86_smoke_transcript,
+        validate_x86_uefi_smoke_transcript,
+    };
 
     const GREEN: &str = "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n\
 MULTIBOOT INITRD   Check     1 module  KUMORD01 9000b  bin/hello 8904b  phys 0x938000   OK\n\
@@ -3891,16 +4061,45 @@ x86_64 MUREX core online, first light reached; HALTING.\n";
         )
         .is_err());
     }
+
+    #[test]
+    fn x86_niji_transcript_requires_the_bootinfo_handoff_and_no_multiboot() {
+        let transcript = format!(
+            "BOOTX64.EFI loaded\nACPI RSDP    : 0x43b7e014 (ACPI 2.0 table, revision 2)\nhandoff      : VALID\n\
+NIJIGUMO PAGE TABLES Check     firmware CR3 0x43c01000  6 frames in 2 runs reserved   OK\n{}",
+            GREEN
+                .replace("first light (Multiboot/GRUB)", "first light (Nijigumo/UEFI)")
+                .replace("MULTIBOOT INITRD", "NIJIGUMO INITRD")
+                .replace("MULTIBOOT BOOTINFO", "NIJIGUMO BOOTINFO")
+                .replace("XSDT 0x07fe1e98   OK", "XSDT 0x07fe1e98  via Nijigumo   OK")
+        );
+        assert_eq!(
+            validate_x86_niji_smoke_transcript(transcript.as_bytes()),
+            Ok(())
+        );
+        // The GRUB transcript is not a Nijigumo proof, and vice versa.
+        assert!(validate_x86_niji_smoke_transcript(GREEN.as_bytes()).is_err());
+        assert!(validate_x86_smoke_transcript(transcript.as_bytes()).is_err());
+        assert!(validate_x86_niji_smoke_transcript(
+            format!("multiboot: v2 magic=0x36d76289\n{transcript}").as_bytes()
+        )
+        .is_err());
+        assert!(validate_x86_niji_smoke_transcript(
+            transcript.replace("via Nijigumo", "legacy scan").as_bytes()
+        )
+        .is_err());
+    }
 }
 
 fn print_help() {
     println!(
-        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|x86-uefi-smoke|x86-initrd|sysroot|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|rpi5|opi5plus|generic-uefi-x86_64] [--console-uart pl011@0x<base>]"
+        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|x86-uefi-smoke|x86-niji-smoke|x86-initrd|sysroot|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|rpi5|opi5plus|generic-uefi-x86_64] [--console-uart pl011@0x<base>]"
     );
     println!("       cargo xtask passwd <root|crux>: set a KUMO password at this terminal; only its argon2id hash is kept, in $KUMO_SHADOW or ~/.config/kumo/shadow");
     println!("default arch: aarch64; default hardware: thinkpad-x13s-gen1");
     println!("--console-uart: image-only explicit PL011 route; use firmware's reported MMIO base");
     println!("x86-uefi-smoke: exact OVMF -> GRUB -> Multiboot2 ISO path; KUMO_OVMF_CODE/KUMO_OVMF_VARS override firmware discovery");
+    println!("x86-niji-smoke: OVMF -> Nijigumo (BOOTX64.EFI) -> BootInfo handoff from the generic-uefi-x86_64 ESP (PLAN/025)");
     println!("preflight: mechanical guardrail tripwires (GUIDANCE/006 §5); KUMO_PREFLIGHT_FULL=1 adds both-backend build + smoke");
 }
 

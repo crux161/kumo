@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j794
 //j797
 //j799
 //j822
 //j823
+//j904
 
 extern crate alloc;
 
@@ -1598,11 +1598,183 @@ fn run_x86_scheduled_ring3_smoke(
     })
 }
 
+/// Which loader entered the x86_64 kernel (PLAN/025 X1). Both front ends feed one bring-up.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+enum X86Entry {
+    /// GRUB Multiboot2 or QEMU's Multiboot1 loader, through the 32-bit trampoline.
+    Multiboot { mbi: u64, magic: u64 },
+    /// Nijigumo's 64-bit BootInfo handoff, on the firmware's identity page tables.
+    Nijigumo { boot: *const BootInfo },
+}
+
+/// Multiboot front end: entered from the 32-bit trampoline in `main.rs`.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
-    klog!("\n[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n");
+    x86_bring_up(X86Entry::Multiboot { mbi, magic }, kernel_stack_top)
+}
+
+/// Nijigumo front end: entered from `_start_bootinfo` with the arm64 BootInfo ABI.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn x86_first_light_bootinfo(boot: *const BootInfo, kernel_stack_top: u64) -> ! {
+    x86_bring_up(X86Entry::Nijigumo { boot }, kernel_stack_top)
+}
+
+/// Resolve Nijigumo's BootInfo before any field is trusted. The firmware identity map is still
+/// live, so the struct, its region slice and the initrd are readable wherever UEFI put them.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn x86_loader_boot_info(boot: *const BootInfo) -> Result<&'static BootInfo, HandoffError> {
+    if boot.is_null() || !boot.is_aligned() {
+        return Err(HandoffError::MissingMemoryMap);
+    }
+    let boot = unsafe { &*boot };
+    validate_boot_info(boot)?;
+    Ok(boot)
+}
+
+/// The loader's initrd range as the x86 first-light harness consumes it: a KUMORD01 image
+/// carrying `bin/hello`, exactly what the Multiboot module provides.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn x86_bootinfo_initrd(
+    boot: &BootInfo,
+) -> Result<X86MultibootInitrd, X86MultibootInitrdError> {
+    if boot.initrd.is_empty() || boot.initrd.start == 0 {
+        return Err(X86MultibootInitrdError::MissingModules);
+    }
+    let len =
+        usize::try_from(boot.initrd.len).map_err(|_| X86MultibootInitrdError::BadModuleRange)?;
+    let bytes = unsafe { core::slice::from_raw_parts(boot.initrd.start as *const u8, len) };
+    let hello = kumo_abi::find_file(bytes, kumo_abi::HELLO_PATH)
+        .map_err(X86MultibootInitrdError::Initrd)?
+        .ok_or(X86MultibootInitrdError::MissingHello)?;
+    Ok(X86MultibootInitrd {
+        bytes,
+        hello: hello.bytes,
+        module_count: 1,
+        start: boot.initrd.start,
+    })
+}
+
+/// Normalize the loader's region list through the Multiboot policy, clipped to `limit`, with
+/// the live firmware page-table frames carved out as reserved.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn x86_bootinfo_memory_map(
+    boot: &BootInfo,
+    live_tables: &[Range],
+    limit: u64,
+) -> Result<alloc::vec::Vec<MemRegion>, X86MultibootMemoryError> {
+    bootstrap::multiboot::normalize_boot_regions(
+        unsafe { boot.mem_regions.as_slice() },
+        live_tables,
+        limit,
+    )
+    .map_err(X86MultibootMemoryError::Parse)
+}
+
+/// Every frame of the page-table tree under the current CR3, coalesced into ranges.
+///
+/// Nijigumo hands off on the firmware's identity map, whose tables sit in BootServicesData
+/// that the loader reports as usable. They stay live until the kernel installs its own CR3,
+/// so the bootstrap allocator must never hand one out (and zero it). The Multiboot path never
+/// needed this: its trampoline switches to tables inside the kernel's `.bss` first. The
+/// frames stay reserved after the switch; reclaiming them is later work. Returns the CR4 value
+/// when 5-level paging is active, which this walker does not handle.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn x86_live_page_table_frames() -> Result<alloc::vec::Vec<Range>, u64> {
+    const PRESENT: u64 = 1;
+    const HUGE: u64 = 1 << 7;
+    const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+    const CR4_LA57: u64 = 1 << 12;
+    const PAGE: u64 = 4096;
+
+    let cr4: u64;
+    unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack)) };
+    if cr4 & CR4_LA57 != 0 {
+        return Err(cr4);
+    }
+    let read = |table: u64, index: usize| unsafe {
+        core::ptr::read_volatile((table as *const u64).add(index))
+    };
+    let root = kumo_hal::active::read_user_aspace_root() & ADDRESS;
+    let mut frames = alloc::vec![root];
+    for pml4_index in 0..512 {
+        let pml4e = read(root, pml4_index);
+        if pml4e & PRESENT == 0 {
+            continue;
+        }
+        let pdpt = pml4e & ADDRESS;
+        frames.push(pdpt);
+        for pdpt_index in 0..512 {
+            let pdpte = read(pdpt, pdpt_index);
+            if pdpte & PRESENT == 0 || pdpte & HUGE != 0 {
+                continue;
+            }
+            let pd = pdpte & ADDRESS;
+            frames.push(pd);
+            for pd_index in 0..512 {
+                let pde = read(pd, pd_index);
+                if pde & PRESENT != 0 && pde & HUGE == 0 {
+                    frames.push(pde & ADDRESS);
+                }
+            }
+        }
+    }
+    frames.sort_unstable();
+    frames.dedup();
+    let mut ranges: alloc::vec::Vec<Range> = alloc::vec::Vec::new();
+    for frame in frames {
+        match ranges.last_mut() {
+            Some(last) if last.end() == frame => last.len += PAGE,
+            _ => ranges.push(Range::new(frame, PAGE)),
+        }
+    }
+    Ok(ranges)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn x86_bring_up(entry: X86Entry, kernel_stack_top: u64) -> ! {
+    let (mbi, magic, loader) = match entry {
+        X86Entry::Multiboot { mbi, magic } => (mbi, magic, None),
+        X86Entry::Nijigumo { boot } => match unsafe { x86_loader_boot_info(boot) } {
+            Ok(boot) => (0, 0, Some(boot)),
+            Err(err) => {
+                klog_at!(
+                    kmsg::ERR,
+                    "NIJIGUMO BOOTINFO Check     handoff @{:#x} {:?}   FAIL\n",
+                    boot as u64,
+                    err
+                );
+                kumo_hal::active::halt();
+            }
+        },
+    };
+    let source = if loader.is_some() {
+        "NIJIGUMO"
+    } else {
+        "MULTIBOOT"
+    };
+    klog!(
+        "\n[MUREX] KUMO x86_64 first light ({})\n",
+        if loader.is_some() {
+            "Nijigumo/UEFI"
+        } else {
+            "Multiboot/GRUB"
+        }
+    );
     klog!("CPU MODE: long mode (64-bit), paging on, serial COM1 live\n");
-    let multiboot2 = if magic == X86_MULTIBOOT2_MAGIC {
+    if let Some(boot) = loader {
+        klog!(
+            "nijigumo: BootInfo ABIv{} @{:#x}  {} regions  framebuffer {}x{} @{:#x}  ACPI RSDP {:#x}\n",
+            boot.version,
+            boot as *const BootInfo as u64,
+            boot.mem_regions.len,
+            boot.framebuffer.width,
+            boot.framebuffer.height,
+            boot.framebuffer.phys,
+            boot.platform.acpi_rsdp
+        );
+    }
+    let multiboot2 = if loader.is_none() && magic == X86_MULTIBOOT2_MAGIC {
         match unsafe { x86_multiboot2_info(mbi) } {
             Ok(info) => Some(info),
             Err(err) => {
@@ -1613,18 +1785,25 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
     } else {
         None
     };
-    let protocol = if multiboot2.is_some() { 2 } else { 1 };
-    klog!(
-        "multiboot: v{} magic={:#010x} info@{:#x}\n",
-        protocol,
-        magic,
-        mbi
-    );
+    if loader.is_none() {
+        let protocol = if multiboot2.is_some() { 2 } else { 1 };
+        klog!(
+            "multiboot: v{} magic={:#010x} info@{:#x}\n",
+            protocol,
+            magic,
+            mbi
+        );
+    }
 
-    let initrd = match unsafe { x86_multiboot_initrd(mbi, magic) } {
+    let initrd = match loader {
+        Some(boot) => unsafe { x86_bootinfo_initrd(boot) },
+        None => unsafe { x86_multiboot_initrd(mbi, magic) },
+    };
+    let initrd = match initrd {
         Ok(initrd) => {
             klog!(
-                "MULTIBOOT INITRD   Check     {} module  KUMORD01 {}b  {} {}b  phys {:#x}   OK\n",
+                "{} INITRD   Check     {} module  KUMORD01 {}b  {} {}b  phys {:#x}   OK\n",
+                source,
                 initrd.module_count,
                 initrd.bytes.len(),
                 kumo_abi::HELLO_PATH,
@@ -1634,51 +1813,93 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             initrd
         }
         Err(err) => {
-            klog_at!(kmsg::ERR, "MULTIBOOT INITRD   Check     {:?}   FAIL\n", err);
+            klog_at!(
+                kmsg::ERR,
+                "{} INITRD   Check     {:?}   FAIL\n",
+                source,
+                err
+            );
             kumo_hal::active::halt();
         }
     };
 
-    let memory_regions = match unsafe { x86_multiboot_memory_map(mbi, magic, X86_PHYS_MAP_LIMIT) } {
+    let live_tables = match loader {
+        Some(_) => match unsafe { x86_live_page_table_frames() } {
+            Ok(ranges) => {
+                klog!(
+                    "NIJIGUMO PAGE TABLES Check     firmware CR3 {:#x}  {} frames in {} runs reserved   OK\n",
+                    kumo_hal::active::read_user_aspace_root(),
+                    ranges.iter().map(|range| range.len / 4096).sum::<u64>(),
+                    ranges.len()
+                );
+                ranges
+            }
+            Err(cr4) => {
+                klog_at!(
+                    kmsg::ERR,
+                    "NIJIGUMO PAGE TABLES Check     5-level paging (CR4 {:#x}) unsupported   FAIL\n",
+                    cr4
+                );
+                kumo_hal::active::halt();
+            }
+        },
+        None => alloc::vec::Vec::new(),
+    };
+    let memory_map = |limit| match loader {
+        Some(boot) => unsafe { x86_bootinfo_memory_map(boot, &live_tables, limit) },
+        None => unsafe { x86_multiboot_memory_map(mbi, magic, limit) },
+    };
+    let memory_regions = match memory_map(X86_PHYS_MAP_LIMIT) {
         Ok(regions) => regions,
         Err(err) => {
             klog_at!(
                 kmsg::ERR,
-                "MULTIBOOT BOOTINFO Check     memory map {:?}   FAIL\n",
+                "{} BOOTINFO Check     memory map {:?}   FAIL\n",
+                source,
                 err
             );
             kumo_hal::active::halt();
         }
     };
-    let bootstrap_regions =
-        match unsafe { x86_multiboot_memory_map(mbi, magic, X86_BOOT_IDENTITY_LIMIT) } {
-            Ok(regions) => regions,
-            Err(err) => {
-                klog_at!(
-                    kmsg::ERR,
-                    "MULTIBOOT BOOTINFO Check     bootstrap map {:?}   FAIL\n",
-                    err
-                );
-                kumo_hal::active::halt();
-            }
-        };
-    let boot = match unsafe { x86_boot_info(&memory_regions, initrd) } {
+    let bootstrap_regions = match memory_map(X86_BOOT_IDENTITY_LIMIT) {
+        Ok(regions) => regions,
+        Err(err) => {
+            klog_at!(
+                kmsg::ERR,
+                "{} BOOTINFO Check     bootstrap map {:?}   FAIL\n",
+                source,
+                err
+            );
+            kumo_hal::active::halt();
+        }
+    };
+    let mut boot = match unsafe { x86_boot_info(&memory_regions, initrd) } {
         Ok(boot) => boot,
         Err(err) => {
             klog_at!(
                 kmsg::ERR,
-                "MULTIBOOT BOOTINFO Check     handoff {:?}   FAIL\n",
+                "{} BOOTINFO Check     handoff {:?}   FAIL\n",
+                source,
                 err
             );
             kumo_hal::active::halt();
         }
     };
+    // The loader's framebuffer and platform facts ride into the kernel-local BootInfo, so the
+    // physmap keeps the GOP aperture uncached and out of RAM exactly as on arm64.
+    if let Some(loader) = loader {
+        boot.framebuffer = loader.framebuffer;
+        boot.flags |= loader.flags
+            & (BootInfo::FLAG_FRAMEBUFFER_PRESENT | BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM);
+        boot.platform = loader.platform;
+    }
     let bootstrap_boot = match unsafe { x86_boot_info(&bootstrap_regions, initrd) } {
         Ok(boot) => boot,
         Err(err) => {
             klog_at!(
                 kmsg::ERR,
-                "MULTIBOOT BOOTINFO Check     bootstrap handoff {:?}   FAIL\n",
+                "{} BOOTINFO Check     bootstrap handoff {:?}   FAIL\n",
+                source,
                 err
             );
             kumo_hal::active::halt();
@@ -1689,18 +1910,25 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         Ok(report) => {
             klog_at!(
                 kmsg::ERR,
-                "MULTIBOOT BOOTINFO Check     {:?}   FAIL\n",
+                "{} BOOTINFO Check     {:?}   FAIL\n",
+                source,
                 report
             );
             kumo_hal::active::halt();
         }
         Err(err) => {
-            klog_at!(kmsg::ERR, "MULTIBOOT BOOTINFO Check     {:?}   FAIL\n", err);
+            klog_at!(
+                kmsg::ERR,
+                "{} BOOTINFO Check     {:?}   FAIL\n",
+                source,
+                err
+            );
             kumo_hal::active::halt();
         }
     };
     klog!(
-        "MULTIBOOT BOOTINFO Check     ABIv{}  {} regions  {} MiB usable / {} MiB mapped  kernel {:#x}+{} KiB  initrd {:#x}+{}b  phys<512G   OK\n",
+        "{} BOOTINFO Check     ABIv{}  {} regions  {} MiB usable / {} MiB mapped  kernel {:#x}+{} KiB  initrd {:#x}+{}b  phys<512G   OK\n",
+        source,
         handoff.abi_version,
         handoff.mem_region_count,
         handoff.usable_bytes >> 20,
@@ -1877,20 +2105,40 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         kumo_hal::active::halt();
     }
 
-    let tagged_acpi = multiboot2.and_then(|info| {
-        let rsdp = info.acpi_rsdp()?;
-        match kumo_hal::active::inspect_acpi_rsdp(rsdp, rsdp.as_ptr() as u64) {
+    // Nijigumo reads the RSDP from the EFI configuration table; the first 36 bytes cover both
+    // the ACPI 1.0 and 2.0 layouts, and the parser checks the revision and checksums.
+    const RSDP_V2_LEN: usize = 36;
+    let loader_rsdp = boot.platform.acpi_rsdp;
+    let tagged_acpi = if loader.is_some() && loader_rsdp != 0 {
+        let bytes = unsafe { core::slice::from_raw_parts(loader_rsdp as *const u8, RSDP_V2_LEN) };
+        match kumo_hal::active::inspect_acpi_rsdp(bytes, loader_rsdp) {
             Some(acpi) => Some(acpi),
             None => {
                 klog_at!(
                     kmsg::ERR,
-                    "ACPI TABLES        Check     Multiboot2 RSDP invalid   FAIL\n"
+                    "ACPI TABLES        Check     Nijigumo RSDP {:#x} invalid   FAIL\n",
+                    loader_rsdp
                 );
                 kumo_hal::active::halt();
             }
         }
-    });
+    } else {
+        multiboot2.and_then(|info| {
+            let rsdp = info.acpi_rsdp()?;
+            match kumo_hal::active::inspect_acpi_rsdp(rsdp, rsdp.as_ptr() as u64) {
+                Some(acpi) => Some(acpi),
+                None => {
+                    klog_at!(
+                        kmsg::ERR,
+                        "ACPI TABLES        Check     Multiboot2 RSDP invalid   FAIL\n"
+                    );
+                    kumo_hal::active::halt();
+                }
+            }
+        })
+    };
     let (acpi_root, acpi_source) = match tagged_acpi {
+        Some(acpi) if loader.is_some() => (acpi, "Nijigumo"),
         Some(acpi) => (acpi, "Multiboot2"),
         None => match kumo_hal::active::discover_acpi_root() {
             Some(acpi) => (acpi, "legacy scan"),

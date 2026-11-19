@@ -4,6 +4,8 @@
 //! link arg is emitted solely when the target OS is `none`, and only for binary
 //! targets, so `cargo test`/`cargo check` on the host keep working unchanged.
 
+//j904
+
 use std::env;
 
 fn main() {
@@ -18,7 +20,7 @@ fn main() {
     }
 
     if target_os == "none" && target_arch == "x86_64" {
-        // GRUB / any Multiboot loader loads the x86_64 kernel at the fixed 1 MiB link
+        // GRUB, Nijigumo and QEMU load the x86_64 kernel at the fixed 16 MiB link
         // address (no rebasing, so no --emit-relocs); the link script puts the Multiboot
         // header first and the entry at `_start` (the 32-bit long-mode trampoline).
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();

@@ -2,6 +2,7 @@
 <!-- j764 -->
 <!-- j768 -->
 <!-- j769 -->
+<!-- j904 -->
 
 <p align="center">
   <img src="resources/kumo_full-color.jpg" alt="KUMO cloud logo" width="180" />
@@ -69,6 +70,7 @@ a limited static arm64 ELF path; syscall coverage grows as applications need it.
 | ThinkPad X13s Gen 1 | arm64 · Qualcomm SC8280XP | Established hardware boot and interactive-shell baseline. |
 | Raspberry Pi 5 | arm64 · Broadcom BCM2712 | Earlier hardware bring-up; interrupt parity remains a secondary lane. |
 | QEMU `virt` | arm64 | Automated boot, userspace, and framebuffer verification. |
+| Intel NUC7i5DNHE | x86_64 · Core i5-7300U (Kaby Lake) | amd64 hardware rig, also a Fuchsia reference machine: PXE netboot via `run-pxehost.sh --target nuc`. |
 | Generic UEFI PC / QEMU | x86_64 | Image builds and Multiboot/UEFI runtime smoke tests. |
 
 Earlier x86 hardware boots include the HP Z4 G4 (Xeon W2123), HP Z650 (Xeon E5-2620),
@@ -133,6 +135,47 @@ To reclaim local disk space, preview rebuildable caches with
 `python3 scripts/cleanup.py --worktrees`. Add `--apply` to remove them, or `--cargo`
 for broader compilation-cache cleanup. Source, reference materials, worktrees,
 sysroots and build evidence are preserved. See [local cleanup](docs/cleanup.md).
+
+### Netbooting hardware
+
+Physical rigs boot over the LAN: `scripts/run-pxehost.sh` builds one hardware target,
+stages it as the TFTP tree `netboot/tftp/`, and serves it with a proxyDHCP/TFTP server
+(a small [pxehost](https://github.com/pxehost/pxehost) overlay, built on first use).
+Your existing router keeps handing out addresses; stop any other DHCP/TFTP service on
+the host first. It listens on UDP 67, 69 and 4011; building the overlay needs Go.
+
+```sh
+./scripts/run-pxehost.sh                 # Orange Pi 5 Plus (the default target)
+./scripts/run-pxehost.sh --target nuc    # Intel NUC7i5DNHE / any x86-64 PXE client
+./scripts/run-pxehost.sh --target all    # serve both from one tree
+./scripts/run-pxehost.sh --no-build      # restage the last build without rebuilding
+```
+
+| Target | Builds | Client sees (DHCP option 93) |
+|---|---|---|
+| `opi5` (default) | `cargo xtask image --arch aarch64 --hardware opi5plus` | arm64 UEFI (0x000b) → `bootaa64.efi` = Nijigumo, which fetches `EFI/KUMO/*` |
+| `nuc` | `scripts/x86-multiboot.sh build` + GRUB network loaders | x86-64 UEFI (0x0007/0x0009) → `bootx64.efi`; legacy BIOS (0x0000) → `core.0`; both GRUB → Multiboot2 KUMO |
+| `all` | both | both |
+
+**The tree only carries the selected target.** A refresh replaces `netboot/tftp/`
+entirely, so after `--target opi5` there is no x86 loader in it: a NUC set to PXE-boot
+first fails the TFTP fetch and falls through to its disk (Fedora on the reference rig)
+rather than booting a stale KUMO from an earlier build. Every run prints the target it
+staged, and `netboot/tftp/BUILD-INFO.txt` records it with the source commit. Set
+`KUMO_PXE_TARGET` to change the no-argument default for your shell, and `KUMO_PXE_IP`
+when the advertised address is detected wrongly. To restage without serving, call
+`scripts/refresh-netboot.sh --target <t>` directly.
+
+Target notes:
+
+- **Orange Pi 5 Plus**: EDK2 SPI firmware with network boot enabled; console on the
+  1,500,000-baud debug UART. After the first boot, typing `reboot` at the shell
+  re-fetches the freshly staged tree.
+- **NUC7i5DNHE**: disable Secure Boot, enable network boot (UEFI PXE on the onboard
+  Intel NIC) in the firmware setup, and put it ahead of the SSD when testing KUMO.
+  GRUB shows its menu on screen and mirrors it, and KUMO's console, to COM1 at
+  115200 baud for when a serial header is wired up. The `nuc` target needs
+  `x86_64-elf-grub` (and `i686-elf-grub` for legacy BIOS PXE) from Homebrew.
 
 ## Inside KUMO
 
