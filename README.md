@@ -1,8 +1,8 @@
-<!-- j458 -->
 <!-- j764 -->
 <!-- j768 -->
 <!-- j769 -->
 <!-- j904 -->
+<!-- j906 -->
 
 <p align="center">
   <img src="resources/kumo_full-color.jpg" alt="KUMO cloud logo" width="180" />
@@ -154,13 +154,16 @@ the host first. It listens on UDP 67, 69 and 4011; building the overlay needs Go
 | Target | Builds | Client sees (DHCP option 93) |
 |---|---|---|
 | `opi5` (default) | `cargo xtask image --arch aarch64 --hardware opi5plus` | arm64 UEFI (0x000b) → `bootaa64.efi` = Nijigumo, which fetches `EFI/KUMO/*` |
-| `nuc` | `scripts/x86-multiboot.sh build` + GRUB network loaders | x86-64 UEFI (0x0007/0x0009) → `bootx64.efi`; legacy BIOS (0x0000) → `core.0`; both GRUB → Multiboot2 KUMO |
+| `nuc` | `cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64` at console level 7, plus GRUB i386-pc when installed | x86-64 UEFI (0x0007/0x0009) → `bootx64.efi` = Nijigumo, which fetches `amd64/EFI/KUMO/*` and puts first light on the screen; legacy BIOS (0x0000) → `core.0` = GRUB → Multiboot2 KUMO (serial only) |
 | `all` | both | both |
 
 **The tree only carries the selected target.** A refresh replaces `netboot/tftp/`
 entirely, so after `--target opi5` there is no x86 loader in it: a NUC set to PXE-boot
-first fails the TFTP fetch and falls through to its disk (Fedora on the reference rig)
-rather than booting a stale KUMO from an earlier build. Every run prints the target it
+first fails the TFTP fetch (`open .../bootx64.efi: no such file`) and falls through to
+its disk (Fedora on the reference rig) rather than booting a stale KUMO from an earlier
+build; `run-pxehost.sh` says `nuc: NOT SERVED` when that will happen. The two boards'
+payloads never collide in an `all` tree: the Orange Pi's Nijigumo reads `EFI/KUMO/*` at
+the root, the x86 Nijigumo reads `amd64/EFI/KUMO/*`. Every run prints the target it
 staged, and `netboot/tftp/BUILD-INFO.txt` records it with the source commit. Set
 `KUMO_PXE_TARGET` to change the no-argument default for your shell, and `KUMO_PXE_IP`
 when the advertised address is detected wrongly. To restage without serving, call
@@ -173,9 +176,15 @@ Target notes:
   re-fetches the freshly staged tree.
 - **NUC7i5DNHE**: disable Secure Boot, enable network boot (UEFI PXE on the onboard
   Intel NIC) in the firmware setup, and put it ahead of the SSD when testing KUMO.
-  GRUB shows its menu on screen and mirrors it, and KUMO's console, to COM1 at
-  115200 baud for when a serial header is wired up. The `nuc` target needs
-  `x86_64-elf-grub` (and `i686-elf-grub` for legacy BIOS PXE) from Homebrew.
+  Nijigumo prints its own progress (GOP mode, kernel placement, TFTP fetches) on screen,
+  then KUMO draws its console on the same screen, write-combined, and mirrors it to COM1
+  at 115200 baud for when a serial header is wired up. The kernel is built at
+  `KUMO_CONSOLE_LOGLEVEL=7` unless you set another level, because the screen shows only
+  lines at or above it. Legacy BIOS PXE needs `i686-elf-grub` from Homebrew; without it
+  the tree is UEFI-only.
+- **Without the hardware**: `scripts/netboot-smoke.sh --uefi` netboots the staged tree in
+  QEMU the way the NUC does (OVMF's own PXE → Nijigumo → KUMO) and saves the screen;
+  `scripts/netboot-smoke.sh` does the legacy BIOS path.
 
 ## Inside KUMO
 

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j804
 //j805
 //j810
 //j904
 //j905
+//j906
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -1075,15 +1075,33 @@ unsafe fn open_tftp_source(
     })
 }
 
+/// j906 (PLAN/025 X3): where this loader's payloads sit in a KUMO TFTP tree. The arm64 loader
+/// keeps the tree root (`EFI/KUMO/...`, the Orange Pi's metal-proven layout); the x86_64 loader
+/// reads `amd64/EFI/KUMO/...`, so one `--target all` tree serves both boards without either
+/// fetching the other's kernel.
+#[cfg(target_arch = "aarch64")]
+const TFTP_PAYLOAD_PREFIX: &str = "";
+#[cfg(not(target_arch = "aarch64"))]
+const TFTP_PAYLOAD_PREFIX: &str = "amd64/";
+
 /// Rewrite an ESP path (`\EFI\KUMO\initrd.img`) as the TFTP filename the server expects
-/// (`EFI/KUMO/initrd.img`): drop the leading separator and use forward slashes. Returns a
-/// NUL-terminated ASCII buffer; a path that does not fit is rejected rather than truncated.
-fn tftp_filename<const N: usize>(path: &str) -> Option<[u8; N]> {
+/// (`prefix` + `EFI/KUMO/initrd.img`): drop the leading separator and use forward slashes.
+/// Returns a NUL-terminated ASCII buffer; a name that does not fit is rejected rather than
+/// truncated.
+fn tftp_filename<const N: usize>(prefix: &str, path: &str) -> Option<[u8; N]> {
     let mut out = [0u8; N];
     let mut len = 0usize;
+    for byte in prefix.bytes() {
+        if len + 1 >= N {
+            return None;
+        }
+        out[len] = byte;
+        len += 1;
+    }
+    let prefix_len = len;
     for byte in path.bytes() {
         let byte = if byte == b'\\' { b'/' } else { byte };
-        if len == 0 && byte == b'/' {
+        if len == prefix_len && byte == b'/' {
             continue;
         }
         if len + 1 >= N {
@@ -1092,7 +1110,13 @@ fn tftp_filename<const N: usize>(path: &str) -> Option<[u8; N]> {
         out[len] = byte;
         len += 1;
     }
-    (len > 0).then_some(out)
+    (len > prefix_len).then_some(out)
+}
+
+/// The text of a [`tftp_filename`] buffer, for the console.
+fn tftp_name_str(name: &[u8]) -> &str {
+    let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    core::str::from_utf8(&name[..len]).unwrap_or("?")
 }
 
 /// Read a whole file over TFTP into a caller-chosen allocation. `pages` selects `AllocatePages`
@@ -1105,7 +1129,7 @@ unsafe fn read_tftp_file(
     path: &str,
     pages: bool,
 ) -> Option<(*mut c_void, usize)> {
-    let name = tftp_filename::<128>(path)?;
+    let name = tftp_filename::<128>(TFTP_PAYLOAD_PREFIX, path)?;
 
     // Ask the server for the size first: the read needs a buffer big enough for the whole file,
     // and a short buffer is a failed transfer rather than a partial one.
@@ -1164,7 +1188,7 @@ unsafe fn read_tftp_file(
     kprint!(
         con_out,
         "tftp         : {} ({} bytes, blksize {}) ...\r\n",
-        path,
+        tftp_name_str(&name),
         size,
         block_size
     );
@@ -1188,7 +1212,7 @@ unsafe fn read_tftp_file(
         kprint!(
             con_out,
             "tftp         : {} FAILED (status {:#x})\r\n",
-            path,
+            tftp_name_str(&name),
             status
         );
         if !pages {
@@ -3398,6 +3422,38 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 mod tests {
     use super::*;
     use core::fmt::Write;
+
+    #[test]
+    fn tftp_names_carry_the_arch_prefix_and_reject_overflow() {
+        let name = |prefix, path| {
+            tftp_filename::<64>(prefix, path).map(|n| std::string::String::from(tftp_name_str(&n)))
+        };
+        // arm64: the tree root, exactly as before j906.
+        assert_eq!(
+            name("", "\\EFI\\KUMO\\initrd.img").as_deref(),
+            Some("EFI/KUMO/initrd.img")
+        );
+        // x86_64: its own subtree, so `--target all` holds both kernels.
+        assert_eq!(
+            name("amd64/", "\\EFI\\KUMO\\kernel\\kumo-kernel.elf").as_deref(),
+            Some("amd64/EFI/KUMO/kernel/kumo-kernel.elf")
+        );
+        // Only the path's own leading separator is dropped.
+        assert_eq!(
+            name("amd64/", "EFI/KUMO/x").as_deref(),
+            Some("amd64/EFI/KUMO/x")
+        );
+        // Nothing after the prefix, or a name that does not fit with its NUL, is refused.
+        assert_eq!(name("amd64/", "\\"), None);
+        assert_eq!(name("", ""), None);
+        assert!(tftp_filename::<8>("amd64/", "ab").is_none());
+        assert!(tftp_filename::<9>("amd64/", "ab").is_some());
+        // The build's own prefix: arm64 keeps the root, every other arch gets amd64/.
+        assert_eq!(
+            TFTP_PAYLOAD_PREFIX.is_empty(),
+            cfg!(target_arch = "aarch64")
+        );
+    }
 
     #[test]
     fn formats_decimal_and_hex_into_utf16() {

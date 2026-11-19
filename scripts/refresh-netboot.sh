@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #j904
+#j906
 # refresh-netboot.sh - rebuild and atomically repopulate KUMO's PXE/TFTP root for one
 # hardware target (or all of them).
 #
@@ -29,9 +30,14 @@ directory is netboot/tftp. Use --no-build to restage already-built payloads.
 
 Targets (default: opi5, or $KUMO_PXE_TARGET):
   opi5   Orange Pi 5 Plus (arm64 UEFI, option 93 arch 0x000b) -> bootaa64.efi = Nijigumo
-  nuc    x86-64 PXE clients, reference rig Intel NUC7i5DNHE (UEFI -> bootx64.efi,
-         legacy BIOS -> GRUB i386-pc core.0) -> GRUB -> Multiboot2 KUMO
+  nuc    x86-64 PXE clients, reference rig Intel NUC7i5DNHE: UEFI (arch 0x0007/0x0009)
+         -> bootx64.efi = Nijigumo, payloads in amd64/EFI/KUMO/; legacy BIOS (arch 0x0000)
+         -> GRUB i386-pc core.0 -> Multiboot2 KUMO (only when i686-elf-grub is installed)
   all    both of the above in one tree
+
+The nuc kernel is built with KUMO_CONSOLE_LOGLEVEL=7 unless you set it: the NUC has no
+serial header, so first light must reach its screen, and the console (glass and COM1)
+shows only lines at or above that level.
 USAGE
 }
 
@@ -110,30 +116,28 @@ fi
 
 echo "==> Netboot target: $TARGET"
 
-MKNETDIR=""
 MKNETDIR_BIOS=""
 if [ "$WANT_X86" -eq 1 ]; then
-  MKNETDIR="$(command -v x86_64-elf-grub-mknetdir || command -v grub-mknetdir || true)"
-  if [ -z "$MKNETDIR" ]; then
-    echo "error: target '$TARGET' needs x86_64-elf-grub-mknetdir or grub-mknetdir" >&2
-    echo "       macOS: brew install x86_64-elf-grub" >&2
-    exit 1
-  fi
-
-  # Legacy BIOS PXE clients (e.g. Intel Boot Agent, DHCP option 93 arch 0x0000) cannot
-  # run the UEFI PE, so we also stage a GRUB i386-pc network boot program when a BIOS
-  # grub is available. This is optional: without it the x86 side is UEFI-only.
-  MKNETDIR_BIOS="$(command -v i686-elf-grub-mknetdir || command -v i386-elf-grub-mknetdir || true)"
-  if [ -z "$MKNETDIR_BIOS" ]; then
-    # A native grub-mknetdir can emit i386-pc if that platform's modules are installed.
-    case "$MKNETDIR" in */grub-mknetdir) MKNETDIR_BIOS="$MKNETDIR" ;; esac
-  fi
+  # j906: x86-64 UEFI clients boot Nijigumo, like the Orange Pi; GRUB is only the legacy
+  # BIOS network boot program (Intel Boot Agent, DHCP option 93 arch 0x0000), which cannot
+  # run a UEFI PE. Optional: without an i386-pc grub the x86 side is UEFI-only.
+  MKNETDIR_BIOS="$(command -v i686-elf-grub-mknetdir || command -v i386-elf-grub-mknetdir || command -v grub-mknetdir || true)"
 fi
+
+X86_LOGLEVEL="${KUMO_CONSOLE_LOGLEVEL:-7}"
+X86_LOGLEVEL_BUILT="$X86_LOGLEVEL"
+[ "$BUILD" -eq 1 ] || X86_LOGLEVEL_BUILT=as-built
 
 if [ "$BUILD" -eq 1 ]; then
   if [ "$WANT_X86" -eq 1 ]; then
-    echo "==> [nuc] Building AMD64 Multiboot2 kernel and initrd"
-    (cd "$ROOT" && ./scripts/x86-multiboot.sh build)
+    # The NUC's only output is its screen, so first light must clear the console level.
+    # Scoped to the x86 builds: an `all` tree's Orange Pi image keeps its own level.
+    echo "==> [nuc] Building the x86_64 UEFI image (Nijigumo + kernel + initrd), console level $X86_LOGLEVEL"
+    (cd "$ROOT" && KUMO_CONSOLE_LOGLEVEL="$X86_LOGLEVEL" cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64 >/dev/null)
+    if [ -n "$MKNETDIR_BIOS" ]; then
+      echo "==> [nuc] Building the Multiboot2 kernel and initrd for legacy BIOS clients"
+      (cd "$ROOT" && KUMO_CONSOLE_LOGLEVEL="$X86_LOGLEVEL" ./scripts/x86-multiboot.sh build)
+    fi
   fi
   if [ "$WANT_ARM64" -eq 1 ]; then
     # ARM64: stage the Orange Pi 5 Plus ESP tree (Nijigumo + kernel + initrd + DTB). The
@@ -148,16 +152,28 @@ fi
 ARM64_ESP="$ROOT/build/images/orange-pi-5-plus"
 ARM64_LOADER="$ARM64_ESP/EFI/BOOT/BOOTAA64.EFI"
 
+# The x86_64 UEFI image staging directory produced by `cargo xtask image`.
+X86_ESP="$ROOT/build/images/generic-uefi-x86_64"
+X86_LOADER="$X86_ESP/EFI/BOOT/BOOTX64.EFI"
 KERNEL="$ROOT/target/x86_64-unknown-none/release/kumo-kernel.bin"
 INITRD="$ROOT/target/x86_64-unknown-none/release/kumo-initrd.img"
 if [ "$WANT_X86" -eq 1 ]; then
-  for payload in "$KERNEL" "$INITRD"; do
+  for payload in "$X86_LOADER" "$X86_ESP/EFI/KUMO/kernel/kumo-kernel.elf" "$X86_ESP/EFI/KUMO/initrd.img"; do
     if [ ! -s "$payload" ]; then
       echo "error: [nuc] missing payload: $payload" >&2
-      echo "       rerun without --no-build" >&2
+      echo "       rerun without --no-build, or run: cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64" >&2
       exit 1
     fi
   done
+  if [ -n "$MKNETDIR_BIOS" ]; then
+    for payload in "$KERNEL" "$INITRD"; do
+      if [ ! -s "$payload" ]; then
+        echo "error: [nuc] missing BIOS payload: $payload" >&2
+        echo "       rerun without --no-build, or run: scripts/x86-multiboot.sh build" >&2
+        exit 1
+      fi
+    done
+  fi
 fi
 if [ "$WANT_ARM64" -eq 1 ] && [ ! -s "$ARM64_LOADER" ]; then
   echo "error: [opi5] missing loader: $ARM64_LOADER" >&2
@@ -185,21 +201,15 @@ trap cleanup EXIT INT TERM
 CORE_BIOS=""
 BIOS_BOOTFILE=""
 if [ "$WANT_X86" -eq 1 ]; then
-  echo "==> [nuc] Generating GRUB UEFI network loader"
-  "$MKNETDIR" \
-    --net-directory="$STAGE" \
-    --subdir=/boot/grub \
-    --install-modules="normal configfile serial terminal multiboot2 mmap net tftp efinet echo boot" \
-    --modules="efinet tftp net normal" \
-    --locales= --themes= --fonts= >/dev/null
+  # x86-64 UEFI clients (option 93 arch 0x0007/0x0009) boot Nijigumo directly, which then
+  # fetches amd64/EFI/KUMO/* over TFTP (its x86 payload prefix; the Orange Pi's loader reads
+  # EFI/KUMO/* at the root, so `all` holds both). bootx64.efi is the concise DHCP filename.
+  echo "==> [nuc] Staging Nijigumo and payloads from $X86_ESP"
+  mkdir -p "$STAGE/amd64/EFI/KUMO"
+  cp "$X86_LOADER" "$STAGE/bootx64.efi"
+  (cd "$X86_ESP/EFI/KUMO" && tar cf - .) | (cd "$STAGE/amd64/EFI/KUMO" && tar xf -)
 
-  CORE="$STAGE/boot/grub/x86_64-efi/core.efi"
-  if [ ! -s "$CORE" ]; then
-    echo "error: GRUB did not produce $CORE" >&2
-    exit 1
-  fi
-
-  # Stage the i386-pc BIOS network boot program alongside the UEFI loader (shared grub.cfg).
+  # Stage the i386-pc BIOS network boot program for legacy PXE clients.
   if [ -n "$MKNETDIR_BIOS" ]; then
     echo "==> [nuc] Generating GRUB i386-pc BIOS network loader ($MKNETDIR_BIOS)"
     "$MKNETDIR_BIOS" \
@@ -214,20 +224,10 @@ if [ "$WANT_X86" -eq 1 ]; then
       exit 1
     fi
     BIOS_BOOTFILE="boot/grub/i386-pc/core.0"
-  else
-    echo "==> [nuc] No i386-pc grub found; x86 side will be UEFI-only" >&2
-    echo "    (legacy BIOS PXE clients need: brew install i686-elf-grub)" >&2
-  fi
+    cp "$KERNEL" "$STAGE/amd64/kumo-kernel"
+    cp "$INITRD" "$STAGE/amd64/kumo-initrd.img"
 
-  mkdir -p "$STAGE/amd64" "$STAGE/EFI/BOOT"
-  cp "$KERNEL" "$STAGE/amd64/kumo-kernel"
-  cp "$INITRD" "$STAGE/amd64/kumo-initrd.img"
-  # bootx64.efi is the concise DHCP filename. Keep the removable-media path too so the
-  # same generated tree remains easy to inspect and reuse.
-  cp "$CORE" "$STAGE/bootx64.efi"
-  cp "$CORE" "$STAGE/EFI/BOOT/BOOTX64.EFI"
-
-  cat > "$STAGE/boot/grub/grub.cfg" <<'CFG'
+    cat > "$STAGE/boot/grub/grub.cfg" <<'CFG'
 set timeout=3
 set default=0
 
@@ -236,7 +236,7 @@ serial --unit=0 --speed=115200
 terminal_input console serial
 terminal_output console serial
 
-menuentry "KUMO (Ziwei) x86_64 - TFTP/Multiboot2" {
+menuentry "KUMO (Ziwei) x86_64 - TFTP/Multiboot2 (legacy BIOS)" {
     insmod multiboot2
     insmod mmap
     # Keep the null page out of GRUB's module allocator. KUMO reserves the rest of the
@@ -249,9 +249,13 @@ menuentry "KUMO (Ziwei) x86_64 - TFTP/Multiboot2" {
 }
 CFG
 
-  GRUB_CHECK="$(command -v x86_64-elf-grub-script-check || command -v grub-script-check || true)"
-  if [ -n "$GRUB_CHECK" ]; then
-    "$GRUB_CHECK" "$STAGE/boot/grub/grub.cfg"
+    GRUB_CHECK="$(command -v i686-elf-grub-script-check || command -v x86_64-elf-grub-script-check || command -v grub-script-check || true)"
+    if [ -n "$GRUB_CHECK" ]; then
+      "$GRUB_CHECK" "$STAGE/boot/grub/grub.cfg"
+    fi
+  else
+    echo "==> [nuc] No i386-pc grub found; x86 side is UEFI-only" >&2
+    echo "    (legacy BIOS PXE clients need: brew install i686-elf-grub)" >&2
   fi
 fi
 
@@ -305,9 +309,10 @@ Secure Boot:    disable it for these unsigned development loaders
 
 The pxehost proxyDHCP service picks the bootfile by DHCP option 93 (client architecture).
 "none" means this tree deliberately carries nothing for that architecture: a machine of
-that kind falls through to its next boot entry instead of booting a stale KUMO. x86
-clients run GRUB, which Multiboot2-boots amd64/kumo-kernel + the KUMORD01 initrd; the
-Orange Pi runs Nijigumo directly, which fetches EFI/KUMO/*.
+that kind falls through to its next boot entry instead of booting a stale KUMO. The
+Orange Pi runs Nijigumo, which fetches EFI/KUMO/*; x86-64 UEFI clients run Nijigumo too,
+which fetches amd64/EFI/KUMO/* and draws first light on the screen; legacy BIOS clients run
+GRUB, which Multiboot2-boots amd64/kumo-kernel + amd64/kumo-initrd.img (serial only).
 
 Run scripts/run-pxehost.sh [--target opi5|nuc|all] to refresh this tree and start
 proxyDHCP/TFTP. Rerun it whenever the kernel or initrd changes.
@@ -316,7 +321,10 @@ EOF
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 cat > "$STAGE/BUILD-INFO.txt" <<EOF
 target=$TARGET
-boot_protocol_x86=grub-multiboot2-over-tftp
+boot_protocol_x86=nijigumo-over-tftp
+boot_protocol_x86_bios=$( [ -n "$BIOS_BOOTFILE" ] && echo grub-multiboot2-over-tftp || echo none )
+x86_payload_prefix=amd64/
+x86_console_loglevel=$( [ "$WANT_X86" -eq 1 ] && echo "$X86_LOGLEVEL_BUILT" || echo none )
 boot_protocol_arm64=nijigumo-over-tftp
 dhcp_bootfile_uefi=$UEFI_BOOTFILE
 dhcp_bootfile_arm64=$ARM64_BOOTFILE
@@ -361,7 +369,7 @@ if [ "$WANT_ARM64" -eq 1 ]; then
   echo "  [opi5] arm64 UEFI bootfile:  bootaa64.efi (Nijigumo; payloads in EFI/KUMO/)"
 fi
 if [ "$WANT_X86" -eq 1 ]; then
-  echo "  [nuc]  x86-64 UEFI bootfile: bootx64.efi (GRUB -> amd64/kumo-kernel + kumo-initrd.img)"
+  echo "  [nuc]  x86-64 UEFI bootfile: bootx64.efi (Nijigumo; payloads in amd64/EFI/KUMO/)"
   echo "  [nuc]  x86 BIOS bootfile:    ${BIOS_BOOTFILE:-<none: UEFI-only>}"
 fi
 echo "  manifest: MANIFEST.sha256"
