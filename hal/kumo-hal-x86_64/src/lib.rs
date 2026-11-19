@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j625
 //j660
 //j823
 //j881
 //j905
+//j907
 
 mod fpsimd;
 mod gdt;
@@ -14,6 +14,7 @@ mod io_apic;
 mod legacy_irq;
 mod local_apic;
 mod paging;
+mod pci_serial;
 mod platform_acpi;
 mod ring3;
 mod userspace;
@@ -25,6 +26,7 @@ pub use io_apic::{
     unmask_boot_io_apic_timer, IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied,
     IoApicTimerPlan,
 };
+pub use pci_serial::{discover_pci_serial_console, PciSerialReport};
 pub use platform_acpi::{
     discover_acpi_madt, discover_acpi_root, inspect_acpi_rsdp, AcpiLegacyIrqRoute, AcpiMadtReport,
     AcpiRootReport,
@@ -651,6 +653,19 @@ pub fn gic_set_no_dtb_fallback(_distributor_base: u64, _redistributor_base: u64,
 /// drops output. Set via [`freeze_console`].
 static CONSOLE_FROZEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// j907: consecutive console bytes the PCI serial mirror (AMT SOL) dropped because it would not
+/// drain; 0 while it flows or when there is no mirror.
+pub fn pci_serial_mirror_stalls() -> u32 {
+    #[cfg(target_os = "none")]
+    {
+        serial::mirror_stalls()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
+}
+
 pub fn early_console_write(bytes: &[u8]) {
     if CONSOLE_FROZEN.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -717,10 +732,19 @@ impl kumo_fbcon::Scanout for Glass {
 /// 16550 UART (COM1) early console for the freestanding x86_64 kernel.
 #[cfg(target_os = "none")]
 pub(crate) mod serial {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
     const COM1: u16 = 0x3F8;
     static READY: AtomicBool = AtomicBool::new(false);
+    /// j907: a PCI 16550 that mirrors COM1 (AMT Serial-over-LAN on the NUC); 0 = none.
+    static MIRROR: AtomicU16 = AtomicU16::new(0);
+    /// Consecutive mirror bytes dropped because THR never emptied (see `mirror_putc`).
+    static MIRROR_STALLS: AtomicU32 = AtomicU32::new(0);
+    /// THR-empty polls before a mirror byte is dropped. A SOL UART with no client attached may
+    /// never drain; the kernel console must not wait on the network. Once stalled, each byte gets
+    /// only a short poll until the UART drains again (a client connected).
+    const MIRROR_SPINS: u32 = 200_000;
+    const MIRROR_SPINS_STALLED: u32 = 64;
 
     unsafe fn outb(port: u16, value: u8) {
         unsafe {
@@ -757,15 +781,59 @@ pub(crate) mod serial {
         }
     }
 
+    /// Program a mirror UART the way COM1 is programmed, then start copying the console to it.
+    pub(crate) fn set_mirror(base: u16) {
+        unsafe {
+            outb(base + 1, 0x00); // no interrupts
+            outb(base + 3, 0x80); // DLAB on
+            outb(base, 0x01); // divisor 1 = 115200 (SOL ignores the rate; real UARTs don't)
+            outb(base + 1, 0x00);
+            outb(base + 3, 0x03); // 8N1
+            outb(base + 2, 0xC7); // FIFO on and cleared
+            outb(base + 4, 0x0B); // DTR/RTS/OUT2: a SOL client sees carrier
+        }
+        MIRROR_STALLS.store(0, Ordering::Relaxed);
+        MIRROR.store(base, Ordering::Release);
+    }
+
+    fn mirror_putc(base: u16, byte: u8) {
+        let spins = if MIRROR_STALLS.load(Ordering::Relaxed) == 0 {
+            MIRROR_SPINS
+        } else {
+            MIRROR_SPINS_STALLED
+        };
+        for _ in 0..spins {
+            if unsafe { inb(base + 5) } & 0x20 != 0 {
+                unsafe { outb(base, byte) };
+                MIRROR_STALLS.store(0, Ordering::Relaxed);
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        MIRROR_STALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mirror bytes dropped in a row because the mirror UART would not drain (0 = flowing).
+    pub(crate) fn mirror_stalls() -> u32 {
+        MIRROR_STALLS.load(Ordering::Relaxed)
+    }
+
     pub fn write(bytes: &[u8]) {
         if !READY.swap(true, Ordering::AcqRel) {
             init();
         }
+        let mirror = MIRROR.load(Ordering::Acquire);
         for &byte in bytes {
             if byte == b'\n' {
                 putc(b'\r');
+                if mirror != 0 {
+                    mirror_putc(mirror, b'\r');
+                }
             }
             putc(byte);
+            if mirror != 0 {
+                mirror_putc(mirror, byte);
+            }
         }
     }
 }

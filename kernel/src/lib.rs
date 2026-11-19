@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j799
 //j822
 //j823
 //j904
 //j905
+//j907
 
 extern crate alloc;
 
@@ -1780,6 +1780,9 @@ fn x86_bring_up(entry: X86Entry, kernel_stack_top: u64) -> ! {
     if let Some(fb) = glass {
         kumo_hal::active::set_framebuffer(fb.phys, fb.len, fb.width, fb.height, fb.stride);
     }
+    // j907: a PCI 16550 on bus 0 — Intel AMT Serial-over-LAN on the NUC — mirrors COM1 from here
+    // on, so a machine without a serial header still has a text console over the network.
+    let serial_mirror = kumo_hal::active::discover_pci_serial_console();
     klog!(
         "\n[MUREX] KUMO x86_64 first light ({})\n",
         if loader.is_some() {
@@ -1789,6 +1792,24 @@ fn x86_bring_up(entry: X86Entry, kernel_stack_top: u64) -> ! {
         }
     );
     klog!("CPU MODE: long mode (64-bit), paging on, serial COM1 live\n");
+    match serial_mirror {
+        Some(uart) => klog!(
+            "SERIAL MIRROR      Check     PCI 00:{:02x}.{} {:04x}:{:04x} {}  io {:#06x}  cmd {:#06x} -> {:#06x}   OK\n",
+            uart.device,
+            uart.function,
+            uart.vendor_id,
+            uart.device_id,
+            if uart.amt_sol {
+                "Intel AMT SOL"
+            } else {
+                "PCI 16550"
+            },
+            uart.io_base,
+            uart.command_before,
+            uart.command_after
+        ),
+        None => klog!("SERIAL MIRROR      Check     no PCI 16550 on bus 0; COM1 only\n"),
+    }
     if let Some(boot) = loader {
         klog!(
             "nijigumo: BootInfo ABIv{} @{:#x}  {} regions  framebuffer {}x{} @{:#x}  ACPI RSDP {:#x}\n",

@@ -1,8 +1,8 @@
-<!-- j764 -->
 <!-- j768 -->
 <!-- j769 -->
 <!-- j904 -->
 <!-- j906 -->
+<!-- j907 -->
 
 <p align="center">
   <img src="resources/kumo_full-color.jpg" alt="KUMO cloud logo" width="180" />
@@ -182,6 +182,14 @@ Target notes:
   `KUMO_CONSOLE_LOGLEVEL=7` unless you set another level, because the screen shows only
   lines at or above it. Legacy BIOS PXE needs `i686-elf-grub` from Homebrew; without it
   the tree is UEFI-only.
+- **Watching the NUC over the network** (it has no serial header wired): its vPro AMT
+  shows the screen remotely — provision AMT once in MEBx (Ctrl+P at power-on), then use
+  MeshCommander (`npx meshcommander`) for the remote desktop. KUMO also mirrors its whole
+  serial console to AMT Serial-over-LAN (the ME's PCI 16550 at 00:16.3; first light prints
+  `SERIAL MIRROR … Intel AMT SOL … OK`), so a text log is one command away:
+  `brew install amtterm`, then `amtterm <nuc-address>` (it asks for the AMT password; one
+  SOL session at a time, so close MeshCommander's terminal first). A mirror nobody is
+  reading never stalls the kernel: bytes it cannot take are dropped.
 - **Without the hardware**: `scripts/netboot-smoke.sh --uefi` netboots the staged tree in
   QEMU the way the NUC does (OVMF's own PXE → Nijigumo → KUMO) and saves the screen;
   `scripts/netboot-smoke.sh` does the legacy BIOS path.

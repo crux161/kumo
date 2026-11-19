@@ -1,8 +1,8 @@
-//j891
 //j893
 //j897
 //j904
 //j905
+//j907
 
 use std::env;
 use std::fmt;
@@ -3261,6 +3261,10 @@ fn run_x86_niji_smoke(root: &Path) -> Result<(), String> {
     // Read-only vvfat behind a snapshot overlay: the disk looks writable to firmware, but any
     // write (NvVars and the like) lands in a throwaway temp file, never in the staged ESP.
     let esp_drive = format!("format=raw,snapshot=on,file=fat:{}", esp.display());
+    // j907: a PCI 16550 standing in for the NUC's AMT Serial-over-LAN UART; KUMO must find it
+    // and mirror COM1 to it.
+    let sol_log = out_dir.join("pci-serial.log");
+    let _ = fs::remove_file(&sol_log);
     let mut child = Command::new("qemu-system-x86_64")
         .args(["-machine", "q35", "-drive"])
         .arg(&code_drive)
@@ -3279,8 +3283,10 @@ fn run_x86_niji_smoke(root: &Path) -> Result<(), String> {
             "none",
             "-serial",
             "stdio",
-            "-monitor",
+            "-chardev",
         ])
+        .arg(format!("file,id=sol,path={}", sol_log.display()))
+        .args(["-device", "pci-serial,chardev=sol", "-monitor"])
         // j905: a monitor socket for the glass screendump. Relative to `root` (the QEMU cwd)
         // because macOS caps a unix socket path at 104 bytes and worktree paths are long.
         .arg(format!("unix:{X86_NIJI_MONITOR},server,nowait"))
@@ -3323,7 +3329,8 @@ fn run_x86_niji_smoke(root: &Path) -> Result<(), String> {
     );
     let smoke_result = match reached_first_light {
         Ok(()) => validate_x86_niji_smoke_transcript(&transcript)
-            .and_then(|()| x86_niji_glass_proof(root, &out_dir)),
+            .and_then(|()| x86_niji_glass_proof(root, &out_dir))
+            .and_then(|()| x86_niji_serial_mirror_proof(&transcript, &sol_log)),
         Err(err) => Err(format!(
             "{err}\nx86 Nijigumo transcript:\n{}",
             String::from_utf8_lossy(&transcript)
@@ -3344,7 +3351,7 @@ fn run_x86_niji_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 Nijigumo smoke green: OVMF -> Nijigumo BOOTX64.EFI -> BootInfo carried the initrd, firmware memory map, ACPI RSDP and GOP; first light completed on COM1 and on the glass"
+        "KUMO x86 Nijigumo smoke green: OVMF -> Nijigumo BOOTX64.EFI -> BootInfo carried the initrd, firmware memory map, ACPI RSDP and GOP; first light completed on COM1, on the glass and on the PCI serial mirror"
     );
     Ok(())
 }
@@ -3360,6 +3367,7 @@ fn validate_x86_niji_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "via Nijigumo   OK",
         "FRAMEBUFFER CONSOLE Check",
         "write-combining",
+        "SERIAL MIRROR      Check     PCI 00:",
     ] {
         if !text.contains(marker) {
             return Err(format!(
@@ -3442,6 +3450,56 @@ fn x86_niji_glass_proof(root: &Path, out_dir: &Path) -> Result<(), String> {
             ppm.display()
         )),
     }
+}
+
+/// j907: the PCI 16550 (QEMU's stand-in for AMT Serial-over-LAN) must carry exactly what COM1
+/// carried, from the first-light banner through HALTING.
+fn x86_niji_serial_mirror_proof(transcript: &[u8], sol_log: &Path) -> Result<(), String> {
+    let mut mirror = Vec::new();
+    for _ in 0..20 {
+        mirror = fs::read(sol_log).unwrap_or_default();
+        if find_bytes(&mirror, X86_FIRST_LIGHT_LAST_LINE.as_bytes()).is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let com1 = kernel_console_span(transcript)
+        .ok_or_else(|| "COM1 transcript has no first-light span".to_owned())?;
+    let pci = kernel_console_span(&mirror).ok_or_else(|| {
+        format!(
+            "the PCI serial mirror {} has no first-light span:\n{}",
+            sol_log.display(),
+            String::from_utf8_lossy(&mirror)
+        )
+    })?;
+    if com1 != pci {
+        return Err(format!(
+            "the PCI serial mirror differs from COM1 ({} vs {} bytes):\n{}",
+            pci.len(),
+            com1.len(),
+            String::from_utf8_lossy(pci)
+        ));
+    }
+    println!(
+        "serial mirror: {} bytes of first light on the PCI 16550 match COM1 exactly",
+        pci.len()
+    );
+    Ok(())
+}
+
+/// From the `[MUREX] KUMO x86_64 first light` banner through the end of the HALTING line.
+fn kernel_console_span(bytes: &[u8]) -> Option<&[u8]> {
+    let start = find_bytes(bytes, b"[MUREX] KUMO x86_64 first light")?;
+    let end = start
+        + find_bytes(&bytes[start..], X86_FIRST_LIGHT_LAST_LINE.as_bytes())?
+        + X86_FIRST_LIGHT_LAST_LINE.len();
+    Some(&bytes[start..end])
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Byte offset of a binary PPM's pixel data.
@@ -4208,7 +4266,8 @@ x86_64 MUREX core online, first light reached; HALTING.\n";
         let transcript = format!(
             "BOOTX64.EFI loaded\nACPI RSDP    : 0x43b7e014 (ACPI 2.0 table, revision 2)\nhandoff      : VALID\n\
 NIJIGUMO PAGE TABLES Check     firmware CR3 0x43c01000  6 frames in 2 runs reserved   OK\n\
-FRAMEBUFFER CONSOLE Check     1280x800 stride 1280 Bgr @0x80000000  4000 KiB write-combining  PAT 0x7040600070406 -> 0x7040100070406  1 split tables   OK\n{}",
+FRAMEBUFFER CONSOLE Check     1280x800 stride 1280 Bgr @0x80000000  4000 KiB write-combining  PAT 0x7040600070406 -> 0x7040100070406  1 split tables   OK\n\
+SERIAL MIRROR      Check     PCI 00:03.0 1b36:0002 PCI 16550  io 0xc000  cmd 0x0007 -> 0x0007   OK\n{}",
             GREEN
                 .replace("first light (Multiboot/GRUB)", "first light (Nijigumo/UEFI)")
                 .replace("MULTIBOOT INITRD", "NIJIGUMO INITRD")
@@ -4235,6 +4294,20 @@ FRAMEBUFFER CONSOLE Check     1280x800 stride 1280 Bgr @0x80000000  4000 KiB wri
             transcript.replace("write-combining", "uncached").as_bytes()
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_serial_mirror_span_runs_from_the_banner_through_halting() {
+        use super::kernel_console_span;
+        let line = "x86_64 MUREX core online, first light reached; HALTING.";
+        let com1 = format!("BdsDxe: firmware noise\r\n\r\n[MUREX] KUMO x86_64 first light (Nijigumo/UEFI)\r\nA  OK\r\n{line}\r\n");
+        let pci = format!("other firmware text\r\n[MUREX] KUMO x86_64 first light (Nijigumo/UEFI)\r\nA  OK\r\n{line}");
+        assert_eq!(
+            kernel_console_span(com1.as_bytes()),
+            kernel_console_span(pci.as_bytes())
+        );
+        assert!(kernel_console_span(b"[MUREX] KUMO x86_64 first light, no end").is_none());
+        assert!(kernel_console_span(line.as_bytes()).is_none());
     }
 
     #[test]
