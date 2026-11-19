@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j622
 //j783
 //j800
 //j804
 //j810
+//j905
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
@@ -91,6 +91,30 @@ pub fn framebuffer_format_from_efi(pixel_format: u32) -> FramebufferFormat {
         p::BGR_RESERVED_8 => FramebufferFormat::Bgr,
         p::BIT_MASK | p::BLT_ONLY => FramebufferFormat::Unknown,
         _ => FramebufferFormat::Unknown,
+    }
+}
+
+/// The pixel format a GOP mode effectively has (j905, PLAN/025 X2c). A `PixelBitMask` mode whose
+/// masks are exactly the byte lanes of a 32-bit pixel (`masks` = the mode's red, green, blue,
+/// reserved `PixelInformation`) is laid out exactly like one of the two 8-bit-per-colour formats,
+/// so it is reported as that format. Some Intel GOP drivers describe their linear framebuffer
+/// this way; Fuchsia's gigaboot maps the same masks to `ZBI_PIXEL_FORMAT_RGB_X888`. Any other
+/// mask (565, 10-bit, overlapping lanes) and BltOnly keep their own format and stay unusable.
+pub fn effective_pixel_format(pixel_format: u32, masks: [u32; 4]) -> u32 {
+    use efi_pixel_format as p;
+    if pixel_format != p::BIT_MASK {
+        return pixel_format;
+    }
+    let [red, green, blue, reserved] = masks;
+    if reserved & (red | green | blue) != 0 || green != 0x0000_ff00 {
+        return pixel_format;
+    }
+    match (red, blue) {
+        // Memory bytes R, G, B, x: the u32 is 0xxxBBGGRR.
+        (0x0000_00ff, 0x00ff_0000) => p::RGB_RESERVED_8,
+        // Memory bytes B, G, R, x: the u32 is 0xxxRRGGBB.
+        (0x00ff_0000, 0x0000_00ff) => p::BGR_RESERVED_8,
+        _ => pixel_format,
     }
 }
 
@@ -688,6 +712,53 @@ mod tests {
     #[test]
     fn unknown_memory_type_is_unknown() {
         assert_eq!(mem_region_kind_from_efi(9999), MemRegionKind::Unknown);
+    }
+
+    #[test]
+    fn x888_bitmask_modes_are_their_byte_layout_and_others_stay_unusable() {
+        use efi_pixel_format as p;
+        let x = 0xff00_0000;
+        // Red in the high lane is the BGR byte order (gigaboot's RGB_x888), red low is RGB.
+        assert_eq!(
+            effective_pixel_format(p::BIT_MASK, [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, x]),
+            p::BGR_RESERVED_8
+        );
+        assert_eq!(
+            effective_pixel_format(p::BIT_MASK, [0x0000_00ff, 0x0000_ff00, 0x00ff_0000, x]),
+            p::RGB_RESERVED_8
+        );
+        // A zero reserved mask is fine; one overlapping a colour lane is not.
+        assert_eq!(
+            effective_pixel_format(p::BIT_MASK, [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0]),
+            p::BGR_RESERVED_8
+        );
+        for masks in [
+            [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0x0000_00ff], // reserved overlaps blue
+            [0x0000_f800, 0x0000_07e0, 0x0000_001f, 0],           // RGB565
+            [0x3ff0_0000, 0x000f_fc00, 0x0000_03ff, 0xc000_0000], // 10-bit
+            [0x00ff_0000, 0x00ff_0000, 0x0000_00ff, 0],           // green not its own lane
+            [0, 0, 0, 0],
+        ] {
+            assert_eq!(effective_pixel_format(p::BIT_MASK, masks), p::BIT_MASK);
+        }
+        // Formats that are not bitmasks pass through whatever the masks say.
+        for format in [p::RGB_RESERVED_8, p::BGR_RESERVED_8, p::BLT_ONLY, 7] {
+            assert_eq!(
+                effective_pixel_format(format, [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0]),
+                format
+            );
+        }
+        // And a normalized mode is linear for the mode chooser.
+        let mode = GopMode {
+            number: 3,
+            width: 1920,
+            height: 1080,
+            pixel_format: effective_pixel_format(
+                p::BIT_MASK,
+                [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, x],
+            ),
+        };
+        assert!(mode.is_linear());
     }
 
     #[test]

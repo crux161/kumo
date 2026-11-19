@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j619
 //j625
 //j660
 //j823
 //j881
+//j905
 
 mod fpsimd;
 mod gdt;
@@ -337,6 +337,133 @@ fn kernel_leaf_flags(is_ram: bool, is_framebuffer: bool, is_kernel: bool) -> u64
     flags
 }
 
+// ---- Framebuffer write-combining (PLAN/025 X2b, j905) --------------------------------------
+//
+// The GOP aperture is a prefetchable PCI BAR. Mapped UC (the first-light policy above) every
+// 32-bit pixel store is its own bus transaction, which makes a 1080p console clear or scroll
+// visibly slow on metal. Linux's efifb and Zircon's boot framebuffer VMO both map it
+// write-combining. KUMO does the same through one PAT entry: IA32_PAT.PA4 becomes WC, and only
+// framebuffer leaves select index 4 (PAT=1, PCD=0, PWT=0). PA0-PA3 keep the firmware's
+// layout, so no live firmware mapping (which never sets the PAT bit) changes type, and PAT WC
+// takes precedence over the MTRR UC firmware places on the BAR (SDM Vol. 3A, Table 12-7).
+
+/// IA32_PAT.
+const IA32_PAT: u32 = 0x277;
+/// PAT memory type: write-combining.
+const PAT_TYPE_WC: u64 = 0x01;
+/// The PAT entry framebuffer leaves select; its 8-bit field sits at bits 32..40.
+const FRAMEBUFFER_PAT_INDEX: u32 = 4;
+/// The PAT-index high bit in a 2 MiB leaf (bit 7 there is PS).
+const KERNEL_PAGE_PAT_LARGE: u64 = 1 << 12;
+/// The PAT-index high bit in a 4 KiB leaf.
+const KERNEL_PAGE_PAT_4K: u64 = 1 << 7;
+
+/// `pat` with entry [`FRAMEBUFFER_PAT_INDEX`] set to write-combining and every other entry kept.
+const fn pat_with_framebuffer_wc(pat: u64) -> u64 {
+    let shift = FRAMEBUFFER_PAT_INDEX * 8;
+    (pat & !(0xff << shift)) | (PAT_TYPE_WC << shift)
+}
+
+/// Leaf flags for framebuffer bytes once PA4 is WC: present, writable, global, never executable,
+/// PAT index 4. `large` picks the 2 MiB encoding (PS + PAT at bit 12) over the 4 KiB one.
+const fn framebuffer_wc_flags(large: bool) -> u64 {
+    let base = KERNEL_PAGE_PRESENT | KERNEL_PAGE_RW | KERNEL_PAGE_GLOBAL | KERNEL_PAGE_NO_EXECUTE;
+    if large {
+        base | KERNEL_PAGE_PS | KERNEL_PAGE_PAT_LARGE
+    } else {
+        base | KERNEL_PAGE_PAT_4K
+    }
+}
+
+/// How one 2 MiB identity leaf meets the (page-rounded) framebuffer span.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FramebufferCover {
+    /// No framebuffer byte in this leaf.
+    None,
+    /// Every byte of the leaf is framebuffer: one write-combining 2 MiB leaf.
+    Full,
+    /// The span starts or ends inside the leaf. Its framebuffer pages become write-combining
+    /// 4 KiB leaves and the rest keep the leaf's old policy, so a neighbouring device's
+    /// registers sharing the 2 MiB block never become write-combining.
+    Partial,
+}
+
+/// The framebuffer span the kernel map treats as pixels: whole pages from `fb_phys`.
+const fn framebuffer_pages(fb_phys: u64, fb_len: u64) -> (u64, u64) {
+    if fb_len == 0 {
+        return (fb_phys, 0);
+    }
+    let end = fb_phys.saturating_add(fb_len);
+    let end = match end.checked_add(KERNEL_PAGE_SIZE - 1) {
+        Some(end) => end & !(KERNEL_PAGE_SIZE - 1),
+        None => u64::MAX & !(KERNEL_PAGE_SIZE - 1),
+    };
+    let start = fb_phys & !(KERNEL_PAGE_SIZE - 1);
+    (start, end - start)
+}
+
+fn framebuffer_cover(leaf: u64, fb_start: u64, fb_len: u64) -> FramebufferCover {
+    if fb_len == 0 || !ranges_overlap(leaf, KERNEL_PAGE_2M, fb_start, fb_len) {
+        FramebufferCover::None
+    } else if fb_start <= leaf && leaf.saturating_add(KERNEL_PAGE_2M) <= fb_start + fb_len {
+        FramebufferCover::Full
+    } else {
+        FramebufferCover::Partial
+    }
+}
+
+/// How many 2 MiB leaves below `top` the framebuffer only partly covers (0, 1 or 2): each costs
+/// one page table.
+fn framebuffer_split_tables(top: u64, fb_start: u64, fb_len: u64) -> usize {
+    if fb_len == 0 {
+        return 0;
+    }
+    let first = fb_start & !(KERNEL_PAGE_2M - 1);
+    let last = (fb_start + fb_len - 1) & !(KERNEL_PAGE_2M - 1);
+    let mut splits = 0;
+    for leaf in [first, last] {
+        if leaf < top && framebuffer_cover(leaf, fb_start, fb_len) == FramebufferCover::Partial {
+            splits += 1;
+        }
+        if first == last {
+            break;
+        }
+    }
+    splits
+}
+
+/// What the permanent map gave the framebuffer, for the first-light checkpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FramebufferMapReport {
+    /// CPUID.01H:EDX.PAT. Without it the aperture keeps the UC first-light policy.
+    pub pat_supported: bool,
+    /// IA32_PAT before and after this map was installed.
+    pub pat_before: u64,
+    pub pat_after: u64,
+    /// Framebuffer bytes mapped write-combining (2 MiB leaves plus 4 KiB leaves).
+    pub wc_bytes: u64,
+    /// Page tables spent splitting partly covered 2 MiB leaves.
+    pub split_tables: usize,
+}
+
+static FB_MAP_REPORT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut FB_MAP: FramebufferMapReport = FramebufferMapReport {
+    pat_supported: false,
+    pat_before: 0,
+    pat_after: 0,
+    wc_bytes: 0,
+    split_tables: 0,
+};
+
+/// The framebuffer side of the last [`enable_kernel_mmu`], or `None` before it ran.
+pub fn framebuffer_map_report() -> Option<FramebufferMapReport> {
+    if !FB_MAP_REPORT.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: written once by the single boot CPU before the Release store above.
+    Some(unsafe { *core::ptr::addr_of!(FB_MAP) })
+}
+
 fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
     a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
 }
@@ -375,6 +502,16 @@ pub unsafe fn enable_kernel_mmu(
     alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<(usize, u64), ()> {
     let plan = kernel_map_plan(top).ok_or(())?;
+    // j905: write-combine the framebuffer when the CPU has a PAT (every x86_64 part does; the
+    // check keeps the UC first-light policy honest if one ever does not).
+    let pat_supported = core::arch::x86_64::__cpuid(1).edx & (1 << 16) != 0;
+    let (fb_start, fb_span) = if pat_supported {
+        framebuffer_pages(fb_phys, fb_len)
+    } else {
+        (fb_phys, 0)
+    };
+    let split_tables = framebuffer_split_tables(plan.top, fb_start, fb_span);
+    let mut wc_bytes = 0u64;
     let mut tables = 0usize;
     let pml4_frame = alloc_kernel_table(alloc, &mut tables)?;
     let pdpt_frame = alloc_kernel_table(alloc, &mut tables)?;
@@ -398,16 +535,55 @@ pub unsafe fn enable_kernel_mmu(
             let framebuffer = ranges_overlap(phys, KERNEL_PAGE_2M, fb_phys, fb_len);
             let kernel = ranges_overlap(phys, KERNEL_PAGE_2M, kernel_phys, kernel_len);
             let flags = kernel_leaf_flags(is_ram(phys), framebuffer, kernel);
-            unsafe { pd.add(leaf_index).write_volatile(phys | flags) };
+            let entry = match framebuffer_cover(phys, fb_start, fb_span) {
+                FramebufferCover::None => phys | flags,
+                FramebufferCover::Full => {
+                    wc_bytes += KERNEL_PAGE_2M;
+                    phys | framebuffer_wc_flags(true)
+                }
+                FramebufferCover::Partial => {
+                    // Split: framebuffer pages WC, the rest keep this leaf's policy as 4 KiB
+                    // leaves (PS dropped; bit 7 means PAT there and stays clear).
+                    let pt_frame = alloc_kernel_table(alloc, &mut tables)?;
+                    let pt = pt_frame as *mut u64;
+                    let rest = flags & !KERNEL_PAGE_PS;
+                    for page_index in 0..KERNEL_TABLE_ENTRIES {
+                        let page = phys + (page_index as u64) * KERNEL_PAGE_SIZE;
+                        let pixels = page >= fb_start && page < fb_start + fb_span;
+                        let page_flags = if pixels {
+                            wc_bytes += KERNEL_PAGE_SIZE;
+                            framebuffer_wc_flags(false)
+                        } else {
+                            rest
+                        };
+                        unsafe { pt.add(page_index).write_volatile(page | page_flags) };
+                    }
+                    pt_frame | KERNEL_PAGE_PRESENT | KERNEL_PAGE_RW
+                }
+            };
+            unsafe { pd.add(leaf_index).write_volatile(entry) };
         }
     }
 
-    if tables != plan.tables {
+    if tables != plan.tables + split_tables {
         return Err(());
     }
 
     // NX is used by every non-kernel leaf. Long mode and CR0.PG are already active here.
     paging::enable_execute_disable();
+    // PA4 changes immediately before the switch: nothing maps through index 4 until this CR3.
+    let pat_before = if pat_supported {
+        unsafe { local_apic::read_msr(IA32_PAT) }
+    } else {
+        0
+    };
+    let pat_after = if pat_supported && wc_bytes != 0 {
+        let value = pat_with_framebuffer_wc(pat_before);
+        unsafe { local_apic::write_msr(IA32_PAT, value) };
+        unsafe { local_apic::read_msr(IA32_PAT) }
+    } else {
+        pat_before
+    };
     unsafe {
         core::arch::asm!(
             "mov cr3, {root}",
@@ -415,6 +591,16 @@ pub unsafe fn enable_kernel_mmu(
             options(nostack, preserves_flags),
         );
     }
+    unsafe {
+        *core::ptr::addr_of_mut!(FB_MAP) = FramebufferMapReport {
+            pat_supported,
+            pat_before,
+            pat_after,
+            wc_bytes,
+            split_tables,
+        };
+    }
+    FB_MAP_REPORT.store(true, core::sync::atomic::Ordering::Release);
 
     Ok((tables, plan.top))
 }
@@ -469,6 +655,10 @@ pub fn early_console_write(bytes: &[u8]) {
     if CONSOLE_FROZEN.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    // j905: both sinks, like the arm64 backend. A NUC without a cabled serial header sees the
+    // glass; QEMU and a cabled board also see COM1. The glass self-gates on a configured
+    // framebuffer the kernel still owns.
+    kumo_fbcon::write::<Glass>(bytes);
     // On the freestanding kernel, drive the 16550 UART at COM1 (0x3F8) — the console
     // GRUB/QEMU leaves usable — so `klog!` produces real output. On the host (CI test
     // build) port I/O is privileged and meaningless, so this is a no-op there.
@@ -484,15 +674,45 @@ pub fn freeze_console() {
     CONSOLE_FROZEN.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn handoff_framebuffer_console(_phys_base: u64, _len_bytes: u64) -> bool {
-    false
+/// Relinquish the glass to a userspace console driver; the claim must name the configured
+/// framebuffer (see `kumo_fbcon::handoff_framebuffer_console`).
+pub fn handoff_framebuffer_console(phys_base: u64, len_bytes: u64) -> bool {
+    kumo_fbcon::handoff_framebuffer_console(phys_base, len_bytes)
 }
 
 pub fn framebuffer_console_owned_by_kernel() -> bool {
-    true
+    kumo_fbcon::framebuffer_console_owned_by_kernel()
 }
 
-pub fn reclaim_framebuffer_console() {}
+/// Fatal kernel paths take the glass back (see `kumo_fbcon::reclaim_framebuffer_console`).
+pub fn reclaim_framebuffer_console() {
+    kumo_fbcon::reclaim_framebuffer_console();
+}
+
+/// [`kumo_fbcon::Scanout`] for x86_64. The aperture is identity-mapped by both the firmware's
+/// tables and the kernel's, and the CPU's view of it is coherent (UC before the kernel map,
+/// write-combining after), so there is no line to clean. One `sfence` at the end of each
+/// glyph, scroll or fill drains the write-combining buffers, so the last line of a halt is
+/// on the glass rather than in a WC buffer.
+struct Glass;
+
+impl kumo_fbcon::Scanout for Glass {
+    #[inline]
+    fn clean_line(_addr: usize) {}
+
+    #[inline]
+    fn barrier() {
+        #[cfg(target_os = "none")]
+        unsafe {
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
+        }
+    }
+
+    #[inline]
+    fn va_offset() -> u64 {
+        0
+    }
+}
 
 /// 16550 UART (COM1) early console for the freestanding x86_64 kernel.
 #[cfg(target_os = "none")]
@@ -550,25 +770,22 @@ pub(crate) mod serial {
     }
 }
 
-pub fn set_framebuffer(_base: u64, _len_bytes: u64, _width: u32, _height: u32, _stride: u32) {
-    // x86_64 is co-equal in CI but not yet bring-up hardware; the framebuffer
-    // console lands with the x86_64 metal milestone. Stubbed so the shared kernel
-    // can call it unconditionally.
+/// Switch the console's glass half to a linear 32-bpp framebuffer and clear it (j905). The
+/// kernel calls this at Nijigumo entry, while the firmware's identity map still covers the
+/// aperture; the kernel map keeps it at the same address, so the console survives the CR3
+/// switch.
+pub fn set_framebuffer(base: u64, len_bytes: u64, width: u32, height: u32, stride: u32) {
+    kumo_fbcon::set_framebuffer::<Glass>(base, len_bytes, width, height, stride);
 }
 
-pub fn fb_paint_band(
-    _phys: u64,
-    _len_bytes: u64,
-    _width: u32,
-    _stride: u32,
-    _y0: u32,
-    _color: u32,
-) {
-    // Direct-framebuffer POST marker; lands with the x86_64 framebuffer console.
+/// Bring-up POST band painted straight into the framebuffer (see `kumo_fbcon::fb_paint_band`).
+pub fn fb_paint_band(phys: u64, len_bytes: u64, width: u32, stride: u32, y0: u32, color: u32) {
+    kumo_fbcon::fb_paint_band::<Glass>(phys, len_bytes, width, stride, y0, color);
 }
 
-pub fn fb_fill(_phys: u64, _len_bytes: u64, _color: u32) {
-    // Direct-framebuffer fill; lands with the x86_64 framebuffer console.
+/// Fill the whole framebuffer with one colour (see `kumo_fbcon::fb_fill`).
+pub fn fb_fill(phys: u64, len_bytes: u64, color: u32) {
+    kumo_fbcon::fb_fill::<Glass>(phys, len_bytes, color);
 }
 
 pub fn clean_dcache_to_poc(_addr: usize, _len: usize) {
@@ -590,9 +807,9 @@ pub fn render_qr_diag(_text: &[u8]) {}
 /// One-shot TOWER QR diagnostic — aarch64-only. No-op on x86_64.
 pub fn render_qr_diag_once(_text: &[u8]) {}
 
-/// Framebuffer geometry getter — no framebuffer console on this backend, so always zeros.
+/// Current framebuffer geometry `(width, height, stride)`; zeros before [`set_framebuffer`].
 pub fn fb_geometry() -> (u32, u32, u32) {
-    (0, 0, 0)
+    kumo_fbcon::fb_geometry()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1328,6 +1545,72 @@ mod tests {
                 KERNEL_PAGE_WRITE_THROUGH | KERNEL_PAGE_CACHE_DISABLE
             );
         }
+    }
+
+    #[test]
+    fn framebuffer_pat_entry_is_write_combining_and_the_rest_are_kept() {
+        // The power-on/firmware layout: WB WT UC- UC WB WT UC- UC.
+        let reset = 0x0007_0406_0007_0406;
+        assert_eq!(pat_with_framebuffer_wc(reset), 0x0007_0401_0007_0406);
+        assert_eq!(
+            pat_with_framebuffer_wc(reset) & 0xffff_ffff,
+            reset & 0xffff_ffff
+        );
+        assert_eq!(pat_with_framebuffer_wc(u64::MAX) >> 32 & 0xff, PAT_TYPE_WC);
+
+        // Index 4 = PAT bit set, PCD and PWT clear, in both leaf encodings.
+        for (large, pat_bit) in [(true, KERNEL_PAGE_PAT_LARGE), (false, KERNEL_PAGE_PAT_4K)] {
+            let flags = framebuffer_wc_flags(large);
+            assert_ne!(flags & pat_bit, 0);
+            assert_eq!(
+                flags & (KERNEL_PAGE_WRITE_THROUGH | KERNEL_PAGE_CACHE_DISABLE),
+                0
+            );
+            assert_ne!(flags & KERNEL_PAGE_NO_EXECUTE, 0);
+            // Bit 7 is PS in a 2 MiB leaf but PAT in a 4 KiB one; bit 12 is PAT only when large.
+            assert_ne!(flags & KERNEL_PAGE_PS, 0);
+            assert_eq!(flags & KERNEL_PAGE_PAT_LARGE != 0, large);
+        }
+    }
+
+    #[test]
+    fn framebuffer_leaves_split_only_where_the_aperture_ends_inside_them() {
+        // OVMF q35: 1280x800x4 at 2 GiB = 0x3e_8000 bytes, so one full leaf and one partial.
+        let (start, span) = framebuffer_pages(0x8000_0000, 1280 * 800 * 4);
+        assert_eq!((start, span), (0x8000_0000, 0x3e_8000));
+        let top = KERNEL_MIN_MAP_TOP;
+        assert_eq!(
+            framebuffer_cover(0x8000_0000, start, span),
+            FramebufferCover::Full
+        );
+        assert_eq!(
+            framebuffer_cover(0x8020_0000, start, span),
+            FramebufferCover::Partial
+        );
+        assert_eq!(
+            framebuffer_cover(0x8040_0000, start, span),
+            FramebufferCover::None
+        );
+        assert_eq!(
+            framebuffer_cover(0x7fe0_0000, start, span),
+            FramebufferCover::None
+        );
+        assert_eq!(framebuffer_split_tables(top, start, span), 1);
+
+        // A 1080p aperture starting mid-leaf and ending mid-leaf costs two tables.
+        let (start, span) = framebuffer_pages(0x9010_0000, 1920 * 1080 * 4);
+        assert_eq!(framebuffer_split_tables(top, start, span), 2);
+        // A small framebuffer inside one leaf costs one; an aligned whole leaf costs none.
+        assert_eq!(framebuffer_split_tables(top, 0x9000_0000, 0x1000), 1);
+        assert_eq!(
+            framebuffer_split_tables(top, 0x9000_0000, KERNEL_PAGE_2M),
+            0
+        );
+        // No framebuffer, or one above the mapped top, costs nothing.
+        assert_eq!(framebuffer_split_tables(top, 0, 0), 0);
+        assert_eq!(framebuffer_split_tables(top, top + 0x1000, 0x1000), 0);
+        // The byte length rounds up to whole pages.
+        assert_eq!(framebuffer_pages(0x9000_0000, 1), (0x9000_0000, 0x1000));
     }
 
     #[test]

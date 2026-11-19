@@ -1,0 +1,10 @@
+[package]
+#j905
+name = "kumo-fbcon"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"

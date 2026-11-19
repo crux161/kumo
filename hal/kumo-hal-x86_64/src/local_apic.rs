@@ -1,6 +1,7 @@
 //j439
 //j450
 //j454
+//j905
 
 #![cfg_attr(not(any(target_os = "none", test)), allow(dead_code))]
 
@@ -123,7 +124,7 @@ impl ApicIo for HardwareMsrs {
 }
 
 #[cfg(target_os = "none")]
-unsafe fn read_msr(register: u32) -> u64 {
+pub(crate) unsafe fn read_msr(register: u32) -> u64 {
     let low: u32;
     let high: u32;
     unsafe {
@@ -139,7 +140,7 @@ unsafe fn read_msr(register: u32) -> u64 {
 }
 
 #[cfg(target_os = "none")]
-unsafe fn write_msr(register: u32, value: u64) {
+pub(crate) unsafe fn write_msr(register: u32, value: u64) {
     unsafe {
         core::arch::asm!(
             "wrmsr",

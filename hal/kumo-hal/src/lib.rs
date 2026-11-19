@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j793
 //j794
 //j823
 //j875
 //j881
+//j905
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -80,7 +80,7 @@ pub mod active {
         device_power_up, device_register_valid, device_register_window, device_register_write,
         device_reset_set, device_reset_unit, discover_acpi_madt, discover_acpi_root,
         early_console_write, el0_exit, enable_kernel_mmu, exceptions_seen, fb_fill, fb_geometry,
-        fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
+        fb_paint_band, framebuffer_console_owned_by_kernel, framebuffer_map_report, freeze_console,
         gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
         handoff_framebuffer_console, init_local_timer_from_reference, init_timer_interrupts,
         inspect_acpi_rsdp, inspect_boot_io_apic, install_descriptor_tables,
@@ -101,10 +101,10 @@ pub mod active {
         user_page_desc, wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs,
         wait_for_timer_irqs, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
         DescriptorTableReport, DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo,
-        DevicePowerUpOutcome, El0Report, FpSimdReport, GicTimerGateReport, IoApicRedirectionEntry,
-        IoApicReport, IoApicTimerApplied, IoApicTimerPlan, PowerStep, Ring3Error, Ring3Report,
-        ThreadContext, TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment,
-        UserMapping, UserState, ARCH, RING3_PING_TOKEN,
+        DevicePowerUpOutcome, El0Report, FpSimdReport, FramebufferMapReport, GicTimerGateReport,
+        IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied, IoApicTimerPlan, PowerStep,
+        Ring3Error, Ring3Report, ThreadContext, TowerContext, TowerThreadRole, UserImage,
+        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH, RING3_PING_TOKEN,
     };
 }
 

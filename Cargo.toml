@@ -1,12 +1,13 @@
-#j823
 #j824
 #j825
 #j826
 #j893
+#j905
 [workspace]
 members = [
     "boot/niji-loader",
     "boot/niji-uefi",
+    "hal/kumo-fbcon",
     "hal/kumo-hal",
     "hal/kumo-hal-aarch64",
     "hal/kumo-hal-x86_64",
@@ -96,6 +97,7 @@ version = "0.1.0"
 kumo-abi = { path = "lib/kumo-abi" }
 kumo-bsp = { path = "lib/kumo-bsp" }
 kumo-fdt = { path = "lib/kumo-fdt" }
+kumo-fbcon = { path = "hal/kumo-fbcon" }
 kumo-hal = { path = "hal/kumo-hal", default-features = false }
 kumo-hal-aarch64 = { path = "hal/kumo-hal-aarch64" }
 kumo-hal-x86_64 = { path = "hal/kumo-hal-x86_64" }

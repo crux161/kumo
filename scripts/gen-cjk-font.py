@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+#j905
 """Generate KUMO's Stage-A CJK console glyph table from GNU Unifont.
 
 This is an *offline* developer tool. Its outputs — `cjk_font.bin` (the packed glyphs) and
-`cjk_font.rs` (a thin `include_bytes!` wrapper) under `hal/kumo-hal-aarch64/src/` — are
+`cjk_font.rs` (a thin `include_bytes!` wrapper) under `hal/kumo-fbcon/src/` — are
 checked in, so a normal `cargo build` needs no font, no Unihan, and no network. Re-run this
 only to change the coverage.
 
@@ -67,8 +68,8 @@ FULLWIDTH_FORMS = range(0xFF01, 0xFF5F)  # fullwidth ASCII variants, incl ： (U
 UNIHAN_URL = "https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip"
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = Path(__file__).resolve().parent / ".cache"
-BIN_OUT = ROOT / "hal/kumo-hal-aarch64/src/cjk_font.bin"
-RS_OUT = ROOT / "hal/kumo-hal-aarch64/src/cjk_font.rs"
+BIN_OUT = ROOT / "hal/kumo-fbcon/src/cjk_font.bin"
+RS_OUT = ROOT / "hal/kumo-fbcon/src/cjk_font.rs"
 RECORD = 34  # 2-byte codepoint + 32-byte bitmap
 
 MAGICK_FONT = "/System/Library/Fonts/Hiragino Sans GB.ttc"

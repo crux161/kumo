@@ -1,8 +1,8 @@
-//j890
 //j891
 //j893
 //j897
 //j904
+//j905
 
 use std::env;
 use std::fmt;
@@ -3280,9 +3280,11 @@ fn run_x86_niji_smoke(root: &Path) -> Result<(), String> {
             "-serial",
             "stdio",
             "-monitor",
-            "none",
-            "-no-reboot",
         ])
+        // j905: a monitor socket for the glass screendump. Relative to `root` (the QEMU cwd)
+        // because macOS caps a unix socket path at 104 bytes and worktree paths are long.
+        .arg(format!("unix:{X86_NIJI_MONITOR},server,nowait"))
+        .arg("-no-reboot")
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3320,7 +3322,8 @@ fn run_x86_niji_smoke(root: &Path) -> Result<(), String> {
         Duration::from_secs(60),
     );
     let smoke_result = match reached_first_light {
-        Ok(()) => validate_x86_niji_smoke_transcript(&transcript),
+        Ok(()) => validate_x86_niji_smoke_transcript(&transcript)
+            .and_then(|()| x86_niji_glass_proof(root, &out_dir)),
         Err(err) => Err(format!(
             "{err}\nx86 Nijigumo transcript:\n{}",
             String::from_utf8_lossy(&transcript)
@@ -3341,7 +3344,7 @@ fn run_x86_niji_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 Nijigumo smoke green: OVMF -> Nijigumo BOOTX64.EFI -> BootInfo carried the initrd, firmware memory map and ACPI RSDP; first light completed"
+        "KUMO x86 Nijigumo smoke green: OVMF -> Nijigumo BOOTX64.EFI -> BootInfo carried the initrd, firmware memory map, ACPI RSDP and GOP; first light completed on COM1 and on the glass"
     );
     Ok(())
 }
@@ -3355,6 +3358,8 @@ fn validate_x86_niji_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "handoff      : VALID",
         "NIJIGUMO PAGE TABLES Check     firmware CR3",
         "via Nijigumo   OK",
+        "FRAMEBUFFER CONSOLE Check",
+        "write-combining",
     ] {
         if !text.contains(marker) {
             return Err(format!(
@@ -3368,6 +3373,142 @@ fn validate_x86_niji_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The x86 Nijigumo smoke's QEMU monitor socket, relative to the repository root.
+const X86_NIJI_MONITOR: &str = "target/x86-niji-smoke/monitor.sock";
+/// The last line of x86 first light, which the glass must show at HALTING.
+const X86_FIRST_LIGHT_LAST_LINE: &str = "x86_64 MUREX core online, first light reached; HALTING.";
+/// The kernel console's PSF2 font, the very bytes `kumo-fbcon` renders with.
+const KUMO_CONSOLE_PSF: &[u8] = include_bytes!("../../hal/kumo-fbcon/font8x16.psf");
+/// `kumo_fbcon::FG` / `BG` as the screendump's RGB bytes (grey, so RGB and BGR agree).
+const KUMO_CONSOLE_FG: [u8; 3] = [0xee, 0xee, 0xee];
+const KUMO_CONSOLE_BG: [u8; 3] = [0x00, 0x00, 0x00];
+
+/// j905 (PLAN/025 X2): ask QEMU for the scanout and require the kernel's last first-light line
+/// on it. Before X2 the glass at this point still showed Nijigumo's "Loading MUREX" text.
+fn x86_niji_glass_proof(root: &Path, out_dir: &Path) -> Result<(), String> {
+    use std::os::unix::net::UnixStream;
+
+    let ppm = out_dir.join("glass.ppm");
+    let _ = fs::remove_file(&ppm);
+    let mut monitor = UnixStream::connect(root.join(X86_NIJI_MONITOR))
+        .map_err(|err| format!("connect to the QEMU monitor {X86_NIJI_MONITOR}: {err}"))?;
+    monitor
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|err| format!("monitor timeout: {err}"))?;
+    // Give the final sfence'd line a moment, then ask for the scanout; QEMU writes the file
+    // before it prints the next prompt.
+    thread::sleep(Duration::from_millis(300));
+    writeln!(monitor, "screendump {}", ppm.display())
+        .map_err(|err| format!("send screendump: {err}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut reply = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        if let Ok(bytes) = fs::read(&ppm) {
+            if let Some((width, height, _)) = parse_ppm(&bytes) {
+                if bytes.len()
+                    >= ppm_pixel_offset(&bytes).unwrap_or(usize::MAX) + width * height * 3
+                {
+                    break;
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "QEMU wrote no screendump at {} (monitor said {:?})",
+                ppm.display(),
+                String::from_utf8_lossy(&reply)
+            ));
+        }
+        if let Ok(n) = monitor.read(&mut buffer) {
+            reply.extend_from_slice(&buffer[..n]);
+        }
+    }
+    let bytes = fs::read(&ppm).map_err(|err| format!("read {}: {err}", ppm.display()))?;
+    let (width, height, pixels) =
+        parse_ppm(&bytes).ok_or_else(|| format!("{} is not a binary PPM", ppm.display()))?;
+    match find_console_line(pixels, width, height, X86_FIRST_LIGHT_LAST_LINE) {
+        Some(row) => {
+            println!(
+                "glass: {width}x{height} screendump {} shows {X86_FIRST_LIGHT_LAST_LINE:?} at text row {row}",
+                ppm.display()
+            );
+            Ok(())
+        }
+        None => Err(format!(
+            "the glass ({width}x{height}, {}) does not show {X86_FIRST_LIGHT_LAST_LINE:?} in the KUMO console font",
+            ppm.display()
+        )),
+    }
+}
+
+/// Byte offset of a binary PPM's pixel data.
+fn ppm_pixel_offset(bytes: &[u8]) -> Option<usize> {
+    // "P6" ws width ws height ws maxval single-ws, comments not used by QEMU.
+    let mut fields = 0;
+    let mut i = 0;
+    while fields < 4 {
+        while bytes.get(i)?.is_ascii_whitespace() {
+            i += 1;
+        }
+        while !bytes.get(i)?.is_ascii_whitespace() {
+            i += 1;
+        }
+        fields += 1;
+    }
+    Some(i + 1)
+}
+
+/// `(width, height, rgb bytes)` of a binary 8-bit PPM (what QEMU's `screendump` writes).
+fn parse_ppm(bytes: &[u8]) -> Option<(usize, usize, &[u8])> {
+    if !bytes.starts_with(b"P6") {
+        return None;
+    }
+    let offset = ppm_pixel_offset(bytes)?;
+    let header = std::str::from_utf8(&bytes[..offset]).ok()?;
+    let mut fields = header.split_ascii_whitespace().skip(1);
+    let width: usize = fields.next()?.parse().ok()?;
+    let height: usize = fields.next()?.parse().ok()?;
+    let maxval: usize = fields.next()?.parse().ok()?;
+    let end = offset.checked_add(width.checked_mul(height)?.checked_mul(3)?)?;
+    (maxval == 255 && bytes.len() >= end).then(|| (width, height, &bytes[offset..end]))
+}
+
+/// The 8x16 PSF2 glyph rows for a printable ASCII byte (`?` otherwise), as kumo-fbcon picks them.
+fn console_glyph(ch: u8) -> &'static [u8] {
+    let field = |offset: usize| {
+        u32::from_le_bytes(KUMO_CONSOLE_PSF[offset..offset + 4].try_into().unwrap()) as usize
+    };
+    let (header, charsize) = (field(8), field(20));
+    let index = if (0x20..=0x7e).contains(&ch) {
+        ch
+    } else {
+        b'?'
+    } as usize;
+    &KUMO_CONSOLE_PSF[header + index * charsize..header + (index + 1) * charsize]
+}
+
+/// The text row (counted in 16-pixel cells from the top) whose leftmost cells show `line`
+/// exactly as the kernel console renders it, or `None`.
+fn find_console_line(rgb: &[u8], width: usize, height: usize, line: &str) -> Option<usize> {
+    const GLYPH_W: usize = 8;
+    const GLYPH_H: usize = 16;
+    if line.len() * GLYPH_W > width {
+        return None;
+    }
+    (0..height / GLYPH_H).find(|&row| {
+        line.bytes().enumerate().all(|(col, ch)| {
+            console_glyph(ch).iter().enumerate().all(|(ry, &bits)| {
+                (0..GLYPH_W).all(|rx| {
+                    let on = (bits >> (7 - rx)) & 1 != 0;
+                    let px = ((row * GLYPH_H + ry) * width + col * GLYPH_W + rx) * 3;
+                    rgb[px..px + 3] == if on { KUMO_CONSOLE_FG } else { KUMO_CONSOLE_BG }
+                })
+            })
+        })
+    })
 }
 
 fn find_ovmf_firmware() -> Result<(PathBuf, PathBuf), String> {
@@ -4066,7 +4207,8 @@ x86_64 MUREX core online, first light reached; HALTING.\n";
     fn x86_niji_transcript_requires_the_bootinfo_handoff_and_no_multiboot() {
         let transcript = format!(
             "BOOTX64.EFI loaded\nACPI RSDP    : 0x43b7e014 (ACPI 2.0 table, revision 2)\nhandoff      : VALID\n\
-NIJIGUMO PAGE TABLES Check     firmware CR3 0x43c01000  6 frames in 2 runs reserved   OK\n{}",
+NIJIGUMO PAGE TABLES Check     firmware CR3 0x43c01000  6 frames in 2 runs reserved   OK\n\
+FRAMEBUFFER CONSOLE Check     1280x800 stride 1280 Bgr @0x80000000  4000 KiB write-combining  PAT 0x7040600070406 -> 0x7040100070406  1 split tables   OK\n{}",
             GREEN
                 .replace("first light (Multiboot/GRUB)", "first light (Nijigumo/UEFI)")
                 .replace("MULTIBOOT INITRD", "NIJIGUMO INITRD")
@@ -4088,6 +4230,46 @@ NIJIGUMO PAGE TABLES Check     firmware CR3 0x43c01000  6 frames in 2 runs reser
             transcript.replace("via Nijigumo", "legacy scan").as_bytes()
         )
         .is_err());
+        // j905: an uncached (or absent) glass is not green.
+        assert!(validate_x86_niji_smoke_transcript(
+            transcript.replace("write-combining", "uncached").as_bytes()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_glass_proof_finds_the_kernel_line_in_its_own_font_and_nothing_else() {
+        use super::{console_glyph, find_console_line, parse_ppm};
+        let (width, height) = (8 * 64, 16 * 6);
+        let line = "first light reached; HALTING.";
+        // Paint `line` at text row 4 exactly as kumo-fbcon would: FG on BG, 8x16 cells.
+        let mut rgb = vec![0u8; width * height * 3];
+        for (col, ch) in line.bytes().enumerate() {
+            for (ry, &bits) in console_glyph(ch).iter().enumerate() {
+                for rx in 0..8 {
+                    if (bits >> (7 - rx)) & 1 != 0 {
+                        let px = ((4 * 16 + ry) * width + col * 8 + rx) * 3;
+                        rgb[px..px + 3].copy_from_slice(&[0xee, 0xee, 0xee]);
+                    }
+                }
+            }
+        }
+        let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+        ppm.extend_from_slice(&rgb);
+        let (w, h, pixels) = parse_ppm(&ppm).expect("a P6 screendump");
+        assert_eq!((w, h), (width, height));
+        assert_eq!(find_console_line(pixels, w, h, line), Some(4));
+        // Another line, a shifted line, or one wrong pixel is not the proof.
+        assert_eq!(
+            find_console_line(pixels, w, h, "first light reached; HALTED."),
+            None
+        );
+        let mut off = rgb.clone();
+        off[((4 * 16 + 8) * width + 3) * 3] ^= 0x01;
+        assert_eq!(find_console_line(&off, w, h, line), None);
+        assert_eq!(find_console_line(&rgb, w, h, "x".repeat(65).as_str()), None);
+        assert!(parse_ppm(b"P5\n1 1\n255\n\0").is_none());
+        assert!(parse_ppm(b"P6\n2 2\n255\n\0\0\0").is_none());
     }
 }
 

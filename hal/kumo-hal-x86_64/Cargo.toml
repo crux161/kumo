@@ -1,5 +1,6 @@
 #j444
 #j445
+#j905
 [package]
 name = "kumo-hal-x86_64"
 authors.workspace = true
@@ -8,6 +9,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+kumo-fbcon = { workspace = true }
 niji-loader = { path = "../../boot/niji-loader" }
 
 [lib]

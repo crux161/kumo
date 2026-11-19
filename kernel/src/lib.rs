@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j797
 //j799
 //j822
 //j823
 //j904
+//j905
 
 extern crate alloc;
 
@@ -1632,6 +1632,26 @@ unsafe fn x86_loader_boot_info(boot: *const BootInfo) -> Result<&'static BootInf
     Ok(boot)
 }
 
+/// The GOP framebuffer the x86 console may draw on (j905): present, geometrically plausible
+/// for the 32-bpp renderer, and in a format Nijigumo named. Anything else stays serial-only;
+/// no glass is better than wrong glass.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn x86_glass(boot: &BootInfo) -> Option<kumo_abi::Framebuffer> {
+    let fb = boot.framebuffer;
+    let format_known = matches!(
+        fb.format,
+        kumo_abi::FramebufferFormat::Rgb | kumo_abi::FramebufferFormat::Bgr
+    );
+    (boot.has_framebuffer() && fb.is_plausible() && format_known).then_some(fb)
+}
+
+/// Whether the kernel map write-combines every page of the glass: PAT present, IA32_PAT.PA4 read
+/// back as WC (type 1), and exactly the framebuffer's page span mapped through it.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn x86_glass_write_combined(map: kumo_hal::active::FramebufferMapReport, pages: u64) -> bool {
+    map.pat_supported && (map.pat_after >> 32) & 0xff == 0x01 && pages != 0 && map.wc_bytes == pages
+}
+
 /// The loader's initrd range as the x86 first-light harness consumes it: a KUMORD01 image
 /// carrying `bin/hello`, exactly what the Multiboot module provides.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -1753,6 +1773,13 @@ fn x86_bring_up(entry: X86Entry, kernel_stack_top: u64) -> ! {
     } else {
         "MULTIBOOT"
     };
+    // j905 (PLAN/025 X2b): the glass comes up before the first line, as on arm64, so a NUC with
+    // no serial header sees the whole first light. The firmware's identity map covers the GOP
+    // aperture now and the kernel map keeps it at the same address after the CR3 switch.
+    let glass = loader.and_then(|boot| x86_glass(boot));
+    if let Some(fb) = glass {
+        kumo_hal::active::set_framebuffer(fb.phys, fb.len, fb.width, fb.height, fb.stride);
+    }
     klog!(
         "\n[MUREX] KUMO x86_64 first light ({})\n",
         if loader.is_some() {
@@ -2052,6 +2079,36 @@ fn x86_bring_up(entry: X86Entry, kernel_stack_top: u64) -> ! {
             paging.mapped_bytes >> 30,
             paging_frames.frames
         );
+    }
+
+    // j905: the console kept drawing across the CR3 switch; say what the kernel map gave it.
+    if let Some(fb) = glass {
+        let pages = fb.mapping_len().unwrap_or(0);
+        let report = kumo_hal::active::framebuffer_map_report();
+        match report {
+            Some(map) if x86_glass_write_combined(map, pages) => klog!(
+                "FRAMEBUFFER CONSOLE Check     {}x{} stride {} {:?} @{:#x}  {} KiB write-combining  PAT {:#x} -> {:#x}  {} split tables   OK\n",
+                fb.width,
+                fb.height,
+                fb.stride,
+                fb.format,
+                fb.phys,
+                map.wc_bytes >> 10,
+                map.pat_before,
+                map.pat_after,
+                map.split_tables
+            ),
+            // Not fatal: the uncached first-light mapping still draws, only slowly.
+            report => klog_at!(
+                kmsg::WARNING,
+                "FRAMEBUFFER CONSOLE Check     {}x{} @{:#x} {} KiB  map {:?}   UNCACHED\n",
+                fb.width,
+                fb.height,
+                fb.phys,
+                pages >> 10,
+                report
+            ),
+        }
     }
 
     // Keep the diagnostic memory summary honest for either boot protocol.

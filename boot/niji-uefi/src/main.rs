@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j801
 //j804
 //j805
 //j810
 //j904
+//j905
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -48,9 +48,9 @@ use niji_loader::elf::EM_AARCH64 as KERNEL_MACHINE;
 use niji_loader::elf::EM_X86_64 as KERNEL_MACHINE;
 use niji_loader::{summarize_platform, validate_boot_info};
 use niji_uefi::{
-    build_boot_info, choose_gop_mode, efi_memory_type, efi_memory_type_is_firmware_owned,
-    efi_pixel_format, fdt_total_size, framebuffer_from_gop, is_fdt_magic,
-    is_plausible_firmware_pointer, mem_region_kind_from_efi, parse_pl011_console,
+    build_boot_info, choose_gop_mode, effective_pixel_format, efi_memory_type,
+    efi_memory_type_is_firmware_owned, efi_pixel_format, fdt_total_size, framebuffer_from_gop,
+    is_fdt_magic, is_plausible_firmware_pointer, mem_region_kind_from_efi, parse_pl011_console,
     reserved_framebuffer_span, BootConfig, GopChoice, GopMode, UefiHandoffSeed, GOP_FALLBACK_MAX,
 };
 
@@ -2884,7 +2884,7 @@ unsafe fn current_gop_mode(gop: *mut EfiGraphicsOutputProtocol) -> GopMode {
             number,
             width: (*info).horizontal_resolution,
             height: (*info).vertical_resolution,
-            pixel_format: (*info).pixel_format,
+            pixel_format: effective_pixel_format((*info).pixel_format, (*info).pixel_information),
         }
     }
 }
@@ -2926,7 +2926,10 @@ unsafe fn select_gop_mode(
                 number,
                 width: (*info).horizontal_resolution,
                 height: (*info).vertical_resolution,
-                pixel_format: (*info).pixel_format,
+                pixel_format: effective_pixel_format(
+                    (*info).pixel_format,
+                    (*info).pixel_information,
+                ),
             }
         };
         count += 1;
@@ -3036,8 +3039,8 @@ unsafe fn discover_framebuffer(
     let base = unsafe { (*mode).frame_buffer_base };
     let len = unsafe { (*mode).frame_buffer_size } as u64;
     let info = unsafe { (*mode).info };
-    let (width, height, stride, pixel_format) = if info.is_null() {
-        (0, 0, 0, efi_pixel_format::BLT_ONLY)
+    let (width, height, stride, raw_format, masks) = if info.is_null() {
+        (0, 0, 0, efi_pixel_format::BLT_ONLY, [0; 4])
     } else {
         unsafe {
             (
@@ -3045,9 +3048,23 @@ unsafe fn discover_framebuffer(
                 (*info).vertical_resolution,
                 (*info).pixels_per_scan_line,
                 (*info).pixel_format,
+                (*info).pixel_information,
             )
         }
     };
+    // j905: an x888 PixelBitMask mode is a byte layout after all (gigaboot does the same).
+    let pixel_format = effective_pixel_format(raw_format, masks);
+    if raw_format == efi_pixel_format::BIT_MASK {
+        kprint!(
+            con_out,
+            "GOP bitmask  : R {:#010x} G {:#010x} B {:#010x} X {:#010x} -> {}\r\n",
+            masks[0],
+            masks[1],
+            masks[2],
+            masks[3],
+            gop_format_name(pixel_format)
+        );
+    }
 
     let fb = framebuffer_from_gop(base, len, width, height, stride, pixel_format);
     if base == 0 || len == 0 || fb.format == FramebufferFormat::Unknown {

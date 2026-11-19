@@ -3,6 +3,7 @@
 #j609
 #j614
 #j792
+#j905
 name = "kumo-hal-aarch64"
 authors.workspace = true
 edition.workspace = true
@@ -14,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 kumo-abi = { workspace = true }
+kumo-fbcon = { workspace = true }
 kumo-fdt = { workspace = true }
 # Vendored, no_std-patched QR generator for the on-screen TOWER diagnostic (see vendor/).
 qrcodegen = { path = "../../vendor/qrcodegen" }

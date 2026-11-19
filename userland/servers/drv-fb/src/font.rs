@@ -2,6 +2,7 @@
 //j673
 //j687
 //j689
+//j905
 
 //! Fixed console bitmaps: ASCII and box drawing in one GLYPH_W x GLYPH_H cell; CJK in a
 //! 16x16 bitmap within a double-width cell.
@@ -11,7 +12,7 @@ use super::{GLYPH_H, GLYPH_W};
 const ASCII_FONT: &[u8] = include_bytes!("../font8x16.psf");
 // Share the existing offline-generated data, not the HAL implementation. This
 // adds only userspace rodata; neither the kernel nor BootInfo grows. — KESTREL
-const CJK_FONT: &[u8] = include_bytes!("../../../../hal/kumo-hal-aarch64/src/cjk_font.bin");
+const CJK_FONT: &[u8] = include_bytes!("../../../../hal/kumo-fbcon/src/cjk_font.bin");
 const CJK_RECORD_BYTES: usize = 34;
 const MISSING: [u8; 32] = [
     0, 0, 0, 0, 0x3f, 0xfc, 0x20, 4, 0x20, 4, 0x20, 4, 0x20, 4, 0x20, 4, 0x20, 4, 0x20, 4, 0x20, 4,
