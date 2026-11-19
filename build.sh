@@ -1,9 +1,9 @@
 #!/bin/sh
-#j213
 #j330
 #j467
 #j468
 #j475
+#j909
 
 # build.sh — quick staging, deploy, and boot-media entry point.
 #
@@ -12,16 +12,18 @@
 #   ./build.sh arm64 img    -> build/kumo-arm64.img   (ThinkPad X13s tree)
 #   ./build.sh opi5  iso    -> build/kumo-opi5.iso    (Orange Pi 5 Plus tree)
 #   ./build.sh opi5  img    -> build/kumo-opi5.img    (Orange Pi 5 Plus tree)
-#   ./build.sh amd64 iso    -> build/kumo-amd64.iso
-#   ./build.sh amd64 img    -> build/kumo-amd64.img
+#   ./build.sh amd64 iso    -> build/kumo-amd64.iso   (generic UEFI x86_64 tree, e.g. the NUC)
+#   ./build.sh amd64 img    -> build/kumo-amd64.img   (generic UEFI x86_64 tree)
 #
 # NOTE: `arm64` media stages the **ThinkPad X13s** profile — it is not board-generic. Flashing
 # an `arm64` image onto a different board boots that board with the X13s BSP entry (framebuffer
 # console, no serial, no GIC fallback), which looks like a hang on serial. Use the board-specific
 # target (`opi5`) for the Orange Pi 5 Plus.
 #
-# `.iso` selects UEFI optical media. `.img` selects disk-writeable media: a raw MBR/FAT32
-# ESP on ARM64 and GRUB's USB-bootable ISO-hybrid layout on AMD64.
+# `.iso` selects UEFI optical media. `.img` selects disk-writeable media: a raw MBR/FAT32 ESP.
+# Every product boots Nijigumo; j909 (PLAN/025 X4) retired the AMD64 GRUB/Multiboot2 media.
+# AMD64 media build the kernel at KUMO_CONSOLE_LOGLEVEL=7 unless set, so x86 first light reaches
+# the screen of a machine without a serial header.
 #
 # Legacy shortcuts remain available:
 #   ./build.sh              -> stage the ThinkPad X13s EFI tree
@@ -42,6 +44,7 @@ DEPLOY_DIR=""
 
 X13S_DIR="build/images/thinkpad-x13s-gen1"
 OPI5_DIR="build/images/orange-pi-5-plus"
+X86_DIR="build/images/generic-uefi-x86_64"
 
 usage() {
     cat >&2 <<'USAGE'
@@ -162,13 +165,17 @@ build_media() {
             ;;
         amd64|x86_64|x86-64)
             artifact="build/kumo-amd64.${format}"
+            x86_level="${KUMO_CONSOLE_LOGLEVEL:-7}"
+            echo "==> Building x86_64 (Generic UEFI staging tree), console level $x86_level..."
+            KUMO_CONSOLE_LOGLEVEL="$x86_level" cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64
             if [ "$format" = "iso" ]; then
-                echo "==> Building AMD64 GRUB/Multiboot2 ISO: $artifact"
-                ./scripts/mkiso.sh amd64 "$artifact"
+                echo "==> Building AMD64 UEFI ISO (Nijigumo): $artifact"
+                ./scripts/mkiso.sh amd64 "$artifact" "$X86_DIR"
             else
-                echo "==> Building AMD64 GRUB/Multiboot2 hybrid image: $artifact"
-                ./scripts/mkimg.sh amd64 "$artifact"
+                echo "==> Building AMD64 raw MBR/FAT32 image (Nijigumo): $artifact"
+                ./scripts/mkimg.sh amd64 "$artifact" "$X86_DIR"
             fi
+            DEPLOY_DIR="$X86_DIR"
             ;;
         *)
             echo "error: unknown architecture '$arch' (expected arm64 or amd64)" >&2

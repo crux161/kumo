@@ -1,8 +1,8 @@
-<!-- j769 -->
 <!-- j904 -->
 <!-- j906 -->
 <!-- j907 -->
 <!-- j908 -->
+<!-- j909 -->
 
 <p align="center">
   <img src="resources/kumo_full-color.jpg" alt="KUMO cloud logo" width="180" />
@@ -117,12 +117,15 @@ cargo xtask image --arch aarch64 --hardware thinkpad-x13s-gen1
 
 rustup target add x86_64-unknown-none x86_64-unknown-uefi
 cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64
-cargo xtask x86-smoke
-cargo xtask x86-uefi-smoke
+cargo xtask x86-smoke        # QEMU's built-in Multiboot loader, no firmware
+cargo xtask x86-niji-smoke   # OVMF -> Nijigumo from the staged ESP
+cargo xtask x86-uefi-smoke   # OVMF -> Nijigumo from the amd64 ISO product (./build.sh amd64 iso)
 ```
 
-The x86 smoke paths use `qemu-system-x86_64`; the UEFI path also requires OVMF and
-GRUB tooling. Core host checks and contributor preflight:
+The x86 smoke paths use `qemu-system-x86_64`; the UEFI paths also require OVMF, and the ISO
+path `mtools` and `xorriso`. Every UEFI path, product and netboot boots Nijigumo, as the arm64
+boards do; GRUB remains only as the legacy-BIOS netboot program. Core host checks and
+contributor preflight:
 
 ```sh
 cargo fmt --check

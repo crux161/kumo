@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
+#j909
 # mkimg.sh - build a disk-writeable KUMO image product.
 #
 #   scripts/mkimg.sh arm64 [out.img] [esp_dir]
-#   scripts/mkimg.sh amd64 [out.img]
+#   scripts/mkimg.sh amd64 [out.img] [esp_dir]
 #
-# ARM64 is emitted as a raw MBR disk with a type-0xef FAT32 EFI System Partition at
-# sector 2048. AMD64 keeps GRUB's ISO-hybrid layout because its Multiboot2 kernel and initrd
-# live in the ISO filesystem; that layout already carries MBR/GPT/ESP records for USB boot.
+# Both are a raw MBR disk with a type-0xef FAT32 EFI System Partition at sector 2048 holding a
+# staged Nijigumo EFI/ tree (BOOTAA64.EFI or BOOTX64.EFI). j909 (PLAN/025 X4) retired the
+# amd64 GRUB ISO-hybrid image.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,9 +15,9 @@ ARCH="${1:-}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "error: missing '$1' ($2)" >&2; exit 1; }; }
 
-build_arm64() {
-  local out="${1:-$ROOT/build/kumo-arm64.img}"
-  local esp_dir="${2:-$ROOT/build/images/thinkpad-x13s-gen1}"
+# build_esp_img <loader file name> <arch label> <out.img> <esp_dir>
+build_esp_img() {
+  local loader="$1" label="$2" out="$3" esp_dir="$4"
   local work; work="$(mktemp -d)"
   trap "rm -rf '$work'" RETURN
 
@@ -26,8 +27,8 @@ build_arm64() {
   need mcopy "install mtools"
   need mdir "install mtools"
   need xorriso "install xorriso"
-  [ -f "$esp_dir/EFI/BOOT/BOOTAA64.EFI" ] || {
-    echo "error: $esp_dir/EFI/BOOT/BOOTAA64.EFI missing" >&2
+  [ -f "$esp_dir/EFI/BOOT/$loader" ] || {
+    echo "error: $esp_dir/EFI/BOOT/$loader missing" >&2
     exit 1
   }
 
@@ -44,10 +45,10 @@ build_arm64() {
     -append_partition 2 0xef "$esp" \
     -e --interval:appended_partition_2:all:: -no-emul-boot \
     -isohybrid-gpt-basdat -partition_cyl_align all \
-    -o "$work/kumo-arm64-hybrid.iso" "$iso_root" 2>/dev/null
+    -o "$work/kumo-$label-hybrid.iso" "$iso_root" 2>/dev/null
 
   mkdir -p "$(dirname "$out")"
-  cp "$work/kumo-arm64-hybrid.iso" "$out"
+  cp "$work/kumo-$label-hybrid.iso" "$out"
 
   # Preserve the xorriso-generated MBR (sector 0) and appended ESP (from sector 2048),
   # but remove the intervening ISO9660 area so firmware treats this as a disk, not optical
@@ -55,12 +56,12 @@ build_arm64() {
   dd if=/dev/zero of="$out" bs=512 seek=1 count=2047 conv=notrunc status=none
   dd if=/dev/zero of="$out" bs=1 seek=446 count=16 conv=notrunc status=none
 
-  mdir -i "${out}@@1048576" ::/EFI/BOOT/BOOTAA64.EFI >/dev/null
+  mdir -i "${out}@@1048576" "::/EFI/BOOT/$loader" >/dev/null
   echo "wrote $out ($(du -h "$out" | cut -f1)) raw MBR + FAT32 ESP"
 }
 
 case "$ARCH" in
-  aarch64|arm64) build_arm64 "${2:-}" "${3:-}" ;;
-  amd64|x86_64|x86-64) exec "$ROOT/scripts/mkiso.sh" amd64 "${2:-$ROOT/build/kumo-amd64.img}" ;;
+  aarch64|arm64) build_esp_img BOOTAA64.EFI arm64 "${2:-$ROOT/build/kumo-arm64.img}" "${3:-$ROOT/build/images/thinkpad-x13s-gen1}" ;;
+  amd64|x86_64|x86-64) build_esp_img BOOTX64.EFI amd64 "${2:-$ROOT/build/kumo-amd64.img}" "${3:-$ROOT/build/images/generic-uefi-x86_64}" ;;
   *) echo "usage: scripts/mkimg.sh {arm64|amd64} [out.img] [esp_dir]" >&2; exit 2 ;;
 esac

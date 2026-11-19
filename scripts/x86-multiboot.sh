@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #j439
+#j909
 # x86-multiboot.sh - build the x86_64 KUMO kernel and KUMORD01 initrd as Multiboot
 # payloads and (by default) boot them under QEMU's built-in Multiboot loader. These are
-# the same payloads that scripts/mkiso.sh installs for GRUB's `multiboot2` and `module2`
-# commands.
+# the same payloads that scripts/refresh-netboot.sh stages for the legacy-BIOS GRUB
+# (core.0) `multiboot2` and `module2` commands. UEFI machines boot Nijigumo instead.
 #
 # Why a flat binary + a.out kludge: QEMU's `-kernel` (and GRUB Multiboot1) refuse a
 # 64-bit ELF ("give a 32bit one"). The a.out address kludge in the kernel's multiboot
-# header lets a flat 64-bit image load at 1 MiB; the kernel's `_start` builds long mode.
+# header lets a flat 64-bit image load at its link address (16 MiB since j904); the
+# kernel's `_start` builds long mode.
 #
 # Usage: scripts/x86-multiboot.sh [build|run]   (default: run)
 #   build  - build the ELF + objcopy to a flat .bin
