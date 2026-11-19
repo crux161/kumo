@@ -1,8 +1,8 @@
-<!-- j768 -->
 <!-- j769 -->
 <!-- j904 -->
 <!-- j906 -->
 <!-- j907 -->
+<!-- j908 -->
 
 <p align="center">
   <img src="resources/kumo_full-color.jpg" alt="KUMO cloud logo" width="180" />
@@ -187,8 +187,11 @@ Target notes:
   MeshCommander (`npx meshcommander`) for the remote desktop. KUMO also mirrors its whole
   serial console to AMT Serial-over-LAN (the ME's PCI 16550 at 00:16.3; first light prints
   `SERIAL MIRROR … Intel AMT SOL … OK`), so a text log is one command away:
-  `brew install amtterm`, then `amtterm <nuc-address>` (it asks for the AMT password; one
-  SOL session at a time, so close MeshCommander's terminal first). A mirror nobody is
+  `scripts/amt-sol.py <nuc-address>` (Python stdlib only; it asks for the AMT password, logs
+  in with a digest so the password never crosses the network, and appends everything to
+  `build/nuc-sol.log`; `--probe` checks the path without a password). Homebrew's `amtterm`
+  cannot open AMT's non-TLS port 16994, which is all a MEBx-provisioned NUC listens on. One
+  SOL session at a time, so close MeshCommander's terminal first. A mirror nobody is
   reading never stalls the kernel: bytes it cannot take are dropped.
 - **Without the hardware**: `scripts/netboot-smoke.sh --uefi` netboots the staged tree in
   QEMU the way the NUC does (OVMF's own PXE → Nijigumo → KUMO) and saves the screen;
