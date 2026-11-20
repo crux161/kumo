@@ -1,8 +1,8 @@
-//j871
 //j873
 //j875
 //j877
 //j881
+//j916
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,7 +206,21 @@ pub enum Syscall {
     /// left it (the shim restores the foreign values first). Only valid inside a redirected
     /// call; otherwise [`Errno::BadState`].
     PersonaReturn = 64,
+    /// The CALLING thread's open persona call (SH7-d3c-2): `(op, pc, sp, x8)`. Op
+    /// [`PERSONA_CONTEXT_GET`] returns `x1` = the foreign PC after the `svc`, `x2` = its SP,
+    /// `x3` = its x8 ([`Errno::BadState`] when no call is open), so a shim can serve Linux
+    /// `clone`, whose child resumes where the parent's `svc` did. Op [`PERSONA_CONTEXT_SEED`]
+    /// opens a call on a registered thread that has none, as if the foreign code had trapped
+    /// at `pc` with `sp` and `x8`; the shim then leaves it with [`Syscall::PersonaReturn`]
+    /// like any other. The kernel writes no user memory and interprets no foreign number.
+    /// [`Errno::BadState`] when the thread has no registration or (seed) a call is open.
+    PersonaContext = 65,
 }
+
+/// [`Syscall::PersonaContext`] op: read the open call's foreign `(pc, sp, x8)`.
+pub const PERSONA_CONTEXT_GET: u64 = 0;
+/// [`Syscall::PersonaContext`] op: open a call to be left by `PersonaReturn`.
+pub const PERSONA_CONTEXT_SEED: u64 = 1;
 
 /// `ProcessKill` flag (SH6-b): kill the target's whole spawn tree, the KUMO stand-in for
 /// a process group.
@@ -565,6 +579,7 @@ mod tests {
         assert_eq!(Syscall::ThreadYield as usize, 62);
         assert_eq!(Syscall::PersonaShimSet as usize, 63);
         assert_eq!(Syscall::PersonaReturn as usize, 64);
+        assert_eq!(Syscall::PersonaContext as usize, 65);
     }
 }
 

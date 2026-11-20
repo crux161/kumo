@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j888
 #j889
 #j890
 #j891
 #j915
+#j916
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -62,6 +62,7 @@ def main():
         b"linux /bin/greet\n"
         b"linux /bin/fileprobe\n"
         b"linux /bin/pipeprobe\n"
+        b"linux /bin/threadprobe\n"
         b"linux /bin/bigread\n"
         b"echo AXH persona ends\n",
         (
@@ -80,6 +81,12 @@ def main():
             "pipeprobe: EPIPE, 128 reuse cycles and EMFILE rollback OK",
             "pipeprobe: OK (0 failures)",
             "linux: /bin/pipeprobe exited 0",
+            "threadprobe: create and join, tid != pid OK",
+            "threadprobe: 4 threads x 10000 locked increments = 40000 OK",
+            "threadprobe: a parked pipe reader woke on a sibling's write OK",
+            "threadprobe: detached thread and timed wait OK",
+            "threadprobe: OK (0 failures)",
+            "linux: /bin/threadprobe exited 0",
             "bigread: OK (0 failures)",
             "linux: /bin/bigread exited 0",
         ),

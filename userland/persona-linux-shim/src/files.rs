@@ -2,6 +2,7 @@
 //j891
 //j892
 //j915
+//j916
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -23,7 +24,9 @@ use kumo_vfs::{
 };
 use persona_linux::stream::ReadTail;
 
-use crate::errno;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::{errno, threads};
 
 /// What one vfs `Read` answers at most (the fatfs reply ceiling).
 const READ_CHUNK: u64 = 256;
@@ -127,9 +130,25 @@ static mut SESSION: Session = Session {
 };
 
 fn session() -> &'static mut Session {
-    // SAFETY: one Linux thread per shim in this slice, and the trap path is not reentrant
-    // (the kernel refuses a second foreign svc while one is open).
+    // SAFETY: SH7-d3c-2: every caller holds the shim lock (threads::lock, taken by
+    // persona_dispatch), and no reference is kept across a wait that releases it. Before the
+    // program starts, only the main thread exists.
     unsafe { &mut *core::ptr::addr_of_mut!(SESSION) }
+}
+
+/// SH7-d3c-2: a reader parked on a descriptor's channel with the shim lock released (1), so a
+/// second reader of the same descriptor waits its turn instead of racing it for the message.
+static PIPE_READER: [AtomicU32; MAX_FDS] = [const { AtomicU32::new(0) }; MAX_FDS];
+static STDIN_READER: AtomicU32 = AtomicU32::new(0);
+
+/// Park in a blocking `ChannelRead` with the shim lock released (a sibling may hold the other
+/// end), then take the lock back. `busy` keeps other readers of the same channel out meanwhile.
+fn parked_read(busy: &AtomicU32, channel: Handle, out: &mut [u8]) -> u64 {
+    busy.store(1, Ordering::Release);
+    let n = threads::unlocked(|| channel_read(channel, out.as_mut_ptr(), out.len()));
+    busy.store(0, Ordering::Release);
+    let _ = kumo_rt::futex_wake(busy.as_ptr(), u32::MAX);
+    n
 }
 
 /// Take the launcher's grants. Handle 0 means "not granted".
@@ -428,8 +447,8 @@ pub fn file_of(fd: i64) -> Result<(u32, u64), i64> {
 // ---- the Linux calls -----------------------------------------------------------------------
 
 /// A private channel pair supplies byte-stream data, blocking reads and peer-close EOF.
-/// The FD table is still single-threaded; SH7-d3c's thread admission must protect it before
-/// admitting concurrent Linux callers. Channel writes have no bounded-capacity backpressure.
+/// The FD table is behind the shim lock (SH7-d3c-2); a blocking read parks with it released.
+/// Channel writes have no bounded-capacity backpressure.
 /// — MILVUS
 pub fn pipe2(pair: u64, flags: u64) -> i64 {
     if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
@@ -528,6 +547,12 @@ pub fn close(fd: i64) -> i64 {
 }
 
 pub fn read(fd: i64, buf: u64, len: u64) -> i64 {
+    read_from(fd, buf, len, true)
+}
+
+/// `read`, or (`may_block` false) a read that answers EAGAIN instead of waiting on an empty
+/// pipe: `readv` blocks for its first bytes only, as on Linux.
+fn read_from(fd: i64, buf: u64, len: u64, may_block: bool) -> i64 {
     let entry = match fd_entry(fd) {
         Ok(entry) => entry,
         Err(e) => return e,
@@ -545,29 +570,15 @@ pub fn read(fd: i64, buf: u64, len: u64) -> i64 {
         if buf == 0 {
             return -errno::EFAULT;
         }
-        if entry.carry.is_empty() {
-            let storage = entry.carry.storage();
-            let n = if entry.flags & O_NONBLOCK != 0 {
-                match channel_try_read_with_handle(
-                    Handle(channel),
-                    storage.as_mut_ptr(),
-                    storage.len(),
-                ) {
-                    Some((n, _)) => n,
-                    None => return -errno::EAGAIN,
-                }
-            } else {
-                channel_read(Handle(channel), storage.as_mut_ptr(), storage.len()) as usize
-            };
-            if n as u32 as i32 == kumo_abi::Errno::PeerClosed.status() {
-                return 0;
+        let block = may_block && entry.flags & O_NONBLOCK == 0;
+        return match fill_pipe(fd as usize, channel, block) {
+            Ok(true) => {
+                let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+                session().fds[fd as usize].carry.take(out) as i64
             }
-            if !entry.carry.received(n) {
-                return -errno::EIO;
-            }
-        }
-        let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-        return entry.carry.take(out) as i64;
+            Ok(false) => 0,
+            Err(e) => e,
+        };
     }
     if buf == 0 && len != 0 {
         return -errno::EFAULT;
@@ -588,21 +599,86 @@ pub fn read(fd: i64, buf: u64, len: u64) -> i64 {
     }
 }
 
+/// Make the pipe read end at `index` hold bytes: `Ok(true)` when its tail has some, `Ok(false)`
+/// at end of stream (the writer closed). With nothing queued, a non-blocking read is EAGAIN and
+/// a blocking one parks with the shim lock released (SH7-d3c-2) — a sibling thread may be the
+/// writer. A descriptor closed while its reader was parked reads EBADF.
+fn fill_pipe(index: usize, channel: u32, block: bool) -> Result<bool, i64> {
+    let busy = &PIPE_READER[index];
+    loop {
+        let entry = &mut session().fds[index];
+        if !matches!(entry.kind, Kind::Pipe { channel: c, readable: true, .. } if c == channel) {
+            return Err(-errno::EBADF);
+        }
+        if !entry.carry.is_empty() {
+            return Ok(true);
+        }
+        if busy.load(Ordering::Acquire) != 0 {
+            if !block {
+                return Err(-errno::EAGAIN);
+            }
+            threads::wait_turn(busy);
+            continue;
+        }
+        let storage = entry.carry.storage();
+        let n = match channel_try_read_with_handle(
+            Handle(channel),
+            storage.as_mut_ptr(),
+            storage.len(),
+        ) {
+            Some((n, _)) => n,
+            None if !block => return Err(-errno::EAGAIN),
+            None => {
+                let mut parked = [0u8; PIPE_CHUNK];
+                let n = parked_read(busy, Handle(channel), &mut parked) as usize;
+                let entry = &mut session().fds[index];
+                if !matches!(entry.kind, Kind::Pipe { channel: c, .. } if c == channel) {
+                    return Err(-errno::EBADF);
+                }
+                if n <= PIPE_CHUNK {
+                    entry.carry.storage()[..n].copy_from_slice(&parked[..n]);
+                }
+                n
+            }
+        };
+        if n as u32 as i32 == kumo_abi::Errno::PeerClosed.status() {
+            return Ok(false);
+        }
+        if !session().fds[index].carry.received(n) {
+            return Err(-errno::EIO);
+        }
+        return Ok(true);
+    }
+}
+
 /// stdin is a channel of messages; a short `read` keeps the rest of a message for the next one.
-/// End of input (no grant, or the writer closed) reads 0.
+/// End of input (no grant, or the writer closed) reads 0. Waiting for a line parks with the shim
+/// lock released (SH7-d3c-2).
 fn read_stdin(out: &mut [u8]) -> i64 {
-    let s = session();
-    if s.stdin_carry_at == s.stdin_carry_len {
+    loop {
+        let s = session();
+        if s.stdin_carry_at < s.stdin_carry_len {
+            break;
+        }
         if s.stdin.0 == 0 {
             return 0;
         }
-        let n = channel_read(s.stdin, s.stdin_carry.as_mut_ptr(), s.stdin_carry.len());
-        if n == 0 || n == u64::MAX {
+        if STDIN_READER.load(Ordering::Acquire) != 0 {
+            threads::wait_turn(&STDIN_READER);
+            continue;
+        }
+        let stdin = s.stdin;
+        let mut parked = [0u8; 256];
+        let n = parked_read(&STDIN_READER, stdin, &mut parked);
+        if n == 0 || n == u64::MAX || n as usize > parked.len() {
             return 0;
         }
+        let s = session();
+        s.stdin_carry[..n as usize].copy_from_slice(&parked[..n as usize]);
         s.stdin_carry_at = 0;
         s.stdin_carry_len = n as usize;
     }
+    let s = session();
     let take = out.len().min(s.stdin_carry_len - s.stdin_carry_at);
     out[..take].copy_from_slice(&s.stdin_carry[s.stdin_carry_at..s.stdin_carry_at + take]);
     s.stdin_carry_at += take;
@@ -643,7 +719,8 @@ pub fn readv(fd: i64, iov: u64, count: u64) -> i64 {
         if len == 0 {
             continue;
         }
-        let n = read(fd, base, len);
+        // SH7-d3c-2: only the first bytes may wait; after them an empty pipe ends the call.
+        let n = read_from(fd, base, len, total == 0);
         if n < 0 {
             return if total > 0 { total } else { n };
         }

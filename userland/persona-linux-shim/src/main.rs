@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j888
 //j889
 //j890
 //j891
 //j915
+//j916
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -31,6 +31,7 @@ use kumo_rt::{
 use persona_linux::elf::{self, Machine};
 
 mod files;
+mod threads;
 
 kumo_rt::entry!(main);
 
@@ -54,11 +55,18 @@ mod nr {
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
     pub const SET_TID_ADDRESS: u64 = 96;
+    pub const FUTEX: u64 = 98;
+    pub const SET_ROBUST_LIST: u64 = 99;
+    pub const NANOSLEEP: u64 = 101;
+    pub const CLOCK_GETTIME: u64 = 113;
+    pub const CLOCK_NANOSLEEP: u64 = 115;
+    pub const SCHED_YIELD: u64 = 124;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const GETPID: u64 = 172;
     pub const GETTID: u64 = 178;
     pub const BRK: u64 = 214;
+    pub const CLONE: u64 = 220;
     pub const MUNMAP: u64 = 215;
     pub const MMAP: u64 = 222;
     pub const MPROTECT: u64 = 226;
@@ -83,6 +91,7 @@ pub(crate) mod errno {
     pub const EPIPE: i64 = 32;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
+    pub const ETIMEDOUT: i64 = 110;
 }
 
 const PAGE: u64 = 4096;
@@ -150,6 +159,16 @@ fn vmar_protect(virt: u64, len: u64, prot: u64) -> u64 {
     status
 }
 
+/// The shim's code range: an `svc` inside it is native, any other is the program's.
+fn shim_code() -> (u64, u64) {
+    let code_base = core::ptr::addr_of!(__ehdr_start) as u64;
+    (code_base, core::ptr::addr_of!(etext) as u64 - code_base)
+}
+
+fn trap_entry_address() -> u64 {
+    persona_trap_entry as *const () as u64
+}
+
 fn persona_shim_set(entry: u64, code_base: u64, code_len: u64, stack_top: u64) -> u64 {
     let status: u64;
     unsafe {
@@ -169,11 +188,6 @@ fn persona_shim_set(entry: u64, code_base: u64, code_len: u64, stack_top: u64) -
 
 // ---- the trap path -----------------------------------------------------------------------
 
-/// The shim's own stack for serving calls (one thread in this slice).
-#[repr(C, align(16))]
-struct TrapStack([u8; 64 * 1024]);
-static mut TRAP_STACK: TrapStack = TrapStack([0; 64 * 1024]);
-
 unsafe extern "C" {
     /// lld: the first byte of the image (the ELF header), so the start of the shim's code.
     static __ehdr_start: u8;
@@ -185,8 +199,9 @@ unsafe extern "C" {
 
 core::arch::global_asm!(
     ".text",
-    // Entered by the kernel's redirect: SP = the trap stack, every other register as the
-    // foreign program left it at its `svc` (x8 = the Linux number, x0..x5 = arguments).
+    // Entered by the kernel's redirect: SP = this thread's trap stack top, which is also its
+    // ThreadRec (SH7-d3c-2); every other register as the foreign program left it at its `svc`
+    // (x8 = the Linux number, x0..x5 = arguments).
     ".global persona_trap_entry",
     ".type persona_trap_entry, %function",
     "persona_trap_entry:",
@@ -208,6 +223,7 @@ core::arch::global_asm!(
     "  stp x28, x29, [sp, #224]",
     "  str x30, [sp, #240]",
     "  mov x0, sp",
+    "  add x1, sp, #256",
     "  bl persona_dispatch",
     // Restore the foreign registers except x0 (the result) and x8 (the kernel restores it).
     "  ldr x1, [sp, #8]",
@@ -257,12 +273,44 @@ struct Program {
 
 static mut PROGRAM: Program = Program { brk_end: 0 };
 
-/// Serve one redirected call. `frame` holds the foreign x0..x30; the result goes in x0.
+/// Serve one redirected call. `frame` holds the foreign x0..x30; the result goes in x0. `rec` is
+/// the calling thread's own record (its trap stack top, SH7-d3c-2).
 #[unsafe(no_mangle)]
-extern "C" fn persona_dispatch(frame: *mut [u64; 31]) {
+extern "C" fn persona_dispatch(frame: *mut [u64; 31], rec: *mut threads::ThreadRec) {
     let frame = unsafe { &mut *frame };
-    let (a0, a1, a2) = (frame[0], frame[1], frame[2]);
+    let rec = unsafe { &mut *rec };
+    let (a0, a1, a2, a3, a4) = (frame[0], frame[1], frame[2], frame[3], frame[4]);
+    // SH7-d3c-2: calls that touch only the calling thread or the kernel run without the shim
+    // lock (a futex wait or a sleep must not hold it); everything else is serialized.
     let result: i64 = match frame[8] {
+        nr::CLONE => threads::clone(frame, a0, a1, a2, a3, a4),
+        nr::FUTEX => threads::futex(a0, a1, a2, a3, frame[5]),
+        nr::EXIT => threads::exit_thread(rec, a0),
+        nr::EXIT_GROUP => process_exit(a0 & 0xff),
+        nr::GETTID => threads::gettid(rec),
+        nr::GETPID => threads::getpid(),
+        nr::SET_TID_ADDRESS => threads::set_tid_address(rec, a0),
+        nr::SET_ROBUST_LIST => threads::set_robust_list(rec, a0, a1),
+        nr::SCHED_YIELD => threads::sched_yield(),
+        nr::CLOCK_GETTIME => threads::clock_gettime(a0, a1),
+        nr::NANOSLEEP => threads::clock_nanosleep(1, 0, a0, a1),
+        nr::CLOCK_NANOSLEEP => threads::clock_nanosleep(a0, a1, a2, a3),
+        nr::RT_SIGACTION | nr::RT_SIGPROCMASK => 0,
+        number => {
+            threads::lock();
+            let result = serve_locked(number, frame);
+            threads::unlock();
+            result
+        }
+    };
+    frame[0] = result as u64;
+}
+
+/// The calls over the shim's shared state, with the shim lock held. A blocking pipe or stdin
+/// read releases it while it waits (files.rs).
+fn serve_locked(number: u64, frame: &[u64; 31]) -> i64 {
+    let (a0, a1, a2) = (frame[0], frame[1], frame[2]);
+    match number {
         nr::WRITE => write(a0, a1, a2),
         nr::WRITEV => writev(a0, a1, a2),
         // SH7-d2: the file surface, over the persona's vfs session (files.rs).
@@ -278,13 +326,10 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31]) {
         nr::GETDENTS64 => files::getdents64(a0 as i64, a1, a2),
         nr::FCNTL => files::fcntl(a0 as i64, a1, a2),
         nr::IOCTL => -errno::ENOTTY,
-        nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => 1,
-        nr::RT_SIGACTION | nr::RT_SIGPROCMASK => 0,
         nr::BRK => brk(a0) as i64,
         nr::MMAP => mmap(a0, a1, a2, frame[3], frame[4] as i64, frame[5]),
         nr::MUNMAP => munmap(a0, a1),
         nr::MPROTECT => mprotect(a0, a1, a2),
-        nr::EXIT | nr::EXIT_GROUP => process_exit(a0 & 0xff),
         other => {
             log(format_args!(
                 "persona-linux: syscall {} unsupported (-ENOSYS)\n",
@@ -292,8 +337,7 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31]) {
             ));
             -errno::ENOSYS
         }
-    };
-    frame[0] = result as u64;
+    }
 }
 
 /// Standard output and error: the launcher's stdout channel (SH7-d2), else the kernel log.
@@ -603,17 +647,8 @@ extern "C" fn main(
 
     let sp = build_stack(&loaded, &linux_argv[..argc], &envp[..envc]);
 
-    let code_base = core::ptr::addr_of!(__ehdr_start) as u64;
-    let code_len = core::ptr::addr_of!(etext) as u64 - code_base;
-    let trap_top =
-        core::ptr::addr_of!(TRAP_STACK) as u64 + core::mem::size_of::<TrapStack>() as u64;
-    if persona_shim_set(
-        persona_trap_entry as *const () as u64,
-        code_base,
-        code_len,
-        trap_top,
-    ) != 0
-    {
+    // SH7-d3c-2: the main thread's record sits on top of its trap stack; its tid is the pid.
+    if !threads::register_main() {
         fail("PersonaShimSet refused");
     }
     unsafe { persona_enter(loaded.start, sp) }

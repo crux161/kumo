@@ -1,8 +1,8 @@
-//j911
 //j912
 //j913
 //j914
 //j915
+//j916
 
 use std::env;
 use std::fmt;
@@ -2121,7 +2121,12 @@ fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
 /// filesystem grant, as Linux `execve` and musl's loader expect. Each file is checked against the
 /// digest persona/MANIFEST records, so the image carries exactly the bytes that manifest and musl's
 /// COPYRIGHT describe. — TEAL
-const PERSONA_PAYLOADS: [(&str, &str, &str); 9] = [
+const PERSONA_PAYLOADS: [(&str, &str, &str); 10] = [
+    (
+        "persona/threadprobe",
+        "/bin/threadprobe",
+        "20a3538d87e85547c8f64dfcdeb9f72b868cdaaa1c16f3bd1843bc29f275174f",
+    ),
     (
         "persona/pipeprobe",
         "/bin/pipeprobe",

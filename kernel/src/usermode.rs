@@ -1,8 +1,8 @@
-//j873
 //j875
 //j877
 //j881
 //j882
+//j916
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -2683,6 +2683,21 @@ extern "C" fn svc_hook(regs: *mut u64) {
             }
         }
         r[0] = Errno::BadState.status() as u32 as u64;
+        return;
+    }
+
+    //j916
+    if num == Syscall::PersonaContext as u64 {
+        // SH7-d3c-2: read or seed the current thread's open persona call (registers only).
+        match crate::user_thread::persona_context(r[0], r[1], r[2], r[3]) {
+            Some((pc, sp, x8)) => {
+                r[0] = Errno::Ok.status() as u32 as u64;
+                r[1] = pc;
+                r[2] = sp;
+                r[3] = x8;
+            }
+            None => r[0] = Errno::BadState.status() as u32 as u64,
+        }
         return;
     }
 

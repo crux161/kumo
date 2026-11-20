@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j877
 //j880
 //j881
 //j882
 //j883
+//j916
 
 use core::cell::UnsafeCell;
 
@@ -306,6 +306,23 @@ impl PersonaShim {
         frame[FRAME_ELR] = self.entry;
         frame[FRAME_SP_EL0] = self.stack_top & !15;
         PersonaTrap::Redirected
+    }
+
+    /// SH7-d3c-2 `PersonaContext` GET: the open call's foreign `(pc, sp, x8)`.
+    pub fn open_call(&self) -> Option<(u64, u64, u64)> {
+        self.saved
+    }
+
+    /// SH7-d3c-2 `PersonaContext` SEED: open a call as if the foreign code had trapped at
+    /// `pc` with `sp` and `x8`, so the next `PersonaReturn` enters it there. A Linux `clone`
+    /// child starts this way: exactly where its parent's `svc` resumes, every register its
+    /// own. Refused while a call is open.
+    pub fn seed_call(&mut self, pc: u64, sp: u64, x8: u64) -> bool {
+        if self.saved.is_some() {
+            return false;
+        }
+        self.saved = Some((pc, sp, x8));
+        true
     }
 
     /// `PersonaReturn`: restore the foreign PC, SP and x8; x0 already holds the result.
@@ -1346,6 +1363,28 @@ pub fn persona_resume(frame: &mut [u64]) -> bool {
         .find(|c| c.thread.koid() == current)
         .and_then(|c| c.persona.as_mut())
         .is_some_and(|shim| shim.resume(frame))
+}
+
+/// SH7-d3c-2 `PersonaContext` for the current thread: `op` GET answers the open call's
+/// foreign `(pc, sp, x8)`, SEED opens one. `None` when the thread has no registration, no
+/// open call (GET), an open call already (SEED), or `op` is unknown.
+pub fn persona_context(op: u64, pc: u64, sp: u64, x8: u64) -> Option<(u64, u64, u64)> {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return None;
+    }
+    let s = unsafe { &mut *sched_ptr() };
+    let current = s.dispatcher.current()?;
+    let shim = s
+        .children
+        .iter_mut()
+        .find(|c| c.thread.koid() == current)
+        .and_then(|c| c.persona.as_mut())?;
+    match op {
+        kumo_abi::sys::PERSONA_CONTEXT_GET => shim.open_call(),
+        kumo_abi::sys::PERSONA_CONTEXT_SEED => shim.seed_call(pc, sp, x8).then_some((0, 0, 0)),
+        _ => None,
+    }
 }
 
 /// SH6: the CURRENT thread's fault entry, taken for one delivery (see `FaultHandlerSet`).
@@ -3265,6 +3304,46 @@ mod ax4_capacity_tests {
             !shim.resume(&mut frame),
             "a second leave has nothing to restore"
         );
+    }
+
+    //j916
+    /// SH7-d3c-2: `PersonaContext` reads the open call and seeds one on a fresh thread, so a
+    /// Linux `clone` child resumes where its parent's `svc` did, through the same leave. A seed
+    /// over an open call is refused and changes nothing. — TEAL
+    #[test]
+    fn persona_context_reads_and_seeds_an_open_call() {
+        let mut parent = super::PersonaShim {
+            entry: 0x1c00_1000,
+            code_base: 0x1c00_0000,
+            code_len: 0x10_0000,
+            stack_top: 0x1c80_0000,
+            saved: None,
+        };
+        assert_eq!(parent.open_call(), None);
+        let mut frame = [0u64; 34];
+        frame[31] = 0x40_1004;
+        frame[33] = 0x7fff_f000;
+        frame[8] = 220; // Linux clone
+        assert_eq!(parent.redirect(&mut frame), super::PersonaTrap::Redirected);
+        assert_eq!(parent.open_call(), Some((0x40_1004, 0x7fff_f000, 220)));
+        assert!(!parent.seed_call(1, 2, 3), "a call is already open");
+        assert_eq!(parent.open_call(), Some((0x40_1004, 0x7fff_f000, 220)));
+
+        let mut child = super::PersonaShim {
+            stack_top: 0x2000_0000,
+            ..parent
+        };
+        child.saved = None;
+        assert!(child.seed_call(0x40_1004, 0x5000_0000, 220));
+        let mut leave = [0u64; 34];
+        leave[8] = 64;
+        leave[31] = 0x1c00_3004;
+        assert!(child.resume(&mut leave));
+        assert_eq!(
+            (leave[31], leave[33], leave[8]),
+            (0x40_1004, 0x5000_0000, 220)
+        );
+        assert_eq!(child.open_call(), None);
     }
 
     /// SH6: a fault registration is per thread, one-shot, and cleared by entry 0; the
