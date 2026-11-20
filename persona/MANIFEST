@@ -1,8 +1,8 @@
-#j915
 #j916
 #j918
 #j919
 #j920
+#j921
 # persona/ — Linux-side payloads for the persona shim (PLAN/022 SH7-c j888, SH7-d j889/j890).
 # Rebuild: scripts/persona-payloads.sh (needs docker + network). xtask refuses to pack a file
 # whose sha256 differs from this list (PERSONA_PAYLOADS in xtask/src/main.rs).
@@ -28,7 +28,7 @@
 02f75bff61ab33904b62ff58a6e2199c468cdfec1fb5a8ffcbc95f787674c806  greet
 fd6a3056417ccd32ab30d26fa68f11128c4769040556d58a7eb7043680879c8a  libgreet.so
 d0ab5f72cb929f2e64ceb1ed9e2d3e35f117f7551ba781ff57f6cfa7fa36af60  fileprobe
-e06a25921d420b47653e8fc3bd56238b11aef8e4229a9b0189322521a011bf18  writeprobe
+2df497d3872574d5d2e0ef31feb8dbc4239753ec7c5b62c274a8e4a823ecef49  writeprobe
 cbc27a4eff02d33406e84b6df75e38eda2322883828b272bd1e3686d61c672f1  bigread
 e704ab6e631bbb2efac56bd96296d29f443a97ec0fc48a81e5d74949eb623455  pipeprobe
 20a3538d87e85547c8f64dfcdeb9f72b868cdaaa1c16f3bd1843bc29f275174f  threadprobe

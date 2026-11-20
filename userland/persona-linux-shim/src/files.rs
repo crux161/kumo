@@ -1,8 +1,8 @@
-//j915
 //j916
 //j917
 //j918
 //j919
+//j921
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -86,7 +86,8 @@ enum Kind {
 }
 
 #[derive(Clone, Copy)]
-struct Fd {
+struct OpenFile {
+    refs: usize,
     kind: Kind,
     offset: u64,
     path: [u8; PATH_MAX],
@@ -97,8 +98,9 @@ struct Fd {
     dirty: bool,
 }
 
-impl Fd {
-    const FREE: Fd = Fd {
+impl OpenFile {
+    const FREE: Self = Self {
+        refs: 0,
         kind: Kind::Free,
         offset: 0,
         path: [0; PATH_MAX],
@@ -113,11 +115,18 @@ impl Fd {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Descriptor {
+    file: usize,
+    cloexec: bool,
+}
+
 struct Session {
     fs: Handle,
     stdin: Handle,
     stdout: Handle,
-    fds: [Fd; MAX_FDS],
+    fds: [Option<Descriptor>; MAX_FDS],
+    files: [OpenFile; MAX_FDS],
     /// Bytes of the last stdin message a short `read` did not take.
     stdin_carry: [u8; 256],
     stdin_carry_at: usize,
@@ -132,7 +141,8 @@ static mut SESSION: Session = Session {
     fs: Handle(0),
     stdin: Handle(0),
     stdout: Handle(0),
-    fds: [Fd::FREE; MAX_FDS],
+    fds: [None; MAX_FDS],
+    files: [OpenFile::FREE; MAX_FDS],
     stdin_carry: [0; 256],
     stdin_carry_at: 0,
     stdin_carry_len: 0,
@@ -182,9 +192,9 @@ pub fn init(fs: Handle, stdin: Handle, stdout: Handle) {
     s.fs = fs;
     s.stdin = stdin;
     s.stdout = stdout;
-    s.fds[0].kind = Kind::Stdin;
-    s.fds[1].kind = Kind::Stdout;
-    s.fds[2].kind = Kind::Stdout;
+    new_fd(Kind::Stdin, &[], O_RDONLY).expect("stdin slot");
+    new_fd(Kind::Stdout, &[], O_WRONLY).expect("stdout slot");
+    new_fd(Kind::Stdout, &[], O_WRONLY).expect("stderr slot");
 }
 
 // ---- the vfs session -----------------------------------------------------------------------
@@ -461,25 +471,84 @@ fn resolve(dirfd: i64, path: &[u8], out: &mut [u8; PATH_MAX]) -> Result<usize, i
 
 // ---- descriptors ---------------------------------------------------------------------------
 
-fn fd_entry(fd: i64) -> Result<&'static mut Fd, i64> {
-    let s = session();
-    if fd < 0 || fd as usize >= MAX_FDS || s.fds[fd as usize].kind == Kind::Free {
-        return Err(-errno::EBADF);
-    }
-    Ok(&mut s.fds[fd as usize])
+fn descriptor(fd: i64) -> Result<Descriptor, i64> {
+    session()
+        .fds
+        .get(fd as usize)
+        .copied()
+        .flatten()
+        .ok_or(-errno::EBADF)
 }
 
-fn new_fd(kind: Kind, path: &[u8]) -> i64 {
+fn fd_entry(fd: i64) -> Result<&'static mut OpenFile, i64> {
+    let index = descriptor(fd)?.file;
+    Ok(&mut session().files[index])
+}
+
+fn free_fd(min: usize) -> Result<usize, i64> {
+    (min..MAX_FDS)
+        .find(|&i| session().fds[i].is_none())
+        .ok_or(-errno::EMFILE)
+}
+
+fn new_fd(kind: Kind, path: &[u8], flags: u64) -> Result<usize, i64> {
+    let fd = free_fd(0)?;
     let s = session();
-    let Some(index) = (3..MAX_FDS).find(|&i| s.fds[i].kind == Kind::Free) else {
-        return -errno::EMFILE;
+    let file = s
+        .files
+        .iter()
+        .position(|entry| entry.refs == 0)
+        .ok_or(-errno::EMFILE)?;
+    let entry = &mut s.files[file];
+    entry.refs = 1;
+    entry.kind = kind;
+    entry.flags = flags & !O_CLOEXEC;
+    entry.path[..path.len()].copy_from_slice(path);
+    entry.path_len = path.len();
+    s.fds[fd] = Some(Descriptor {
+        file,
+        cloexec: flags & O_CLOEXEC != 0,
+    });
+    Ok(fd)
+}
+
+pub fn dup(fd: i64, min: u64, cloexec: bool) -> i64 {
+    let src = match descriptor(fd) {
+        Ok(src) => src,
+        Err(e) => return e,
     };
-    let fd = &mut s.fds[index];
-    fd.kind = kind;
-    fd.offset = 0;
-    fd.path[..path.len()].copy_from_slice(path);
-    fd.path_len = path.len();
-    index as i64
+    if min >= MAX_FDS as u64 {
+        return -errno::EINVAL;
+    }
+    match free_fd(min as usize) {
+        Ok(target) => duplicate_to(src, target, cloexec),
+        Err(e) => e,
+    }
+}
+
+pub fn dup3(fd: i64, target: i64, flags: u64) -> i64 {
+    if flags & !O_CLOEXEC != 0 || fd == target {
+        return -errno::EINVAL;
+    }
+    if !(0..MAX_FDS as i64).contains(&target) {
+        return -errno::EBADF;
+    }
+    match descriptor(fd) {
+        Ok(src) => duplicate_to(src, target as usize, flags & O_CLOEXEC != 0),
+        Err(e) => e,
+    }
+}
+
+fn duplicate_to(src: Descriptor, target: usize, cloexec: bool) -> i64 {
+    // The shim lock covers replacement. Hold the source across closing an existing alias.
+    session().files[src.file].refs += 1;
+    if let Some(old) = session().fds[target].replace(Descriptor {
+        file: src.file,
+        cloexec,
+    }) {
+        release_file(old.file);
+    }
+    target as i64
 }
 
 /// The open file behind `fd`, for `mmap`: `(vfs handle, size)`.
@@ -504,11 +573,6 @@ pub fn pipe2(pair: u64, flags: u64) -> i64 {
     if pair == 0 {
         return -errno::EFAULT;
     }
-    let s = session();
-    let mut slots = (3..MAX_FDS).filter(|&i| s.fds[i].kind == Kind::Free);
-    let (Some(reader), Some(writer)) = (slots.next(), slots.next()) else {
-        return -errno::EMFILE;
-    };
     let (a, b) = channel_create_pair();
     if a == u64::MAX || b == u64::MAX {
         if a != u64::MAX {
@@ -519,19 +583,29 @@ pub fn pipe2(pair: u64, flags: u64) -> i64 {
         }
         return -errno::ENOMEM;
     }
-    let inode = s.next_pipe;
-    s.next_pipe += 1;
-    for (fd, channel, readable) in [(reader, a, true), (writer, b, false)] {
-        s.fds[fd] = Fd {
-            kind: Kind::Pipe {
-                channel: channel as u32,
-                readable,
-                inode,
-            },
-            flags,
-            ..Fd::FREE
-        };
-    }
+    let inode = session().next_pipe;
+    session().next_pipe += 1;
+    let end = |channel: u64, readable: bool| Kind::Pipe {
+        channel: channel as u32,
+        readable,
+        inode,
+    };
+    let reader = match new_fd(end(a, true), &[], flags) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = handle_close(Handle(a as u32));
+            let _ = handle_close(Handle(b as u32));
+            return e;
+        }
+    };
+    let writer = match new_fd(end(b, false), &[], flags | O_WRONLY) {
+        Ok(fd) => fd,
+        Err(e) => {
+            close(reader as i64);
+            let _ = handle_close(Handle(b as u32));
+            return e;
+        }
+    };
     // As with the existing file surface, an invalid non-null user pointer faults the program.
     unsafe {
         (pair as *mut i32).write_unaligned(reader as i32);
@@ -577,17 +651,15 @@ pub fn openat(dirfd: i64, path_ptr: u64, flags: u64) -> i64 {
 /// A descriptor for a fresh open, recording its Linux flags; the vfs handle is released if the
 /// table is full.
 fn new_open(kind: Kind, path: &[u8], flags: u64, handle: u32) -> i64 {
-    let fd = new_fd(kind, path);
-    if fd < 0 {
-        if handle != u32::MAX {
-            close_vfs(handle);
+    match new_fd(kind, path, flags) {
+        Ok(fd) => fd as i64,
+        Err(e) => {
+            if handle != u32::MAX {
+                close_vfs(handle);
+            }
+            e
         }
-        return fd;
     }
-    let entry = &mut session().fds[fd as usize];
-    entry.flags = flags;
-    entry.dirty = false;
-    fd
 }
 
 /// SH7-e1: an open that may create, truncate or write. The existing entry is stat'ed first so
@@ -652,20 +724,30 @@ fn close_vfs(handle: u32) {
 }
 
 pub fn close(fd: i64) -> i64 {
-    let entry = match fd_entry(fd) {
-        Ok(entry) => entry,
-        Err(e) => return e,
+    let Some(open) = session().fds.get_mut(fd as usize).and_then(Option::take) else {
+        return -errno::EBADF;
     };
-    if let Kind::File { handle, .. } = entry.kind {
-        if entry.dirty {
+    release_file(open.file);
+    0
+}
+
+fn release_file(index: usize) {
+    let entry = &mut session().files[index];
+    entry.refs -= 1;
+    if entry.refs != 0 {
+        return;
+    }
+    let kind = entry.kind;
+    let dirty = entry.dirty;
+    *entry = OpenFile::FREE;
+    if let Kind::File { handle, .. } = kind {
+        if dirty {
             let _ = vfs_status(&Request::Flush { handle });
         }
         close_vfs(handle);
-    } else if let Kind::Pipe { channel, .. } = entry.kind {
+    } else if let Kind::Pipe { channel, .. } = kind {
         let _ = handle_close(Handle(channel));
     }
-    *entry = Fd::FREE;
-    0
 }
 
 pub fn read(fd: i64, buf: u64, len: u64) -> i64 {
@@ -693,14 +775,19 @@ fn read_from(fd: i64, buf: u64, len: u64, may_block: bool) -> i64 {
             return -errno::EFAULT;
         }
         let block = may_block && entry.flags & O_NONBLOCK == 0;
-        return match fill_pipe(fd as usize, channel, block) {
+        // A Linux read keeps the open file alive if another thread closes or replaces its fd.
+        let index = descriptor(fd).unwrap().file;
+        session().files[index].refs += 1;
+        let result = match fill_pipe(index, channel, block) {
             Ok(true) => {
                 let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-                session().fds[fd as usize].carry.take(out) as i64
+                session().files[index].carry.take(out) as i64
             }
             Ok(false) => 0,
             Err(e) => e,
         };
+        release_file(index);
+        return result;
     }
     if buf == 0 && len != 0 {
         return -errno::EFAULT;
@@ -724,12 +811,11 @@ fn read_from(fd: i64, buf: u64, len: u64, may_block: bool) -> i64 {
 
 /// Make the pipe read end at `index` hold bytes: `Ok(true)` when its tail has some, `Ok(false)`
 /// at end of stream (the writer closed). With nothing queued, a non-blocking read is EAGAIN and
-/// a blocking one parks with the shim lock released (SH7-d3c-2) — a sibling thread may be the
-/// writer. A descriptor closed while its reader was parked reads EBADF.
+/// a blocking one parks with the shim lock released so a sibling may write or close its end.
 fn fill_pipe(index: usize, channel: u32, block: bool) -> Result<bool, i64> {
     let busy = &PIPE_READER[index];
     loop {
-        let entry = &mut session().fds[index];
+        let entry = &mut session().files[index];
         if !matches!(entry.kind, Kind::Pipe { channel: c, readable: true, .. } if c == channel) {
             return Err(-errno::EBADF);
         }
@@ -757,7 +843,7 @@ fn fill_pipe(index: usize, channel: u32, block: bool) -> Result<bool, i64> {
                     return Err(-crate::signals::ERESTARTSYS);
                 };
                 let n = n as usize;
-                let entry = &mut session().fds[index];
+                let entry = &mut session().files[index];
                 if !matches!(entry.kind, Kind::Pipe { channel: c, .. } if c == channel) {
                     return Err(-errno::EBADF);
                 }
@@ -770,7 +856,7 @@ fn fill_pipe(index: usize, channel: u32, block: bool) -> Result<bool, i64> {
         if n as u32 as i32 == kumo_abi::Errno::PeerClosed.status() {
             return Ok(false);
         }
-        if !session().fds[index].carry.received(n) {
+        if !session().files[index].carry.received(n) {
             return Err(-errno::EIO);
         }
         return Ok(true);
@@ -894,33 +980,27 @@ pub fn fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
     const F_SETFD: u64 = 2;
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
-    let entry = match fd_entry(fd) {
-        Ok(entry) => entry,
+    let d = match descriptor(fd) {
+        Ok(d) => d,
         Err(e) => return e,
     };
-    if let Kind::Pipe { readable, .. } = entry.kind {
-        return match cmd {
-            F_GETFD => i64::from(entry.flags & O_CLOEXEC != 0),
-            F_SETFD => {
-                entry.flags = (entry.flags & !O_CLOEXEC) | if arg & 1 != 0 { O_CLOEXEC } else { 0 };
-                0
-            }
-            F_GETFL => (entry.flags & O_NONBLOCK) as i64 | i64::from(!readable),
-            F_SETFL => {
-                entry.flags = (entry.flags & !O_NONBLOCK) | (arg & O_NONBLOCK);
-                0
-            }
-            _ => -errno::EINVAL,
-        };
-    }
     match cmd {
-        // Close-on-exec has no meaning until the persona can exec (SH7-f); accepted and kept 0.
-        F_GETFD | F_SETFD | F_SETFL => 0,
-        F_GETFL => match entry.kind {
-            Kind::Dir { .. } => O_DIRECTORY as i64,
-            Kind::Stdout => 1, // O_WRONLY
-            _ => 0,            // O_RDONLY
-        },
+        0 | 1030 => dup(fd, arg, cmd == 1030), // F_DUPFD, F_DUPFD_CLOEXEC
+        F_GETFD => i64::from(d.cloexec),
+        F_SETFD => {
+            session().fds[fd as usize] = Some(Descriptor {
+                cloexec: arg & 1 != 0,
+                ..d
+            });
+            0
+        }
+        F_GETFL => (session().files[d.file].flags & !(O_CREAT | O_EXCL | O_TRUNC)) as i64,
+        F_SETFL => {
+            let flags = &mut session().files[d.file].flags;
+            let mutable = O_NONBLOCK | O_APPEND;
+            *flags = (*flags & !mutable) | (arg & mutable);
+            0
+        }
         _ => -errno::EINVAL,
     }
 }
@@ -1305,7 +1385,7 @@ fn write_file(fd: i64, bytes: &[u8], at: Option<u64>) -> i64 {
             break;
         }
     }
-    let entry = &mut session().fds[fd as usize];
+    let entry = fd_entry(fd).expect("open file under shim lock");
     if let Kind::File { size, .. } = &mut entry.kind {
         *size = (*size).max(offset);
     }
@@ -1353,7 +1433,7 @@ pub fn ftruncate(fd: i64, len: u64) -> i64 {
     }
     let status = vfs_status(&Request::SetLen { handle, len });
     if status == 0 {
-        let entry = &mut session().fds[fd as usize];
+        let entry = fd_entry(fd).expect("open file under shim lock");
         if let Kind::File { size, .. } = &mut entry.kind {
             *size = len;
         }
@@ -1369,7 +1449,7 @@ pub fn fsync(fd: i64) -> i64 {
             Kind::File { handle, .. } => {
                 let status = vfs_status(&Request::Flush { handle });
                 if status == 0 {
-                    session().fds[fd as usize].dirty = false;
+                    entry.dirty = false;
                 }
                 status
             }

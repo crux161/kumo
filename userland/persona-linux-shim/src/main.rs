@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j915
 //j916
 //j917
 //j918
 //j919
+//j921
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -40,6 +40,8 @@ kumo_rt::entry!(main);
 
 mod nr {
     pub const GETCWD: u64 = 17;
+    pub const DUP: u64 = 23;
+    pub const DUP3: u64 = 24;
     pub const FCNTL: u64 = 25;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
@@ -441,6 +443,8 @@ fn serve_locked(number: u64, frame: &[u64; 31]) -> i64 {
         nr::FSTAT => files::fstat(a0 as i64, a1),
         nr::NEWFSTATAT => files::newfstatat(a0 as i64, a1, a2, frame[3]),
         nr::GETDENTS64 => files::getdents64(a0 as i64, a1, a2),
+        nr::DUP => files::dup(a0 as i64, 0, false),
+        nr::DUP3 => files::dup3(a0 as i64, a1 as i64, a2),
         nr::FCNTL => files::fcntl(a0 as i64, a1, a2),
         nr::IOCTL => -errno::ENOTTY,
         nr::RT_SIGACTION => signals::rt_sigaction(a0, a1, a2, frame[3]),

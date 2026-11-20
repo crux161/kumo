@@ -1,3 +1,4 @@
+//j921
 /* SH7-e1 (j918, PLAN/022 SH7-e, cut W1): the Linux write surface on KUMO, over the image's
  * read-write vfs session, through musl. One line per failed check, a phase line per section,
  * then a verdict. Leaves nothing behind (it removes its own tree). — TEAL */
@@ -26,6 +27,44 @@ static unsigned char pattern(long i)
 }
 
 static unsigned char data[5003], back[5003];
+
+/* Exercise the operations musl performs between clone and exec of the linker. */
+static void check_aliases(void)
+{
+    int fd = open("/tmp/Write-Probe/data.bin", O_RDONLY | O_CLOEXEC);
+    int alias = fcntl(fd, F_DUPFD_CLOEXEC, 12);
+    char byte;
+    check(alias >= 12 && fcntl(alias, F_GETFD) == FD_CLOEXEC, "F_DUPFD_CLOEXEC minimum");
+    check(fcntl(alias, F_SETFD, 0) == 0 && fcntl(fd, F_GETFD) == FD_CLOEXEC,
+          "close-on-exec belongs to the descriptor");
+    check(read(alias, &byte, 1) == 1 && lseek(fd, 0, SEEK_CUR) == 1, "shared offset");
+    close(fd);
+    check(read(alias, &byte, 1) == 1 && (unsigned char)byte == data[1],
+          "file survives close of original fd");
+    close(alias);
+
+    int ends[2];
+    if (pipe2(ends, O_CLOEXEC | O_NONBLOCK) != 0) {
+        check(0, "pipe for dup3");
+        return;
+    }
+    int reader = dup(ends[0]);
+    int saved = dup(STDOUT_FILENO);
+    check(reader >= 0 && fcntl(reader, F_GETFD) == 0, "dup clears close-on-exec");
+    check(dup3(-1, ends[1], 0) < 0 && errno == EBADF, "bad source preserves target");
+    check(dup3(ends[1], ends[1], 0) < 0 && errno == EINVAL, "dup3 rejects identical fds");
+    check(dup3(ends[1], STDOUT_FILENO, O_CLOEXEC) == STDOUT_FILENO, "redirect stdout");
+    close(ends[1]);
+    ssize_t sent = write(STDOUT_FILENO, "abc", 3);
+    check(dup3(saved, STDOUT_FILENO, 0) == STDOUT_FILENO, "restore stdout");
+    close(saved);
+    check(sent == 3 && read(ends[0], &byte, 1) == 1 && byte == 'a', "redirected write");
+    close(ends[0]);
+    char tail[2];
+    check(read(reader, tail, 2) == 2 && memcmp(tail, "bc", 2) == 0, "shared pipe tail");
+    check(read(reader, &byte, 1) == 0, "EOF after last writer alias closes");
+    close(reader);
+}
 
 int main(void)
 {
@@ -61,6 +100,7 @@ int main(void)
     check(write(fd, data, 1) == -1 && errno == EBADF, "write on O_RDONLY is EBADF");
     close(fd);
     printf("writeprobe: create, 5003-byte write and read-back OK\n");
+    check_aliases();
 
     /* pwrite/pread, truncate, append, O_TRUNC, O_EXCL */
     fd = open("/tmp/Write-Probe/data.bin", O_RDWR);
