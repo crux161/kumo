@@ -1,5 +1,6 @@
 //j456
 //j457
+//j911
 
 //! x86_64 ring-3 transition and `int 0x80` dispatch mechanics.
 //!
@@ -54,6 +55,24 @@ pub(crate) fn set_svc_hook(hook: extern "C" fn(*mut u64)) {
 pub(crate) fn svc_hook() -> Option<extern "C" fn(*mut u64)> {
     let hook = SVC_HOOK.load(Ordering::Acquire);
     (hook != 0).then(|| unsafe { core::mem::transmute(hook) })
+}
+
+/// j911 (PLAN/026 U1): the shared Kumo syscall frame for an AMD64 `int 0x80`. Arguments x0–x7
+/// arrive in RDI,RSI,RDX,RCX,R8,R9,R10,R11 (`args`, in that order) and the number in RAX, which
+/// lands in x8 as arm64's `svc` convention puts it. Eight arguments cover `channel_call`.
+pub(crate) fn int80_args(number: u64, args: [u64; 8]) -> [u64; 31] {
+    let mut regs = [0u64; 31];
+    regs[..8].copy_from_slice(&args);
+    regs[8] = number;
+    regs
+}
+
+/// j911: the six result slots x0–x5 the kernel may write, in the order AMD64 returns them:
+/// RAX,RDX,RCX,R8,R9,R10. RDI, RSI and R11 are not result registers, so a caller's x0, x1 and x7
+/// survive the call (the FP/SIMD probe tests RSI afterwards). Every result register is
+/// caller-clobbered in kumo-rt's `clobber_abi("C")`.
+pub(crate) fn int80_results(regs: &[u64; 31]) -> [u64; 6] {
+    [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]]
 }
 
 pub(crate) fn set_fault_hook(hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {
@@ -268,6 +287,16 @@ pub(crate) fn fpsimd_payload() -> &'static [u8] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn int80_carries_eight_arguments_and_six_results() {
+        let regs = super::int80_args(0x2f, [10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(&regs[..9], &[10, 11, 12, 13, 14, 15, 16, 17, 0x2f]);
+        assert!(regs[9..].iter().all(|&r| r == 0));
+        let mut out = regs;
+        out[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(super::int80_results(&out), [1, 2, 3, 4, 5, 6]);
+    }
+
     use super::*;
 
     #[test]

@@ -1,12 +1,12 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j689
 //j692
 //j695
 //j700
 //j702
 //j711
 //j711
+//j911
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
@@ -86,7 +86,10 @@ struct Utf8Decoder {
 /// controller scans the framebuffer from RAM; on metal, CPU pixel writes can sit in the
 /// D-cache where the scanout never sees them (a blank screen even though the driver is
 /// running). No-op on the host; harmless on QEMU and on WC/Device buffers.
-#[cfg(target_os = "none")]
+/// j911: every cache clean and barrier in this file is arm64-only. On x86 the CPU's caches
+/// snoop and user framebuffer mappings are uncached or write-combining, so the host no-ops
+/// (`clean_pixels` below) serve x86 too.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 #[inline]
 unsafe fn fb_clean_line(addr: usize) {
     unsafe {
@@ -127,7 +130,7 @@ unsafe fn blit_glyph(
             }
         }
         // Clean both endpoints, including a wide glyph's second cache line. — KESTREL
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         if row_start < len_px {
             unsafe {
                 fb_clean_line(base.add(row_start) as usize);
@@ -138,7 +141,7 @@ unsafe fn blit_glyph(
             }
         }
     }
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     unsafe {
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
@@ -175,7 +178,7 @@ unsafe fn blit_face_cell(
             }
         }
         // Clean both endpoints of the row, as the bit blitter does. — TIMBERDOODLE
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         if row_start < len_px {
             unsafe {
                 fb_clean_line(base.add(row_start) as usize);
@@ -186,7 +189,7 @@ unsafe fn blit_face_cell(
             }
         }
     }
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     unsafe {
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
@@ -244,7 +247,7 @@ unsafe fn blit_wide_glyph(
             }
         }
         // Clean both endpoints of the row, as the narrow blitters do. — TIMBERDOODLE
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         if row_start < len_px {
             unsafe {
                 fb_clean_line(base.add(row_start) as usize);
@@ -255,7 +258,7 @@ unsafe fn blit_wide_glyph(
             }
         }
     }
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     unsafe {
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
@@ -432,7 +435,7 @@ impl Console {
             unsafe {
                 self.flush_shadow(self.len_px);
             }
-            #[cfg(target_os = "none")]
+            #[cfg(all(target_arch = "aarch64", target_os = "none"))]
             unsafe {
                 for i in (0..self.len_px).step_by(16) {
                     fb_clean_line(self.base.add(i) as usize);
@@ -478,7 +481,7 @@ impl Console {
         for idx in 0..self.len_px {
             unsafe { self.put(idx, color) };
         }
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         unsafe {
             let mut j = 0;
             while j < self.len_px {
@@ -893,7 +896,7 @@ impl Console {
                 for index in start.min(self.len_px)..end {
                     unsafe { self.put(index, color) };
                 }
-                #[cfg(target_os = "none")]
+                #[cfg(all(target_arch = "aarch64", target_os = "none"))]
                 if start < end {
                     unsafe {
                         fb_clean_line(self.base.add(start) as usize);
@@ -902,7 +905,7 @@ impl Console {
                 }
             }
         }
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         unsafe {
             core::arch::asm!("dsb ish", options(nostack, preserves_flags));
         }
@@ -932,7 +935,7 @@ impl Console {
                 let pixel = unsafe { self.shadow.add(index).read() };
                 unsafe { self.put(index, pixel ^ 0x00ff_ffff) };
             }
-            #[cfg(target_os = "none")]
+            #[cfg(all(target_arch = "aarch64", target_os = "none"))]
             if start < end {
                 unsafe {
                     fb_clean_line(self.base.add(start) as usize);
@@ -940,7 +943,7 @@ impl Console {
                 }
             }
         }
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         unsafe {
             core::arch::asm!("dsb ish", options(nostack, preserves_flags));
         }
@@ -1058,7 +1061,7 @@ impl Console {
             }
             self.flush_shadow(visible);
         }
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         unsafe {
             let mut j = 0;
             while j < visible.min(self.len_px) {
@@ -1777,7 +1780,7 @@ pub fn present_is_narrated(presented: u32) -> bool {
 /// # Safety
 /// `base` must point at a framebuffer mapping covering `start..start + len` pixels, and the
 /// caller must own that mapping for the duration of the call.
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
 pub unsafe fn clean_pixels(_base: *mut u32, _start: usize, _len: usize) {}
 
 /// Clean the cache lines covering `start..start + len` pixels, then DSB.
@@ -1785,7 +1788,7 @@ pub unsafe fn clean_pixels(_base: *mut u32, _start: usize, _len: usize) {}
 /// # Safety
 /// `base` must point at a framebuffer mapping covering `start..start + len` pixels, and the
 /// caller must own that mapping for the duration of the call.
-#[cfg(target_os = "none")]
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 pub unsafe fn clean_pixels(base: *mut u32, start: usize, len: usize) {
     unsafe {
         let mut offset = 0;

@@ -1,8 +1,8 @@
-//j897
 //j904
 //j905
 //j907
 //j909
+//j911
 
 use std::env;
 use std::fmt;
@@ -1355,10 +1355,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             ];
             split_payload(out_dir, plan, files)?
         }
-        ImageArch::X86_64 => {
-            let hello = build_x86_hello_image(&workspace_root()?)?;
-            build_initrd(&[(HELLO_PATH, hello.as_slice())])?
-        }
+        ImageArch::X86_64 => build_x86_initrd(&workspace_root()?)?,
     };
 
     let staged_path = out_dir
@@ -1729,9 +1726,44 @@ fn build_x86_hello_image(root: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn build_x86_multiboot_initrd(root: &Path) -> Result<PathBuf, String> {
+/// j911 (PLAN/026 U1): Sora for AMD64. kumo-rt's syscall wrappers and Sora's `_start` now have
+/// x86 forms, so this is the whole supervisor (arm64-sized), linked fixed-address by Sora's
+/// build.rs. The x86 initrds carry it as `bin/sora`; the first-light harness still only runs
+/// `bin/hello` until U2 starts Sora.
+fn build_x86_sora_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "sora",
+            "--bin",
+            "sora",
+            "--target",
+            "x86_64-unknown-none",
+            "--release",
+        ],
+    )?;
+    let source_path = root.join("target/x86_64-unknown-none/release").join("sora");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_x86_64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as x86 Sora ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+/// The AMD64 boot initrd: the first-light program and the supervisor.
+fn build_x86_initrd(root: &Path) -> Result<Vec<u8>, String> {
     let hello = build_x86_hello_image(root)?;
-    let initrd = build_initrd(&[(HELLO_PATH, hello.as_slice())])?;
+    let sora = build_x86_sora_image(root)?;
+    build_initrd(&[
+        (HELLO_PATH, hello.as_slice()),
+        (kumo_abi::SORA_INIT_PATH, sora.as_slice()),
+    ])
+}
+
+fn build_x86_multiboot_initrd(root: &Path) -> Result<PathBuf, String> {
+    let initrd = build_x86_initrd(root)?;
     let hello_file = kumo_abi::find_file(&initrd, HELLO_PATH)
         .map_err(|err| format!("validate x86 initrd: {err:?}"))?
         .ok_or_else(|| format!("x86 initrd is missing {HELLO_PATH}"))?;

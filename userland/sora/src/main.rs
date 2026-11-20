@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j890
 //j892
 //j893
 //j894
 //j895
+//j911
 
 extern crate alloc;
 
@@ -2010,6 +2010,7 @@ fn graphics_clients(cmd: &kumoza::Command, initrd: Handle) {
 // `BOOTINFO_VMO_HANDLE`. x9 is scratch; sora_main is reached with x0–x7 (its C-ABI args)
 // untouched. `_start` runs at EL0 with Sora's address space live, so the static (.bss, mapped
 // RW) is writable here.
+#[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     ".section .text._start, \"ax\"",
     ".global _start",
@@ -2028,6 +2029,32 @@ core::arch::global_asm!(
     slot = sym BOOTINFO_VMO_HANDLE,
     dtb_slot = sym DTB_VMO_HANDLE,
     job_slot = sym ROOT_JOB_HANDLE,
+);
+
+// j911 (PLAN/026 U1): Sora's AMD64 entry. The kernel's register image x[0..10] arrives as
+// RDI,RSI,RDX,RCX,R8,R9 (sora_main's first six arguments), R10/R11 (its seventh and eighth, which
+// SysV passes on the stack), and RAX/RBX/RBP (the BootInfo VMO, DTB VMO and root Job handles that
+// arm64 carries in x8/x9/x10). Stash the three handles, push the two stack arguments on a 16-byte
+// aligned stack, clear the frame pointer, and call sora_main.
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+core::arch::global_asm!(
+    ".section .text._start, \"ax\"",
+    ".global _start",
+    "_start:",
+    "  movq %rax, {slot}(%rip)",
+    "  movq %rbx, {dtb_slot}(%rip)",
+    "  movq %rbp, {job_slot}(%rip)",
+    "  xorl %ebp, %ebp",
+    "  andq $-16, %rsp",
+    "  subq $16, %rsp",
+    "  movq %r10, 0(%rsp)",
+    "  movq %r11, 8(%rsp)",
+    "  call sora_main",
+    "1: jmp 1b",
+    slot = sym BOOTINFO_VMO_HANDLE,
+    dtb_slot = sym DTB_VMO_HANDLE,
+    job_slot = sym ROOT_JOB_HANDLE,
+    options(att_syntax),
 );
 
 fn log(msg: &[u8]) {

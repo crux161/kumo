@@ -1,8 +1,8 @@
-//j873
 //j881
 //j884
 //j891
 //j894
+//j911
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -115,6 +115,32 @@ fn syscall6(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64) 
     ret
 }
 
+/// j911 (PLAN/026 U1): the whole AMD64 KUMO syscall frame. `int 0x80` with the number in RAX
+/// and x0–x7 in RDI,RSI,RDX,RCX,R8,R9,R10,R11; the kernel returns x0–x5 in RAX,RDX,RCX,R8,R9,R10
+/// (`kumo-hal-x86_64::ring3::int80_results`). The arm64 wrappers name x-registers directly; their
+/// x86 twins below go through this one function instead.
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+fn syscall_full(num: Syscall, args: [u64; 8]) -> [u64; 6] {
+    let (r0, r1, r2, r3, r4, r5): (u64, u64, u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") num as u64 => r0,
+            in("rdi") args[0],
+            in("rsi") args[1],
+            inlateout("rdx") args[2] => r1,
+            inlateout("rcx") args[3] => r2,
+            inlateout("r8") args[4] => r3,
+            inlateout("r9") args[5] => r4,
+            inlateout("r10") args[6] => r5,
+            in("r11") args[7],
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    [r0, r1, r2, r3, r4, r5]
+}
+
 #[cfg(not(any(
     target_arch = "aarch64",
     all(target_arch = "x86_64", target_os = "none")
@@ -139,12 +165,18 @@ pub fn debug_write(_ptr: *const u8, _len: usize) -> u64 {
     0
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn channel_create() -> u64 {
     syscall(Syscall::ChannelCreate, 0, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_create() -> u64 {
     u64::MAX
 }
@@ -168,7 +200,16 @@ pub fn channel_create_pair() -> (u64, u64) {
     (h0, h1)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn channel_create_pair() -> (u64, u64) {
+    let r = syscall_full(Syscall::ChannelCreate, [0; 8]);
+    (r[0], r[1])
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_create_pair() -> (u64, u64) {
     (u64::MAX, u64::MAX)
 }
@@ -312,7 +353,10 @@ pub const fn syscall_handle(raw: u64) -> Option<Handle> {
 
 /// Duplicate a handle with a subset of its original rights.
 /// The new handle shares the same kernel object.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn handle_duplicate(handle: Handle, rights: Rights) -> u64 {
     syscall(
         Syscall::HandleDuplicate,
@@ -323,7 +367,10 @@ pub fn handle_duplicate(handle: Handle, rights: Rights) -> u64 {
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn handle_duplicate(_handle: Handle, _rights: Rights) -> u64 {
     0
 }
@@ -331,7 +378,10 @@ pub fn handle_duplicate(_handle: Handle, _rights: Rights) -> u64 {
 /// Write a message with an optional handle transfer. Pass `handle` = Handle(0) for
 /// no transfer; any non-zero handle is removed from the sender's table and arrives
 /// at the receiver.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn channel_write_with_handle(
     channel: Handle,
     ptr: *const u8,
@@ -347,7 +397,10 @@ pub fn channel_write_with_handle(
     ) as Status
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_write_with_handle(
     _channel: Handle,
     _ptr: *const u8,
@@ -368,12 +421,18 @@ pub fn channel_write_with_handle(
 ///     futex_wait(state.as_ptr(), OBSERVED);
 /// }
 /// ```
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn futex_wait(addr: *const u32, expected: u32) -> Status {
     syscall(Syscall::FutexWait, addr as u64, u64::from(expected), 0, 0) as Status
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn futex_wait(_addr: *const u32, _expected: u32) -> Status {
     kumo_abi::Errno::NotSupported.status()
 }
@@ -381,17 +440,26 @@ pub fn futex_wait(_addr: *const u32, _expected: u32) -> Status {
 /// Wake up to `count` threads parked on `addr`. Returns how many were woken — waking none is
 /// normal, not an error: it means nobody had arrived yet, and that waiter will find the updated
 /// word instead of sleeping.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
     syscall(Syscall::FutexWake, addr as u64, u64::from(count), 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn futex_wake(_addr: *const u32, _count: u32) -> u64 {
     0
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn channel_read(channel: Handle, buf: *mut u8, cap: usize) -> u64 {
     syscall(
         Syscall::ChannelRead,
@@ -402,7 +470,10 @@ pub fn channel_read(channel: Handle, buf: *mut u8, cap: usize) -> u64 {
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_read(_channel: Handle, _buf: *mut u8, _cap: usize) -> u64 {
     0
 }
@@ -467,6 +538,31 @@ pub fn channel_try_read_with_handle(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn channel_try_read_with_handle(
+    channel: Handle,
+    buf: *mut u8,
+    cap: usize,
+) -> Option<(usize, u64)> {
+    let r = syscall_full(
+        Syscall::ChannelRead,
+        [
+            channel.0 as u64,
+            buf as u64,
+            cap as u64,
+            kumo_abi::sys::CHANNEL_READ_NONBLOCK,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    if r[0] == kumo_abi::Errno::ShouldWait.status() as u32 as u64 {
+        return None;
+    }
+    Some((r[0] as usize, r[1]))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub fn channel_read_with_handle(channel: Handle, buf: *mut u8, cap: usize) -> (usize, u64) {
     let mut ret = Syscall::ChannelRead as u64;
     let mut handle = cap as u64;
@@ -527,9 +623,30 @@ pub fn channel_read_call(handle: Handle, buf: &mut [u8]) -> (i64, usize, [u64; 4
     (count as i64, attached as usize, [w0, w1, w2, w3])
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn channel_read_call(handle: Handle, buf: &mut [u8]) -> (i64, usize, [u64; 4]) {
+    let r = syscall_full(
+        Syscall::ChannelRead,
+        [
+            handle.0 as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    (r[0] as i64, r[1] as usize, [r[2], r[3], r[4], r[5]])
+}
+
 /// The x86_64 backend does not implement the AX2 register fast path yet; there is no call
 /// frame to return, so the read is refused up front with `NotSupported` in x0.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_read_call(_handle: Handle, _buf: &mut [u8]) -> (i64, usize, [u64; 4]) {
     (i64::from(kumo_abi::Errno::NotSupported.status()), 0, [0; 4])
 }
@@ -675,9 +792,33 @@ pub fn channel_call(handle: Handle, deadline_ns: u64, payload: &[u8]) -> (i64, u
     (status as i64, reply_len as usize, [w0, w1, w2, w3])
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn channel_call(handle: Handle, deadline_ns: u64, payload: &[u8]) -> (i64, usize, [u64; 4]) {
+    let Some(words) = kumo_abi::pack_call_payload(payload) else {
+        return (i64::from(kumo_abi::Errno::InvalidArgs.status()), 0, [0; 4]);
+    };
+    let r = syscall_full(
+        Syscall::ChannelCall,
+        [
+            handle.0 as u64,
+            deadline_ns,
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            payload.len() as u64,
+            0,
+        ],
+    );
+    (r[0] as i64, r[1] as usize, [r[2], r[3], r[4], r[5]])
+}
+
 /// The x86_64 backend does not implement the AX2 register fast path yet, so a call is refused
 /// up front instead of entering a syscall the kernel does not route.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_call(_handle: Handle, _deadline_ns: u64, _payload: &[u8]) -> (i64, usize, [u64; 4]) {
     (i64::from(kumo_abi::Errno::NotSupported.status()), 0, [0; 4])
 }
@@ -689,7 +830,10 @@ pub fn channel_call(_handle: Handle, _deadline_ns: u64, _payload: &[u8]) -> (i64
 /// Returns `0` when the parked caller receives the reply, or `BadState` when it is no longer
 /// parked (it timed out or died; the reply is discarded). A reply longer than 32 bytes is
 /// refused locally with `InvalidArgs`, never truncated.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn channel_reply(len: usize, words: [u64; 4]) -> i64 {
     if len > kumo_abi::MAX_CALL_BYTES {
         return i64::from(kumo_abi::Errno::InvalidArgs.status());
@@ -707,12 +851,18 @@ pub fn channel_reply(len: usize, words: [u64; 4]) -> i64 {
 
 /// The x86_64 backend does not implement the AX2 register fast path yet, so a reply is refused
 /// up front with `NotSupported`; no call can be parked for it to answer.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_reply(_len: usize, _words: [u64; 4]) -> i64 {
     i64::from(kumo_abi::Errno::NotSupported.status())
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn vmo_write(vmo: Handle, offset: u64, buf: *const u8, len: usize) -> u64 {
     syscall(
         Syscall::VmoWrite,
@@ -723,24 +873,36 @@ pub fn vmo_write(vmo: Handle, offset: u64, buf: *const u8, len: usize) -> u64 {
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn vmo_write(_vmo: Handle, _offset: u64, _buf: *const u8, _len: usize) -> u64 {
     0
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn vmo_create(size: u64) -> u64 {
     syscall(Syscall::VmoCreate, size, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn vmo_create(_size: u64) -> u64 {
     u64::MAX
 }
 
 /// Create one shareable DMA VMO backed by independent pages. `pages` must have exactly
 /// one entry per rounded-up 4 KiB page; it receives physical addresses only on success.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn vmo_create_paged(size: u64, pages: &mut [u64]) -> u64 {
     syscall(
         Syscall::VmoCreatePaged,
@@ -751,7 +913,10 @@ pub fn vmo_create_paged(size: u64, pages: &mut [u64]) -> u64 {
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn vmo_create_paged(_size: u64, _pages: &mut [u64]) -> u64 {
     u64::MAX
 }
@@ -804,7 +969,10 @@ pub fn vmo_create_contiguous(_size: u64) -> (u64, u64) {
     (u64::MAX, 0)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn vmo_read(vmo: Handle, offset: u64, buf: *mut u8, len: usize) -> u64 {
     syscall(
         Syscall::VmoRead,
@@ -815,24 +983,36 @@ pub fn vmo_read(vmo: Handle, offset: u64, buf: *mut u8, len: usize) -> u64 {
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn vmo_read(_vmo: Handle, _offset: u64, _buf: *mut u8, _len: usize) -> u64 {
     0
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn process_create(vmar_base: u64, vmar_size: u64) -> u64 {
     syscall(Syscall::ProcessCreate, vmar_base, vmar_size, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn process_create(_vmar_base: u64, _vmar_size: u64) -> u64 {
     u64::MAX
 }
 
 /// Map a VMO into a process's address space (syscall `VmarMap`).
 /// `flags` are [`kumo_abi::VmarFlags`] bits OR'd together.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn vmar_map(
     process: Handle,
     vmo: Handle,
@@ -881,7 +1061,17 @@ pub fn vmar_map_anywhere(vmo: Handle, len: u64, flags: u64) -> (u64, u64) {
     (status, addr)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn vmar_map_anywhere(vmo: Handle, len: u64, flags: u64) -> (u64, u64) {
+    // process: self, vmo_offset 0, virt 0 asks the kernel to place it.
+    let r = syscall_full(Syscall::VmarMap, [0, vmo.0 as u64, 0, 0, len, flags, 0, 0]);
+    (r[0], r[1])
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn vmar_map_anywhere(_vmo: Handle, _len: u64, _flags: u64) -> (u64, u64) {
     (u64::MAX, 0)
 }
@@ -911,12 +1101,28 @@ pub fn vmar_map_anywhere_at(vmo: Handle, vmo_offset: u64, len: u64, flags: u64) 
     (status, addr)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn vmar_map_anywhere_at(vmo: Handle, vmo_offset: u64, len: u64, flags: u64) -> (u64, u64) {
+    // process: self, virt 0 asks the kernel to place it.
+    let r = syscall_full(
+        Syscall::VmarMap,
+        [0, vmo.0 as u64, vmo_offset, 0, len, flags, 0, 0],
+    );
+    (r[0], r[1])
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn vmar_map_anywhere_at(_vmo: Handle, _vmo_offset: u64, _len: u64, _flags: u64) -> (u64, u64) {
     (u64::MAX, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn vmar_map(
     _process: Handle,
     _vmo: Handle,
@@ -930,37 +1136,58 @@ pub fn vmar_map(
 
 /// Remove an exact mapping from this process's address space (syscall `VmarUnmap`).
 /// The range must match one recorded mapping exactly; returns 0 on success. (J660)
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn vmar_unmap(virt: u64, len: u64) -> u64 {
     syscall(Syscall::VmarUnmap, 0, virt, len, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn vmar_unmap(_virt: u64, _len: u64) -> u64 {
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn thread_create(process: Handle) -> u64 {
     syscall(Syscall::ThreadCreate, process.0 as u64, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn thread_create(_process: Handle) -> u64 {
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn thread_start(thread: Handle, entry: u64, sp: u64, arg: u64) -> u64 {
     syscall(Syscall::ThreadStart, thread.0 as u64, entry, sp, arg)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn thread_start(_thread: Handle, _entry: u64, _sp: u64, _arg: u64) -> u64 {
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn address_space_create(process: Handle, stack_virt: u64, stack_size: u64) -> u64 {
     syscall(
         Syscall::AddressSpaceCreate,
@@ -971,12 +1198,18 @@ pub fn address_space_create(process: Handle, stack_virt: u64, stack_size: u64) -
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn address_space_create(_process: Handle, _stack_virt: u64, _stack_size: u64) -> u64 {
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn process_run(process: Handle, entry: u64, sp: u64, arg: u64, arg2: u64, flags: u64) -> u64 {
     syscall6(
         Syscall::ProcessRun,
@@ -989,7 +1222,10 @@ pub fn process_run(process: Handle, entry: u64, sp: u64, arg: u64, arg2: u64, fl
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn process_run(
     _process: Handle,
     _entry: u64,
@@ -1036,9 +1272,30 @@ pub fn log_read(resource: Handle, offset: u64, buf: &mut [u8]) -> (u64, u64) {
     (copied, next)
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn log_read(resource: Handle, offset: u64, buf: &mut [u8]) -> (u64, u64) {
+    let r = syscall_full(
+        Syscall::LogRead,
+        [
+            resource.0 as u64,
+            offset,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    (r[0], r[1])
+}
+
 /// Without a second return register here, the next offset is assumed to follow on directly; a
 /// ring that wrapped past `offset` is read again from its oldest line instead of skipped to.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn log_read(resource: Handle, offset: u64, buf: &mut [u8]) -> (u64, u64) {
     let copied = syscall(
         Syscall::LogRead,
@@ -1063,18 +1320,27 @@ pub fn log_level(resource: Handle, level: u64) -> u64 {
 
 /// End a process this caller manages (J556). Needs `MANAGE` on `process`, which the handle
 /// `process_create` returned carries. Returns 0 on success.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn process_kill(process: Handle) -> u64 {
     syscall(Syscall::ProcessKill, process.0 as u64, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn process_kill(_process: Handle) -> u64 {
     u64::MAX
 }
 
 /// P10-g: block until the async child process exits.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn process_wait() -> u64 {
     syscall(Syscall::ProcessWait, 0, 0, 0, 0)
 }
@@ -1100,12 +1366,24 @@ pub fn process_wait_reaped() -> (u64, u64, u64) {
     (status, koid, code)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn process_wait_reaped() -> (u64, u64, u64) {
+    let r = syscall_full(Syscall::ProcessWait, [0; 8]);
+    (r[0], r[1], r[2])
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn process_wait_reaped() -> (u64, u64, u64) {
     (u64::MAX, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn process_wait() -> u64 {
     u64::MAX
 }
@@ -1131,19 +1409,34 @@ pub fn thread_self() -> (u64, u64, u64) {
     (thread, threads, mappings)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn thread_self() -> (u64, u64, u64) {
+    let r = syscall_full(Syscall::ThreadSelf, [0; 8]);
+    (r[0], r[1], r[2])
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn thread_self() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
 /// j881: give up the CPU to the next ready thread at this priority (`ThreadYield`). For poll
 /// loops: the caller keeps its own clock deadline but stops holding the CPU while it waits.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn thread_yield() -> u64 {
     syscall(Syscall::ThreadYield, 0, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn thread_yield() -> u64 {
     0
 }
@@ -1167,7 +1460,10 @@ pub fn job_set_policy(_job: Handle, _limit: u64) -> i64 {
     kumo_abi::Errno::NotSupported.status() as i64
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn interrupt_create(resource: Handle, irq: u32) -> u64 {
     syscall(
         Syscall::InterruptCreate,
@@ -1178,28 +1474,43 @@ pub fn interrupt_create(resource: Handle, irq: u32) -> u64 {
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn interrupt_create(_resource: Handle, _irq: u32) -> u64 {
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn port_wait(port: Handle) -> u64 {
     syscall(Syscall::PortWait, port.0 as u64, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn port_wait(_port: Handle) -> u64 {
     0
 }
 
 /// Read the kernel monotonic clock in nanoseconds.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn clock_get() -> u64 {
     syscall(Syscall::ClockGet, 0, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn clock_get() -> u64 {
     0
 }
@@ -1209,7 +1520,10 @@ pub fn clock_get() -> u64 {
 /// A one-shot timer bound to a private port, which is the only way a process blocks on time here.
 /// `drv-i2c-hid` has hand-rolled this since its bring-up; hoisting it means a caller who wants to
 /// wait until a deadline does not have to know that timers are delivered through ports.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn sleep_ns(delay_ns: u64) -> bool {
     let port_raw = port_create();
     if port_raw == u64::MAX {
@@ -1228,29 +1542,44 @@ pub fn sleep_ns(delay_ns: u64) -> bool {
     ok
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn sleep_ns(_delay_ns: u64) -> bool {
     false
 }
 
 /// Create a one-shot timer that signals after `delay_ns` of monotonic time.
 /// The returned handle is waitable and can be bound to a `Port`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn timer_create(delay_ns: u64) -> u64 {
     syscall(Syscall::TimerCreate, delay_ns, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn timer_create(_delay_ns: u64) -> u64 {
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn interrupt_wait(interrupt: Handle) -> u64 {
     syscall(Syscall::InterruptWait, interrupt.0 as u64, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn interrupt_wait(_interrupt: Handle) -> u64 {
     0
 }
@@ -1277,22 +1606,43 @@ pub fn interrupt_wait_stamped(interrupt: Handle) -> (u64, u64) {
     (count, stamp)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn interrupt_wait_stamped(interrupt: Handle) -> (u64, u64) {
+    let r = syscall_full(
+        Syscall::InterruptWait,
+        [interrupt.0 as u64, 0, 0, 0, 0, 0, 0, 0],
+    );
+    (r[0], r[1])
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn interrupt_wait_stamped(_interrupt: Handle) -> (u64, u64) {
     (0, 0)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn interrupt_complete(interrupt: Handle) -> Status {
     syscall(Syscall::InterruptComplete, interrupt.0 as u64, 0, 0, 0) as Status
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn interrupt_complete(_interrupt: Handle) -> Status {
     0
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn resource_mint_mmio(resource: Handle, phys_base: u64, len: u64) -> u64 {
     syscall(
         Syscall::ResourceMintMmio,
@@ -1303,7 +1653,10 @@ pub fn resource_mint_mmio(resource: Handle, phys_base: u64, len: u64) -> u64 {
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn resource_mint_mmio(_resource: Handle, _phys_base: u64, _len: u64) -> u64 {
     u64::MAX
 }
@@ -1427,7 +1780,10 @@ pub fn device_power_status(
 /// Claim the boot framebuffer for a userspace console driver. The kernel accepts
 /// this only when `resource` grants the requested physical range and that range is
 /// the framebuffer currently owned by the Stage-A console.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn framebuffer_claim(resource: Handle, phys_base: u64, len: u64) -> Status {
     syscall(
         Syscall::FramebufferClaim,
@@ -1438,7 +1794,10 @@ pub fn framebuffer_claim(resource: Handle, phys_base: u64, len: u64) -> Status {
     ) as Status
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn framebuffer_claim(_resource: Handle, _phys_base: u64, _len: u64) -> Status {
     kumo_abi::Errno::NotSupported.status()
 }
@@ -1446,7 +1805,10 @@ pub fn framebuffer_claim(_resource: Handle, _phys_base: u64, _len: u64) -> Statu
 /// Carve a child Resource bounded to MMIO `[phys_base, phys_base + len)` and the IRQ
 /// window `[irq_base, irq_base + irq_count)`. The IRQ window is packed into one argument
 /// as `(irq_base << 32) | irq_count` so the call fits the four-register syscall ABI.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn resource_create_child(
     parent: Handle,
     phys_base: u64,
@@ -1464,7 +1826,10 @@ pub fn resource_create_child(
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn resource_create_child(
     _parent: Handle,
     _phys_base: u64,
@@ -1475,42 +1840,66 @@ pub fn resource_create_child(
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn port_create() -> u64 {
     syscall(Syscall::PortCreate, 0, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn port_create() -> u64 {
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn handle_koid(handle: Handle) -> u64 {
     syscall(Syscall::HandleKoid, handle.0 as u64, 0, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn handle_koid(_handle: Handle) -> u64 {
     0
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn port_bind(port: Handle, object: Handle) -> u64 {
     syscall(Syscall::PortBind, port.0 as u64, object.0 as u64, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn port_bind(_port: Handle, _object: Handle) -> u64 {
     u64::MAX
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn port_unbind(port: Handle, object: Handle) -> u64 {
     syscall(Syscall::PortUnbind, port.0 as u64, object.0 as u64, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn port_unbind(_port: Handle, _object: Handle) -> u64 {
     u64::MAX
 }

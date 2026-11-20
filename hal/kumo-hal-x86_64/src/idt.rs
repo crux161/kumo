@@ -1,8 +1,8 @@
-//j435
 //j436
 //j439
 //j449
 //j450
+//j911
 
 //! x86_64 Interrupt Descriptor Table + CPU-exception handlers — "the Tower" for AMD64.
 //!
@@ -307,21 +307,26 @@ mod metal {
         if frame.vector == crate::ring3::SYSCALL_VECTOR as u64 && frame.cs & 3 == 3 {
             if let Some(hook) = crate::ring3::svc_hook() {
                 crate::ring3::record_call();
-                // Adapt the AMD64 int80 ABI to the shared Kumo syscall frame: RAX is the
-                // number, RDI/RSI/RDX/RCX/R8/R9 are arguments, and x0/x1 results return
-                // through RAX/RDX. The hardware frame below remains the authoritative full
+                // Adapt the AMD64 int80 ABI to the shared Kumo syscall frame (see
+                // `crate::ring3::int80_args` / `int80_results`, j911): RAX is the number,
+                // x0–x7 arrive in RDI,RSI,RDX,RCX,R8,R9,R10,R11 and x0–x5 return through
+                // RAX,RDX,RCX,R8,R9,R10. The hardware frame below remains the authoritative full
                 // user register image while a blocking syscall is switched out.
-                let mut regs = [0u64; 31];
-                regs[0] = frame.rdi;
-                regs[1] = frame.rsi;
-                regs[2] = frame.rdx;
-                regs[3] = frame.rcx;
-                regs[4] = frame.r8;
-                regs[5] = frame.r9;
-                regs[8] = frame.rax;
+                let mut regs = crate::ring3::int80_args(
+                    frame.rax,
+                    [
+                        frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8, frame.r9, frame.r10,
+                        frame.r11,
+                    ],
+                );
                 hook(regs.as_mut_ptr());
-                frame.rax = regs[0];
-                frame.rdx = regs[1];
+                let [rax, rdx, rcx, r8, r9, r10] = crate::ring3::int80_results(&regs);
+                frame.rax = rax;
+                frame.rdx = rdx;
+                frame.rcx = rcx;
+                frame.r8 = r8;
+                frame.r9 = r9;
+                frame.r10 = r10;
             } else {
                 match crate::ring3::dispatch(frame.rax, frame.rdi) {
                     crate::ring3::Dispatch::Return(value) => frame.rax = value,
