@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 //j823
+//j922
 //! AX1 address-space stress probe (PLAN/021).
 //!
 //! Every role maps a VMO at the same fixed user VA (`0x1800_0000`), fills it with a pattern
@@ -489,6 +490,102 @@ fn reuse(out: &Out, nonce: u32) -> bool {
     true
 }
 
+const SNAPSHOT_ALIAS: u64 = FIXED_VA + PAGE as u64;
+
+static PARENT_VMO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn snapshot_child() -> ! {
+    let parent_handle = PARENT_VMO.load(core::sync::atomic::Ordering::Relaxed);
+    if kumo_rt::handle_koid(Handle(parent_handle)) != u64::MAX {
+        process_exit(1);
+    }
+    if check_page(21).0 != 0 {
+        process_exit(3);
+    }
+    // A write through one alias must be visible through the other in this child.
+    unsafe { (SNAPSHOT_ALIAS as *mut u8).write_volatile(0x6d) };
+    let alias_ok = unsafe { (FIXED_VA as *const u8).read_volatile() } == 0x6d;
+    process_exit(if alias_ok { 37 } else { 2 });
+}
+
+fn snapshot(out: &Out) -> bool {
+    use kumo_abi::{Errno, ProcessRunFlags, Rights};
+    use kumo_rt::{
+        address_space_create, handle_duplicate, handle_koid, process_create, process_run,
+        process_wait_reaped, vmar_snapshot,
+    };
+    let Some(vmo) = map_page(out, b"snapshot", 21) else {
+        return false;
+    };
+    let flags = (VmarFlags::READ | VmarFlags::WRITE).0;
+    if vmar_map(Handle(0), vmo, 0, SNAPSHOT_ALIAS, PAGE as u64, flags) != 0 {
+        return false;
+    }
+    let raw = process_create(0, 512 * 1024 * 1024);
+    if raw == 0 || raw > i32::MAX as u64 {
+        return false;
+    }
+    let child = Handle(raw as u32);
+    // A ProcessRun argument naming a held handle explicitly grants it. Convey the
+    // numeric test value through the snapshot and pass zero for both arguments.
+    PARENT_VMO.store(vmo.0, core::sync::atomic::Ordering::Relaxed);
+    let passed = (|| {
+        let narrow = handle_duplicate(child, Rights::WRITE);
+        if narrow == u64::MAX
+            || vmar_snapshot(Handle(narrow as u32)) != Errno::AccessDenied.status() as u32 as u64
+        {
+            return false;
+        }
+        let _ = handle_close(Handle(narrow as u32));
+        let status = vmar_snapshot(child);
+        if status != 0 {
+            out.line(&[b"asidpair: snapshot refused status=", dec(status).bytes()]);
+            return false;
+        }
+        if !fill_vmo(vmo, 23) {
+            return false;
+        }
+        let sp = 0x1f00_0000;
+        let aspace = address_space_create(child, sp, 0x4000);
+        if aspace == u64::MAX {
+            return false;
+        }
+        let id = handle_koid(child);
+        if process_run(
+            child,
+            snapshot_child as *const () as u64,
+            sp,
+            0,
+            0,
+            ProcessRunFlags::ASYNC.bits(),
+        ) != 0
+        {
+            return false;
+        }
+        for _ in 0..100 {
+            let (_, reaped, code) = process_wait_reaped();
+            if reaped == id {
+                let ok = code == 37 && check_page(23).0 == 0;
+                if ok {
+                    out.line(&[
+                        b"asidpair: PASS snapshot private bytes, child aliases, explicit handles",
+                    ]);
+                } else {
+                    out.line(&[b"asidpair: snapshot child exit=", dec(code).bytes()]);
+                }
+                return ok;
+            }
+            sleep_ns(20_000_000);
+        }
+        false
+    })();
+    if !passed {
+        let _ = kumo_rt::process_kill(child);
+    }
+    let _ = handle_close(child);
+    passed
+}
+
 #[no_mangle]
 extern "C" fn main(
     bootstrap: u64,
@@ -532,6 +629,8 @@ extern "C" fn main(
                 false
             }
         }
+    } else if mode == b"snapshot" {
+        snapshot(&out)
     } else if mode == b"remap" {
         match args.next().and_then(parse_u32) {
             Some(nonce) => remap(&out, nonce),
@@ -549,7 +648,7 @@ extern "C" fn main(
             }
         }
     } else {
-        out.line(&[b"asidpair: FAIL usage <conc|remap|reuse>"]);
+        out.line(&[b"asidpair: FAIL usage <conc|remap|reuse|snapshot>"]);
         false
     };
     process_exit(if ok { 0 } else { 1 });

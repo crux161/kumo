@@ -1,8 +1,8 @@
-//j875
 //j877
 //j881
 //j882
 //j916
+//j922
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -2315,6 +2315,16 @@ fn dispatch_object_syscall(
                 _ => r[0] = u64::MAX,
             }
         }
+    } else if num == Syscall::VmarSnapshot as u64 {
+        r[0] = match engine.dispatch(
+            target,
+            KernelCall::VmarSnapshot {
+                child: Handle(r[0] as u32),
+            },
+        ) {
+            KernelCallResult::Status(status) => status as u32 as u64,
+            _ => u64::MAX,
+        };
     } else if num == Syscall::VmarMap as u64 {
         let process_handle = Handle(r[0] as u32);
         let vmo_handle = Handle(r[1] as u32);

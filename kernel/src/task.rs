@@ -1,8 +1,8 @@
-//j660
 //j743
 //j825
 //j875
 //j889
+//j922
 use alloc::vec::Vec;
 
 use kumo_abi::{KoId, ObjectKind, Signals};
@@ -147,6 +147,11 @@ impl Process {
 
     pub const fn object(&self) -> KernelObject {
         self.object
+    }
+
+    pub(crate) fn install_snapshot(&mut self, mappings: Vec<(Mapping, KoId)>) {
+        debug_assert!(self.mappings.is_empty() && self.ttbr0.is_none());
+        self.mappings = mappings;
     }
 
     pub fn add_mapping(&mut self, mapping: Mapping, vmo_koid: KoId) {

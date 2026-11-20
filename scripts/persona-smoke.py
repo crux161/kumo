@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j916
 #j917
 #j918
 #j919
 #j920
+#j922
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -62,6 +62,7 @@ def main():
         # SH7-d2 (j890): every Linux program runs through the shell's `linux` word, which
         # grants the shim a filesystem; the shim loads the program and its interpreter by path.
         b"echo AXH persona begins\n"
+        b"run asidpair snapshot\n"
         b"linux /bin/m10-hello\n"
         b"linux /bin/hello-dyn\n"
         b"linux /bin/vmprobe\n"
@@ -74,6 +75,7 @@ def main():
         b"linux /bin/bigread\n"
         b"echo AXH persona ends\n",
         (
+            "asidpair: PASS snapshot private bytes, child aliases, explicit handles",
             "M10 elf linux hi",
             "linux: /bin/m10-hello exited 0",
             "SH7-c dynamic musl hello: argc=1 argv0=/bin/hello-dyn",

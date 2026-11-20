@@ -1,8 +1,8 @@
-//j875
 //j877
 //j881
 //j916
 //j919
+//j922
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +218,11 @@ pub enum Syscall {
     /// next `PersonaReturn` resumes there instead: a Linux signal handler's entry, the context
     /// `rt_sigreturn` restores, or a restarted `svc` ([`Errno::BadState`] with no open call).
     PersonaContext = 65,
+    /// Copy the caller's anonymous VMO mappings into a fresh process named by x0
+    /// (MANAGE | WRITE). Preserves addresses, access and aliases. The child receives
+    /// independent backing and no handles. AddressSpaceCreate supplies its new stack.
+    /// A device or physical mapping refuses the whole operation. Returns a status.
+    VmarSnapshot = 66,
 }
 
 /// [`Syscall::PersonaContext`] op: read the open call's foreign `(pc, sp, x8)`.
@@ -585,6 +590,7 @@ mod tests {
         assert_eq!(Syscall::PersonaShimSet as usize, 63);
         assert_eq!(Syscall::PersonaReturn as usize, 64);
         assert_eq!(Syscall::PersonaContext as usize, 65);
+        assert_eq!(Syscall::VmarSnapshot as usize, 66);
     }
 }
 

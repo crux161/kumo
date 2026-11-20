@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j916
 #j917
 #j918
 #j919
 #j920
+#j922
 """SH7-d metal: the persona-linux programs on the Orange Pi 5 Plus, one PXE boot.
 
     linux /bin/m10-hello   static Linux ELF through the in-process shim (SH7-b)
@@ -50,6 +50,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 BOOT = (
     b"echo SH7D begins\n"
+    b"run asidpair snapshot\n"
     b"linux /bin/m10-hello\n"
     b"linux /bin/hello-dyn\n"
     b"linux /bin/vmprobe\n"
@@ -63,6 +64,7 @@ BOOT = (
     b"echo SH7D ends\n"
 )
 EXPECTED = (
+    "asidpair: PASS snapshot private bytes, child aliases, explicit handles",
     "M10 elf linux hi",
     "linux: /bin/m10-hello exited 0",
     "SH7-c dynamic musl hello: argc=1 argv0=/bin/hello-dyn",

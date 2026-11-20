@@ -1,8 +1,8 @@
-//j825
 //j871
 //j875
 //j889
 //j912
+//j922
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -112,6 +112,9 @@ pub enum KernelCall<'a> {
         parent_job: Job,
         vmar_base: u64,
         vmar_size: u64,
+    },
+    VmarSnapshot {
+        child: Handle,
     },
     VmarMap {
         process_handle: Handle,
@@ -884,6 +887,36 @@ fn ensure_anonymous_frame(
             .ok_or(Errno::BadState);
     }
     ensure_vmo_frame(entry, page_index, || alloc_anonymous_frame(boot))
+}
+
+fn copy_snapshot_range(
+    source: &VmoEntry,
+    copy: &VmoEntry,
+    mapping: Mapping,
+    boot: Option<&BootInfo>,
+) -> Result<(), Errno> {
+    use crate::mm::PAGE_SIZE;
+    let first = (mapping.vmo_offset / PAGE_SIZE) as usize;
+    let end = ((mapping.vmo_offset + mapping.len) / PAGE_SIZE) as usize;
+    let end = end.min(source.frames.borrow().len());
+    for page in first..end {
+        let Some(original) = source.frames.borrow()[page] else {
+            continue;
+        };
+        // ensure_vmo_frame invokes the closure once even for overlapping aliases.
+        ensure_vmo_frame(copy, page, || {
+            let frame = alloc_anonymous_frame(boot.ok_or(Errno::BadState)?)?;
+            let dest = phys_ptr_mut(frame);
+            // Both pages are ordinary RAM. The new frame is exclusively owned by this
+            // unpublished VMO, and the kernel physmap covers both pages during this copy.
+            unsafe {
+                core::ptr::copy_nonoverlapping(phys_ptr_mut(original), dest, PAGE_SIZE as usize);
+            }
+            kumo_hal::active::clean_dcache_to_poc(dest as usize, PAGE_SIZE as usize);
+            Ok(frame)
+        })?;
+    }
+    Ok(())
 }
 
 fn ensure_vmo_frame(
@@ -3535,6 +3568,94 @@ impl SyscallEngine {
         Ok(handle)
     }
 
+    /// Copy the caller's VMO-backed mappings into an unstarted child. Only pages accessible
+    /// through those mappings belong to the copy. A second alias of a page reuses its copy.
+    /// The bootstrap stack is separate and AddressSpaceCreate installs a fresh one.
+    fn vmar_snapshot(&mut self, source: &Process, child: Handle) -> Result<(), Errno> {
+        let id = source
+            .handles()
+            .require(child, ObjectKind::Process, Rights::WRITE | Rights::MANAGE)
+            .map_err(errno_from_object)?
+            .koid;
+        if source.koid() == id {
+            return Err(Errno::InvalidArgs);
+        }
+        let target = self.process_by_koid(id).ok_or(Errno::BadHandle)?;
+        if target.ttbr0.is_some()
+            || target.user_stack().is_some()
+            || !target.mappings().is_empty()
+            || target.signals().contains(kumo_abi::Signals::TERMINATED)
+        {
+            return Err(Errno::BadState);
+        }
+        let vmar = target.root_vmar();
+        let mut mappings = Vec::new();
+        mappings
+            .try_reserve_exact(source.mappings().len())
+            .map_err(|_| Errno::NoMemory)?;
+        let mut copies: Vec<(KoId, Rc<VmoEntry>)> = Vec::new();
+        copies
+            .try_reserve(source.mappings().len())
+            .map_err(|_| Errno::NoMemory)?;
+        // Validate the entire layout before allocating a single physical page.
+        for &(mapping, old) in source.mappings() {
+            let vmo = self.vmo_by_koid(old).ok_or(Errno::BadState)?;
+            if vmo.backing() != crate::mm::VmoBacking::Anonymous
+                || mapping.flags.contains(PageFlags::DEVICE)
+                || mapping.flags.contains(PageFlags::UNCACHED)
+            {
+                return Err(Errno::NotSupported);
+            }
+            vmar.map(
+                vmo,
+                mapping.vmo_offset,
+                mapping.virt,
+                mapping.len,
+                mapping.flags,
+            )
+            .map_err(|_| Errno::InvalidArgs)?;
+            let copy = match copies.iter().find(|(key, _)| *key == old) {
+                Some((_, entry)) => entry,
+                None => {
+                    let object = self.objects.create(ObjectKind::Vmo);
+                    copies.push((
+                        old,
+                        Rc::new(VmoEntry {
+                            koid: object.koid(),
+                            vmo,
+                            frames: RefCell::new(Vec::new()),
+                        }),
+                    ));
+                    &copies.last().unwrap().1
+                }
+            };
+            mappings.push((mapping, copy.koid));
+        }
+        self.vmos
+            .try_reserve(copies.len())
+            .map_err(|_| Errno::NoMemory)?;
+        for &(mapping, old) in source.mappings() {
+            let original = self.vmo_entry_by_koid(old).unwrap();
+            let (_, copy) = copies.iter().find(|(key, _)| *key == old).unwrap();
+            if let Err(error) =
+                copy_snapshot_range(original, copy, mapping, self.boot_info.as_ref())
+            {
+                for (_, entry) in &copies {
+                    for &frame in entry.frames.borrow().iter().flatten() {
+                        crate::mm::free_frame(frame);
+                    }
+                }
+                return Err(error);
+            }
+        }
+        // Everything below is infallible. No half-populated VMAR or VMO handle is observable.
+        self.vmos.extend(copies.into_iter().map(|(_, entry)| entry));
+        self.process_by_koid_mut(id)
+            .unwrap()
+            .install_snapshot(mappings);
+        Ok(())
+    }
+
     /// The process `ProcessKill` would end: `handle` must name a live process in `caller`'s
     /// table with `MANAGE`. A process may not kill itself; it exits instead. Pure, so the
     /// policy is host-tested apart from the scheduler half of the kill.
@@ -4439,6 +4560,12 @@ impl SyscallEngine {
                     Err(error) => KernelCallResult::Status(error.status()),
                 }
             }
+            KernelCall::VmarSnapshot { child } => KernelCallResult::Status(
+                self.vmar_snapshot(process, child)
+                    .err()
+                    .unwrap_or(Errno::Ok)
+                    .status(),
+            ),
             KernelCall::VmarMap {
                 process_handle,
                 vmo_handle,
@@ -8546,6 +8673,93 @@ mod tests {
         let job = crate::task::Job::root(engine.objects_mut());
         let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
         Process::new(engine.objects_mut(), &job, vmar)
+    }
+
+    #[test]
+    fn snapshot_preserves_aliases_offsets_and_guards_without_granting_handles() {
+        let mut engine = SyscallEngine::new();
+        let mut parent = test_process(&mut engine);
+        let page = crate::mm::PAGE_SIZE;
+        let vmar = parent.root_vmar();
+        let job = Job::root(engine.objects_mut());
+        let child = engine.process_create(&mut parent, &job, vmar).unwrap();
+        let id = parent.handles().get(child).unwrap().koid;
+        let vmo = Vmo::new(4 * page).unwrap();
+        let handle = engine
+            .root_vmo_create(&mut parent, vmo, Rights::READ)
+            .unwrap();
+        let old = parent.handles().get(handle).unwrap().koid;
+        for (index, offset, flags) in [
+            (0, page, PageFlags::READ),
+            (2, page, PageFlags::READ),
+            (3, 2 * page, PageFlags(0)),
+        ] {
+            let mapping = vmar
+                .map(vmo, offset, vmar.base() + index * page, page, flags)
+                .unwrap();
+            parent.add_mapping(mapping, old);
+        }
+        let weak = parent
+            .handles_mut()
+            .duplicate(child, Rights::WRITE)
+            .unwrap();
+        assert_eq!(
+            engine.vmar_snapshot(&parent, weak),
+            Err(Errno::AccessDenied)
+        );
+        assert_eq!(engine.vmar_snapshot(&parent, handle), Err(Errno::WrongType));
+        let before = engine.vmos.len();
+        engine.vmar_snapshot(&parent, child).unwrap();
+        let target = engine.process_by_koid(id).unwrap();
+        assert!(target.handles().get(handle).is_err());
+        assert_eq!(target.mappings().len(), parent.mappings().len());
+        let new = target.mappings()[0].1;
+        assert_ne!(new, old);
+        for (&(src, _), &(dst, backing)) in parent.mappings().iter().zip(target.mappings()) {
+            assert_eq!(src, dst);
+            assert_eq!(backing, new);
+        }
+        assert_eq!(engine.vmar_snapshot(&parent, child), Err(Errno::BadState));
+        assert_eq!(engine.vmos.len(), before + 1);
+    }
+
+    #[test]
+    fn snapshot_refuses_physical_backing_and_out_of_bounds_without_publication() {
+        let mut engine = SyscallEngine::new();
+        let mut parent = test_process(&mut engine);
+        let page = crate::mm::PAGE_SIZE;
+        let vmar = parent.root_vmar();
+        let job = Job::root(engine.objects_mut());
+        let child = engine.process_create(&mut parent, &job, vmar).unwrap();
+        let id = parent.handles().get(child).unwrap().koid;
+        let anon = Vmo::new(page).unwrap();
+        let physical = Vmo::from_physical_range(0x9400_0000, page).unwrap();
+        for (i, vmo) in [anon, physical].into_iter().enumerate() {
+            let h = engine
+                .root_vmo_create(&mut parent, vmo, Rights::READ)
+                .unwrap();
+            let mapping = vmar
+                .map(
+                    vmo,
+                    0,
+                    vmar.base() + (i as u64 + 1) * page,
+                    page,
+                    PageFlags::READ,
+                )
+                .unwrap();
+            parent.add_mapping(mapping, parent.handles().get(h).unwrap().koid);
+        }
+        let before = engine.vmos.len();
+        assert_eq!(
+            engine.vmar_snapshot(&parent, child),
+            Err(Errno::NotSupported)
+        );
+        assert!(engine.process_by_koid(id).unwrap().mappings().is_empty());
+        let tiny = engine
+            .process_create(&mut parent, &job, Vmar::new(vmar.base(), page).unwrap())
+            .unwrap();
+        assert_eq!(engine.vmar_snapshot(&parent, tiny), Err(Errno::InvalidArgs));
+        assert_eq!(before, engine.vmos.len());
     }
 
     #[test]

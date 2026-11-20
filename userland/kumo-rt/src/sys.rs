@@ -1,8 +1,8 @@
-//j884
 //j891
 //j894
 //j911
 //j913
+//j922
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -983,6 +983,22 @@ pub fn vmo_read(vmo: Handle, offset: u64, buf: *mut u8, len: usize) -> u64 {
 )))]
 pub fn vmo_read(_vmo: Handle, _offset: u64, _buf: *mut u8, _len: usize) -> u64 {
     0
+}
+
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
+pub fn vmar_snapshot(child: Handle) -> u64 {
+    syscall(Syscall::VmarSnapshot, child.0 as u64, 0, 0, 0)
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
+pub fn vmar_snapshot(_child: Handle) -> u64 {
+    u64::MAX
 }
 
 #[cfg(any(
