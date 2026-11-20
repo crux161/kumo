@@ -1,6 +1,7 @@
 //j890
 //j891
 //j892
+//j915
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -12,13 +13,15 @@
 
 use kumo_abi::{Handle, Rights};
 use kumo_rt::{
-    channel_read, channel_write, channel_write_with_handle, handle_close, handle_duplicate,
-    log_write, vmar_map_anywhere, vmo_create,
+    channel_create_pair, channel_read, channel_try_read_with_handle, channel_write,
+    channel_write_with_handle, handle_close, handle_duplicate, log_write, vmar_map_anywhere,
+    vmo_create,
 };
 use kumo_vfs::{
     parse_dir_reply, parse_open_reply, parse_read_vmo_reply, parse_stat_reply, read_payload,
     Request, VfsError, READ_VMO_MAX, STAT_KIND_DIRECTORY, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_FOUND,
 };
+use persona_linux::stream::ReadTail;
 
 use crate::errno;
 
@@ -29,11 +32,14 @@ const READ_CHUNK: u64 = 256;
 const BOUNCE_BYTES: u64 = 1024 * 1024;
 const PATH_MAX: usize = kumo_vfs::MAX_PATH;
 const MAX_FDS: usize = 64;
+const PIPE_CHUNK: usize = 4096;
 
 const O_ACCMODE: u64 = 3;
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_DIRECTORY: u64 = 0o40000;
+const O_NONBLOCK: u64 = 0o4000;
+const O_CLOEXEC: u64 = 0o2000000;
 const AT_FDCWD: i64 = -100;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const SEEK_SET: u64 = 0;
@@ -42,6 +48,7 @@ const SEEK_END: u64 = 2;
 const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
+const S_IFIFO: u32 = 0o010000;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 
@@ -50,6 +57,11 @@ enum Kind {
     Free,
     Stdin,
     Stdout,
+    Pipe {
+        channel: u32,
+        readable: bool,
+        inode: u64,
+    },
     /// An open vfs file: its server handle and size.
     File {
         handle: u32,
@@ -67,6 +79,8 @@ struct Fd {
     offset: u64,
     path: [u8; PATH_MAX],
     path_len: usize,
+    flags: u64,
+    carry: ReadTail<PIPE_CHUNK>,
 }
 
 impl Fd {
@@ -75,6 +89,8 @@ impl Fd {
         offset: 0,
         path: [0; PATH_MAX],
         path_len: 0,
+        flags: 0,
+        carry: ReadTail::EMPTY,
     };
 
     fn path(&self) -> &[u8] {
@@ -94,6 +110,7 @@ struct Session {
     /// The bulk-read bounce VMO and where the shim mapped it (0 until the first large read).
     bounce: Handle,
     bounce_at: u64,
+    next_pipe: u64,
 }
 
 static mut SESSION: Session = Session {
@@ -106,6 +123,7 @@ static mut SESSION: Session = Session {
     stdin_carry_len: 0,
     bounce: Handle(0),
     bounce_at: 0,
+    next_pipe: 1,
 };
 
 fn session() -> &'static mut Session {
@@ -402,12 +420,59 @@ fn new_fd(kind: Kind, path: &[u8]) -> i64 {
 pub fn file_of(fd: i64) -> Result<(u32, u64), i64> {
     match fd_entry(fd)?.kind {
         Kind::File { handle, size } => Ok((handle, size)),
-        Kind::Dir { .. } => Err(-errno::ENODEV),
+        Kind::Dir { .. } | Kind::Pipe { .. } => Err(-errno::ENODEV),
         _ => Err(-errno::EACCES),
     }
 }
 
 // ---- the Linux calls -----------------------------------------------------------------------
+
+/// A private channel pair supplies byte-stream data, blocking reads and peer-close EOF.
+/// The FD table is still single-threaded; SH7-d3c's thread admission must protect it before
+/// admitting concurrent Linux callers. Channel writes have no bounded-capacity backpressure.
+/// — MILVUS
+pub fn pipe2(pair: u64, flags: u64) -> i64 {
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return -errno::EINVAL;
+    }
+    if pair == 0 {
+        return -errno::EFAULT;
+    }
+    let s = session();
+    let mut slots = (3..MAX_FDS).filter(|&i| s.fds[i].kind == Kind::Free);
+    let (Some(reader), Some(writer)) = (slots.next(), slots.next()) else {
+        return -errno::EMFILE;
+    };
+    let (a, b) = channel_create_pair();
+    if a == u64::MAX || b == u64::MAX {
+        if a != u64::MAX {
+            let _ = handle_close(Handle(a as u32));
+        }
+        if b != u64::MAX {
+            let _ = handle_close(Handle(b as u32));
+        }
+        return -errno::ENOMEM;
+    }
+    let inode = s.next_pipe;
+    s.next_pipe += 1;
+    for (fd, channel, readable) in [(reader, a, true), (writer, b, false)] {
+        s.fds[fd] = Fd {
+            kind: Kind::Pipe {
+                channel: channel as u32,
+                readable,
+                inode,
+            },
+            flags,
+            ..Fd::FREE
+        };
+    }
+    // As with the existing file surface, an invalid non-null user pointer faults the program.
+    unsafe {
+        (pair as *mut i32).write_unaligned(reader as i32);
+        ((pair + 4) as *mut i32).write_unaligned(writer as i32);
+    }
+    0
+}
 
 pub fn openat(dirfd: i64, path_ptr: u64, flags: u64) -> i64 {
     let mut raw = [0u8; PATH_MAX];
@@ -455,6 +520,8 @@ pub fn close(fd: i64) -> i64 {
     };
     if let Kind::File { handle, .. } = entry.kind {
         close_vfs(handle);
+    } else if let Kind::Pipe { channel, .. } = entry.kind {
+        let _ = handle_close(Handle(channel));
     }
     *entry = Fd::FREE;
     0
@@ -465,6 +532,43 @@ pub fn read(fd: i64, buf: u64, len: u64) -> i64 {
         Ok(entry) => entry,
         Err(e) => return e,
     };
+    if let Kind::Pipe {
+        channel, readable, ..
+    } = entry.kind
+    {
+        if !readable {
+            return -errno::EBADF;
+        }
+        if len == 0 {
+            return 0;
+        }
+        if buf == 0 {
+            return -errno::EFAULT;
+        }
+        if entry.carry.is_empty() {
+            let storage = entry.carry.storage();
+            let n = if entry.flags & O_NONBLOCK != 0 {
+                match channel_try_read_with_handle(
+                    Handle(channel),
+                    storage.as_mut_ptr(),
+                    storage.len(),
+                ) {
+                    Some((n, _)) => n,
+                    None => return -errno::EAGAIN,
+                }
+            } else {
+                channel_read(Handle(channel), storage.as_mut_ptr(), storage.len()) as usize
+            };
+            if n as u32 as i32 == kumo_abi::Errno::PeerClosed.status() {
+                return 0;
+            }
+            if !entry.carry.received(n) {
+                return -errno::EIO;
+            }
+        }
+        let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+        return entry.carry.take(out) as i64;
+    }
     if buf == 0 && len != 0 {
         return -errno::EFAULT;
     }
@@ -579,7 +683,7 @@ pub fn lseek(fd: i64, offset: i64, whence: u64) -> i64 {
     }
 }
 
-pub fn fcntl(fd: i64, cmd: u64) -> i64 {
+pub fn fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
     const F_GETFD: u64 = 1;
     const F_SETFD: u64 = 2;
     const F_GETFL: u64 = 3;
@@ -588,6 +692,21 @@ pub fn fcntl(fd: i64, cmd: u64) -> i64 {
         Ok(entry) => entry,
         Err(e) => return e,
     };
+    if let Kind::Pipe { readable, .. } = entry.kind {
+        return match cmd {
+            F_GETFD => i64::from(entry.flags & O_CLOEXEC != 0),
+            F_SETFD => {
+                entry.flags = (entry.flags & !O_CLOEXEC) | if arg & 1 != 0 { O_CLOEXEC } else { 0 };
+                0
+            }
+            F_GETFL => (entry.flags & O_NONBLOCK) as i64 | i64::from(!readable),
+            F_SETFL => {
+                entry.flags = (entry.flags & !O_NONBLOCK) | (arg & O_NONBLOCK);
+                0
+            }
+            _ => -errno::EINVAL,
+        };
+    }
     match cmd {
         // Close-on-exec has no meaning until the persona can exec (SH7-f); accepted and kept 0.
         F_GETFD | F_SETFD | F_SETFL => 0,
@@ -635,6 +754,7 @@ pub fn fstat(fd: i64, buf: u64) -> i64 {
     match entry.kind {
         Kind::File { size, .. } => put_stat(buf, 1, inode(entry.path()), S_IFREG | 0o755, size),
         Kind::Dir { .. } => put_stat(buf, 1, inode(entry.path()), S_IFDIR | 0o755, 0),
+        Kind::Pipe { inode, .. } => put_stat(buf, 3, inode, S_IFIFO | 0o600, 0),
         _ => put_stat(buf, 2, fd as u64 + 1, S_IFCHR | 0o620, 0),
     }
 }
@@ -756,6 +876,27 @@ pub fn getdents64(fd: i64, buf: u64, count: u64) -> i64 {
 pub fn write_out(fd: i64, bytes: &[u8]) -> i64 {
     match fd_entry(fd).map(|entry| entry.kind) {
         Ok(Kind::Stdout) => {}
+        Ok(Kind::Pipe {
+            channel,
+            readable: false,
+            ..
+        }) => {
+            let mut written = 0;
+            for chunk in bytes.chunks(PIPE_CHUNK) {
+                let status = channel_write(Handle(channel), chunk.as_ptr(), chunk.len());
+                if status != 0 {
+                    return if written > 0 {
+                        written as i64
+                    } else if status == kumo_abi::Errno::PeerClosed.status() {
+                        -errno::EPIPE
+                    } else {
+                        -errno::EIO
+                    };
+                }
+                written += chunk.len();
+            }
+            return written as i64;
+        }
         Ok(Kind::File { .. } | Kind::Dir { .. }) => return -errno::EBADF,
         Ok(_) => return -errno::EBADF,
         Err(e) => return e,

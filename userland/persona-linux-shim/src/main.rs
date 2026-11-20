@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j885
 //j888
 //j889
 //j890
 //j891
+//j915
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -39,6 +39,7 @@ kumo_rt::entry!(main);
 mod nr {
     pub const FCNTL: u64 = 25;
     pub const IOCTL: u64 = 29;
+    pub const PIPE2: u64 = 59;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
     pub const GETDENTS64: u64 = 61;
@@ -67,6 +68,7 @@ pub(crate) mod errno {
     pub const ENOENT: i64 = 2;
     pub const EIO: i64 = 5;
     pub const EBADF: i64 = 9;
+    pub const EAGAIN: i64 = 11;
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
@@ -78,6 +80,7 @@ pub(crate) mod errno {
     pub const ENOTTY: i64 = 25;
     pub const ESPIPE: i64 = 29;
     pub const EROFS: i64 = 30;
+    pub const EPIPE: i64 = 32;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
 }
@@ -268,11 +271,12 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31]) {
         nr::PREAD64 => files::pread(a0 as i64, a1, a2, frame[3]),
         nr::OPENAT => files::openat(a0 as i64, a1, a2),
         nr::CLOSE => files::close(a0 as i64),
+        nr::PIPE2 => files::pipe2(a0, a1),
         nr::LSEEK => files::lseek(a0 as i64, a1 as i64, a2),
         nr::FSTAT => files::fstat(a0 as i64, a1),
         nr::NEWFSTATAT => files::newfstatat(a0 as i64, a1, a2, frame[3]),
         nr::GETDENTS64 => files::getdents64(a0 as i64, a1, a2),
-        nr::FCNTL => files::fcntl(a0 as i64, a1),
+        nr::FCNTL => files::fcntl(a0 as i64, a1, a2),
         nr::IOCTL => -errno::ENOTTY,
         nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => 1,
         nr::RT_SIGACTION | nr::RT_SIGPROCMASK => 0,
@@ -294,6 +298,9 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31]) {
 
 /// Standard output and error: the launcher's stdout channel (SH7-d2), else the kernel log.
 fn write(fd: u64, buf: u64, len: u64) -> i64 {
+    if len == 0 {
+        return files::write_out(fd as i64, &[]);
+    }
     if buf == 0 && len != 0 {
         return -errno::EFAULT;
     }
@@ -302,12 +309,12 @@ fn write(fd: u64, buf: u64, len: u64) -> i64 {
     files::write_out(fd as i64, bytes)
 }
 
-/// One `writev` goes out in as few messages as possible: its vectors are gathered into 256-byte
+/// One `writev` goes out in as few messages as possible: its vectors are gathered into 4096-byte
 /// pieces, so a short line arrives whole. musl's stdio hands `printf`'s text and its `\n` over
 /// as two vectors; sent one message each, another process's line could land between them (seen
 /// on metal, j888). A small `writev` is atomic on Linux too.
 fn writev(fd: u64, iov: u64, count: u64) -> i64 {
-    let mut record = [0u8; 256];
+    let mut record = [0u8; 4096];
     let mut used = 0usize;
     let mut total = 0i64;
     for index in 0..count.min(1024) {
@@ -319,7 +326,10 @@ fn writev(fd: u64, iov: u64, count: u64) -> i64 {
                 core::ptr::read_unaligned((entry + 8) as *const u64),
             )
         };
-        if base == 0 && len != 0 {
+        if len == 0 {
+            continue;
+        }
+        if base == 0 {
             return if total > 0 { total } else { -errno::EFAULT };
         }
         // SAFETY: as above.
@@ -334,16 +344,20 @@ fn writev(fd: u64, iov: u64, count: u64) -> i64 {
                 if sent < 0 {
                     return if total > 0 { total } else { sent };
                 }
+                total += sent;
+                if sent as usize != used {
+                    return total;
+                }
                 used = 0;
             }
         }
-        total += len as i64;
     }
     if used > 0 {
         let sent = files::write_out(fd as i64, &record[..used]);
         if sent < 0 {
             return if total > 0 { total } else { sent };
         }
+        total += sent;
     }
     total
 }

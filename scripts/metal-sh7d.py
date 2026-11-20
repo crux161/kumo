@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j891
 #j892
+#j915
 """SH7-d metal: the persona-linux programs on the Orange Pi 5 Plus, one PXE boot.
 
     linux /bin/m10-hello   static Linux ELF through the in-process shim (SH7-b)
@@ -9,6 +10,7 @@
     linux /bin/greet       NEEDED libgreet.so, found by musl in /lib (SH7-d2)
     linux /bin/fileprobe   the Linux file surface (SH7-d2)
     linux /bin/bigread     bulk read/mmap/pread of a 6 MiB file through vfs ReadVmo (SH7-d3a)
+    linux /bin/pipeprobe   Linux pipe descriptors, byte-stream tails, EOF and errors (SH7-d3c-1)
     --stick: linux /media/KUMO/bin/bigread, the same probe from the USB stick, whose fatfs
              session hands the client's VMO to drv-xhci (SH7-d3b; the stick carries the files
              build/verification/sh7/sh7d3/stick stages)
@@ -39,6 +41,7 @@ BOOT = (
     b"linux /bin/vmprobe\n"
     b"linux /bin/greet\n"
     b"linux /bin/fileprobe\n"
+    b"linux /bin/pipeprobe\n"
     b"linux /bin/bigread\n"
     b"echo SH7D ends\n"
 )
@@ -53,6 +56,11 @@ EXPECTED = (
     "linux: /bin/greet exited 0",
     "fileprobe: OK (0 failures)",
     "linux: /bin/fileprobe exited 0",
+    "pipeprobe: flags, errors and empty reads OK",
+    "pipeprobe: 5003 exact bytes, short-read tails and EOF OK",
+    "pipeprobe: EPIPE, 128 reuse cycles and EMFILE rollback OK",
+    "pipeprobe: OK (0 failures)",
+    "linux: /bin/pipeprobe exited 0",
     "bigread: OK (0 failures)",
     "linux: /bin/bigread exited 0",
 )
