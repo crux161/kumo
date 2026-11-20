@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j915
 #j916
 #j917
 #j918
 #j919
+#j920
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -14,10 +14,9 @@ program's `write` arrives as an INFO record. The case requires the program's lin
 `M10-c Check ok` exactly once each, and no TOWER. The image is rebuilt with the proof loglevel,
 then the default image is restored.
 
---rustc (SH7-d3d, j917): instead, one boot of the opt-in KUMO_PERSONA_RUSTC=1 image, whose FAT
-tree carries the pinned Linux rustc (scripts/persona-rustc.sh), running
-`linux /opt/rust/bin/rustc --version` under 4 GiB of QEMU memory. The raw initrd is ~320 MB, so
-that build skips the zstd copy (KUMO_INITRD_ZSTD=0); QEMU boots the raw one either way.
+--rustc boots the opt-in KUMO_PERSONA_RUSTC=1 image with 4 GiB of QEMU memory. It runs the
+pinned Linux compiler's -Vv, compiles /w/add.rs for aarch64-unknown-none and checks the hash
+of /w/add.o in a second process. Run scripts/persona-rustc.sh to stage the compiler and sysroot.
 """
 
 import argparse
@@ -27,8 +26,9 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+
+import persona_rustc_proof
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -43,8 +43,8 @@ def load_axh():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "build/verification/sh7/sh7b")
-    parser.add_argument("--timeout", type=float, default=90)
-    parser.add_argument("--rustc", action="store_true", help="rustc --version from the opt-in image")
+    parser.add_argument("--timeout", type=float, help="seconds per boot (default 90, or 900 with --rustc)")
+    parser.add_argument("--rustc", action="store_true", help="compile and verify /w/add.o with the opt-in rustc image")
     args = parser.parse_args()
 
     axh = load_axh()
@@ -118,13 +118,8 @@ def main():
     if args.rustc:
         case = axh.Case(
             "persona-rustc",
-            b"echo AXH persona-rustc begins\n"
-            b"linux /opt/rust/bin/rustc --version\n"
-            b"echo AXH persona-rustc ends\n",
-            (
-                "rustc 1.98.0-nightly (91fe22da8 2026-06-21)",
-                "linux: /opt/rust/bin/rustc exited 0",
-            ),
+            b"echo AXH persona-rustc begins\n" + persona_rustc_proof.BOOT + b"echo AXH persona-rustc ends\n",
+            (*persona_rustc_proof.VERSION, persona_rustc_proof.OBJECT, "linux: /bin/objprobe exited 0"),
             ready=0,
         )
         proof_env.update(KUMO_PERSONA_RUSTC="1", KUMO_INITRD_ZSTD="0")
@@ -138,8 +133,11 @@ def main():
         # block or pollute this one.
         shutil.rmtree(work / case.name, ignore_errors=True)
         manifest["case"] = axh.boot(
-            ROOT, source, case, work / case.name, qemu, firmware, args.timeout, memory_mib
+            ROOT, source, case, work / case.name, qemu, firmware,
+            args.timeout if args.timeout is not None else (900 if args.rustc else 90), memory_mib
         )
+        if args.rustc:
+            persona_rustc_proof.validate((work / case.name / "serial.log").read_text(errors="replace"))
         manifest["passed"] = True
     except BaseException as error:
         manifest["passed"] = False

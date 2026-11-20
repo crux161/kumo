@@ -1,8 +1,8 @@
-//j915
 //j916
 //j917
 //j918
 //j919
+//j920
 
 use std::env;
 use std::fmt;
@@ -1297,6 +1297,9 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let big = bigread_data();
             linux_files.push(("/etc/big.bin", big.as_slice()));
             // SH7-d3d (j917): the opt-in rustc tree.
+            if !persona_rustc.is_empty() {
+                linux_files.push(("/w/add.rs", include_bytes!("../../persona/add.rs")));
+            }
             for (path, bytes) in &persona_rustc {
                 linux_files.push((path, bytes.as_slice()));
             }
@@ -2126,7 +2129,17 @@ fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
 /// filesystem grant, as Linux `execve` and musl's loader expect. Each file is checked against the
 /// digest persona/MANIFEST records, so the image carries exactly the bytes that manifest and musl's
 /// COPYRIGHT describe. — TEAL
-const PERSONA_PAYLOADS: [(&str, &str, &str); 12] = [
+const PERSONA_PAYLOADS: [(&str, &str, &str); 14] = [
+    (
+        "persona/libmd-COPYING",
+        "/usr/share/licenses/libmd/COPYING",
+        "143d61c17c7f39521080e4c0c2e1285fb078884fb9148e47b70f6fb481381fbf",
+    ),
+    (
+        "persona/objprobe",
+        "/bin/objprobe",
+        "efbb647e3b5dadf42f35c4a30e4b9401b9b533b2be1a11fec3814b7d75f8cae1",
+    ),
     (
         "persona/sigprobe",
         "/bin/sigprobe",
@@ -2193,8 +2206,8 @@ const PERSONA_PAYLOADS: [(&str, &str, &str); 12] = [
 /// `KUMO_PERSONA_RUSTC=1` (the SH7-d3 cut's Q1: an opt-in QEMU image; default images are
 /// unchanged). `scripts/persona-rustc.sh` fetches it into build/persona-rustc/tree, never
 /// committed (the driver alone is 290 MiB): the pinned nightly's unmodified musl `rustc`
-/// component and Alpine 3.22's libgcc_s, which the driver NEEDs.
-const PERSONA_RUSTC: [(&str, &str, &str); 3] = [
+/// component, its aarch64-unknown-none target libraries, and Alpine 3.22's libgcc_s.
+const PERSONA_RUSTC: [(&str, &str, &str); 9] = [
     (
         "build/persona-rustc/tree/opt/rust/bin/rustc",
         "/opt/rust/bin/rustc",
@@ -2209,6 +2222,36 @@ const PERSONA_RUSTC: [(&str, &str, &str); 3] = [
         "build/persona-rustc/tree/lib/libgcc_s.so.1",
         "/lib/libgcc_s.so.1",
         "2d945d6ce360769b41fbffc652c2440014bbd69416f13fe206fbac19d32c9431",
+    ),
+    (
+        "build/persona-rustc/tree/opt/rust/lib/rustlib/aarch64-unknown-none/lib/liballoc-e7dd7d8211fee4be.rlib",
+        "/opt/rust/lib/rustlib/aarch64-unknown-none/lib/liballoc-e7dd7d8211fee4be.rlib",
+        "4e89dab3b4938053d0a0b92bd34f3b1c5189d05bf18d46f7c26356b61c8a6c1d",
+    ),
+    (
+        "build/persona-rustc/tree/opt/rust/lib/rustlib/aarch64-unknown-none/lib/liballoc-e7dd7d8211fee4be.rmeta",
+        "/opt/rust/lib/rustlib/aarch64-unknown-none/lib/liballoc-e7dd7d8211fee4be.rmeta",
+        "7d095451ef66c054c807c7d990a4f49c2d9cb4d8c477f29b5fde8b369089996c",
+    ),
+    (
+        "build/persona-rustc/tree/opt/rust/lib/rustlib/aarch64-unknown-none/lib/libcompiler_builtins-d1e347987669791e.rlib",
+        "/opt/rust/lib/rustlib/aarch64-unknown-none/lib/libcompiler_builtins-d1e347987669791e.rlib",
+        "d66b25a7acfe706557eda67001170cdeff1aec1f34b6886b33f7e6362e80ff5e",
+    ),
+    (
+        "build/persona-rustc/tree/opt/rust/lib/rustlib/aarch64-unknown-none/lib/libcompiler_builtins-d1e347987669791e.rmeta",
+        "/opt/rust/lib/rustlib/aarch64-unknown-none/lib/libcompiler_builtins-d1e347987669791e.rmeta",
+        "6e13fee72d9708b5412ff440b9d3bb03935045a7d01cbca1724473e86937a812",
+    ),
+    (
+        "build/persona-rustc/tree/opt/rust/lib/rustlib/aarch64-unknown-none/lib/libcore-bf137cc3142afd85.rlib",
+        "/opt/rust/lib/rustlib/aarch64-unknown-none/lib/libcore-bf137cc3142afd85.rlib",
+        "f743f925e93779c189dc5574dc919002409fe5ce7c83836ed3f8bad6a26eed29",
+    ),
+    (
+        "build/persona-rustc/tree/opt/rust/lib/rustlib/aarch64-unknown-none/lib/libcore-bf137cc3142afd85.rmeta",
+        "/opt/rust/lib/rustlib/aarch64-unknown-none/lib/libcore-bf137cc3142afd85.rmeta",
+        "51696641966b07d28020dca5628f211b81221690b6c547687c09613845d3857d",
     ),
 ];
 

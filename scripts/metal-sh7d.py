@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j915
 #j916
 #j917
 #j918
 #j919
+#j920
 """SH7-d metal: the persona-linux programs on the Orange Pi 5 Plus, one PXE boot.
 
     linux /bin/m10-hello   static Linux ELF through the in-process shim (SH7-b)
@@ -23,9 +23,9 @@
              from the stick (scripts/persona-rustc.sh fetches the same tree; the stick carries
              /opt/rust and /lib/{ld-musl-aarch64.so.1,libgcc_s.so.1}), after listing those
              folders so a stick without them reads as such
-    --rustc-image: `linux /opt/rust/bin/rustc --version` from the image's own FAT tree, for a
+    --rustc-image: rustc -Vv, a no_std compile and independent hash from the image's FAT, for a
              board without the stick: build the image with KUMO_PERSONA_RUSTC=1
-             KUMO_INITRD_ZSTD=0 (and KUMO_CONSOLE_LOGLEVEL=6); the ~320 MB raw initrd netboots
+             KUMO_INITRD_ZSTD=0 (and KUMO_CONSOLE_LOGLEVEL=6); the opt-in raw initrd netboots
 
 The metal half of scripts/persona-smoke.py. Reuses scripts/metal-sh3e.py's board machinery
 (import only), like the other metal suites. Prerequisites, per the opi5 serial-loop recipe:
@@ -43,6 +43,8 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+import persona_rustc_proof
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -130,13 +132,13 @@ def phase_times(text, run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", type=Path, default=ROOT / "build/verification/sh7/sh7d-metal")
-    parser.add_argument("--timeout", type=float, default=240.0)
+    parser.add_argument("--timeout", type=float, help="seconds after reset (default 240, or 900 with --rustc-image)")
     parser.add_argument("--stick", action="store_true", help="also run bigread from /media/KUMO")
     parser.add_argument("--rustc", action="store_true", help="also run rustc --version from /media/KUMO")
     parser.add_argument(
         "--rustc-image",
         action="store_true",
-        help="also run rustc --version from the image (KUMO_PERSONA_RUSTC=1 build)",
+        help="compile and verify /w/add.o with the image's rustc (KUMO_PERSONA_RUSTC=1)",
     )
     parser.add_argument(
         "--enter",
@@ -160,16 +162,10 @@ def main():
             b"ls /media/KUMO/opt/rust/lib\nls /media/KUMO/lib\n"
             b"linux /media/KUMO/opt/rust/bin/rustc --version\necho SH7D ends\n",
         )
-        expected.append("rustc 1.98.0-nightly (91fe22da8 2026-06-21)")
         expected.append("linux: /media/KUMO/opt/rust/bin/rustc exited 0")
 
     if args.rustc_image:
-        boot = boot.replace(
-            b"echo SH7D ends\n",
-            b"linux /opt/rust/bin/rustc --version\necho SH7D ends\n",
-        )
-        expected.append("rustc 1.98.0-nightly (91fe22da8 2026-06-21)")
-        expected.append("linux: /opt/rust/bin/rustc exited 0")
+        boot = boot.replace(b"echo SH7D ends\n", persona_rustc_proof.BOOT + b"echo SH7D ends\n")
 
     board = load_board()
     if shutil.which("tio") is None:
@@ -197,7 +193,8 @@ def main():
             board.send_raw(b"\r")
         else:
             board.wake_board(work / "boot.log")
-        board.wait_for("SH7D ends", work / "boot.log", args.timeout)
+        timeout = args.timeout if args.timeout is not None else (900 if args.rustc_image else 240)
+        board.wait_for("SH7D ends", work / "boot.log", timeout)
         # The login prompt after autoexec must come AFTER the end marker (a stale pre-reset
         # prompt would otherwise pass); prompts lack newlines, so read the raw capture.
         deadline = time.monotonic() + 60
@@ -211,6 +208,10 @@ def main():
         text = board.log_whole(work / "boot.log")
         board.validate(text, expected, "SH7D begins", "SH7D ends", login_text=raw)
         window = text[text.index("SH7D begins"):text.index("SH7D ends")]
+        if args.rustc and window.partition("SH7-e3 begins")[0].count(persona_rustc_proof.VERSION[0]) != 1:
+            raise RuntimeError("wrong or missing rustc version from the stick")
+        if args.rustc_image:
+            persona_rustc_proof.validate(window)
         if args.stick and window.count("bigread: OK (0 failures)") != 2:
             raise RuntimeError("bigread did not pass both from the image and from the stick")
         if "TOWER" in window:
