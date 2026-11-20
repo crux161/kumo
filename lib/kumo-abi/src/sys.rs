@@ -1,8 +1,8 @@
-//j873
 //j875
 //j877
 //j881
 //j916
+//j919
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +214,9 @@ pub enum Syscall {
     /// at `pc` with `sp` and `x8`; the shim then leaves it with [`Syscall::PersonaReturn`]
     /// like any other. The kernel writes no user memory and interprets no foreign number.
     /// [`Errno::BadState`] when the thread has no registration or (seed) a call is open.
+    /// Op [`PERSONA_CONTEXT_MOVE`] (SH7-e2) replaces the open call's `(pc, sp, x8)`, so the
+    /// next `PersonaReturn` resumes there instead: a Linux signal handler's entry, the context
+    /// `rt_sigreturn` restores, or a restarted `svc` ([`Errno::BadState`] with no open call).
     PersonaContext = 65,
 }
 
@@ -221,6 +224,8 @@ pub enum Syscall {
 pub const PERSONA_CONTEXT_GET: u64 = 0;
 /// [`Syscall::PersonaContext`] op: open a call to be left by `PersonaReturn`.
 pub const PERSONA_CONTEXT_SEED: u64 = 1;
+/// [`Syscall::PersonaContext`] op (SH7-e2): move the open call's foreign `(pc, sp, x8)`.
+pub const PERSONA_CONTEXT_MOVE: u64 = 2;
 
 /// `ProcessKill` flag (SH6-b): kill the target's whole spawn tree, the KUMO stand-in for
 /// a process group.

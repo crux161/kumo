@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j892
 #j915
 #j916
 #j917
 #j918
+#j919
 """SH7-d metal: the persona-linux programs on the Orange Pi 5 Plus, one PXE boot.
 
     linux /bin/m10-hello   static Linux ELF through the in-process shim (SH7-b)
@@ -15,6 +15,7 @@
     linux /bin/bigread     bulk read/mmap/pread of a 6 MiB file through vfs ReadVmo (SH7-d3a)
     linux /bin/pipeprobe   Linux pipe descriptors, byte-stream tails, EOF and errors (SH7-d3c-1)
     linux /bin/threadprobe musl pthreads: clone, futex, a parked reader woken by a sibling (SH7-d3c-2)
+    linux /bin/sigprobe    Linux signal delivery: frames, masks, EINTR/SA_RESTART, FP state (SH7-e2)
     --stick: linux /media/KUMO/bin/bigread, the same probe from the USB stick, whose fatfs
              session hands the client's VMO to drv-xhci (SH7-d3b; the stick carries the files
              build/verification/sh7/sh7d3/stick stages)
@@ -55,6 +56,7 @@ BOOT = (
     b"linux /bin/writeprobe\n"
     b"linux /bin/pipeprobe\n"
     b"linux /bin/threadprobe\n"
+    b"linux /bin/sigprobe\n"
     b"linux /bin/bigread\n"
     b"echo SH7D ends\n"
 )
@@ -85,6 +87,13 @@ EXPECTED = (
     "threadprobe: detached thread and timed wait OK",
     "threadprobe: OK (0 failures)",
     "linux: /bin/threadprobe exited 0",
+    "sigprobe: raise, siginfo and ucontext OK",
+    "sigprobe: masks, sigpending and SIG_IGN OK",
+    "sigprobe: altstack and nested frames OK",
+    "sigprobe: EINTR and SA_RESTART on a parked pipe read OK",
+    "sigprobe: futex-parked handler and interrupted sleep OK",
+    "sigprobe: OK (0 failures)",
+    "linux: /bin/sigprobe exited 0",
     "bigread: OK (0 failures)",
     "linux: /bin/bigread exited 0",
 )

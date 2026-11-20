@@ -1,6 +1,7 @@
 #j915
 #j916
 #j918
+#j919
 # persona/ — Linux-side payloads for the persona shim (PLAN/022 SH7-c j888, SH7-d j889/j890).
 # Rebuild: scripts/persona-payloads.sh (needs docker + network). xtask refuses to pack a file
 # whose sha256 differs from this list (PERSONA_PAYLOADS in xtask/src/main.rs).
@@ -15,6 +16,7 @@
 # writeprobe   : gcc -O2 -o writeprobe writeprobe.c && strip writeprobe  (SH7-e1, j918: the write surface; passes on Linux too)
 # bigread      : gcc -O2 -o bigread bigread.c && strip bigread  (SH7-d3a, j891: bulk read/pread/mmap of /etc/big.bin)
 # threadprobe  : gcc -O2 -o threadprobe threadprobe.c && strip threadprobe  (SH7-d3c-2, j916: musl pthreads — clone, futex, exit, timed waits)
+# sigprobe     : gcc -O2 -o sigprobe sigprobe.c && strip sigprobe  (SH7-e2, j919: signal delivery; passes on Linux too)
 # pipeprobe    : scripts/persona-probes.sh (SH7-d3c-1; header-free, clang + pinned rust-lld)
 # musl/ld-musl-aarch64.so.1 : /lib/ld-musl-aarch64.so.1 from musl-1.2.5-r13 (musl's libc.so and dynamic loader)
 # musl/COPYRIGHT : https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5 (MIT; covers ld-musl-aarch64.so.1)
@@ -28,5 +30,6 @@ e06a25921d420b47653e8fc3bd56238b11aef8e4229a9b0189322521a011bf18  writeprobe
 cbc27a4eff02d33406e84b6df75e38eda2322883828b272bd1e3686d61c672f1  bigread
 e704ab6e631bbb2efac56bd96296d29f443a97ec0fc48a81e5d74949eb623455  pipeprobe
 20a3538d87e85547c8f64dfcdeb9f72b868cdaaa1c16f3bd1843bc29f275174f  threadprobe
+bf6367753015b26b088eebc72ec6d6251555fa0870e4483e7fceeb97f372e46c  sigprobe
 42fb025bc758b76e60e7b3b0fcdcfab93b6ba1694b363244c2e8e6f51847e28c  musl/ld-musl-aarch64.so.1
 f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af  musl/COPYRIGHT

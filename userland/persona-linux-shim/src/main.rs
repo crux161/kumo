@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j891
 //j915
 //j916
 //j917
 //j918
+//j919
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -31,6 +31,7 @@ use kumo_rt::{
 use persona_linux::elf::{self, Machine};
 
 mod files;
+mod signals;
 mod threads;
 
 kumo_rt::entry!(main);
@@ -77,8 +78,13 @@ mod nr {
     pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const SCHED_YIELD: u64 = 124;
     pub const SIGALTSTACK: u64 = 132;
+    pub const KILL: u64 = 129;
+    pub const TKILL: u64 = 130;
+    pub const TGKILL: u64 = 131;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
+    pub const RT_SIGPENDING: u64 = 136;
+    pub const RT_SIGRETURN: u64 = 139;
     pub const PRCTL: u64 = 167;
     pub const GETPID: u64 = 172;
     pub const GETTID: u64 = 178;
@@ -97,6 +103,8 @@ mod nr {
 pub(crate) mod errno {
     pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
+    pub const ESRCH: i64 = 3;
+    pub const EINTR: i64 = 4;
     pub const EIO: i64 = 5;
     pub const EBADF: i64 = 9;
     pub const EAGAIN: i64 = 11;
@@ -229,11 +237,13 @@ core::arch::global_asm!(
     ".text",
     // Entered by the kernel's redirect: SP = this thread's trap stack top, which is also its
     // ThreadRec (SH7-d3c-2); every other register as the foreign program left it at its `svc`
-    // (x8 = the Linux number, x0..x5 = arguments).
+    // (x8 = the Linux number, x0..x5 = arguments). j919 (SH7-e2): the frame is a [`TrapFrame`]
+    // — x0..x30, then q0..q31, FPSR and FPCR. The shim's own Rust uses SIMD registers, and a
+    // Linux syscall preserves every one of them; a signal frame carries them too.
     ".global persona_trap_entry",
     ".type persona_trap_entry, %function",
     "persona_trap_entry:",
-    "  sub sp, sp, #256",
+    "  sub sp, sp, #784",
     "  stp x0, x1, [sp, #0]",
     "  stp x2, x3, [sp, #16]",
     "  stp x4, x5, [sp, #32]",
@@ -250,10 +260,52 @@ core::arch::global_asm!(
     "  stp x26, x27, [sp, #208]",
     "  stp x28, x29, [sp, #224]",
     "  str x30, [sp, #240]",
+    "  add x9, sp, #256",
+    "  stp q0, q1, [x9, #0]",
+    "  stp q2, q3, [x9, #32]",
+    "  stp q4, q5, [x9, #64]",
+    "  stp q6, q7, [x9, #96]",
+    "  stp q8, q9, [x9, #128]",
+    "  stp q10, q11, [x9, #160]",
+    "  stp q12, q13, [x9, #192]",
+    "  stp q14, q15, [x9, #224]",
+    "  stp q16, q17, [x9, #256]",
+    "  stp q18, q19, [x9, #288]",
+    "  stp q20, q21, [x9, #320]",
+    "  stp q22, q23, [x9, #352]",
+    "  stp q24, q25, [x9, #384]",
+    "  stp q26, q27, [x9, #416]",
+    "  stp q28, q29, [x9, #448]",
+    "  stp q30, q31, [x9, #480]",
+    "  mrs x10, fpsr",
+    "  mrs x11, fpcr",
+    "  add x12, sp, #768",
+    "  stp x10, x11, [x12]",
     "  mov x0, sp",
-    "  add x1, sp, #256",
+    "  add x1, sp, #784",
     "  bl persona_dispatch",
-    // Restore the foreign registers except x0 (the result) and x8 (the kernel restores it).
+    // Restore the FP/SIMD state, then the foreign registers except x8 (the kernel restores it).
+    "  add x12, sp, #768",
+    "  ldp x10, x11, [x12]",
+    "  msr fpsr, x10",
+    "  msr fpcr, x11",
+    "  add x9, sp, #256",
+    "  ldp q0, q1, [x9, #0]",
+    "  ldp q2, q3, [x9, #32]",
+    "  ldp q4, q5, [x9, #64]",
+    "  ldp q6, q7, [x9, #96]",
+    "  ldp q8, q9, [x9, #128]",
+    "  ldp q10, q11, [x9, #160]",
+    "  ldp q12, q13, [x9, #192]",
+    "  ldp q14, q15, [x9, #224]",
+    "  ldp q16, q17, [x9, #256]",
+    "  ldp q18, q19, [x9, #288]",
+    "  ldp q20, q21, [x9, #320]",
+    "  ldp q22, q23, [x9, #352]",
+    "  ldp q24, q25, [x9, #384]",
+    "  ldp q26, q27, [x9, #416]",
+    "  ldp q28, q29, [x9, #448]",
+    "  ldp q30, q31, [x9, #480]",
     "  ldr x1, [sp, #8]",
     "  ldp x2, x3, [sp, #16]",
     "  ldp x4, x5, [sp, #32]",
@@ -294,6 +346,24 @@ core::arch::global_asm!(
     "  br x16",
 );
 
+/// j919 (SH7-e2): what `persona_trap_entry` saves of the program at its `svc`: the general
+/// registers, then the whole FP/SIMD state. Dispatch reads arguments from `x` and leaves the
+/// result in `x[0]`; signal delivery and `rt_sigreturn` read and rewrite all of it.
+#[repr(C)]
+pub struct TrapFrame {
+    pub x: [u64; 31],
+    _pad: u64,
+    pub q: [u128; 32],
+    pub fpsr: u64,
+    pub fpcr: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<TrapFrame>() == 784);
+    assert!(core::mem::offset_of!(TrapFrame, q) == 256);
+    assert!(core::mem::offset_of!(TrapFrame, fpsr) == 768);
+};
+
 /// The foreign program's state the shim keeps: its program break.
 struct Program {
     brk_end: u64,
@@ -304,15 +374,17 @@ static mut PROGRAM: Program = Program { brk_end: 0 };
 /// Serve one redirected call. `frame` holds the foreign x0..x30; the result goes in x0. `rec` is
 /// the calling thread's own record (its trap stack top, SH7-d3c-2).
 #[unsafe(no_mangle)]
-extern "C" fn persona_dispatch(frame: *mut [u64; 31], rec: *mut threads::ThreadRec) {
+extern "C" fn persona_dispatch(frame: *mut TrapFrame, rec: *mut threads::ThreadRec) {
     let frame = unsafe { &mut *frame };
     let rec = unsafe { &mut *rec };
-    let (a0, a1, a2, a3, a4) = (frame[0], frame[1], frame[2], frame[3], frame[4]);
+    let x = &frame.x;
+    let (a0, a1, a2, a3, a4, a5) = (x[0], x[1], x[2], x[3], x[4], x[5]);
+    let number = x[8];
     // SH7-d3c-2: calls that touch only the calling thread or the kernel run without the shim
     // lock (a futex wait or a sleep must not hold it); everything else is serialized.
-    let result: i64 = match frame[8] {
-        nr::CLONE => threads::clone(rec, frame, a0, a1, a2, a3, a4),
-        nr::FUTEX => threads::futex(a0, a1, a2, a3, frame[5]),
+    let mut result: i64 = match number {
+        nr::CLONE => threads::clone(rec, &frame.x, a0, a1, a2, a3, a4),
+        nr::FUTEX => threads::futex(rec, a0, a1, a2, a3, a5),
         nr::EXIT => threads::exit_thread(rec, a0),
         nr::EXIT_GROUP => process_exit(a0 & 0xff),
         nr::GETTID => threads::gettid(rec),
@@ -321,22 +393,34 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31], rec: *mut threads::ThreadR
         nr::SET_ROBUST_LIST => threads::set_robust_list(rec, a0, a1),
         nr::SCHED_YIELD => threads::sched_yield(),
         nr::CLOCK_GETTIME => threads::clock_gettime(a0, a1),
-        nr::NANOSLEEP => threads::clock_nanosleep(1, 0, a0, a1),
-        nr::CLOCK_NANOSLEEP => threads::clock_nanosleep(a0, a1, a2, a3),
-        // j917 (SH7-d3d): what rustc's startup asks for, per thread or kernel-only.
-        nr::RT_SIGPROCMASK => threads::rt_sigprocmask(rec, a0, a1, a2, a3),
-        nr::SIGALTSTACK => threads::sigaltstack(rec, a0, a1),
+        nr::NANOSLEEP => threads::clock_nanosleep(rec, 1, 0, a0, a1),
+        nr::CLOCK_NANOSLEEP => threads::clock_nanosleep(rec, a0, a1, a2, a3),
+        // j917 (SH7-d3d) / j919 (SH7-e2): signal state, per thread or kernel-only.
+        nr::RT_SIGPROCMASK => signals::rt_sigprocmask(rec, a0, a1, a2, a3),
+        nr::RT_SIGPENDING => signals::rt_sigpending(rec, a0, a1),
+        nr::SIGALTSTACK => signals::sigaltstack(rec, a0, a1),
+        nr::RT_SIGRETURN => signals::rt_sigreturn(frame, rec),
         nr::PRCTL => threads::prctl(a0, a1),
         nr::GETRANDOM => threads::getrandom(a0, a1, a2),
         nr::MEMBARRIER => threads::membarrier(a0, a1),
         number => {
             threads::lock();
-            let result = serve_locked(number, frame);
+            let result = match number {
+                // j919: sending needs the registry and the dispositions, both lock-guarded.
+                nr::TKILL => signals::tgkill(0, a0, a1, rec),
+                nr::TGKILL => signals::tgkill(a0, a1, a2, rec),
+                nr::KILL => signals::kill(a0 as i64, a1, rec),
+                _ => serve_locked(number, &frame.x),
+            };
             threads::unlock();
             result
         }
     };
-    frame[0] = result as u64;
+    // j919: a deliverable signal enters its handler here, on the way back to the program (the
+    // exits never get here), and a call one interrupted (-ERESTARTSYS) restarts or answers
+    // EINTR. `rt_sigreturn` returns a restored x0, which is never an interruption.
+    signals::on_return(frame, rec, a0, number != nr::RT_SIGRETURN, &mut result);
+    frame.x[0] = result as u64;
 }
 
 /// The calls over the shim's shared state, with the shim lock held. A blocking pipe or stdin
@@ -359,7 +443,7 @@ fn serve_locked(number: u64, frame: &[u64; 31]) -> i64 {
         nr::GETDENTS64 => files::getdents64(a0 as i64, a1, a2),
         nr::FCNTL => files::fcntl(a0 as i64, a1, a2),
         nr::IOCTL => -errno::ENOTTY,
-        nr::RT_SIGACTION => threads::rt_sigaction(a0, a1, a2, frame[3]),
+        nr::RT_SIGACTION => signals::rt_sigaction(a0, a1, a2, frame[3]),
         nr::READLINKAT => files::readlinkat(a0 as i64, a1, a2, frame[3]),
         nr::PPOLL => files::ppoll(a0, a1, a2),
         // SH7-e1 (j918): the write surface over the image's read-write session (cut W1).

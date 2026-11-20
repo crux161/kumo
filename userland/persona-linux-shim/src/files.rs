@@ -1,8 +1,8 @@
-//j892
 //j915
 //j916
 //j917
 //j918
+//j919
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -153,11 +153,24 @@ fn session() -> &'static mut Session {
 static PIPE_READER: [AtomicU32; MAX_FDS] = [const { AtomicU32::new(0) }; MAX_FDS];
 static STDIN_READER: AtomicU32 = AtomicU32::new(0);
 
-/// Park in a blocking `ChannelRead` with the shim lock released (a sibling may hold the other
-/// end), then take the lock back. `busy` keeps other readers of the same channel out meanwhile.
-fn parked_read(busy: &AtomicU32, channel: Handle, out: &mut [u8]) -> u64 {
+/// Park until `channel` has a message, with the shim lock released (a sibling may hold the
+/// other end), then take the lock back. `busy` keeps other readers of the same channel out
+/// meanwhile. j919 (SH7-e2): the wait also watches the thread's alert channel, so a deliverable
+/// signal ends it: `None`, which the caller answers with -ERESTARTSYS.
+fn parked_read(busy: &AtomicU32, channel: Handle, out: &mut [u8]) -> Option<u64> {
     busy.store(1, Ordering::Release);
-    let n = threads::unlocked(|| channel_read(channel, out.as_mut_ptr(), out.len()));
+    let me = crate::signals::current();
+    let n = threads::unlocked(|| loop {
+        if let Some((n, _)) = channel_try_read_with_handle(channel, out.as_mut_ptr(), out.len()) {
+            break Some(n as u64);
+        }
+        match me.map(|rec| crate::signals::wait_or_alert(rec, channel)) {
+            Some(Some(true)) => break None,
+            Some(Some(false)) => continue,
+            // No record or no port: the plain blocking read, uninterruptible.
+            _ => break Some(channel_read(channel, out.as_mut_ptr(), out.len())),
+        }
+    });
     busy.store(0, Ordering::Release);
     let _ = kumo_rt::futex_wake(busy.as_ptr(), u32::MAX);
     n
@@ -740,7 +753,10 @@ fn fill_pipe(index: usize, channel: u32, block: bool) -> Result<bool, i64> {
             None if !block => return Err(-errno::EAGAIN),
             None => {
                 let mut parked = [0u8; PIPE_CHUNK];
-                let n = parked_read(busy, Handle(channel), &mut parked) as usize;
+                let Some(n) = parked_read(busy, Handle(channel), &mut parked) else {
+                    return Err(-crate::signals::ERESTARTSYS);
+                };
+                let n = n as usize;
                 let entry = &mut session().fds[index];
                 if !matches!(entry.kind, Kind::Pipe { channel: c, .. } if c == channel) {
                     return Err(-errno::EBADF);
@@ -779,7 +795,9 @@ fn read_stdin(out: &mut [u8]) -> i64 {
         }
         let stdin = s.stdin;
         let mut parked = [0u8; 256];
-        let n = parked_read(&STDIN_READER, stdin, &mut parked);
+        let Some(n) = parked_read(&STDIN_READER, stdin, &mut parked) else {
+            return -crate::signals::ERESTARTSYS;
+        };
         if n == 0 || n == u64::MAX || n as usize > parked.len() {
             return 0;
         }

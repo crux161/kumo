@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j880
 //j881
 //j882
 //j883
 //j916
+//j919
 
 use core::cell::UnsafeCell;
 
@@ -323,6 +323,18 @@ impl PersonaShim {
         }
         self.saved = Some((pc, sp, x8));
         true
+    }
+
+    /// SH7-e2 `PersonaContext` MOVE: the open call resumes at `(pc, sp, x8)` instead. Refused
+    /// with no call open.
+    pub fn move_call(&mut self, pc: u64, sp: u64, x8: u64) -> bool {
+        match self.saved.as_mut() {
+            Some(saved) => {
+                *saved = (pc, sp, x8);
+                true
+            }
+            None => false,
+        }
     }
 
     /// `PersonaReturn`: restore the foreign PC, SP and x8; x0 already holds the result.
@@ -1383,6 +1395,8 @@ pub fn persona_context(op: u64, pc: u64, sp: u64, x8: u64) -> Option<(u64, u64, 
     match op {
         kumo_abi::sys::PERSONA_CONTEXT_GET => shim.open_call(),
         kumo_abi::sys::PERSONA_CONTEXT_SEED => shim.seed_call(pc, sp, x8).then_some((0, 0, 0)),
+        //j919
+        kumo_abi::sys::PERSONA_CONTEXT_MOVE => shim.move_call(pc, sp, x8).then_some((0, 0, 0)),
         _ => None,
     }
 }
@@ -3344,6 +3358,35 @@ mod ax4_capacity_tests {
             (0x40_1004, 0x5000_0000, 220)
         );
         assert_eq!(child.open_call(), None);
+        assert!(!child.move_call(1, 2, 3), "no call open to move");
+    }
+
+    //j919
+    /// SH7-e2: MOVE redirects only an open call, and the leave then resumes at the moved
+    /// context — a signal handler's entry, or the context rt_sigreturn restores. — TEAL
+    #[test]
+    fn persona_context_move_redirects_the_open_call() {
+        let mut shim = super::PersonaShim {
+            entry: 0x1c00_1000,
+            code_base: 0x1c00_0000,
+            code_len: 0x10_0000,
+            stack_top: 0x1c80_0000,
+            saved: None,
+        };
+        let mut frame = [0u64; 34];
+        frame[31] = 0x40_2004;
+        frame[33] = 0x7fff_e000;
+        frame[8] = 63; // Linux read, interrupted
+        assert_eq!(shim.redirect(&mut frame), super::PersonaTrap::Redirected);
+        assert!(shim.move_call(0x40_9000, 0x7fff_c000, 63));
+        assert_eq!(shim.open_call(), Some((0x40_9000, 0x7fff_c000, 63)));
+        let mut leave = [0u64; 34];
+        assert!(shim.resume(&mut leave));
+        assert_eq!(
+            (leave[31], leave[33], leave[8]),
+            (0x40_9000, 0x7fff_c000, 63)
+        );
+        assert!(!shim.move_call(0, 0, 0));
     }
 
     /// SH6: a fault registration is per thread, one-shot, and cleared by entry 0; the

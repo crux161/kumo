@@ -1,5 +1,6 @@
 //j916
 //j917
+//j919
 //! SH7-d3c-2: the minimum Linux thread (the ratified SH7-d3 cut, T1).
 //!
 //! **Threads.** A Linux `clone` with musl's pthread flag set becomes a KUMO `ThreadSpawn` in
@@ -19,7 +20,7 @@
 //! read with nothing to read) parks with the lock released, so a sibling can make it ready.
 //! — TEAL
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use kumo_rt::{
     clock_get, futex_wait, futex_wake, process_exit, sleep_ns, thread_self, thread_yield,
@@ -65,6 +66,15 @@ pub struct ThreadRec {
     pub alt_sp: u64,
     pub alt_flags: u64,
     pub alt_size: u64,
+    /// j919 (SH7-e2): signals sent to this thread and not yet delivered (bit `sig - 1`), and
+    /// which of them came from `kill` (SI_USER) rather than `tkill` (SI_TKILL).
+    pub pending: AtomicU64,
+    pub pending_user: AtomicU64,
+    /// The futex word this thread is parked on in an untimed wait, or 0: a sender wakes it.
+    pub waiting_on: AtomicU64,
+    /// This thread's alert channel: senders write `alert_send`, its waits watch `alert_recv`.
+    pub alert_recv: u32,
+    pub alert_send: u32,
 }
 
 const _: () = {
@@ -88,8 +98,13 @@ impl ThreadRec {
         child_tid_at: 0,
         sigmask: 0,
         alt_sp: 0,
-        alt_flags: SS_DISABLE,
+        alt_flags: crate::signals::SS_DISABLE,
         alt_size: 0,
+        pending: AtomicU64::new(0),
+        pending_user: AtomicU64::new(0),
+        waiting_on: AtomicU64::new(0),
+        alert_recv: 0,
+        alert_send: 0,
     };
 }
 
@@ -186,7 +201,7 @@ fn thread_exit(stack_base: u64, stack_len: u64) -> ! {
 }
 
 /// `PersonaContext`: `(status, pc, sp, x8)`.
-fn persona_context(op: u64, pc: u64, sp: u64, x8: u64) -> (u64, u64, u64, u64) {
+pub fn persona_context(op: u64, pc: u64, sp: u64, x8: u64) -> (u64, u64, u64, u64) {
     let status: u64;
     let (out_pc, out_sp, out_x8): (u64, u64, u64);
     unsafe {
@@ -260,7 +275,8 @@ pub fn register_main() -> bool {
     };
     rec.tid = tid as u64;
     PID.store(tid as u32, Ordering::Relaxed);
-    register(rec)
+    // j919: the program has no other thread yet, so the registry needs no lock here.
+    crate::signals::register(rec) && register(rec)
 }
 
 /// The Rust half of `persona_thread_entry`. Returns only when the child can enter the program.
@@ -271,6 +287,12 @@ extern "C" fn persona_thread_start(rec: *mut ThreadRec) {
         child_failed("a thread koid does not fit a Linux tid");
     };
     r.tid = tid as u64;
+    lock();
+    let listed = crate::signals::register(r);
+    unlock();
+    if !listed {
+        child_failed("no room or no alert channel for a thread");
+    }
     if !register(rec) {
         child_failed("PersonaShimSet refused a thread");
     }
@@ -350,6 +372,7 @@ pub fn clone(
     rec.parent_tid_at = if kind.parent_set_tid { ptid } else { 0 };
     rec.child_tid_at = if kind.child_set_tid { ctid } else { 0 };
     rec.sigmask = parent.sigmask;
+    // A clone starts with nothing pending and no alternate stack (Linux, CLONE_VM).
 
     let (status, koid) = thread_spawn(persona_thread_entry as *const () as u64, rec_at, rec_at);
     if status != 0 {
@@ -380,6 +403,10 @@ pub fn exit_thread(rec: &ThreadRec, status: u64) -> ! {
     if thread_self().1 <= 1 {
         process_exit(status & 0xff);
     }
+    // j919: no sender may find this record once its trap stack is gone.
+    lock();
+    crate::signals::unregister(rec);
+    unlock();
     thread_exit(rec.region_base, rec.region_len)
 }
 
@@ -411,7 +438,7 @@ pub fn sched_yield() -> i64 {
 }
 
 /// Linux `futex` on the kernel futex (one domain per process, keyed by address).
-pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> i64 {
+pub fn futex(rec: &ThreadRec, uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> i64 {
     if uaddr == 0 || uaddr % 4 != 0 {
         return -errno::EINVAL;
     }
@@ -451,8 +478,19 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> i64 {
             expected,
             deadline: Deadline::Never,
         }) => {
-            let status = futex_wait(word.as_ptr(), expected);
-            if status == kumo_abi::Errno::Ok.status() {
+            // j919: interruptible. The word is recorded first, so a sender that sets a pending
+            // bit after the check below wakes this word; one that set it before is seen here.
+            rec.waiting_on.store(uaddr, Ordering::Release);
+            let status = if crate::signals::deliverable(rec) != 0 {
+                rec.waiting_on.store(0, Ordering::Release);
+                return -crate::signals::ERESTARTSYS;
+            } else {
+                futex_wait(word.as_ptr(), expected)
+            };
+            rec.waiting_on.store(0, Ordering::Release);
+            if crate::signals::deliverable(rec) != 0 {
+                -crate::signals::ERESTARTSYS
+            } else if status == kumo_abi::Errno::Ok.status() {
                 0
             } else if status == kumo_abi::Errno::ShouldWait.status() {
                 -errno::EAGAIN
@@ -468,7 +506,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, val3: u64) -> i64 {
                 Deadline::Relative => clock_get().saturating_add(ns),
                 _ => ns,
             };
-            timed_wait(word, expected, until)
+            timed_wait(rec, word, expected, until)
         }
     }
 }
@@ -483,7 +521,7 @@ const TIMED_WAIT_STEP_NS: u64 = 1_000_000;
 /// probe failed). A wake that does not change the word is seen only at the deadline (Linux
 /// callers re-check their condition), and one that does is seen up to a tick late. The real fix
 /// is a deadline on the kernel's FutexWait (a later slice).
-fn timed_wait(word: &AtomicU32, expected: u32, until: u64) -> i64 {
+fn timed_wait(rec: &ThreadRec, word: &AtomicU32, expected: u32, until: u64) -> i64 {
     if word.load(Ordering::Acquire) != expected {
         return -errno::EAGAIN;
     }
@@ -492,9 +530,12 @@ fn timed_wait(word: &AtomicU32, expected: u32, until: u64) -> i64 {
         if now >= until {
             return -errno::ETIMEDOUT;
         }
-        if !sleep_ns((until - now).min(TIMED_WAIT_STEP_NS)) {
+        // j919: each step also ends for a deliverable signal (the call then restarts or EINTRs).
+        match crate::signals::sleep_or_alert(rec, (until - now).min(TIMED_WAIT_STEP_NS)) {
+            Some(true) => return -crate::signals::ERESTARTSYS,
+            Some(false) => {}
             // No timer to sleep on (out of handles): time out early rather than spin or hang.
-            return -errno::ETIMEDOUT;
+            None => return -errno::ETIMEDOUT,
         }
         if word.load(Ordering::Acquire) != expected {
             return 0;
@@ -551,8 +592,9 @@ pub fn clock_gettime(clock: u64, at: u64) -> i64 {
     0
 }
 
-/// Linux `nanosleep` and `clock_nanosleep` (relative or TIMER_ABSTIME). Never interrupted.
-pub fn clock_nanosleep(clock: u64, flags: u64, request: u64, remain: u64) -> i64 {
+/// Linux `nanosleep` and `clock_nanosleep` (relative or TIMER_ABSTIME). j919: a deliverable
+/// signal ends the sleep with EINTR and the time left in `remain`, as on Linux.
+pub fn clock_nanosleep(rec: &ThreadRec, clock: u64, flags: u64, request: u64, remain: u64) -> i64 {
     if !wall_clock(clock) || flags & !TIMER_ABSTIME != 0 {
         return -errno::EINVAL;
     }
@@ -564,8 +606,25 @@ pub fn clock_nanosleep(clock: u64, flags: u64, request: u64, remain: u64) -> i64
     } else {
         ns
     };
-    if delay == 0 || !sleep_ns(delay) {
+    let start = clock_get();
+    let interrupted = if delay == 0 {
         let _ = thread_yield();
+        false
+    } else {
+        match crate::signals::sleep_or_alert(rec, delay) {
+            Some(interrupted) => interrupted,
+            None => {
+                // No timer: the old blocking sleep, uninterruptible.
+                let _ = sleep_ns(delay);
+                false
+            }
+        }
+    };
+    if interrupted {
+        if remain != 0 && flags & TIMER_ABSTIME == 0 {
+            write_timespec(remain, delay.saturating_sub(clock_get() - start));
+        }
+        return -errno::EINTR;
     }
     if remain != 0 && flags & TIMER_ABSTIME == 0 {
         write_timespec(remain, 0);
@@ -573,97 +632,7 @@ pub fn clock_nanosleep(clock: u64, flags: u64, request: u64, remain: u64) -> i64
     0
 }
 
-// ---- j917 (SH7-d3d): what rustc's startup asks of signals and the process ------------------
-
-const SS_ONSTACK: u64 = 1;
-const SS_DISABLE: u64 = 2;
-const SIG_BLOCK: u64 = 0;
-const SIG_UNBLOCK: u64 = 1;
-const SIG_SETMASK: u64 = 2;
-const SIGKILL: u64 = 9;
-const SIGSTOP: u64 = 19;
-
-/// Linux `rt_sigprocmask` on this thread's own mask. No signal is ever delivered to a Linux
-/// thread yet (async signals are SH6's KUMO messages, not served here), so the mask is kept
-/// exactly and only reported back: musl saves and restores it around `clone`.
-pub fn rt_sigprocmask(rec: &mut ThreadRec, how: u64, set: u64, old: u64, size: u64) -> i64 {
-    if size != 8 {
-        return -errno::EINVAL;
-    }
-    let previous = rec.sigmask;
-    if set != 0 {
-        let wanted = unsafe { *(set as *const u64) };
-        // SIGKILL and SIGSTOP cannot be blocked.
-        let unblockable = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
-        rec.sigmask = match how {
-            SIG_BLOCK => previous | wanted,
-            SIG_UNBLOCK => previous & !wanted,
-            SIG_SETMASK => wanted,
-            _ => return -errno::EINVAL,
-        } & !unblockable;
-    }
-    if old != 0 {
-        unsafe { *(old as *mut u64) = previous };
-    }
-    0
-}
-
-/// The process's signal dispositions, as `rt_sigaction` set them: `struct k_sigaction` on
-/// aarch64 = handler, flags, restorer, mask (8 bytes with `sigsetsize` 8). Guarded by the shim
-/// lock. Recorded and reported back only; nothing is delivered through them yet.
-static mut SIGACTIONS: [[u64; 4]; 65] = [[0; 4]; 65];
-
-/// Linux `rt_sigaction`. Called with the shim lock held.
-pub fn rt_sigaction(sig: u64, act: u64, old: u64, size: u64) -> i64 {
-    if size != 8 || sig == 0 || sig > 64 {
-        return -errno::EINVAL;
-    }
-    if act != 0 && (sig == SIGKILL || sig == SIGSTOP) {
-        return -errno::EINVAL;
-    }
-    let table = unsafe { &mut *core::ptr::addr_of_mut!(SIGACTIONS) };
-    let previous = table[sig as usize];
-    if act != 0 {
-        table[sig as usize] = unsafe { core::ptr::read_unaligned(act as *const [u64; 4]) };
-    }
-    if old != 0 {
-        unsafe { core::ptr::write_unaligned(old as *mut [u64; 4], previous) };
-    }
-    0
-}
-
-/// Linux `sigaltstack` on this thread's record (Rust's runtime installs one per thread for its
-/// stack-overflow report, and takes it down at exit).
-pub fn sigaltstack(rec: &mut ThreadRec, new: u64, old: u64) -> i64 {
-    // stack_t { void *ss_sp; int ss_flags; size_t ss_size; } = 24 bytes on aarch64.
-    let previous = (rec.alt_sp, rec.alt_flags, rec.alt_size);
-    if new != 0 {
-        let (sp, flags, size) = unsafe {
-            (
-                *(new as *const u64),
-                *((new + 8) as *const u32) as u64,
-                *((new + 16) as *const u64),
-            )
-        };
-        if flags & !(SS_DISABLE | SS_ONSTACK) != 0 {
-            return -errno::EINVAL;
-        }
-        if flags & SS_DISABLE != 0 {
-            (rec.alt_sp, rec.alt_flags, rec.alt_size) = (0, SS_DISABLE, 0);
-        } else {
-            (rec.alt_sp, rec.alt_flags, rec.alt_size) = (sp, 0, size);
-        }
-    }
-    if old != 0 {
-        unsafe {
-            *(old as *mut u64) = previous.0;
-            *((old + 8) as *mut u32) = previous.1 as u32;
-            *((old + 12) as *mut u32) = 0;
-            *((old + 16) as *mut u64) = previous.2;
-        }
-    }
-    0
-}
+// ---- j917 (SH7-d3d): what rustc's startup asks of the process (signals: signals.rs) -----
 
 const PR_SET_NAME: u64 = 15;
 const PR_GET_NAME: u64 = 16;
