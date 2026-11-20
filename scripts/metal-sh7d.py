@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j891
 #j892
 #j915
 #j916
 #j917
+#j918
 """SH7-d metal: the persona-linux programs on the Orange Pi 5 Plus, one PXE boot.
 
     linux /bin/m10-hello   static Linux ELF through the in-process shim (SH7-b)
@@ -11,6 +11,7 @@
     linux /bin/vmprobe     mmap/mprotect/munmap semantics (SH7-d1)
     linux /bin/greet       NEEDED libgreet.so, found by musl in /lib (SH7-d2)
     linux /bin/fileprobe   the Linux file surface (SH7-d2)
+    linux /bin/writeprobe  the write surface over the image's read-write session (SH7-e1)
     linux /bin/bigread     bulk read/mmap/pread of a 6 MiB file through vfs ReadVmo (SH7-d3a)
     linux /bin/pipeprobe   Linux pipe descriptors, byte-stream tails, EOF and errors (SH7-d3c-1)
     linux /bin/threadprobe musl pthreads: clone, futex, a parked reader woken by a sibling (SH7-d3c-2)
@@ -51,6 +52,7 @@ BOOT = (
     b"linux /bin/vmprobe\n"
     b"linux /bin/greet\n"
     b"linux /bin/fileprobe\n"
+    b"linux /bin/writeprobe\n"
     b"linux /bin/pipeprobe\n"
     b"linux /bin/threadprobe\n"
     b"linux /bin/bigread\n"
@@ -67,6 +69,11 @@ EXPECTED = (
     "linux: /bin/greet exited 0",
     "fileprobe: OK (0 failures)",
     "linux: /bin/fileprobe exited 0",
+    "writeprobe: create, 5003-byte write and read-back OK",
+    "writeprobe: pwrite, ftruncate, append, O_TRUNC and O_EXCL OK",
+    "writeprobe: rename, cwd, dir fds, unlink and rmdir OK",
+    "writeprobe: OK (0 failures)",
+    "linux: /bin/writeprobe exited 0",
     "pipeprobe: flags, errors and empty reads OK",
     "pipeprobe: 5003 exact bytes, short-read tails and EOF OK",
     "pipeprobe: EPIPE, 128 reuse cycles and EMFILE rollback OK",

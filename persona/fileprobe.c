@@ -69,7 +69,8 @@ int main(void)
     errno = 0;
     check(open("/no-such-file", O_RDONLY) == -1 && errno == ENOENT, "open missing is ENOENT");
     errno = 0;
-    check(open("/etc/fileprobe.txt", O_WRONLY) == -1, "write open refused");
+    /* SH7-e1 (j918): the image is read-write for `linux` (cut W1); a directory still is not. */
+    check(open("/etc", O_WRONLY) == -1 && errno == EISDIR, "write open of a dir is EISDIR");
 
     /* relative to the cwd (/) and to a directory fd */
     fd = openat(AT_FDCWD, "etc/fileprobe.txt", O_RDONLY);

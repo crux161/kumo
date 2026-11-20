@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j890
 #j891
 #j915
 #j916
 #j917
+#j918
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -67,6 +67,7 @@ def main():
         b"linux /bin/vmprobe\n"
         b"linux /bin/greet\n"
         b"linux /bin/fileprobe\n"
+        b"linux /bin/writeprobe\n"
         b"linux /bin/pipeprobe\n"
         b"linux /bin/threadprobe\n"
         b"linux /bin/bigread\n"
@@ -82,6 +83,11 @@ def main():
             "linux: /bin/greet exited 0",
             "fileprobe: OK (0 failures)",
             "linux: /bin/fileprobe exited 0",
+            "writeprobe: create, 5003-byte write and read-back OK",
+            "writeprobe: pwrite, ftruncate, append, O_TRUNC and O_EXCL OK",
+            "writeprobe: rename, cwd, dir fds, unlink and rmdir OK",
+            "writeprobe: OK (0 failures)",
+            "linux: /bin/writeprobe exited 0",
             "pipeprobe: flags, errors and empty reads OK",
             "pipeprobe: 5003 exact bytes, short-read tails and EOF OK",
             "pipeprobe: EPIPE, 128 reuse cycles and EMFILE rollback OK",

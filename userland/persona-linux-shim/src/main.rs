@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j890
 //j891
 //j915
 //j916
 //j917
+//j918
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -38,7 +38,17 @@ kumo_rt::entry!(main);
 // ---- Linux aarch64 ABI ------------------------------------------------------------------
 
 mod nr {
+    pub const GETCWD: u64 = 17;
     pub const FCNTL: u64 = 25;
+    pub const MKDIRAT: u64 = 34;
+    pub const UNLINKAT: u64 = 35;
+    pub const RENAMEAT: u64 = 38;
+    pub const FTRUNCATE: u64 = 46;
+    pub const FACCESSAT: u64 = 48;
+    pub const CHDIR: u64 = 49;
+    pub const FCHDIR: u64 = 50;
+    pub const FCHMOD: u64 = 52;
+    pub const FCHMODAT: u64 = 53;
     pub const PPOLL: u64 = 73;
     pub const READLINKAT: u64 = 78;
     pub const IOCTL: u64 = 29;
@@ -52,8 +62,11 @@ mod nr {
     pub const READV: u64 = 65;
     pub const WRITEV: u64 = 66;
     pub const PREAD64: u64 = 67;
+    pub const PWRITE64: u64 = 68;
     pub const NEWFSTATAT: u64 = 79;
     pub const FSTAT: u64 = 80;
+    pub const FSYNC: u64 = 82;
+    pub const FDATASYNC: u64 = 83;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
     pub const SET_TID_ADDRESS: u64 = 96;
@@ -74,29 +87,38 @@ mod nr {
     pub const MUNMAP: u64 = 215;
     pub const MMAP: u64 = 222;
     pub const MPROTECT: u64 = 226;
+    pub const RENAMEAT2: u64 = 276;
     pub const GETRANDOM: u64 = 278;
     pub const MEMBARRIER: u64 = 283;
+    pub const COPY_FILE_RANGE: u64 = 285;
+    pub const FACCESSAT2: u64 = 439;
 }
 
 pub(crate) mod errno {
+    pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
     pub const EIO: i64 = 5;
     pub const EBADF: i64 = 9;
     pub const EAGAIN: i64 = 11;
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
+    pub const EEXIST: i64 = 17;
     pub const EFAULT: i64 = 14;
     pub const ENODEV: i64 = 19;
     pub const ENOTDIR: i64 = 20;
     pub const EISDIR: i64 = 21;
     pub const EINVAL: i64 = 22;
     pub const EMFILE: i64 = 24;
+    pub const EFBIG: i64 = 27;
+    pub const ENOSPC: i64 = 28;
     pub const ENOTTY: i64 = 25;
     pub const ESPIPE: i64 = 29;
     pub const EROFS: i64 = 30;
     pub const EPIPE: i64 = 32;
+    pub const ERANGE: i64 = 34;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
+    pub const ENOTEMPTY: i64 = 39;
     pub const ETIMEDOUT: i64 = 110;
 }
 
@@ -340,6 +362,22 @@ fn serve_locked(number: u64, frame: &[u64; 31]) -> i64 {
         nr::RT_SIGACTION => threads::rt_sigaction(a0, a1, a2, frame[3]),
         nr::READLINKAT => files::readlinkat(a0 as i64, a1, a2, frame[3]),
         nr::PPOLL => files::ppoll(a0, a1, a2),
+        // SH7-e1 (j918): the write surface over the image's read-write session (cut W1).
+        nr::PWRITE64 => files::pwrite(a0 as i64, a1, a2, frame[3]),
+        nr::FTRUNCATE => files::ftruncate(a0 as i64, a1),
+        nr::FSYNC | nr::FDATASYNC => files::fsync(a0 as i64),
+        nr::MKDIRAT => files::mkdirat(a0 as i64, a1),
+        nr::UNLINKAT => files::unlinkat(a0 as i64, a1, a2),
+        nr::RENAMEAT => files::renameat(a0 as i64, a1, a2 as i64, frame[3], 0),
+        nr::RENAMEAT2 => files::renameat(a0 as i64, a1, a2 as i64, frame[3], frame[4]),
+        nr::FCHMOD => files::fchmod(a0 as i64, a1),
+        nr::FCHMODAT => files::fchmodat(a0 as i64, a1, a2),
+        nr::FACCESSAT | nr::FACCESSAT2 => files::faccessat(a0 as i64, a1),
+        nr::GETCWD => files::getcwd(a0, a1),
+        nr::CHDIR => files::chdir(a0),
+        nr::FCHDIR => files::fchdir(a0 as i64),
+        // Rust's fs::copy falls back to read/write on ENOSYS; there is no in-server copy yet.
+        nr::COPY_FILE_RANGE => -errno::ENOSYS,
         nr::BRK => brk(a0) as i64,
         nr::MMAP => mmap(a0, a1, a2, frame[3], frame[4] as i64, frame[5]),
         nr::MUNMAP => munmap(a0, a1),

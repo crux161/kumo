@@ -1,16 +1,17 @@
-//j891
 //j892
 //j915
 //j916
 //j917
+//j918
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
 //! over the image or a volume. Every Linux path the program names resolves against that
-//! session's root, the cwd is `/`, and descriptors 3 and up are the shim's own table of vfs
-//! handles (files) and paths (directories). Descriptors 0–2 are the launcher's stdin and stdout
-//! channels. This slice is **read-only**: a write or create open answers `EROFS`, and says so.
-//! — TEAL
+//! session's root, the cwd starts at `/`, and descriptors 3 and up are the shim's own table of
+//! vfs handles (files) and paths (directories). Descriptors 0–2 are the launcher's stdin and
+//! stdout channels. SH7-e1 (j918, cut W1): the image session is read-write, so creates, writes,
+//! truncation, mkdir/unlink/rmdir/rename and chdir go to the server; a read-only session (a
+//! `/media` launch) answers each mutation with the server's refusal as EROFS. — TEAL
 
 use kumo_abi::{Handle, Rights};
 use kumo_rt::{
@@ -19,8 +20,10 @@ use kumo_rt::{
     vmo_create,
 };
 use kumo_vfs::{
-    parse_dir_reply, parse_open_reply, parse_read_vmo_reply, parse_stat_reply, read_payload,
-    Request, VfsError, READ_VMO_MAX, STAT_KIND_DIRECTORY, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_FOUND,
+    parse_dir_reply, parse_open_reply, parse_read_vmo_reply, parse_stat_reply, parse_write_reply,
+    read_payload, Request, VfsError, MAX_WRITE_DATA, OPEN_CREATE, OPEN_READ, OPEN_WRITE,
+    READ_VMO_MAX, STAT_KIND_DIRECTORY, VFS_ACCESS_DENIED, VFS_EXISTS, VFS_IS_DIR, VFS_NOT_DIR,
+    VFS_NOT_EMPTY, VFS_NOT_FOUND, VFS_NOT_SUPPORTED, VFS_NO_SPACE, VFS_OK,
 };
 use persona_linux::stream::ReadTail;
 
@@ -38,8 +41,14 @@ const MAX_FDS: usize = 64;
 const PIPE_CHUNK: usize = 4096;
 
 const O_ACCMODE: u64 = 3;
+const O_RDONLY: u64 = 0;
+const O_WRONLY: u64 = 1;
 const O_CREAT: u64 = 0o100;
+const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
+const O_APPEND: u64 = 0o2000;
+const AT_REMOVEDIR: u64 = 0x200;
+const RENAME_NOREPLACE: u64 = 1;
 const O_DIRECTORY: u64 = 0o40000;
 const O_NONBLOCK: u64 = 0o4000;
 const O_CLOEXEC: u64 = 0o2000000;
@@ -84,6 +93,8 @@ struct Fd {
     path_len: usize,
     flags: u64,
     carry: ReadTail<PIPE_CHUNK>,
+    /// SH7-e1: a file written through this descriptor, flushed when it closes.
+    dirty: bool,
 }
 
 impl Fd {
@@ -94,6 +105,7 @@ impl Fd {
         path_len: 0,
         flags: 0,
         carry: ReadTail::EMPTY,
+        dirty: false,
     };
 
     fn path(&self) -> &[u8] {
@@ -187,7 +199,25 @@ fn status_errno(error: VfsError) -> i64 {
         VfsError::Status(VFS_NOT_FOUND) => -errno::ENOENT,
         VfsError::Status(VFS_NOT_DIR) => -errno::ENOTDIR,
         VfsError::Status(VFS_IS_DIR) => -errno::EISDIR,
+        // SH7-e1: the mutation statuses.
+        VfsError::Status(VFS_EXISTS) => -errno::EEXIST,
+        VfsError::Status(VFS_NOT_EMPTY) => -errno::ENOTEMPTY,
+        VfsError::Status(VFS_NO_SPACE) => -errno::ENOSPC,
+        // A read-only session refuses every mutation this way.
+        VfsError::Status(VFS_ACCESS_DENIED) => -errno::EROFS,
+        VfsError::Status(VFS_NOT_SUPPORTED) => -errno::EPERM,
         _ => -errno::EIO,
+    }
+}
+
+/// SH7-e1: a one-status-byte vfs reply (mkdir, unlink, rmdir, rename, flush, set-len, chmod).
+fn vfs_status(request: &Request<'_>) -> i64 {
+    let mut reply = [0u8; 8];
+    match vfs_call(request, &mut reply) {
+        None => -errno::EIO,
+        Some([]) => -errno::EIO,
+        Some(&[VFS_OK, ..]) => 0,
+        Some(&[status, ..]) => status_errno(VfsError::Status(status)),
     }
 }
 
@@ -372,7 +402,11 @@ fn resolve(dirfd: i64, path: &[u8], out: &mut [u8; PATH_MAX]) -> Result<usize, i
         Ok(())
     };
     if path.first() != Some(&b'/') {
-        if dirfd != AT_FDCWD {
+        if dirfd == AT_FDCWD {
+            // SH7-e1: relative to the cwd (`chdir`), `/` until the program changes it.
+            let cwd = unsafe { &*core::ptr::addr_of!(CWD) };
+            push(&cwd.0[..cwd.1], &mut len)?;
+        } else {
             let fd = fd_entry(dirfd)?;
             if !matches!(fd.kind, Kind::Dir { .. }) {
                 return Err(-errno::ENOTDIR);
@@ -502,12 +536,13 @@ pub fn openat(dirfd: i64, path_ptr: u64, flags: u64) -> i64 {
         Err(e) => return e,
     };
     let path = &path[..len];
-    if flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
-        log_once(
-            &SAID_EROFS,
-            b"persona-linux: write opens arrive in a later slice (-EROFS)\n",
-        );
-        return -errno::EROFS;
+    let access = flags & O_ACCMODE;
+    if access == O_ACCMODE {
+        return -errno::EINVAL;
+    }
+    let writes = access != O_RDONLY || flags & (O_CREAT | O_TRUNC) != 0;
+    if writes {
+        return open_for_write(path, flags);
     }
     let mut reply = [0u8; 64];
     let Some(raw_reply) = vfs_call(&Request::open(path), &mut reply) else {
@@ -519,15 +554,83 @@ pub fn openat(dirfd: i64, path_ptr: u64, flags: u64) -> i64 {
                 close_vfs(handle);
                 return -errno::ENOTDIR;
             }
-            let fd = new_fd(Kind::File { handle, size }, path);
-            if fd < 0 {
-                close_vfs(handle);
-            }
-            fd
+            new_open(Kind::File { handle, size }, path, flags, handle)
         }
-        Err(VfsError::Status(VFS_IS_DIR)) => new_fd(Kind::Dir { next: 0 }, path),
+        Err(VfsError::Status(VFS_IS_DIR)) => new_open(Kind::Dir { next: 0 }, path, flags, u32::MAX),
         Err(error) => status_errno(error),
     }
+}
+
+/// A descriptor for a fresh open, recording its Linux flags; the vfs handle is released if the
+/// table is full.
+fn new_open(kind: Kind, path: &[u8], flags: u64, handle: u32) -> i64 {
+    let fd = new_fd(kind, path);
+    if fd < 0 {
+        if handle != u32::MAX {
+            close_vfs(handle);
+        }
+        return fd;
+    }
+    let entry = &mut session().fds[fd as usize];
+    entry.flags = flags;
+    entry.dirty = false;
+    fd
+}
+
+/// SH7-e1: an open that may create, truncate or write. The existing entry is stat'ed first so
+/// O_EXCL, O_DIRECTORY and "a directory opened for writing" answer as Linux does; the server
+/// creates a missing file only with O_CREAT. O_TRUNC empties the file through SetLen.
+fn open_for_write(path: &[u8], flags: u64) -> i64 {
+    let access = flags & O_ACCMODE;
+    let mut reply = [0u8; 32];
+    let existing = vfs_call(&Request::stat(path), &mut reply).map(parse_stat_reply);
+    match existing {
+        Some(Ok(stat)) => {
+            if flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
+                return -errno::EEXIST;
+            }
+            if stat.kind == STAT_KIND_DIRECTORY {
+                return -errno::EISDIR;
+            }
+        }
+        Some(Err(VfsError::Status(VFS_NOT_FOUND))) => {
+            if flags & O_CREAT == 0 {
+                return -errno::ENOENT;
+            }
+        }
+        Some(Err(error)) => return status_errno(error),
+        None => return -errno::EIO,
+    }
+    if flags & O_DIRECTORY != 0 {
+        return -errno::ENOTDIR;
+    }
+    let mut options = 0;
+    if access != O_WRONLY {
+        options |= OPEN_READ;
+    }
+    if access != O_RDONLY || flags & O_TRUNC != 0 {
+        options |= OPEN_WRITE;
+    }
+    if flags & O_CREAT != 0 {
+        options |= OPEN_CREATE;
+    }
+    let mut reply = [0u8; 64];
+    let Some(raw_reply) = vfs_call(&Request::OpenOptions { path, options }, &mut reply) else {
+        return -errno::EIO;
+    };
+    let (handle, mut size) = match parse_open_reply(raw_reply) {
+        Ok(open) => open,
+        Err(error) => return status_errno(error),
+    };
+    if flags & O_TRUNC != 0 && size != 0 {
+        let status = vfs_status(&Request::SetLen { handle, len: 0 });
+        if status < 0 {
+            close_vfs(handle);
+            return status;
+        }
+        size = 0;
+    }
+    new_open(Kind::File { handle, size }, path, flags, handle)
 }
 
 fn close_vfs(handle: u32) {
@@ -541,6 +644,9 @@ pub fn close(fd: i64) -> i64 {
         Err(e) => return e,
     };
     if let Kind::File { handle, .. } = entry.kind {
+        if entry.dirty {
+            let _ = vfs_status(&Request::Flush { handle });
+        }
         close_vfs(handle);
     } else if let Kind::Pipe { channel, .. } = entry.kind {
         let _ = handle_close(Handle(channel));
@@ -589,6 +695,7 @@ fn read_from(fd: i64, buf: u64, len: u64, may_block: bool) -> i64 {
     // SAFETY: the program's buffer, as it named it.
     let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
     match entry.kind {
+        Kind::File { .. } if entry.flags & O_ACCMODE == O_WRONLY => -errno::EBADF,
         Kind::File { handle, size } => {
             let n = vfs_pread(handle, size, entry.offset, out);
             if n > 0 {
@@ -697,6 +804,7 @@ pub fn pread(fd: i64, buf: u64, len: u64, offset: u64) -> i64 {
         return -errno::EINVAL;
     }
     match entry.kind {
+        Kind::File { .. } if entry.flags & O_ACCMODE == O_WRONLY => -errno::EBADF,
         Kind::File { handle, size } => {
             // SAFETY: the program's buffer, as it named it.
             let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
@@ -1085,7 +1193,8 @@ pub fn write_out(fd: i64, bytes: &[u8]) -> i64 {
             }
             return written as i64;
         }
-        Ok(Kind::File { .. } | Kind::Dir { .. }) => return -errno::EBADF,
+        Ok(Kind::File { .. }) => return write_file(fd, bytes, None),
+        Ok(Kind::Dir { .. }) => return -errno::EBADF,
         Ok(_) => return -errno::EBADF,
         Err(e) => return e,
     }
@@ -1100,7 +1209,6 @@ pub fn write_out(fd: i64, bytes: &[u8]) -> i64 {
     bytes.len() as i64
 }
 
-static SAID_EROFS: AtomicBool = AtomicBool::new(false);
 static SAID_PPOLL: AtomicBool = AtomicBool::new(false);
 
 /// Log `message` the first time `said` is seen unset (j917: one flag per message, atomic now
@@ -1125,4 +1233,325 @@ pub fn open_path(path: &[u8]) -> Result<(u32, u64), i64> {
 /// Release a handle [`open_path`] returned.
 pub fn close_handle(handle: u32) {
     close_vfs(handle);
+}
+
+// ---- SH7-e1 (j918): the write surface (cut W1) ----------------------------------------------
+
+/// The working directory `resolve` joins relative paths to: absolute and normalized. Guarded by
+/// the shim lock like the rest of the session.
+static mut CWD: ([u8; PATH_MAX], usize) = ([0; PATH_MAX], 0);
+
+/// Write `bytes` to the file behind `fd`: at `at` (pwrite), else at the descriptor's offset (or
+/// the end, with O_APPEND), which then advances. MAX_WRITE_DATA (256) bytes per vfs request; a
+/// short count from the server ends the call there, as a short write does on Linux.
+fn write_file(fd: i64, bytes: &[u8], at: Option<u64>) -> i64 {
+    let entry = match fd_entry(fd) {
+        Ok(entry) => entry,
+        Err(e) => return e,
+    };
+    let Kind::File { handle, size } = entry.kind else {
+        return -errno::EBADF;
+    };
+    if entry.flags & O_ACCMODE == O_RDONLY {
+        return -errno::EBADF;
+    }
+    let mut offset = match at {
+        Some(at) => at,
+        None if entry.flags & O_APPEND != 0 => size,
+        None => entry.offset,
+    };
+    if offset
+        .checked_add(bytes.len() as u64)
+        .is_none_or(|end| end > u32::MAX as u64)
+    {
+        // FAT files end at 4 GiB.
+        return -errno::EFBIG;
+    }
+    let mut written = 0usize;
+    for chunk in bytes.chunks(MAX_WRITE_DATA) {
+        let mut reply = [0u8; 16];
+        let request = Request::Write {
+            handle,
+            offset,
+            data: chunk,
+        };
+        let n = match vfs_call(&request, &mut reply).map(parse_write_reply) {
+            Some(Ok(n)) => n as usize,
+            Some(Err(error)) if written == 0 => return status_errno(error),
+            None if written == 0 => return -errno::EIO,
+            _ => break,
+        };
+        written += n;
+        offset += n as u64;
+        if n < chunk.len() {
+            break;
+        }
+    }
+    let entry = &mut session().fds[fd as usize];
+    if let Kind::File { size, .. } = &mut entry.kind {
+        *size = (*size).max(offset);
+    }
+    if at.is_none() {
+        entry.offset = offset;
+    }
+    entry.dirty |= written > 0;
+    written as i64
+}
+
+/// Linux `pwrite64`.
+pub fn pwrite(fd: i64, buf: u64, len: u64, offset: u64) -> i64 {
+    if (offset as i64) < 0 {
+        return -errno::EINVAL;
+    }
+    if !matches!(fd_entry(fd).map(|e| e.kind), Ok(Kind::File { .. })) {
+        return if fd_entry(fd).is_err() {
+            -errno::EBADF
+        } else {
+            -errno::ESPIPE
+        };
+    }
+    if len == 0 {
+        return 0;
+    }
+    // SAFETY: the program's buffer, as it named it.
+    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    write_file(fd, bytes, Some(offset))
+}
+
+/// Linux `ftruncate`: the file's length through SetLen (zero-filled when it grows).
+pub fn ftruncate(fd: i64, len: u64) -> i64 {
+    let entry = match fd_entry(fd) {
+        Ok(entry) => entry,
+        Err(e) => return e,
+    };
+    let Kind::File { handle, .. } = entry.kind else {
+        return -errno::EINVAL;
+    };
+    if entry.flags & O_ACCMODE == O_RDONLY {
+        return -errno::EINVAL;
+    }
+    if (len as i64) < 0 || len > u32::MAX as u64 {
+        return -errno::EINVAL;
+    }
+    let status = vfs_status(&Request::SetLen { handle, len });
+    if status == 0 {
+        let entry = &mut session().fds[fd as usize];
+        if let Kind::File { size, .. } = &mut entry.kind {
+            *size = len;
+        }
+        entry.dirty = true;
+    }
+    status
+}
+
+/// Linux `fsync` / `fdatasync`: Flush for a file; nothing to do for the rest.
+pub fn fsync(fd: i64) -> i64 {
+    match fd_entry(fd) {
+        Ok(entry) => match entry.kind {
+            Kind::File { handle, .. } => {
+                let status = vfs_status(&Request::Flush { handle });
+                if status == 0 {
+                    session().fds[fd as usize].dirty = false;
+                }
+                status
+            }
+            _ => 0,
+        },
+        Err(e) => e,
+    }
+}
+
+/// A user path resolved against `dirfd` (or the cwd).
+fn user_resolved(dirfd: i64, path_ptr: u64, out: &mut [u8; PATH_MAX]) -> Result<usize, i64> {
+    let mut raw = [0u8; PATH_MAX];
+    let n = user_path(path_ptr, &mut raw)?;
+    if n == 0 {
+        return Err(-errno::ENOENT);
+    }
+    resolve(dirfd, &raw[..n], out)
+}
+
+/// Linux `mkdirat` (the mode is not kept: FAT has none).
+pub fn mkdirat(dirfd: i64, path_ptr: u64) -> i64 {
+    let mut path = [0u8; PATH_MAX];
+    match user_resolved(dirfd, path_ptr, &mut path) {
+        Ok(len) => vfs_status(&Request::Mkdir { path: &path[..len] }),
+        Err(e) => e,
+    }
+}
+
+/// Linux `unlinkat`: a file, or with AT_REMOVEDIR an empty directory.
+pub fn unlinkat(dirfd: i64, path_ptr: u64, flags: u64) -> i64 {
+    if flags & !AT_REMOVEDIR != 0 {
+        return -errno::EINVAL;
+    }
+    let mut path = [0u8; PATH_MAX];
+    let len = match user_resolved(dirfd, path_ptr, &mut path) {
+        Ok(len) => len,
+        Err(e) => return e,
+    };
+    let path = &path[..len];
+    if path == b"/" {
+        return -errno::EPERM;
+    }
+    if flags & AT_REMOVEDIR != 0 {
+        vfs_status(&Request::Rmdir { path })
+    } else {
+        // Linux unlinks no directory (EISDIR); the server's unlink is files-only too.
+        let mut reply = [0u8; 32];
+        if let Some(Ok(stat)) = vfs_call(&Request::stat(path), &mut reply).map(parse_stat_reply) {
+            if stat.kind == STAT_KIND_DIRECTORY {
+                return -errno::EISDIR;
+            }
+        }
+        vfs_status(&Request::Unlink { path })
+    }
+}
+
+/// Linux `renameat` / `renameat2` (flags 0 or RENAME_NOREPLACE): the server replaces an existing
+/// file atomically.
+pub fn renameat(from_dir: i64, from_ptr: u64, to_dir: i64, to_ptr: u64, flags: u64) -> i64 {
+    if flags & !RENAME_NOREPLACE != 0 {
+        return -errno::EINVAL;
+    }
+    let mut from = [0u8; PATH_MAX];
+    let mut to = [0u8; PATH_MAX];
+    let (from_len, to_len) = match (
+        user_resolved(from_dir, from_ptr, &mut from),
+        user_resolved(to_dir, to_ptr, &mut to),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    if flags & RENAME_NOREPLACE != 0 {
+        let mut reply = [0u8; 32];
+        if let Some(Ok(_)) =
+            vfs_call(&Request::stat(&to[..to_len]), &mut reply).map(parse_stat_reply)
+        {
+            return -errno::EEXIST;
+        }
+    }
+    vfs_status(&Request::Rename {
+        from: &from[..from_len],
+        to: &to[..to_len],
+    })
+}
+
+/// Linux `fchmod`: the server records a synthetic mode (FAT stores none).
+pub fn fchmod(fd: i64, mode: u64) -> i64 {
+    let entry = match fd_entry(fd) {
+        Ok(entry) => entry,
+        Err(e) => return e,
+    };
+    match entry.kind {
+        Kind::File { .. } | Kind::Dir { .. } => {
+            let mut path = [0u8; PATH_MAX];
+            let len = entry.path_len;
+            path[..len].copy_from_slice(entry.path());
+            chmod_path(&path[..len], mode)
+        }
+        // Pipes and the standard streams: nothing to keep.
+        _ => 0,
+    }
+}
+
+/// Linux `fchmodat` (flags are not taken: there are no symlinks to not follow).
+pub fn fchmodat(dirfd: i64, path_ptr: u64, mode: u64) -> i64 {
+    let mut path = [0u8; PATH_MAX];
+    match user_resolved(dirfd, path_ptr, &mut path) {
+        Ok(len) => chmod_path(&path[..len], mode),
+        Err(e) => e,
+    }
+}
+
+fn chmod_path(path: &[u8], mode: u64) -> i64 {
+    match vfs_status(&Request::Chmod {
+        path,
+        mode: (mode & 0o7777) as u16,
+    }) {
+        // A server that keeps no modes for this volume: the call still succeeds, as on vfat.
+        status if status == -errno::EPERM => 0,
+        status => status,
+    }
+}
+
+/// Linux `faccessat`: whether the path exists; every existing entry is accessible.
+pub fn faccessat(dirfd: i64, path_ptr: u64) -> i64 {
+    let mut path = [0u8; PATH_MAX];
+    let len = match user_resolved(dirfd, path_ptr, &mut path) {
+        Ok(len) => len,
+        Err(e) => return e,
+    };
+    let mut reply = [0u8; 32];
+    match vfs_call(&Request::stat(&path[..len]), &mut reply).map(parse_stat_reply) {
+        Some(Ok(_)) => 0,
+        Some(Err(error)) => status_errno(error),
+        None => -errno::ENOENT,
+    }
+}
+
+/// The cwd as an absolute path.
+fn cwd() -> &'static [u8] {
+    let cwd = unsafe { &*core::ptr::addr_of!(CWD) };
+    if cwd.1 == 0 {
+        b"/"
+    } else {
+        &cwd.0[..cwd.1]
+    }
+}
+
+/// Linux `getcwd`: the path and its NUL; ERANGE when it does not fit.
+pub fn getcwd(buf: u64, size: u64) -> i64 {
+    let path = cwd();
+    if buf == 0 {
+        return -errno::EFAULT;
+    }
+    if (size as usize) < path.len() + 1 {
+        return -errno::ERANGE;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(path.as_ptr(), buf as *mut u8, path.len());
+        *((buf + path.len() as u64) as *mut u8) = 0;
+    }
+    (path.len() + 1) as i64
+}
+
+/// Linux `chdir`: an existing directory becomes the cwd.
+pub fn chdir(path_ptr: u64) -> i64 {
+    let mut path = [0u8; PATH_MAX];
+    let len = match user_resolved(AT_FDCWD, path_ptr, &mut path) {
+        Ok(len) => len,
+        Err(e) => return e,
+    };
+    set_cwd(&path[..len])
+}
+
+/// Linux `fchdir`: the directory a descriptor names becomes the cwd.
+pub fn fchdir(fd: i64) -> i64 {
+    let entry = match fd_entry(fd) {
+        Ok(entry) => entry,
+        Err(e) => return e,
+    };
+    if !matches!(entry.kind, Kind::Dir { .. }) {
+        return -errno::ENOTDIR;
+    }
+    let mut path = [0u8; PATH_MAX];
+    let len = entry.path_len;
+    path[..len].copy_from_slice(entry.path());
+    set_cwd(&path[..len])
+}
+
+fn set_cwd(path: &[u8]) -> i64 {
+    let mut reply = [0u8; 32];
+    match vfs_call(&Request::stat(path), &mut reply).map(parse_stat_reply) {
+        Some(Ok(stat)) if stat.kind == STAT_KIND_DIRECTORY => {
+            let cwd = unsafe { &mut *core::ptr::addr_of_mut!(CWD) };
+            cwd.0[..path.len()].copy_from_slice(path);
+            cwd.1 = path.len();
+            0
+        }
+        Some(Ok(_)) => -errno::ENOTDIR,
+        Some(Err(error)) => status_errno(error),
+        None => -errno::ENOENT,
+    }
 }

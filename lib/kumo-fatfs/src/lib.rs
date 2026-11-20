@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j547
 //j548
 //j861
 //j891
 //j892
+//j918
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -39,6 +39,9 @@ pub const SECTOR_SIZE: usize = 512;
 pub const DIR_ENTRY_SIZE: usize = 32;
 
 /// Directory-entry attribute bits (`FatFs`/MS-DOS standard).
+/// SH7-e1 (j918): VFAT long names on the write side.
+pub mod names;
+
 pub mod attr {
     pub const READ_ONLY: u8 = 0x01;
     pub const HIDDEN: u8 = 0x02;
@@ -1445,66 +1448,6 @@ impl FatVolume {
 
     /// Resolve a path's parent directory cluster and final 8.3 name (SH3). The
     /// parent must already exist; the final component need not.
-    fn parent_and_name<R: SectorReader>(
-        &self,
-        io: &mut R,
-        path: &[u8],
-    ) -> Result<(u32, [u8; 11]), FatWriteError> {
-        let mut components = path
-            .split(|&byte| byte == b'/')
-            .filter(|component| !component.is_empty())
-            .peekable();
-        let mut directory = self.bpb.root_cluster;
-        let name = loop {
-            let component = components.next().ok_or(FatWriteError::Invalid)?;
-            let name = name_to_83(component).ok_or(FatWriteError::Invalid)?;
-            if components.peek().is_none() {
-                break name;
-            }
-            let parent = self
-                .find_in_dir(io, directory, &name)
-                .ok_or(FatWriteError::Invalid)?;
-            if !parent.is_dir() {
-                return Err(FatWriteError::Invalid);
-            }
-            directory = parent.first_cluster;
-        };
-        Ok((directory, name))
-    }
-
-    /// Find a free (never-used or deleted) short-entry slot in a directory, walking
-    /// its cluster chain when needed. SH3's metadata operations share this walk.
-    fn free_dir_slot<R: SectorReader + SectorWriter>(
-        &self,
-        io: &mut R,
-        dir_cluster: u32,
-    ) -> Result<DirLocation, FatWriteError> {
-        let mut cluster = dir_cluster;
-        loop {
-            let first = self.bpb.cluster_to_sector(cluster);
-            for sector_index in 0..self.bpb.sectors_per_cluster as u32 {
-                let lba = first + sector_index;
-                let mut sector = [0u8; SECTOR_SIZE];
-                if !io.read_sector(lba, &mut sector) {
-                    return Err(FatWriteError::Io);
-                }
-                for offset in (0..SECTOR_SIZE).step_by(DIR_ENTRY_SIZE) {
-                    if sector[offset] == 0 || sector[offset] == 0xE5 {
-                        return Ok(DirLocation {
-                            sector: lba,
-                            offset: offset as u16,
-                        });
-                    }
-                }
-            }
-            cluster = match self.next_link(io, cluster) {
-                Some(FatEntry::Next(next)) => next,
-                Some(FatEntry::End) => return Err(FatWriteError::NoSpace),
-                _ => return Err(FatWriteError::Io),
-            };
-        }
-    }
-
     /// Retire one short entry by writing the deleted marker (SH3).
     fn clear_entry<R: SectorReader + SectorWriter>(
         &self,
@@ -1588,87 +1531,19 @@ impl FatVolume {
         Ok(())
     }
 
-    /// Create one missing 8.3 regular file. Parent directories must already
-    /// exist; a full directory returns [`FatWriteError::NoSpace`].
+    /// Create one missing regular file. Parent directories must already exist and are found
+    /// by long or 8.3 name; a name that is not exactly 8.3 is stored as a VFAT long name with a
+    /// short alias (SH7-e1). An existing entry is [`FatWriteError::Invalid`].
     pub fn create_file<R: SectorReader + SectorWriter>(
         &self,
         io: &mut R,
         path: &[u8],
     ) -> Result<DirEntry, FatWriteError> {
-        let mut components = path
-            .split(|&byte| byte == b'/')
-            .filter(|component| !component.is_empty())
-            .peekable();
-        let mut directory = self.bpb.root_cluster;
-        let name = loop {
-            let component = components.next().ok_or(FatWriteError::Invalid)?;
-            let name = name_to_83(component).ok_or(FatWriteError::Invalid)?;
-            if components.peek().is_none() {
-                break name;
-            }
-            let parent = self
-                .find_in_dir(io, directory, &name)
-                .ok_or(FatWriteError::Invalid)?;
-            if !parent.is_dir() {
-                return Err(FatWriteError::Invalid);
-            }
-            directory = parent.first_cluster;
-        };
-        if self.find_in_dir(io, directory, &name).is_some() {
+        let (directory, component) = self.parent_dir(io, path)?;
+        if self.find_named_in_dir(io, directory, component).is_some() {
             return Err(FatWriteError::Invalid);
         }
-
-        let mut cluster = directory;
-        let location = loop {
-            let first = self.bpb.cluster_to_sector(cluster);
-            let mut found = None;
-            for sector_index in 0..self.bpb.sectors_per_cluster as u32 {
-                let lba = first + sector_index;
-                let mut sector = [0u8; SECTOR_SIZE];
-                if !io.read_sector(lba, &mut sector) {
-                    return Err(FatWriteError::Io);
-                }
-                for offset in (0..SECTOR_SIZE).step_by(DIR_ENTRY_SIZE) {
-                    if sector[offset] == 0 || sector[offset] == 0xE5 {
-                        found = Some(DirLocation {
-                            sector: lba,
-                            offset: offset as u16,
-                        });
-                        break;
-                    }
-                }
-                if found.is_some() {
-                    break;
-                }
-            }
-            if let Some(location) = found {
-                break location;
-            }
-            cluster = match self.next_link(io, cluster) {
-                Some(FatEntry::Next(next)) => next,
-                Some(FatEntry::End) => return Err(FatWriteError::NoSpace),
-                _ => return Err(FatWriteError::Io),
-            };
-        };
-
-        let mut sector = [0u8; SECTOR_SIZE];
-        if !io.read_sector(location.sector, &mut sector) {
-            return Err(FatWriteError::Io);
-        }
-        let offset = location.offset as usize;
-        sector[offset..offset + 11].copy_from_slice(&name);
-        sector[offset + 11] = attr::ARCHIVE;
-        sector[offset + 12..offset + DIR_ENTRY_SIZE].fill(0);
-        if !io.write_sector(location.sector, &sector) {
-            return Err(FatWriteError::Io);
-        }
-        Ok(DirEntry {
-            name,
-            attr: attr::ARCHIVE,
-            first_cluster: 0,
-            size: 0,
-            location: Some(location),
-        })
+        self.write_named(io, directory, component, attr::ARCHIVE, 0, 0)
     }
 
     /// Change a file's logical length. Growth allocates and zeroes clusters;
@@ -1718,18 +1593,17 @@ impl FatVolume {
         self.write_storage(io, entry, offset, data)
     }
 
-    /// Create one missing 8.3 directory (SH3). Parent directories must already
-    /// exist; an existing target returns [`FatWriteError::Invalid`].
+    /// Create one missing directory (SH3; any name since SH7-e1). Parent directories must
+    /// already exist; an existing target returns [`FatWriteError::Invalid`].
     pub fn create_dir<R: SectorReader + SectorWriter>(
         &self,
         io: &mut R,
         path: &[u8],
     ) -> Result<DirEntry, FatWriteError> {
-        let (parent, name) = self.parent_and_name(io, path)?;
-        if self.find_in_dir(io, parent, &name).is_some() {
+        let (parent, component) = self.parent_dir(io, path)?;
+        if self.find_named_in_dir(io, parent, component).is_some() {
             return Err(FatWriteError::Invalid);
         }
-        let slot = self.free_dir_slot(io, parent)?;
         let cluster = self.find_free_cluster(io)?;
         self.write_fat_entry(io, cluster, FAT32_EOF_MIN)?;
         self.zero_cluster(io, cluster)?;
@@ -1749,14 +1623,14 @@ impl FatVolume {
         if !io.write_sector(first, &first_sector) {
             return Err(FatWriteError::Io);
         }
-        self.write_entry_at(io, slot, &name, attr::DIRECTORY, cluster, 0)?;
-        Ok(DirEntry {
-            name,
-            attr: attr::DIRECTORY,
-            first_cluster: cluster,
-            size: 0,
-            location: Some(slot),
-        })
+        match self.write_named(io, parent, component, attr::DIRECTORY, cluster, 0) {
+            Ok(entry) => Ok(entry),
+            Err(error) => {
+                // Give the cluster back rather than leak it.
+                let _ = self.write_fat_entry(io, cluster, 0);
+                Err(error)
+            }
+        }
     }
 
     /// Remove one regular file and free its cluster chain (SH3). Directories are
@@ -1766,13 +1640,15 @@ impl FatVolume {
         io: &mut R,
         path: &[u8],
     ) -> Result<(), FatWriteError> {
-        let entry = self.resolve_path(io, path).ok_or(FatWriteError::Invalid)?;
+        let (directory, component) = self.parent_dir(io, path)?;
+        let (entry, slots) = self
+            .find_with_slots(io, directory, component)
+            .ok_or(FatWriteError::Invalid)?;
         if entry.is_dir() {
             return Err(FatWriteError::Invalid);
         }
         self.free_chain(io, entry.first_cluster)?;
-        let location = entry.location.ok_or(FatWriteError::Invalid)?;
-        self.clear_entry(io, location)
+        self.clear_with_slots(io, &entry, &slots)
     }
 
     /// Remove one empty 8.3 directory (SH3). A directory holding anything but its
@@ -1782,7 +1658,10 @@ impl FatVolume {
         io: &mut R,
         path: &[u8],
     ) -> Result<(), FatWriteError> {
-        let entry = self.resolve_path(io, path).ok_or(FatWriteError::Invalid)?;
+        let (directory, component) = self.parent_dir(io, path)?;
+        let (entry, slots) = self
+            .find_with_slots(io, directory, component)
+            .ok_or(FatWriteError::Invalid)?;
         if !entry.is_dir() {
             return Err(FatWriteError::Invalid);
         }
@@ -1824,50 +1703,47 @@ impl FatVolume {
             }
         }
         self.free_chain(io, entry.first_cluster)?;
-        let location = entry.location.ok_or(FatWriteError::Invalid)?;
-        self.clear_entry(io, location)
+        self.clear_with_slots(io, &entry, &slots)
     }
 
-    /// Rename one 8.3 file, replacing an existing target file (SH3). The new entry
-    /// is written before the old one is retired, so a mid-way failure leaves a
-    /// duplicate rather than a lost file. Directory renames are refused; FAT would
-    /// also require rewriting the directory's `..` entry.
+    /// Rename one file, replacing an existing target file (SH3; any names since SH7-e1). The
+    /// new entry is written before the old one is retired, so a mid-way failure leaves a
+    /// duplicate rather than a lost file. Directory renames are refused; FAT would also require
+    /// rewriting the directory's `..` entry.
     pub fn rename<R: SectorReader + SectorWriter>(
         &self,
         io: &mut R,
         from: &[u8],
         to: &[u8],
     ) -> Result<(), FatWriteError> {
-        let source = self.resolve_path(io, from).ok_or(FatWriteError::Invalid)?;
+        let (from_dir, from_name) = self.parent_dir(io, from)?;
+        let (source, source_slots) = self
+            .find_with_slots(io, from_dir, from_name)
+            .ok_or(FatWriteError::Invalid)?;
         if source.is_dir() {
             return Err(FatWriteError::Invalid);
         }
-        let (parent_to, name_to) = self.parent_and_name(io, to)?;
-        let slot = match self.find_in_dir(io, parent_to, &name_to) {
-            Some(target) => {
+        let (to_dir, to_name) = self.parent_dir(io, to)?;
+        if let Some((target, target_slots)) = self.find_with_slots(io, to_dir, to_name) {
+            if target.location != source.location {
                 if target.is_dir() {
                     return Err(FatWriteError::Invalid);
                 }
-                let location = target.location.ok_or(FatWriteError::Invalid)?;
                 self.free_chain(io, target.first_cluster)?;
-                location
+                self.clear_with_slots(io, &target, &target_slots)?;
             }
-            None => self.free_dir_slot(io, parent_to)?,
-        };
-        self.write_entry_at(
+            // Else the target *is* the source (the same name, or one differing only in case):
+            // the entry is rewritten under the new spelling below.
+        }
+        self.write_named(
             io,
-            slot,
-            &name_to,
+            to_dir,
+            to_name,
             source.attr,
             source.first_cluster,
             source.size,
         )?;
-        if let Some(source_location) = source.location {
-            if source_location != slot {
-                self.clear_entry(io, source_location)?;
-            }
-        }
-        Ok(())
+        self.clear_with_slots(io, &source, &source_slots)
     }
 
     pub fn flush<R: SectorWriter>(&self, writer: &mut R) -> Result<(), FatWriteError> {
@@ -1891,6 +1767,7 @@ fn u32_le(buf: &[u8], off: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     // Geometry constants identical to xtask's `build_fat32_image()` fixture so
@@ -3491,5 +3368,150 @@ mod tests {
             vol.rename(&mut disk, b"/WORK", b"/OTHER"),
             Err(FatWriteError::Invalid)
         );
+    }
+
+    //j918
+    /// The names a directory lists, as people see them (long name, else 8.3).
+    fn listed(
+        vol: &FatVolume,
+        disk: &mut WritableDisk,
+        dir: u32,
+    ) -> std::vec::Vec<std::string::String> {
+        let mut names = std::vec::Vec::new();
+        vol.for_each_named_in_dir(disk, dir, |_, name| {
+            names.push(std::string::String::from_utf8(name.as_bytes().to_vec()).unwrap());
+            true
+        });
+        names
+    }
+
+    /// Live (not deleted, not end) slots in a directory's first `sectors` sectors.
+    fn live_slots(disk: &WritableDisk, first_sector: u32, sectors: u32) -> usize {
+        (first_sector..first_sector + sectors)
+            .flat_map(|lba| {
+                disk.sectors[lba as usize]
+                    .chunks(DIR_ENTRY_SIZE)
+                    .map(|s| s[0])
+                    .collect::<std::vec::Vec<_>>()
+            })
+            .filter(|&b| b != 0 && b != 0xE5)
+            .count()
+    }
+
+    /// SH7-e1: rustc's names round-trip — a long-named directory, long and lower-case names
+    /// inside it, written, listed, renamed and removed with their slots. — TEAL
+    #[test]
+    fn long_names_create_list_rename_and_remove() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        let dir = vol
+            .create_dir(&mut disk, b"/rmeta3NYqFZ")
+            .expect("long mkdir");
+        assert_eq!(&dir.name, b"RMETA3~1   ");
+        let found = vol
+            .resolve_path(&mut disk, b"/RMETA3NYQFZ")
+            .expect("case-insensitive");
+        assert_eq!(found.first_cluster, dir.first_cluster);
+
+        let mut file = vol
+            .create_file(&mut disk, b"/rmeta3NYqFZ/full.rmeta")
+            .expect("long create in a long dir");
+        assert_eq!(&file.name, b"FULL~1  RME");
+        let data = *b"rust metadata";
+        vol.set_file_len(&mut disk, &mut file, data.len() as u64)
+            .unwrap();
+        assert_eq!(
+            vol.write_file_at(&mut disk, &mut file, 0, &data),
+            Ok(data.len())
+        );
+        let lower = vol
+            .create_file(&mut disk, b"/rmeta3NYqFZ/data.bin")
+            .unwrap();
+        assert_eq!(
+            &lower.name, b"DATA~1  BIN",
+            "a lower-case 8.3 name keeps its case"
+        );
+        assert_eq!(
+            listed(&vol, &mut disk, dir.first_cluster),
+            [".", "..", "full.rmeta", "data.bin"]
+        );
+        let reread = vol
+            .resolve_path(&mut disk, b"/rmeta3NYqFZ/full.rmeta")
+            .unwrap();
+        let mut out = [0u8; 13];
+        assert_eq!(vol.read_file(&mut disk, &reread, &mut out), 13);
+        assert_eq!(&out, &data);
+        assert_eq!(
+            vol.create_file(&mut disk, b"/rmeta3NYqFZ/FULL.RMETA"),
+            Err(FatWriteError::Invalid),
+            "names compare without case"
+        );
+
+        // Rename long -> long, then onto an existing file; the old names and slots go.
+        vol.rename(
+            &mut disk,
+            b"/rmeta3NYqFZ/full.rmeta",
+            b"/rmeta3NYqFZ/add.add.470e2b1de9f3f846-cgu.0.rcgu.o",
+        )
+        .unwrap();
+        assert!(vol
+            .resolve_path(&mut disk, b"/rmeta3NYqFZ/full.rmeta")
+            .is_none());
+        vol.rename(
+            &mut disk,
+            b"/rmeta3NYqFZ/data.bin",
+            b"/rmeta3NYqFZ/add.add.470e2b1de9f3f846-cgu.0.rcgu.o",
+        )
+        .unwrap();
+        assert_eq!(
+            listed(&vol, &mut disk, dir.first_cluster),
+            [".", "..", "add.add.470e2b1de9f3f846-cgu.0.rcgu.o"]
+        );
+
+        vol.remove_file(
+            &mut disk,
+            b"/rmeta3NYqFZ/add.add.470e2b1de9f3f846-cgu.0.rcgu.o",
+        )
+        .unwrap();
+        let first = vol.bpb().cluster_to_sector(dir.first_cluster);
+        assert_eq!(
+            live_slots(&disk, first, 1),
+            2,
+            "only . and .. remain: no orphan slots"
+        );
+        vol.remove_dir(&mut disk, b"/rmeta3NYqFZ").unwrap();
+        assert!(vol.resolve_path(&mut disk, b"/rmeta3NYqFZ").is_none());
+        assert!(!listed(&vol, &mut disk, vol.bpb().root_cluster).contains(&"rmeta3NYqFZ".into()));
+    }
+
+    /// SH7-e1: aliases stay unique, and a full directory grows by a cluster. — TEAL
+    #[test]
+    fn aliases_stay_unique_and_directories_grow() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        let dir = vol.create_dir(&mut disk, b"/many-long-names").unwrap();
+        let mut aliases = std::vec::Vec::new();
+        for i in 0..8 {
+            let name = std::format!("/many-long-names/codegen-unit-{i:02}.rcgu.o");
+            let entry = vol.create_file(&mut disk, name.as_bytes()).expect("create");
+            aliases.push(entry.name);
+        }
+        // 8 names x (2 long slots + 1 short) + . and .. = 26 slots: more than one 16-slot cluster.
+        let mut sorted = aliases.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 8, "every alias unique");
+        assert_eq!(&aliases[0], b"CODEGE~1O  ");
+        assert_eq!(&aliases[7], b"CODEGE~8O  ");
+        assert!(
+            matches!(
+                vol.next_link(&mut disk, dir.first_cluster),
+                Some(FatEntry::Next(_))
+            ),
+            "the directory grew a second cluster"
+        );
+        let names = listed(&vol, &mut disk, dir.first_cluster);
+        assert_eq!(names.len(), 10);
+        assert_eq!(names[9], "codegen-unit-07.rcgu.o");
     }
 }
