@@ -1,8 +1,8 @@
-//j904
 //j905
 //j907
 //j909
 //j911
+//j912
 
 use std::env;
 use std::fmt;
@@ -3102,9 +3102,13 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"USER ELF / FRAMES  Check",
             b"USER ELF / ENGINE  Check     2 PT_LOAD  entry 0x8000000000  boot h1  4 int80",
             b"wrote 34b  2 switches  exit 0   OK",
-            b"x86_64 MUREX core online, first light reached; HALTING.",
+            b"x86_64 MUREX core online, first light reached; starting Sora.",
+            b"hello from Sora via SVC",
+            b"SORA EL0           Check",
+            b"SORA HANDSHAKE     Check     root channel: \"sora ack\"   OK",
+            b"x86_64 MUREX userland online: Sora serving; HALTING.",
         ],
-        Duration::from_secs(8),
+        Duration::from_secs(20),
     )
     .and_then(|()| validate_x86_smoke_transcript(&transcript));
 
@@ -3270,7 +3274,7 @@ fn run_x86_nijigumo_smoke(root: &Path, media: X86UefiMedia) -> Result<(), String
         &rx,
         &mut transcript,
         "x86 UEFI/Nijigumo first-light proof",
-        &[b"x86_64 MUREX core online, first light reached; HALTING."],
+        &[b"x86_64 MUREX userland online: Sora serving; HALTING."],
         Duration::from_secs(60),
     );
     let smoke_result = match reached_first_light {
@@ -3335,7 +3339,7 @@ fn validate_x86_niji_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
 }
 
 /// The last line of x86 first light, which the glass must show at HALTING.
-const X86_FIRST_LIGHT_LAST_LINE: &str = "x86_64 MUREX core online, first light reached; HALTING.";
+const X86_FIRST_LIGHT_LAST_LINE: &str = "x86_64 MUREX userland online: Sora serving; HALTING.";
 /// The kernel console's PSF2 font, the very bytes `kumo-fbcon` renders with.
 const KUMO_CONSOLE_PSF: &[u8] = include_bytes!("../../hal/kumo-fbcon/font8x16.psf");
 /// `kumo_fbcon::FG` / `BG` as the screendump's RGB bytes (grey, so RGB and BGR agree).
@@ -3637,7 +3641,14 @@ fn validate_x86_first_light_transcript(
         "USER ELF / FRAMES  Check",
         "USER ELF / ENGINE  Check     2 PT_LOAD  entry 0x8000000000  boot h1  4 int80",
         "wrote 34b  2 switches  exit 0   OK",
-        "x86_64 MUREX core online, first light reached; HALTING.",
+        // j912 (PLAN/026 U2): first light hands over to Sora instead of halting.
+        "x86_64 MUREX core online, first light reached; starting Sora.",
+        "hello from Sora via SVC",
+        "SORA INITRD        Check     bin/sora",
+        "SORA EL0           Check",
+        "serving   OK",
+        "SORA HANDSHAKE     Check     root channel: \"sora ack\"   OK",
+        "x86_64 MUREX userland online: Sora serving; HALTING.",
     ] {
         if !text.contains(marker) {
             return Err(format!("x86 smoke transcript missing {marker:?}:\n{text}"));
@@ -4107,7 +4118,12 @@ PREEMPT SCHED      Check     2 kthreads  4 body switches  5 ticks  timer-preempt
 hello from a native KUMO program!\n\
 USER ELF / FRAMES  Check     24 BootInfo frames  first 0x942000  last 0x959000  CR3 0x942000  monotonic  kernel+initrd excluded   OK\n\
 USER ELF / ENGINE  Check     2 PT_LOAD  entry 0x8000000000  boot h1  4 int80  wrote 34b  2 switches  exit 0   OK\n\
-x86_64 MUREX core online, first light reached; HALTING.\n";
+x86_64 MUREX core online, first light reached; starting Sora.\n\
+SORA INITRD        Check     bin/sora 1209504b in a 1218640b KUMORD01 initrd   OK\n\
+hello from Sora via SVC\n\
+SORA EL0           Check     201 int80  wrote 919b  boot h1  attempts 0  serving   OK\n\
+SORA HANDSHAKE     Check     root channel: \"sora ack\"   OK\n\
+x86_64 MUREX userland online: Sora serving; HALTING.\n";
 
     #[test]
     fn x86_transcript_requires_all_live_interrupt_proofs() {

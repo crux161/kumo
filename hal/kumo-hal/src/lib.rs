@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j823
 //j875
 //j881
 //j905
 //j907
+//j912
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -58,7 +58,7 @@ pub mod active {
         user_nc_page_desc, user_page_desc, wait_for_timer_irqs, AppsSmmuTopology, DevicePowerError,
         DevicePowerReadout, DevicePowerUnitInfo, DevicePowerUpOutcome, El0Report,
         GicTimerGateReport, PowerStep, ThreadContext, TowerContext, TowerThreadRole, UserImage,
-        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH, KERNEL_PHYSMAP_BASE,
     };
     pub use kumo_hal_aarch64::{
         display_controller_activate, display_controller_detach, display_controller_new,
@@ -104,7 +104,8 @@ pub mod active {
         DevicePowerUpOutcome, El0Report, FpSimdReport, FramebufferMapReport, GicTimerGateReport,
         IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied, IoApicTimerPlan, PciSerialReport,
         PowerStep, Ring3Error, Ring3Report, ThreadContext, TowerContext, TowerThreadRole,
-        UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH, RING3_PING_TOKEN,
+        UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        KERNEL_PHYSMAP_BASE, RING3_PING_TOKEN,
     };
 }
 

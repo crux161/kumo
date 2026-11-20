@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j823
 //j875
 //j881
 //j882
 //j905
+//j912
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -479,6 +479,11 @@ pub fn console_use_physmap() {
 
 #[cfg(not(target_os = "none"))]
 pub fn console_use_physmap() {}
+
+/// Where the kernel's map shows physical memory: frame `p` is at `KERNEL_PHYSMAP_BASE + p` once
+/// `enable_kernel_mmu` has run. arm64 keeps it in TTBR1, live under every TTBR0. j912 (PLAN/026
+/// U2) made this the HAL's answer instead of a constant the shared kernel repeated.
+pub const KERNEL_PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
 
 /// Read bytes from a physical address into `dest`. Only safe when the physmap is live
 /// (after `enable_kernel_mmu`) — the physical address is accessed at `PHYSMAP_BASE + phys`.
@@ -1243,7 +1248,7 @@ pub mod mmu {
 
     const GB: u64 = 1 << 30;
     const PAGE_4K: u64 = 1 << 12;
-    pub const PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
+    pub const PHYSMAP_BASE: u64 = super::KERNEL_PHYSMAP_BASE;
 
     // Descriptor bits.
     const DESC_VALID: u64 = 1 << 0;

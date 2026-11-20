@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #j904
 #j906
+#j912
 # netboot-smoke.sh - boot the generated AMD64 netboot tree end-to-end in QEMU and assert
 # KUMO's serial POST, without the physical test machine.
 #
@@ -101,7 +102,8 @@ fi
 # hard timeout elapses), instead of always waiting out the full timeout.
 deadline=$(( $(date +%s) + SECS ))
 while kill -0 "$QPID" 2>/dev/null; do
-  if tr -d '\000' < "$SERIAL" 2>/dev/null | grep -qaE 'HALT|FAIL|PREEMPT SCHED|USER ELF'; then
+  # j912: stop at the real end (Sora serving), a FAIL, or a fatal exception.
+  if tr -d '\000' < "$SERIAL" 2>/dev/null | grep -qaE 'Sora serving; HALTING|   FAIL|fatal exception'; then
     break
   fi
   [ "$(date +%s)" -ge "$deadline" ] && break
@@ -127,7 +129,7 @@ echo "-------------------------------"
 grep_c() { printf '%s\n' "$CLEAN" | grep -qa "$1"; }
 grep_e() { printf '%s\n' "$CLEAN" | grep -qaE "$1"; }
 
-# KUMO's POST ends with "... first light reached; HALTING." on success (a hlt loop, not a
+# KUMO's POST ends with "... userland online: Sora serving; HALTING." on success (j912; a hlt loop, not a
 # crash), and prints "TOWER-x86 ... fatal exception" or a "   FAIL" check on error.
 if ! grep_c 'KUMO x86_64 first light'; then
   echo "netboot-smoke: FAIL - KUMO never reached first light over netboot (delivery/GRUB problem)" >&2
@@ -139,7 +141,8 @@ elif [ "$MODE" = uefi ] && ! { grep_c 'BOOTX64.EFI loaded' && grep_c 'tftp      
     && grep_c 'first light (Nijigumo/UEFI)' && grep_e 'FRAMEBUFFER CONSOLE Check .* write-combining .* OK'; }; then
   echo "netboot-smoke: FAIL - KUMO reached first light, but not as Nijigumo over TFTP with a write-combined glass" >&2
   exit 1
-elif grep_c 'first light reached'; then
+elif grep_c 'first light reached' && grep_c 'SORA HANDSHAKE     Check     root channel: "sora ack"   OK' \
+    && grep_c 'Sora serving; HALTING'; then
   if [ "$MODE" = uefi ]; then
     echo "netboot-smoke: PASS - UEFI PXE -> Nijigumo -> KUMO completed its POST on COM1 and the glass"
     [ -s "$GLASS" ] && echo "    glass: $GLASS"

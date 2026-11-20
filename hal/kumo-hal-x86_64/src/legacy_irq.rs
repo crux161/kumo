@@ -1,5 +1,6 @@
 //j436
 //j452
+//j912
 
 #![cfg_attr(not(any(target_os = "none", test)), allow(dead_code))]
 
@@ -85,6 +86,29 @@ fn initialize_sequence<IO: PortIo>(io: &mut IO, setup: TimerSetup) {
     io.write8(PIT_CHANNEL0, (setup.divisor >> 8) as u8);
 }
 
+/// j912: remap the 8259 pair clear of the CPU exception vectors and mask every line, touching
+/// nothing else. A legacy-BIOS loader (GRUB i386-pc) hands over with the PICs still at the BIOS
+/// base 0x08 and the PIT on IRQ0 unmasked, so the first timer tick after ring 3 enables
+/// interrupts arrives as vector 8 and looks like a double fault (no error code: the TOWER printed
+/// `vec=0x8 err=0x8000000000 rip=0x23`, the user RIP and CS). UEFI firmware and QEMU's `-kernel`
+/// path leave the PICs masked, which is why only that lane hit it.
+fn quiesce_sequence<IO: PortIo>(io: &mut IO) {
+    write_with_wait(io, PRIMARY_COMMAND, INIT_WITH_ICW4);
+    write_with_wait(io, SECONDARY_COMMAND, INIT_WITH_ICW4);
+    write_with_wait(io, PRIMARY_DATA, INTERRUPT_VECTOR_BASE);
+    write_with_wait(
+        io,
+        SECONDARY_DATA,
+        INTERRUPT_VECTOR_BASE + LEGACY_INTERRUPT_VECTORS / 2,
+    );
+    write_with_wait(io, PRIMARY_DATA, 1 << 2);
+    write_with_wait(io, SECONDARY_DATA, 2);
+    write_with_wait(io, PRIMARY_DATA, MODE_8086);
+    write_with_wait(io, SECONDARY_DATA, MODE_8086);
+    io.write8(PRIMARY_DATA, PRIMARY_ALL_MASKED);
+    io.write8(SECONDARY_DATA, 0xff);
+}
+
 /// Mask IRQ0 on the primary PIC — take the PIT off the legacy vector 0x20 path so the I/O APIC
 /// redirection entry can own the timer without double delivery.
 fn mask_timer_source_sequence<IO: PortIo>(io: &mut IO) {
@@ -127,6 +151,12 @@ impl PortIo for HardwarePorts {
 pub(crate) fn initialize(setup: TimerSetup) {
     TIMER_INTERRUPTS.store(0, Ordering::Relaxed);
     initialize_sequence(&mut HardwarePorts, setup);
+}
+
+/// See [`quiesce_sequence`]: called before the IDT goes live, ahead of anything that can set IF.
+#[cfg(target_os = "none")]
+pub(crate) fn quiesce() {
+    quiesce_sequence(&mut HardwarePorts);
 }
 
 #[cfg(target_os = "none")]
@@ -238,6 +268,33 @@ mod tests {
         mask_timer_source_sequence(&mut io);
         // Only IRQ0 was live (0xfe) after init, so masking it fully masks the primary.
         assert_eq!(io.recorded(), &[(PRIMARY_DATA, 0xff)]);
+    }
+
+    #[test]
+    fn quiescing_remaps_both_pics_and_masks_every_line_without_touching_the_pit() {
+        let mut io = RecordingIo::default();
+        quiesce_sequence(&mut io);
+        let expected = [
+            (PRIMARY_COMMAND, INIT_WITH_ICW4),
+            (SECONDARY_COMMAND, INIT_WITH_ICW4),
+            (PRIMARY_DATA, 0x20),
+            (SECONDARY_DATA, 0x28),
+            (PRIMARY_DATA, 1 << 2),
+            (SECONDARY_DATA, 2),
+            (PRIMARY_DATA, MODE_8086),
+            (SECONDARY_DATA, MODE_8086),
+            (PRIMARY_DATA, 0xff),
+            (SECONDARY_DATA, 0xff),
+        ];
+        let mut writes = io.recorded().iter().filter(|&&(port, _)| port != IO_WAIT);
+        for want in expected {
+            assert_eq!(writes.next(), Some(&want));
+        }
+        assert_eq!(writes.next(), None);
+        assert!(io
+            .recorded()
+            .iter()
+            .all(|&(port, _)| port != PIT_COMMAND && port != PIT_CHANNEL0));
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//j824
 //j825
 //j871
 //j875
 //j889
+//j912
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -802,7 +802,9 @@ impl VmoPin {
     }
 }
 
-const PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
+/// j912 (PLAN/026 U2): the backend's physmap. This was arm64's TTBR1 base hard-coded here, so on
+/// x86 (identity-mapped RAM) every write through `phys_ptr_mut` hit an unmapped kernel page.
+const PHYSMAP_BASE: u64 = kumo_hal::active::KERNEL_PHYSMAP_BASE;
 
 pub(crate) fn phys_ptr_mut(phys: u64) -> *mut u8 {
     (PHYSMAP_BASE + phys) as *mut u8

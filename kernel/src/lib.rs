@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j822
 //j823
 //j904
 //j905
 //j907
+//j912
 
 extern crate alloc;
 
@@ -2838,7 +2838,80 @@ fn x86_bring_up(entry: X86Entry, kernel_stack_top: u64) -> ! {
         }
     }
 
-    klog!("x86_64 MUREX core online, first light reached; HALTING.\n");
+    klog!("x86_64 MUREX core online, first light reached; starting Sora.\n");
+    x86_start_sora(&boot)
+}
+
+/// PLAN/026 U2 (j912): after first light, run the userland supervisor through the same
+/// `usermode::run_sora` path arm64's stage_a uses: Sora's ELF from the initrd in its own CR3,
+/// the bootstrap channels, its greeting and root-channel handshake, until it parks serving.
+/// The checkpoints mirror stage_a's. The shared POST tail (console route, block/file serve, ports,
+/// net loopback, the shell) is U3; until then the boot halts here with Sora serving.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn x86_start_sora(boot: &BootInfo) -> ! {
+    let initrd = unsafe {
+        core::slice::from_raw_parts(boot.initrd.start as *const u8, boot.initrd.len as usize)
+    };
+    match kumo_abi::find_file(initrd, kumo_abi::SORA_INIT_PATH) {
+        Ok(Some(sora)) => klog!(
+            "SORA INITRD        Check     {} {}b in a {}b KUMORD01 initrd   OK\n",
+            kumo_abi::SORA_INIT_PATH,
+            sora.bytes.len(),
+            initrd.len()
+        ),
+        other => {
+            klog_at!(
+                kmsg::ERR,
+                "SORA INITRD        Check     {} not found: {:?}   FAIL\n",
+                kumo_abi::SORA_INIT_PATH,
+                other.map(|file| file.map(|f| f.bytes.len()))
+            );
+            kumo_hal::active::halt();
+        }
+    }
+    let u = match usermode::run_sora(boot, initrd) {
+        Ok(report) => report,
+        Err(err) => {
+            klog_at!(kmsg::ERR, "SORA EL0           Check     {:?}   FAIL\n", err);
+            kumo_hal::active::halt();
+        }
+    };
+    let handshake = core::str::from_utf8(&u.handshake[..u.handshake_len]).unwrap_or("<binary>");
+    if u.entered && u.serving && u.syscalls >= 3 && u.wrote > 0 && u.chan.0 != 0 {
+        klog!(
+            "SORA EL0           Check     {} int80  wrote {}b  boot h{}  attempts {}  serving   OK\n",
+            u.syscalls,
+            u.wrote,
+            u.chan.0,
+            u.attempts
+        );
+    } else {
+        klog_at!(
+            kmsg::ERR,
+            "SORA EL0           Check     entered={} serving={} int80={} wrote={} boot h{} exit {}   FAIL\n",
+            u.entered,
+            u.serving,
+            u.syscalls,
+            u.wrote,
+            u.chan.0,
+            u.exit_code
+        );
+        kumo_hal::active::halt();
+    }
+    if handshake == "sora ack\n" {
+        klog!(
+            "SORA HANDSHAKE     Check     root channel: {:?}   OK\n",
+            handshake.trim_end()
+        );
+    } else {
+        klog_at!(
+            kmsg::ERR,
+            "SORA HANDSHAKE     Check     root channel: {:?}   FAIL\n",
+            handshake
+        );
+        kumo_hal::active::halt();
+    }
+    klog!("x86_64 MUREX userland online: Sora serving; HALTING.\n");
     kumo_hal::active::halt()
 }
 

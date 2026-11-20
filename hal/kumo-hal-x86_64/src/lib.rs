@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j660
 //j823
 //j881
 //j905
 //j907
+//j912
 
 mod fpsimd;
 mod gdt;
@@ -1028,6 +1028,10 @@ pub fn syscall_count() -> u32 {
 /// Install the x86_64 IDT ("the Tower"): 32 CPU-exception vectors report through the j435 handler,
 /// and 16 remapped legacy-PIC vectors route through the silent j436 IRQ path.
 pub fn install_exception_vectors() {
+    // j912: quiesce the legacy PICs first (remapped to 0x20/0x28, every line masked), so a
+    // loader that left the BIOS PIC live cannot deliver IRQ0 as vector 8 once ring 3 sets IF.
+    #[cfg(target_os = "none")]
+    legacy_irq::quiesce();
     #[cfg(target_os = "none")]
     idt::install();
 }
@@ -1266,7 +1270,20 @@ pub fn irq_unmask() {
 /// Stub: the x86_64 physmap console migration lands with its paging slice.
 pub fn console_use_physmap() {}
 
-/// Stub: physical memory read not yet wired for x86_64.
+/// Where the kernel's map shows physical memory (j912, PLAN/026 U2): the x86 kernel CR3 identity-
+/// maps RAM below the userspace window (PML4[0]), and every process CR3 shares that half, so a
+/// frame's kernel address is its physical address. arm64 answers with its TTBR1 physmap.
+pub const KERNEL_PHYSMAP_BASE: u64 = 0;
+
+/// Read bytes from a physical address into `dest` through the identity map. Before j912 this
+/// was an empty stub, so every VMO read through it returned zeros (Sora saw a blank initrd).
+#[cfg(target_os = "none")]
+pub fn read_phys(phys: u64, dest: &mut [u8]) {
+    let src = (KERNEL_PHYSMAP_BASE + phys) as *const u8;
+    unsafe { core::ptr::copy_nonoverlapping(src, dest.as_mut_ptr(), dest.len()) };
+}
+
+#[cfg(not(target_os = "none"))]
 pub fn read_phys(_phys: u64, _dest: &mut [u8]) {}
 
 // ---- x86 user page-table primitives -------------------------------------------------
