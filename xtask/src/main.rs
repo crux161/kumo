@@ -1,8 +1,8 @@
-//j912
 //j913
 //j914
 //j915
 //j916
+//j917
 
 use std::env;
 use std::fmt;
@@ -1247,6 +1247,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let drv_gpu = build_drv_gpu_image(&workspace_root()?)?;
             let mali_firmware = build_mali_firmware(&workspace_root()?)?;
             let persona_payloads = build_persona_payloads(&workspace_root()?)?;
+            let persona_rustc = build_persona_rustc(&workspace_root()?)?;
             let drv_i2c_hid = build_drv_i2c_hid_image(&workspace_root()?)?;
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
             let drv_nvme = build_drv_nvme_image(&workspace_root()?)?;
@@ -1295,6 +1296,10 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             // SH7-d3a: the bulk-read probe's file.
             let big = bigread_data();
             linux_files.push(("/etc/big.bin", big.as_slice()));
+            // SH7-d3d (j917): the opt-in rustc tree.
+            for (path, bytes) in &persona_rustc {
+                linux_files.push((path, bytes.as_slice()));
+            }
             let fat32_img = build_fat32_image(std_smoke.as_slice(), &linux_files);
             let payloadd = build_native_bin(&workspace_root()?, "payloadd")?;
             let drv_thermal = build_native_bin(&workspace_root()?, "drv-thermal")?;
@@ -2173,6 +2178,63 @@ const PERSONA_PAYLOADS: [(&str, &str, &str); 10] = [
         "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
     ),
 ];
+
+/// SH7-d3d (j917): the Linux rustc tree, packed into the image's FAT tree only when
+/// `KUMO_PERSONA_RUSTC=1` (the SH7-d3 cut's Q1: an opt-in QEMU image; default images are
+/// unchanged). `scripts/persona-rustc.sh` fetches it into build/persona-rustc/tree, never
+/// committed (the driver alone is 290 MiB): the pinned nightly's unmodified musl `rustc`
+/// component and Alpine 3.22's libgcc_s, which the driver NEEDs.
+const PERSONA_RUSTC: [(&str, &str, &str); 3] = [
+    (
+        "build/persona-rustc/tree/opt/rust/bin/rustc",
+        "/opt/rust/bin/rustc",
+        "c4742590a4a083a1343941f00f0730edbdfe780b7a16e5f2d88494c9b6063f9c",
+    ),
+    (
+        "build/persona-rustc/tree/opt/rust/lib/librustc_driver-814edb8bd1ddf471.so",
+        "/opt/rust/lib/librustc_driver-814edb8bd1ddf471.so",
+        "b7b785e44c682f134c1ab90589604cfb6a038d94b56d3287063fa701ab5daff0",
+    ),
+    (
+        "build/persona-rustc/tree/lib/libgcc_s.so.1",
+        "/lib/libgcc_s.so.1",
+        "2d945d6ce360769b41fbffc652c2440014bbd69416f13fe206fbac19d32c9431",
+    ),
+];
+
+/// Read and verify [`PERSONA_RUSTC`] when `KUMO_PERSONA_RUSTC=1`; empty otherwise.
+fn build_persona_rustc(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    if env::var("KUMO_PERSONA_RUSTC").as_deref() != Ok("1") {
+        return Ok(Vec::new());
+    }
+    pinned_files(root, &PERSONA_RUSTC, "run scripts/persona-rustc.sh")
+}
+
+/// Read each `(repo-relative path, linux path, sha256)` and refuse any byte that differs.
+fn pinned_files(
+    root: &Path,
+    list: &[(&str, &'static str, &str)],
+    remedy: &str,
+) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    list.iter()
+        .map(|&(rel, linux, want)| {
+            let path = root.join(rel);
+            let bytes = fs::read(&path)
+                .map_err(|err| format!("read {}: {err}; {remedy}", path.display()))?;
+            let got: String = kumo_sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if got != want {
+                return Err(format!(
+                    "{}: sha256 {got} is not the pinned {want}; {remedy}",
+                    path.display()
+                ));
+            }
+            Ok((linux, bytes))
+        })
+        .collect()
+}
 
 /// Read and verify [`PERSONA_PAYLOADS`]: `(linux path, bytes)` for each.
 fn build_persona_payloads(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
@@ -4460,5 +4522,38 @@ mod net_restart_proof_tests {
         assert_eq!(enabled(Some("1"), "qemu-virt-aarch64"), Ok(true));
         assert!(enabled(Some("1"), "orange-pi-5-plus").is_err());
         assert!(enabled(Some("yes"), "qemu-virt-aarch64").is_err());
+    }
+}
+
+//j917
+#[cfg(test)]
+mod persona_rustc_tests {
+    use super::{pinned_files, PERSONA_RUSTC};
+
+    /// SH7-d3d: the opt-in rustc tree is read only byte-exact; a wrong or missing file names the
+    /// fetch script instead of packing something unpinned. — TEAL
+    #[test]
+    fn pinned_files_accept_exact_bytes_and_refuse_anything_else() {
+        let dir = std::env::temp_dir().join(format!("kumo-pinned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hello"), b"hello").unwrap();
+        // sha256("hello")
+        let good = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let list = [("hello", "/bin/hello", good)];
+        let read = pinned_files(&dir, &list, "fetch it").unwrap();
+        assert_eq!(read, vec![("/bin/hello", b"hello".to_vec())]);
+        let wrong = [("hello", "/bin/hello", &"0".repeat(64)[..])];
+        let error = pinned_files(&dir, &wrong, "fetch it").unwrap_err();
+        assert!(error.contains("is not the pinned") && error.ends_with("fetch it"));
+        let missing = [("absent", "/bin/absent", good)];
+        assert!(pinned_files(&dir, &missing, "fetch it")
+            .unwrap_err()
+            .ends_with("fetch it"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The rustc pins name the tree scripts/persona-rustc.sh writes.
+        assert!(PERSONA_RUSTC.iter().all(|(rel, linux, sha)| rel
+            .starts_with("build/persona-rustc/tree/")
+            && rel.ends_with(linux)
+            && sha.len() == 64));
     }
 }

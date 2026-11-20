@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j867
 #j868
 #j869
 #j870
 #j891
+#j917
 """AXH: build, boot and check native NET2 loopback/recovery; restore the default image.
 
 No NIC, credentials or board access. Artifacts remain under build/verification. POST is
@@ -147,7 +147,7 @@ CASES = (
 POST_NAMES = ("CONSOLE ROUTE", "BLOCK SERVE", "BLOCK FAT32", "BLOCK FILE", "NET LOOPBACK")
 POST_ALL = ("USERLAND EL0", "SORA HANDSHAKE", *POST_NAMES, "HANDLE XFER", "PORT BIND")
 IMAGE_ARGS = ["cargo", "xtask", "image", "--arch", "aarch64", "--hardware", "qemu-virt-aarch64"]
-CONTROLS = ("KUMO_CONSOLE_LOGLEVEL", "KUMO_NET_RESTART_PROOF", "KUMO_NVME_ORACLE",
+CONTROLS = ("KUMO_CONSOLE_LOGLEVEL", "KUMO_PERSONA_RUSTC", "KUMO_NET_RESTART_PROOF", "KUMO_NVME_ORACLE",
             "KUMO_NVME_PREPARE", "KUMO_NVME_WRITE_PROOF", "KUMO_AX88_ORACLE")
 
 
@@ -243,7 +243,7 @@ def validate(case, text):
     return {"post": post, "known_post_failures": len(failures), "instances": ready, "expected_exit2": case.towers}
 
 
-def boot(root, source, case, work, qemu, firmware, timeout):
+def boot(root, source, case, work, qemu, firmware, timeout, memory_mib=2048):
     work.mkdir()
     shutil.copytree(source, work / "esp")
     initrd_hash = stage(work / "esp/EFI/KUMO/initrd.img", case)
@@ -251,7 +251,7 @@ def boot(root, source, case, work, qemu, firmware, timeout):
     (work / "autoexec.txt").write_bytes(case.script)
     shutil.copyfile(firmware / "edk2-arm-vars.fd", work / "vars.fd")
     serial = work / "serial.log"
-    command = [qemu, "-machine", "virt,gic-version=3", "-cpu", "cortex-a72", "-m", "2048",
+    command = [qemu, "-machine", "virt,gic-version=3", "-cpu", "cortex-a72", "-m", str(memory_mib),
                "-display", "none", "-monitor", "none", "-serial", f"file:{serial}",
                "-drive", f"if=pflash,format=raw,file={firmware / 'edk2-aarch64-code.fd'},readonly=on",
                "-drive", f"if=pflash,format=raw,file={work / 'vars.fd'}",

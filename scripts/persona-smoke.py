@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j889
 #j890
 #j891
 #j915
 #j916
+#j917
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -13,6 +13,11 @@ the kernel redirects the program's `svc`s to the shim (no Linux number in the ke
 program's `write` arrives as an INFO record. The case requires the program's line and Sora's
 `M10-c Check ok` exactly once each, and no TOWER. The image is rebuilt with the proof loglevel,
 then the default image is restored.
+
+--rustc (SH7-d3d, j917): instead, one boot of the opt-in KUMO_PERSONA_RUSTC=1 image, whose FAT
+tree carries the pinned Linux rustc (scripts/persona-rustc.sh), running
+`linux /opt/rust/bin/rustc --version` under 4 GiB of QEMU memory. The raw initrd is ~320 MB, so
+that build skips the zstd copy (KUMO_INITRD_ZSTD=0); QEMU boots the raw one either way.
 """
 
 import argparse
@@ -39,6 +44,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "build/verification/sh7/sh7b")
     parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--rustc", action="store_true", help="rustc --version from the opt-in image")
     args = parser.parse_args()
 
     axh = load_axh()
@@ -94,6 +100,21 @@ def main():
     )
 
     proof_env = dict(os.environ, KUMO_CONSOLE_LOGLEVEL="6")
+    memory_mib = 2048
+    if args.rustc:
+        case = axh.Case(
+            "persona-rustc",
+            b"echo AXH persona-rustc begins\n"
+            b"linux /opt/rust/bin/rustc --version\n"
+            b"echo AXH persona-rustc ends\n",
+            (
+                "rustc 1.98.0-nightly (91fe22da8 2026-06-21)",
+                "linux: /opt/rust/bin/rustc exited 0",
+            ),
+            ready=0,
+        )
+        proof_env.update(KUMO_PERSONA_RUSTC="1", KUMO_INITRD_ZSTD="0")
+        memory_mib = 4096
     default_env = {k: v for k, v in os.environ.items() if k not in axh.CONTROLS}
     manifest = {"head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
     try:
@@ -101,8 +122,10 @@ def main():
             subprocess.run(axh.IMAGE_ARGS, cwd=ROOT, env=proof_env, stdout=log, stderr=log, check=True)
         # boot() insists on a fresh case directory; a previous run's evidence must not
         # block or pollute this one.
-        shutil.rmtree(work / "persona", ignore_errors=True)
-        manifest["case"] = axh.boot(ROOT, source, case, work / "persona", qemu, firmware, args.timeout)
+        shutil.rmtree(work / case.name, ignore_errors=True)
+        manifest["case"] = axh.boot(
+            ROOT, source, case, work / case.name, qemu, firmware, args.timeout, memory_mib
+        )
         manifest["passed"] = True
     except BaseException as error:
         manifest["passed"] = False

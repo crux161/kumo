@@ -1,8 +1,8 @@
-//j890
 //j891
 //j892
 //j915
 //j916
+//j917
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -24,7 +24,7 @@ use kumo_vfs::{
 };
 use persona_linux::stream::ReadTail;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::{errno, threads};
 
@@ -503,7 +503,10 @@ pub fn openat(dirfd: i64, path_ptr: u64, flags: u64) -> i64 {
     };
     let path = &path[..len];
     if flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
-        log_once(b"persona-linux: write opens arrive in a later slice (-EROFS)\n");
+        log_once(
+            &SAID_EROFS,
+            b"persona-linux: write opens arrive in a later slice (-EROFS)\n",
+        );
         return -errno::EROFS;
     }
     let mut reply = [0u8; 64];
@@ -868,6 +871,114 @@ pub fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64, flags: u64) -> i64 {
     }
 }
 
+/// SH7-d3d (j917): the exec path `/proc/self/exe` answers (musl resolves the main program's
+/// `$ORIGIN` RPATH through it). Set once by `main`, before the program runs.
+static mut EXEC_PATH: ([u8; PATH_MAX], usize) = ([0; PATH_MAX], 0);
+
+pub fn set_exec_path(path: &[u8]) {
+    let mut absolute = [0u8; PATH_MAX];
+    let len = resolve(AT_FDCWD, path, &mut absolute).unwrap_or(0);
+    let exec = unsafe { &mut *core::ptr::addr_of_mut!(EXEC_PATH) };
+    exec.0[..len].copy_from_slice(&absolute[..len]);
+    exec.1 = len;
+}
+
+/// `readlinkat`: `/proc/self/exe` is the one link there is. Any other path that exists is not a
+/// link (EINVAL, which musl's `realpath` takes as "a real component"); one that does not is
+/// ENOENT. The result is not NUL-terminated and truncates to `size`, as on Linux.
+pub fn readlinkat(dirfd: i64, path_ptr: u64, buf: u64, size: u64) -> i64 {
+    let mut raw = [0u8; PATH_MAX];
+    let n = match user_path(path_ptr, &mut raw) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if (size as i64) <= 0 {
+        return -errno::EINVAL;
+    }
+    if &raw[..n] == b"/proc/self/exe" {
+        let exec = unsafe { &*core::ptr::addr_of!(EXEC_PATH) };
+        let len = exec.1.min(size as usize);
+        // SAFETY: the program's buffer of `size` bytes.
+        unsafe { core::ptr::copy_nonoverlapping(exec.0.as_ptr(), buf as *mut u8, len) };
+        return len as i64;
+    }
+    if n == 0 {
+        return -errno::ENOENT;
+    }
+    let mut path = [0u8; PATH_MAX];
+    let len = match resolve(dirfd, &raw[..n], &mut path) {
+        Ok(len) => len,
+        Err(e) => return e,
+    };
+    let mut reply = [0u8; 32];
+    let Some(raw_reply) = vfs_call(&Request::stat(&path[..len]), &mut reply) else {
+        return -errno::ENOENT;
+    };
+    match parse_stat_reply(raw_reply) {
+        Ok(_) => -errno::EINVAL,
+        Err(error) => status_errno(error),
+    }
+}
+
+const POLLIN: u16 = 0x1;
+const POLLOUT: u16 = 0x4;
+const POLLNVAL: u16 = 0x20;
+
+/// `ppoll` without waiting (SH7-d3d): what each descriptor is ready for now. Rust's runtime
+/// polls fds 0-2 with no events and a zero timeout at startup to learn which are open (it aborts
+/// if `poll` is missing). A closed descriptor is POLLNVAL; a write end (stdout, a pipe's writer)
+/// is POLLOUT; a file, a directory or a pipe reader with a held tail is POLLIN. A call that
+/// would have to wait for something not yet ready is not served yet (-ENOSYS, logged).
+pub fn ppoll(fds: u64, count: u64, timeout: u64) -> i64 {
+    if count > MAX_FDS as u64 * 4 {
+        return -errno::EINVAL;
+    }
+    let mut ready = 0i64;
+    for i in 0..count {
+        let at = fds + i * 8;
+        // struct pollfd { int fd; short events; short revents; }
+        let (fd, events) = unsafe {
+            (
+                core::ptr::read_unaligned(at as *const i32),
+                core::ptr::read_unaligned((at + 4) as *const u16),
+            )
+        };
+        let revents = if fd < 0 {
+            0
+        } else {
+            match fd_entry(fd as i64) {
+                Err(_) => POLLNVAL,
+                Ok(entry) => {
+                    let now = match entry.kind {
+                        Kind::Stdout
+                        | Kind::Pipe {
+                            readable: false, ..
+                        } => POLLOUT,
+                        Kind::File { .. } | Kind::Dir { .. } => POLLIN | POLLOUT,
+                        Kind::Pipe { readable: true, .. } if !entry.carry.is_empty() => POLLIN,
+                        _ => 0,
+                    };
+                    now & events
+                }
+            }
+        };
+        unsafe { core::ptr::write_unaligned((at + 6) as *mut u16, revents) };
+        if revents != 0 {
+            ready += 1;
+        }
+    }
+    let zero_timeout = timeout != 0
+        && unsafe { *(timeout as *const u64) == 0 && *((timeout + 8) as *const u64) == 0 };
+    if ready == 0 && !zero_timeout {
+        log_once(
+            &SAID_PPOLL,
+            b"persona-linux: a waiting ppoll arrives in a later slice (-ENOSYS)\n",
+        );
+        return -errno::ENOSYS;
+    }
+    ready
+}
+
 /// `getdents64`: `.` and `..` first (fatfs does not list them), then the server's entries, as
 /// `linux_dirent64` records: `d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name[]`.
 pub fn getdents64(fd: i64, buf: u64, count: u64) -> i64 {
@@ -989,14 +1100,14 @@ pub fn write_out(fd: i64, bytes: &[u8]) -> i64 {
     bytes.len() as i64
 }
 
-fn log_once(message: &[u8]) {
-    static mut SAID: bool = false;
-    // SAFETY: single-threaded trap path.
-    unsafe {
-        if !SAID {
-            SAID = true;
-            let _ = log_write(kumo_abi::sys::log_level::NOTICE, message);
-        }
+static SAID_EROFS: AtomicBool = AtomicBool::new(false);
+static SAID_PPOLL: AtomicBool = AtomicBool::new(false);
+
+/// Log `message` the first time `said` is seen unset (j917: one flag per message, atomic now
+/// that Linux threads share the shim).
+fn log_once(said: &AtomicBool, message: &[u8]) {
+    if !said.swap(true, Ordering::Relaxed) {
+        let _ = log_write(kumo_abi::sys::log_level::NOTICE, message);
     }
 }
 

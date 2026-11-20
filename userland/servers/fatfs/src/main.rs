@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j559
 //j864
 //j891
 //j892
 //j913
+//j917
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -40,9 +40,11 @@ fn log_info(message: &[u8]) {
 
 kumo_rt::entry!(main);
 
-/// Largest backing image this server will map. Matches `drv-blk`'s ceiling for the
-/// same reason: it covers the shipped FAT32 image with room to spare.
-const MAX_VMO_MAP: u64 = 16 * 1024 * 1024;
+/// j917 (SH7-d3d): how much of the backing image is mapped at once. The image itself may be
+/// far larger (an opt-in image carries the 290 MiB rustc tree); [`MappedSectors`] slides this
+/// window over it, so the server's address space stays small and its `ReadVmo` client windows
+/// keep their room. Matches `drv-blk`'s old single-map ceiling.
+const WINDOW_LEN: u64 = 16 * 1024 * 1024;
 
 /// Where the backing VMO lands in this process. `drv-blk` picks the same base, and
 /// for the same reason: `run_elf` puts the child stack at [0x1000_C000, 0x1001_0000),
@@ -55,61 +57,89 @@ fn fail(message: &[u8]) -> ! {
     kumo_rt::process_exit(1)
 }
 
-/// The backing store as mapped bytes. `base` is the byte offset of the FAT image
-/// inside that mapping, so the volume's LBA 0 is the image's first sector rather
-/// than the container's.
+/// The backing store as mapped bytes. `base` is the byte offset of the FAT image inside the
+/// backing VMO, so the volume's LBA 0 is the image's first sector rather than the container's;
+/// `len` is the VMO's usable (page-rounded) length. j917: only a [`WINDOW_LEN`] window of the VMO
+/// is mapped at a time, at [`VMO_VA`]; an access outside it moves the window (one unmap + map).
 struct MappedSectors {
+    vmo: Handle,
     base: u64,
     len: u64,
+    /// The VMO offset the window maps, or `u64::MAX` before the first access.
+    window_at: u64,
 }
 
-impl SectorReader for MappedSectors {
-    fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
-        let sector = SECTOR_SIZE as u64;
-        let Some(offset) = (lba as u64)
-            .checked_mul(sector)
-            .and_then(|o| o.checked_add(self.base))
-        else {
-            return false;
-        };
-        // Every read is bounded by the mapping, so a request past the image is a
-        // clean failure the volume reports, never a fault.
-        if offset.checked_add(sector).is_none_or(|end| end > self.len) {
+impl MappedSectors {
+    /// Bytes `[offset, offset + n)` of the VMO, `n` clipped to the window that holds `offset`.
+    /// `None` when the window cannot be mapped.
+    fn at(&mut self, offset: u64, n: u64) -> Option<(*mut u8, u64)> {
+        let start = offset & !(WINDOW_LEN - 1);
+        if self.window_at != start {
+            if self.window_at != u64::MAX {
+                let _ = vmar_unmap(VMO_VA, WINDOW_LEN.min(self.len - self.window_at));
+                self.window_at = u64::MAX;
+            }
+            let map_len = WINDOW_LEN.min(self.len - start);
+            if vmar_map(
+                Handle(0),
+                self.vmo,
+                start,
+                VMO_VA,
+                map_len,
+                (VmarFlags::READ | VmarFlags::WRITE).0,
+            ) != 0
+            {
+                log_info(b"fatfs: image window map failed\n");
+                return None;
+            }
+            self.window_at = start;
+        }
+        let inside = offset - start;
+        Some(((VMO_VA + inside) as *mut u8, n.min(WINDOW_LEN - inside)))
+    }
+
+    /// Copy VMO bytes `[offset, offset + out.len())` out, across windows. False past the end.
+    fn copy_out(&mut self, mut offset: u64, mut out: &mut [u8]) -> bool {
+        if offset
+            .checked_add(out.len() as u64)
+            .is_none_or(|end| end > self.len)
+        {
             return false;
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (VMO_VA + offset) as *const u8,
-                buf.as_mut_ptr(),
-                SECTOR_SIZE,
-            );
+        while !out.is_empty() {
+            let Some((from, n)) = self.at(offset, out.len() as u64) else {
+                return false;
+            };
+            let (head, tail) = out.split_at_mut(n as usize);
+            unsafe { core::ptr::copy_nonoverlapping(from, head.as_mut_ptr(), head.len()) };
+            out = tail;
+            offset += n;
         }
         true
     }
 
-    /// A run of sectors is one copy out of the mapped image (SH7-d3a).
-    fn read_sectors(&mut self, lba: u32, out: &mut [u8]) -> bool {
-        let Some(offset) = (lba as u64)
+    /// The image offset of `lba`, or `None` on overflow.
+    fn offset_of(&self, lba: u32) -> Option<u64> {
+        (lba as u64)
             .checked_mul(SECTOR_SIZE as u64)
             .and_then(|o| o.checked_add(self.base))
-        else {
-            return false;
-        };
-        if out.len() % SECTOR_SIZE != 0
-            || offset
-                .checked_add(out.len() as u64)
-                .is_none_or(|end| end > self.len)
-        {
-            return false;
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (VMO_VA + offset) as *const u8,
-                out.as_mut_ptr(),
-                out.len(),
-            );
-        }
-        true
+    }
+}
+
+impl SectorReader for MappedSectors {
+    fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+        // Every read is bounded by the backing VMO, so a request past the image is a clean
+        // failure the volume reports, never a fault.
+        self.offset_of(lba)
+            .is_some_and(|offset| self.copy_out(offset, buf))
+    }
+
+    /// A run of sectors is one copy per window out of the mapped image (SH7-d3a, j917).
+    fn read_sectors(&mut self, lba: u32, out: &mut [u8]) -> bool {
+        out.len() % SECTOR_SIZE == 0
+            && self
+                .offset_of(lba)
+                .is_some_and(|offset| self.copy_out(offset, out))
     }
 }
 
@@ -154,20 +184,23 @@ impl BulkWindow for VmoWindow {
 
 impl SectorWriter for MappedSectors {
     fn write_sector(&mut self, lba: u32, buf: &[u8; SECTOR_SIZE]) -> bool {
-        let sector = SECTOR_SIZE as u64;
-        let Some(offset) = (lba as u64)
-            .checked_mul(sector)
-            .and_then(|value| value.checked_add(self.base))
-        else {
+        let Some(offset) = self.offset_of(lba) else {
             return false;
         };
-        if offset.checked_add(sector).is_none_or(|end| end > self.len) {
+        if offset
+            .checked_add(SECTOR_SIZE as u64)
+            .is_none_or(|end| end > self.len)
+        {
             return false;
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), (VMO_VA + offset) as *mut u8, SECTOR_SIZE);
+        // A sector never straddles a window: windows and the image base are sector-aligned.
+        match self.at(offset, SECTOR_SIZE as u64) {
+            Some((to, n)) if n == SECTOR_SIZE as u64 => {
+                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), to, SECTOR_SIZE) };
+                true
+            }
+            _ => false,
         }
-        true
     }
 }
 
@@ -387,24 +420,19 @@ extern "C" fn main(
     let base = u64::from_le_bytes(header[..8].try_into().unwrap());
     let map_len = u64::from_le_bytes(header[8..].try_into().unwrap());
     // `vmar_map` requires a page-aligned length, and the initrd size the launcher
-    // computes is not 4 KiB-aligned (the same rounding drv-blk does).
-    let map_len = map_len.min(MAX_VMO_MAP) & !0xFFF;
-    if map_len == 0 || base >= map_len {
+    // computes is not 4 KiB-aligned (the same rounding drv-blk does). j917: no size ceiling;
+    // the image is mapped a window at a time.
+    let map_len = map_len & !0xFFF;
+    if map_len == 0 || base >= map_len || base % SECTOR_SIZE as u64 != 0 {
         fail(b"fatfs: bootstrap image out of range\n");
     }
-    if vmar_map(
-        Handle(0),
-        Handle(vmo_raw as u32),
-        0,
-        VMO_VA,
-        map_len,
-        (VmarFlags::READ | VmarFlags::WRITE).0,
-    ) != 0
-    {
-        fail(b"fatfs: image map failed\n");
-    }
 
-    let mut disk = MappedSectors { base, len: map_len };
+    let mut disk = MappedSectors {
+        vmo: Handle(vmo_raw as u32),
+        base,
+        len: map_len,
+        window_at: u64::MAX,
+    };
     let Ok(volume) = FatVolume::mount(&mut disk) else {
         fail(b"fatfs: mount failed\n");
     };

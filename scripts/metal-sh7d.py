@@ -3,6 +3,7 @@
 #j892
 #j915
 #j916
+#j917
 """SH7-d metal: the persona-linux programs on the Orange Pi 5 Plus, one PXE boot.
 
     linux /bin/m10-hello   static Linux ELF through the in-process shim (SH7-b)
@@ -16,6 +17,13 @@
     --stick: linux /media/KUMO/bin/bigread, the same probe from the USB stick, whose fatfs
              session hands the client's VMO to drv-xhci (SH7-d3b; the stick carries the files
              build/verification/sh7/sh7d3/stick stages)
+    --rustc: `linux /media/KUMO/opt/rust/bin/rustc --version` (SH7-d3d): the pinned Linux rustc
+             from the stick (scripts/persona-rustc.sh fetches the same tree; the stick carries
+             /opt/rust and /lib/{ld-musl-aarch64.so.1,libgcc_s.so.1}), after listing those
+             folders so a stick without them reads as such
+    --rustc-image: `linux /opt/rust/bin/rustc --version` from the image's own FAT tree, for a
+             board without the stick: build the image with KUMO_PERSONA_RUSTC=1
+             KUMO_INITRD_ZSTD=0 (and KUMO_CONSOLE_LOGLEVEL=6); the ~320 MB raw initrd netboots
 
 The metal half of scripts/persona-smoke.py. Reuses scripts/metal-sh3e.py's board machinery
 (import only), like the other metal suites. Prerequisites, per the opi5 serial-loop recipe:
@@ -108,6 +116,12 @@ def main():
     parser.add_argument("--work", type=Path, default=ROOT / "build/verification/sh7/sh7d-metal")
     parser.add_argument("--timeout", type=float, default=240.0)
     parser.add_argument("--stick", action="store_true", help="also run bigread from /media/KUMO")
+    parser.add_argument("--rustc", action="store_true", help="also run rustc --version from /media/KUMO")
+    parser.add_argument(
+        "--rustc-image",
+        action="store_true",
+        help="also run rustc --version from the image (KUMO_PERSONA_RUSTC=1 build)",
+    )
     parser.add_argument(
         "--enter",
         action="store_true",
@@ -123,6 +137,23 @@ def main():
         # The verdict appears once per run; it is counted below instead.
         expected.remove("bigread: OK (0 failures)")
         expected.append("linux: /media/KUMO/bin/bigread exited 0")
+
+    if args.rustc:
+        boot = boot.replace(
+            b"echo SH7D ends\n",
+            b"ls /media/KUMO/opt/rust/lib\nls /media/KUMO/lib\n"
+            b"linux /media/KUMO/opt/rust/bin/rustc --version\necho SH7D ends\n",
+        )
+        expected.append("rustc 1.98.0-nightly (91fe22da8 2026-06-21)")
+        expected.append("linux: /media/KUMO/opt/rust/bin/rustc exited 0")
+
+    if args.rustc_image:
+        boot = boot.replace(
+            b"echo SH7D ends\n",
+            b"linux /opt/rust/bin/rustc --version\necho SH7D ends\n",
+        )
+        expected.append("rustc 1.98.0-nightly (91fe22da8 2026-06-21)")
+        expected.append("linux: /opt/rust/bin/rustc exited 0")
 
     board = load_board()
     if shutil.which("tio") is None:

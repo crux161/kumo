@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j889
 //j890
 //j891
 //j915
 //j916
+//j917
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -39,6 +39,8 @@ kumo_rt::entry!(main);
 
 mod nr {
     pub const FCNTL: u64 = 25;
+    pub const PPOLL: u64 = 73;
+    pub const READLINKAT: u64 = 78;
     pub const IOCTL: u64 = 29;
     pub const PIPE2: u64 = 59;
     pub const OPENAT: u64 = 56;
@@ -61,8 +63,10 @@ mod nr {
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const SCHED_YIELD: u64 = 124;
+    pub const SIGALTSTACK: u64 = 132;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
+    pub const PRCTL: u64 = 167;
     pub const GETPID: u64 = 172;
     pub const GETTID: u64 = 178;
     pub const BRK: u64 = 214;
@@ -70,6 +74,8 @@ mod nr {
     pub const MUNMAP: u64 = 215;
     pub const MMAP: u64 = 222;
     pub const MPROTECT: u64 = 226;
+    pub const GETRANDOM: u64 = 278;
+    pub const MEMBARRIER: u64 = 283;
 }
 
 pub(crate) mod errno {
@@ -283,7 +289,7 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31], rec: *mut threads::ThreadR
     // SH7-d3c-2: calls that touch only the calling thread or the kernel run without the shim
     // lock (a futex wait or a sleep must not hold it); everything else is serialized.
     let result: i64 = match frame[8] {
-        nr::CLONE => threads::clone(frame, a0, a1, a2, a3, a4),
+        nr::CLONE => threads::clone(rec, frame, a0, a1, a2, a3, a4),
         nr::FUTEX => threads::futex(a0, a1, a2, a3, frame[5]),
         nr::EXIT => threads::exit_thread(rec, a0),
         nr::EXIT_GROUP => process_exit(a0 & 0xff),
@@ -295,7 +301,12 @@ extern "C" fn persona_dispatch(frame: *mut [u64; 31], rec: *mut threads::ThreadR
         nr::CLOCK_GETTIME => threads::clock_gettime(a0, a1),
         nr::NANOSLEEP => threads::clock_nanosleep(1, 0, a0, a1),
         nr::CLOCK_NANOSLEEP => threads::clock_nanosleep(a0, a1, a2, a3),
-        nr::RT_SIGACTION | nr::RT_SIGPROCMASK => 0,
+        // j917 (SH7-d3d): what rustc's startup asks for, per thread or kernel-only.
+        nr::RT_SIGPROCMASK => threads::rt_sigprocmask(rec, a0, a1, a2, a3),
+        nr::SIGALTSTACK => threads::sigaltstack(rec, a0, a1),
+        nr::PRCTL => threads::prctl(a0, a1),
+        nr::GETRANDOM => threads::getrandom(a0, a1, a2),
+        nr::MEMBARRIER => threads::membarrier(a0, a1),
         number => {
             threads::lock();
             let result = serve_locked(number, frame);
@@ -326,6 +337,9 @@ fn serve_locked(number: u64, frame: &[u64; 31]) -> i64 {
         nr::GETDENTS64 => files::getdents64(a0 as i64, a1, a2),
         nr::FCNTL => files::fcntl(a0 as i64, a1, a2),
         nr::IOCTL => -errno::ENOTTY,
+        nr::RT_SIGACTION => threads::rt_sigaction(a0, a1, a2, frame[3]),
+        nr::READLINKAT => files::readlinkat(a0 as i64, a1, a2, frame[3]),
+        nr::PPOLL => files::ppoll(a0, a1, a2),
         nr::BRK => brk(a0) as i64,
         nr::MMAP => mmap(a0, a1, a2, frame[3], frame[4] as i64, frame[5]),
         nr::MUNMAP => munmap(a0, a1),
@@ -627,6 +641,8 @@ extern "C" fn main(
     }
 
     // execve: the program by path, then the interpreter its PT_INTERP names.
+    // SH7-d3d (j917): `/proc/self/exe` is the program's path (cwd is `/`).
+    files::set_exec_path(linux_argv[0]);
     let program = read_image(linux_argv[0]);
     let header = match elf::parse_linux_image(program.bytes, Machine::Aarch64) {
         Ok(header) => header,

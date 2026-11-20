@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j894
 //j895
 //j911
 //j913
 //j914
+//j917
 
 extern crate alloc;
 
@@ -2070,6 +2070,10 @@ const NATIVE_MACHINE: linux_elf::Machine = linux_elf::Machine::Aarch64;
 const CHILD_WINDOW_BASE: u64 = kumo_rt::USER_WINDOW_BASE;
 /// The window's size, the same 512 MiB on both architectures.
 const CHILD_WINDOW_SIZE: u64 = 0x2000_0000;
+/// j917 (SH7-d3d): the persona shim's process gets 64 GiB from 0. A Linux program maps what it
+/// likes (rustc's driver alone is a 214 MB private mapping, placed above the shim at
+/// 0x1c00_0000); per-process TTBR0 trees make this a launcher constant, not a kernel change.
+const PERSONA_WINDOW_SIZE: u64 = 0x10_0000_0000;
 
 fn log(msg: &[u8]) {
     debug_write(msg.as_ptr(), msg.len());
@@ -12639,6 +12643,52 @@ fn media_session(access: BlockAccess) -> Option<Handle> {
     Some(client)
 }
 
+/// j917: copy `[src_base, src_base + len)` of `src` to `[0, len)` of `dst` through two
+/// 16 MiB mapped windows, as far as `src` has whole pages; returns how many bytes were copied
+/// (the caller finishes the rest). Stops early, without error, if a window cannot be mapped.
+fn copy_by_windows(src: Handle, src_base: u64, dst: Handle, len: u64) -> u64 {
+    const SRC_VA: u64 = 0x3c00_0000;
+    const DST_VA: u64 = 0x3e00_0000;
+    const WINDOW: u64 = 0x0100_0000;
+    const PAGE: u64 = 0x1000;
+    let end = (src_base + len) & !(PAGE - 1);
+    let mut done = 0u64;
+    while src_base + done < end {
+        let src_off = src_base + done;
+        let src_page = src_off & !(PAGE - 1);
+        let src_len = WINDOW.min(end - src_page);
+        let bytes = src_len - (src_off - src_page);
+        let dst_page = done & !(PAGE - 1);
+        let dst_len = (done - dst_page + bytes).next_multiple_of(PAGE);
+        if vmar_map(Handle(0), src, src_page, SRC_VA, src_len, VmarFlags::READ.0) != 0 {
+            break;
+        }
+        if vmar_map(
+            Handle(0),
+            dst,
+            dst_page,
+            DST_VA,
+            dst_len,
+            (VmarFlags::READ | VmarFlags::WRITE).0,
+        ) != 0
+        {
+            let _ = kumo_rt::vmar_unmap(SRC_VA, src_len);
+            break;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (SRC_VA + (src_off - src_page)) as *const u8,
+                (DST_VA + (done - dst_page)) as *mut u8,
+                bytes as usize,
+            );
+        }
+        let _ = kumo_rt::vmar_unmap(SRC_VA, src_len);
+        let _ = kumo_rt::vmar_unmap(DST_VA, dst_len);
+        done += bytes;
+    }
+    done
+}
+
 fn fat_image_alias(initrd: Handle) -> Option<(u64, u64)> {
     let mut backing = FAT_IMAGE_VMO.load(Ordering::Acquire);
     let mut map_len = FAT_IMAGE_LEN.load(Ordering::Relaxed);
@@ -12656,8 +12706,10 @@ fn fat_image_alias(initrd: Handle) -> Option<(u64, u64)> {
 
         // Child VMO copy syscalls are deliberately capped at 256 bytes (J166), so copy
         // the exact FAT payload in bounded pieces. Padding stays zero from VmoCreate.
+        // j917: whole pages first, through two mapped windows (an opt-in image carries a
+        // 300 MB FAT image: 2.4 M syscalls the other way); the 256-byte loop takes the tail.
         let backing_handle = Handle(backing as u32);
-        let mut offset = 0u64;
+        let mut offset = copy_by_windows(initrd, image_base, backing_handle, image_len);
         let mut chunk = [0u8; 256];
         while offset < image_len {
             let n = (image_len - offset).min(chunk.len() as u64) as usize;
@@ -13798,7 +13850,12 @@ fn run_elf_threads_status(
             }
         }
 
-        let child_as_h = process_create(CHILD_WINDOW_BASE, CHILD_WINDOW_SIZE);
+        let window = if path == kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes() {
+            PERSONA_WINDOW_SIZE
+        } else {
+            CHILD_WINDOW_SIZE
+        };
+        let child_as_h = process_create(CHILD_WINDOW_BASE, window);
         if child_as_h == u64::MAX {
             log(name);
             log(b": process fail\n");

@@ -1,4 +1,5 @@
 //j916
+//j917
 //! SH7-d3c-2: the minimum Linux thread (the ratified SH7-d3 cut, T1).
 //!
 //! **Threads.** A Linux `clone` with musl's pthread flag set becomes a KUMO `ThreadSpawn` in
@@ -58,6 +59,12 @@ pub struct ThreadRec {
     /// Where the child itself writes its tid before the program runs (PARENT/CHILD_SETTID).
     pub parent_tid_at: u64,
     pub child_tid_at: u64,
+    /// j917: this thread's blocked-signal mask (`rt_sigprocmask`), inherited by its clones.
+    pub sigmask: u64,
+    /// j917: this thread's `sigaltstack` (sp, flags, size); a clone starts with none.
+    pub alt_sp: u64,
+    pub alt_flags: u64,
+    pub alt_size: u64,
 }
 
 const _: () = {
@@ -79,6 +86,10 @@ impl ThreadRec {
         region_len: 0,
         parent_tid_at: 0,
         child_tid_at: 0,
+        sigmask: 0,
+        alt_sp: 0,
+        alt_flags: SS_DISABLE,
+        alt_size: 0,
     };
 }
 
@@ -287,7 +298,15 @@ fn child_failed(what: &str) -> ! {
 // ---- the calls -----------------------------------------------------------------------------
 
 /// Linux `clone(flags, stack, parent_tid, tls, child_tid)`: a sibling thread only.
-pub fn clone(frame: &[u64; 31], flags: u64, stack: u64, ptid: u64, tls: u64, ctid: u64) -> i64 {
+pub fn clone(
+    parent: &ThreadRec,
+    frame: &[u64; 31],
+    flags: u64,
+    stack: u64,
+    ptid: u64,
+    tls: u64,
+    ctid: u64,
+) -> i64 {
     let Some(kind) = thread::thread_clone(flags) else {
         log(format_args!(
             "persona-linux: clone flags {:#x} are not a thread (-EINVAL)\n",
@@ -330,6 +349,7 @@ pub fn clone(frame: &[u64; 31], flags: u64, stack: u64, ptid: u64, tls: u64, cti
     rec.region_len = region_len;
     rec.parent_tid_at = if kind.parent_set_tid { ptid } else { 0 };
     rec.child_tid_at = if kind.child_set_tid { ctid } else { 0 };
+    rec.sigmask = parent.sigmask;
 
     let (status, koid) = thread_spawn(persona_thread_entry as *const () as u64, rec_at, rec_at);
     if status != 0 {
@@ -551,4 +571,169 @@ pub fn clock_nanosleep(clock: u64, flags: u64, request: u64, remain: u64) -> i64
         write_timespec(remain, 0);
     }
     0
+}
+
+// ---- j917 (SH7-d3d): what rustc's startup asks of signals and the process ------------------
+
+const SS_ONSTACK: u64 = 1;
+const SS_DISABLE: u64 = 2;
+const SIG_BLOCK: u64 = 0;
+const SIG_UNBLOCK: u64 = 1;
+const SIG_SETMASK: u64 = 2;
+const SIGKILL: u64 = 9;
+const SIGSTOP: u64 = 19;
+
+/// Linux `rt_sigprocmask` on this thread's own mask. No signal is ever delivered to a Linux
+/// thread yet (async signals are SH6's KUMO messages, not served here), so the mask is kept
+/// exactly and only reported back: musl saves and restores it around `clone`.
+pub fn rt_sigprocmask(rec: &mut ThreadRec, how: u64, set: u64, old: u64, size: u64) -> i64 {
+    if size != 8 {
+        return -errno::EINVAL;
+    }
+    let previous = rec.sigmask;
+    if set != 0 {
+        let wanted = unsafe { *(set as *const u64) };
+        // SIGKILL and SIGSTOP cannot be blocked.
+        let unblockable = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
+        rec.sigmask = match how {
+            SIG_BLOCK => previous | wanted,
+            SIG_UNBLOCK => previous & !wanted,
+            SIG_SETMASK => wanted,
+            _ => return -errno::EINVAL,
+        } & !unblockable;
+    }
+    if old != 0 {
+        unsafe { *(old as *mut u64) = previous };
+    }
+    0
+}
+
+/// The process's signal dispositions, as `rt_sigaction` set them: `struct k_sigaction` on
+/// aarch64 = handler, flags, restorer, mask (8 bytes with `sigsetsize` 8). Guarded by the shim
+/// lock. Recorded and reported back only; nothing is delivered through them yet.
+static mut SIGACTIONS: [[u64; 4]; 65] = [[0; 4]; 65];
+
+/// Linux `rt_sigaction`. Called with the shim lock held.
+pub fn rt_sigaction(sig: u64, act: u64, old: u64, size: u64) -> i64 {
+    if size != 8 || sig == 0 || sig > 64 {
+        return -errno::EINVAL;
+    }
+    if act != 0 && (sig == SIGKILL || sig == SIGSTOP) {
+        return -errno::EINVAL;
+    }
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(SIGACTIONS) };
+    let previous = table[sig as usize];
+    if act != 0 {
+        table[sig as usize] = unsafe { core::ptr::read_unaligned(act as *const [u64; 4]) };
+    }
+    if old != 0 {
+        unsafe { core::ptr::write_unaligned(old as *mut [u64; 4], previous) };
+    }
+    0
+}
+
+/// Linux `sigaltstack` on this thread's record (Rust's runtime installs one per thread for its
+/// stack-overflow report, and takes it down at exit).
+pub fn sigaltstack(rec: &mut ThreadRec, new: u64, old: u64) -> i64 {
+    // stack_t { void *ss_sp; int ss_flags; size_t ss_size; } = 24 bytes on aarch64.
+    let previous = (rec.alt_sp, rec.alt_flags, rec.alt_size);
+    if new != 0 {
+        let (sp, flags, size) = unsafe {
+            (
+                *(new as *const u64),
+                *((new + 8) as *const u32) as u64,
+                *((new + 16) as *const u64),
+            )
+        };
+        if flags & !(SS_DISABLE | SS_ONSTACK) != 0 {
+            return -errno::EINVAL;
+        }
+        if flags & SS_DISABLE != 0 {
+            (rec.alt_sp, rec.alt_flags, rec.alt_size) = (0, SS_DISABLE, 0);
+        } else {
+            (rec.alt_sp, rec.alt_flags, rec.alt_size) = (sp, 0, size);
+        }
+    }
+    if old != 0 {
+        unsafe {
+            *(old as *mut u64) = previous.0;
+            *((old + 8) as *mut u32) = previous.1 as u32;
+            *((old + 12) as *mut u32) = 0;
+            *((old + 16) as *mut u64) = previous.2;
+        }
+    }
+    0
+}
+
+const PR_SET_NAME: u64 = 15;
+const PR_GET_NAME: u64 = 16;
+
+/// Linux `prctl`: a thread naming itself (std's `thread::Builder::name`) is accepted; reading a
+/// name back answers "linux"; nothing else is served.
+pub fn prctl(option: u64, arg: u64) -> i64 {
+    match option {
+        PR_SET_NAME => 0,
+        PR_GET_NAME if arg != 0 => {
+            unsafe { core::ptr::copy_nonoverlapping(b"linux\0".as_ptr(), arg as *mut u8, 6) };
+            0
+        }
+        _ => -errno::EINVAL,
+    }
+}
+
+/// Bits of state for [`getrandom`]: splitmix64 over the kernel clock.
+static RANDOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Linux `getrandom`. KUMO has no entropy source a user program can read yet, so this is a
+/// splitmix64 stream reseeded from the monotonic clock on every call: unpredictable enough for
+/// HashMap keys (what Rust's runtime asks for), **not** for keys or nonces. Never blocks.
+pub fn getrandom(buf: u64, len: u64, flags: u64) -> i64 {
+    // GRND_NONBLOCK 1, GRND_RANDOM 2, GRND_INSECURE 4.
+    if flags & !7 != 0 {
+        return -errno::EINVAL;
+    }
+    let len = len.min(i32::MAX as u64);
+    let mut done = 0u64;
+    while done < len {
+        let mut z = RANDOM
+            .fetch_add(clock_get() | 1, Ordering::Relaxed)
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let take = (len - done).min(8);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                z.to_le_bytes().as_ptr(),
+                (buf + done) as *mut u8,
+                take as usize,
+            )
+        };
+        done += take;
+    }
+    len as i64
+}
+
+const MEMBARRIER_CMD_QUERY: u64 = 0;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED: u64 = 8;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: u64 = 16;
+
+/// Linux `membarrier`, private-expedited only (musl registers at its first `pthread_create`
+/// and uses it when a dlopen installs TLS). **Correct only while KUMO runs one CPU** (SMP is
+/// PLAN/014): every other thread of the process is then off-CPU and has passed a context
+/// switch, so a full barrier here is the barrier on all of them.
+pub fn membarrier(cmd: u64, flags: u64) -> i64 {
+    if flags != 0 {
+        return -errno::EINVAL;
+    }
+    match cmd {
+        MEMBARRIER_CMD_QUERY => {
+            (MEMBARRIER_CMD_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) as i64
+        }
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
+            unsafe { core::arch::asm!("dsb ish", options(nostack)) };
+            0
+        }
+        _ => -errno::EINVAL,
+    }
 }
