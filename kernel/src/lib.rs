@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j904
 //j905
 //j907
 //j912
 //j913
+//j914
 
 extern crate alloc;
 
@@ -865,13 +865,82 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         klog!("SORA HANDSHAKE     Check     no message on root channel   --\n");
     }
 
+    userland_post(initrd, u.serving);
+
+    if !stage_a_uses_serial_floor(
+        report.has_framebuffer,
+        selected_pl011_base,
+        selected_dw8250_base,
+    ) {
+        // Framebuffer-only console (the X13s): no resolved UART and no kernel keyboard yet, so
+        // idle here. The screen keeps the boot report; a pre-handoff pause lives in the loader.
+        klog!("\nFRAMEBUFFER   Check     GREEN                    OK\n");
+        klog!("\nMUREX core online -- all subsystems nominal.\n");
+        klog!("KUMO MUREX core Stage-A online; awaiting userspace.  HALT.\n");
+        loop {
+            user_thread::pump_idle_floor();
+            kumo_hal::active::spin_once();
+        }
+    } else {
+        // P8-b: selected PL011 console (QEMU, Pi uart10, or explicit RP1) — forward polled
+        // keystrokes to Sora via the keyboard channel. Polling deliberately avoids inventing an
+        // IRQ for the PCIe-hosted RP1 UART. Sora buffers keystrokes (minimal line editing:
+        // backspace), echoes via DebugWrite, and sends completed lines to the kernel via the root
+        // channel. The framebuffer remains an independent sink; its presence no longer suppresses
+        // this serial floor. The kernel runs shell::run_command on each line. This is scaffold
+        // under DESIGN/006 §b — the line-edit loop is IPC, not a TTY. — KESTREL 2026-07-18
+        kdemo::install_preemption_probe();
+        let mut env = shell::ShellEnv {
+            arch: report.arch,
+            abi_version: report.abi_version,
+            usable_frames: mm.usable_frames,
+            usable_bytes: report.usable_bytes,
+            total_bytes: report.total_bytes,
+            heap_kib: mm.heap_bytes >> 10,
+            uptime_ns: 0,
+            preempt_ticks: 0,
+            preempt_switches: 0,
+            preempted_runaways: 0,
+        };
+        let mut sysrq_out = bootstrap::console::Writer;
+        klog!("\nKUMO MUREX core Stage-A serial shell. Type 'help'.\n");
+        klog!("escape hatch: ctrl-\\ or ~~~ then '?' (works even if userland wedges).\n");
+        klog!("{}", shell::PROMPT);
+        loop {
+            // The UART now has exactly one reader — the IRQ handler in `conin` — because the
+            // boot floor stops running whenever a child spins at EL0, which is the very case the
+            // escape hatch exists for. What arrives here is what that handler judged ordinary
+            // input. Every C0 control key crosses, as it does from a USB keyboard: TAB drives
+            // ttyd's completion, ESC its escape sequences, Ctrl-C cancels a line, and kilo's
+            // Ctrl-S/Ctrl-Q save and quit. See `conin::forwarded_to_userland` for the two
+            // exceptions.
+            if let Some(byte) = conin::next_byte() {
+                if conin::forwarded_to_userland(byte) {
+                    usermode::kbd_forward(byte);
+                }
+            }
+            if let Some(action) = conin::take_deferred_action() {
+                run_sysrq(action, &env, &mut sysrq_out);
+            }
+            // Check for a completed command line from Sora via the root channel.
+            if usermode::poll_root_command(&mut env) > 0 {
+                klog!("{}", shell::PROMPT);
+            }
+            user_thread::pump_idle_floor();
+        }
+    }
+}
+
+/// Shared userspace POST after Sora parks serving. Keep device discovery in each boot front end
+/// and release Sora borrows before any console write or userspace wake. — MILVUS
+fn userland_post(initrd: Option<&[u8]>, serving: bool) {
     // P6-e: with Sora serving, route the kernel console through it. The probe is an empty
     // message (J559: the INFO line beside it is no longer echoed, so it no longer travels the
     // route); the syscall delta proves Sora actually round-tripped it (wake -> ChannelRead
     // -> park). On a zero delta the route is torn
     // back down so output never silently vanishes. Everything below — the remaining
     // POST lines and the serial shell — rides the userspace console server.
-    if u.serving {
+    if serving {
         let svc_before = kumo_hal::active::syscall_count();
         usermode::enable_console_route();
         klog!("MUREX console     -> Sora console channel\n");
@@ -1081,69 +1150,6 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                     );
                 }
             }
-        }
-    }
-
-    if !stage_a_uses_serial_floor(
-        report.has_framebuffer,
-        selected_pl011_base,
-        selected_dw8250_base,
-    ) {
-        // Framebuffer-only console (the X13s): no resolved UART and no kernel keyboard yet, so
-        // idle here. The screen keeps the boot report; a pre-handoff pause lives in the loader.
-        klog!("\nFRAMEBUFFER   Check     GREEN                    OK\n");
-        klog!("\nMUREX core online -- all subsystems nominal.\n");
-        klog!("KUMO MUREX core Stage-A online; awaiting userspace.  HALT.\n");
-        loop {
-            user_thread::pump_idle_floor();
-            kumo_hal::active::spin_once();
-        }
-    } else {
-        // P8-b: selected PL011 console (QEMU, Pi uart10, or explicit RP1) — forward polled
-        // keystrokes to Sora via the keyboard channel. Polling deliberately avoids inventing an
-        // IRQ for the PCIe-hosted RP1 UART. Sora buffers keystrokes (minimal line editing:
-        // backspace), echoes via DebugWrite, and sends completed lines to the kernel via the root
-        // channel. The framebuffer remains an independent sink; its presence no longer suppresses
-        // this serial floor. The kernel runs shell::run_command on each line. This is scaffold
-        // under DESIGN/006 §b — the line-edit loop is IPC, not a TTY. — KESTREL 2026-07-18
-        kdemo::install_preemption_probe();
-        let mut env = shell::ShellEnv {
-            arch: report.arch,
-            abi_version: report.abi_version,
-            usable_frames: mm.usable_frames,
-            usable_bytes: report.usable_bytes,
-            total_bytes: report.total_bytes,
-            heap_kib: mm.heap_bytes >> 10,
-            uptime_ns: 0,
-            preempt_ticks: 0,
-            preempt_switches: 0,
-            preempted_runaways: 0,
-        };
-        let mut sysrq_out = bootstrap::console::Writer;
-        klog!("\nKUMO MUREX core Stage-A serial shell. Type 'help'.\n");
-        klog!("escape hatch: ctrl-\\ or ~~~ then '?' (works even if userland wedges).\n");
-        klog!("{}", shell::PROMPT);
-        loop {
-            // The UART now has exactly one reader — the IRQ handler in `conin` — because the
-            // boot floor stops running whenever a child spins at EL0, which is the very case the
-            // escape hatch exists for. What arrives here is what that handler judged ordinary
-            // input. Every C0 control key crosses, as it does from a USB keyboard: TAB drives
-            // ttyd's completion, ESC its escape sequences, Ctrl-C cancels a line, and kilo's
-            // Ctrl-S/Ctrl-Q save and quit. See `conin::forwarded_to_userland` for the two
-            // exceptions.
-            if let Some(byte) = conin::next_byte() {
-                if conin::forwarded_to_userland(byte) {
-                    usermode::kbd_forward(byte);
-                }
-            }
-            if let Some(action) = conin::take_deferred_action() {
-                run_sysrq(action, &env, &mut sysrq_out);
-            }
-            // Check for a completed command line from Sora via the root channel.
-            if usermode::poll_root_command(&mut env) > 0 {
-                klog!("{}", shell::PROMPT);
-            }
-            user_thread::pump_idle_floor();
         }
     }
 }
@@ -2859,8 +2865,8 @@ fn x86_bring_up(entry: X86Entry, kernel_stack_top: u64) -> ! {
 /// PLAN/026 U2 (j912): after first light, run the userland supervisor through the same
 /// `usermode::run_sora` path arm64's stage_a uses: Sora's ELF from the initrd in its own CR3,
 /// the bootstrap channels, its greeting and root-channel handshake, until it parks serving.
-/// The checkpoints mirror stage_a's. The shared POST tail (console route, block/file serve, ports,
-/// net loopback, the shell) is U3; until then the boot halts here with Sora serving.
+/// The checkpoints and userspace POST tail are shared with stage_a. U3c adds the shell loop;
+/// until then the boot halts here after the POST with Sora serving.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn x86_start_sora(boot: &BootInfo) -> ! {
     let initrd = unsafe {
@@ -2925,6 +2931,7 @@ fn x86_start_sora(boot: &BootInfo) -> ! {
         );
         kumo_hal::active::halt();
     }
+    userland_post(Some(initrd), u.serving);
     klog!("x86_64 MUREX userland online: Sora serving; HALTING.\n");
     kumo_hal::active::halt()
 }

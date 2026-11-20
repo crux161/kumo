@@ -1,8 +1,8 @@
-//j907
 //j909
 //j911
 //j912
 //j913
+//j914
 
 use std::env;
 use std::fmt;
@@ -1803,8 +1803,9 @@ fn build_x86_initrd(root: &Path) -> Result<Vec<u8>, String> {
     let shadow = identity::shadow_file()?;
     let fat32_img = build_fat32_image(hello.as_slice(), &[]);
     build_initrd(&[
-        (HELLO_PATH, hello.as_slice()),
+        // The shared block POST reads the first entry's path as bin/sora. — MILVUS
         (kumo_abi::SORA_INIT_PATH, sora.as_slice()),
+        (HELLO_PATH, hello.as_slice()),
         (SVC_HEALTH_PATH, svc_health.as_slice()),
         (TTYD_PATH, ttyd.as_slice()),
         (DRV_BLK_PATH, drv_blk.as_slice()),
@@ -3384,6 +3385,7 @@ fn validate_x86_niji_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "FRAMEBUFFER CONSOLE Check",
         "write-combining",
         "SERIAL MIRROR      Check     PCI 00:",
+        "drv-fb: snapshot fb geometry ",
     ] {
         if !text.contains(marker) {
             return Err(format!(
@@ -3648,6 +3650,17 @@ fn find_ovmf_firmware() -> Result<(PathBuf, PathBuf), String> {
     )
 }
 
+// U3b: these are emitted by the same POST function on both architectures. — MILVUS
+const X86_USERLAND_POST_MARKERS: &[&str] = &[
+    "CONSOLE ROUTE      Check     probe ",
+    "BLOCK SERVE        Check     2 req  16b  via sora   OK",
+    "BLOCK FAT32        Check     sector 0 BPB  via sora   OK",
+    "BLOCK FILE         Check     HELLO.TXT +4b @1  via sora   OK",
+    "HANDLE XFER        Check     net channel  via sora   OK",
+    "PORT BIND          Check     channel signal  via eng   OK",
+    "NET LOOPBACK       Check     ping +conn +pipe  via sora   OK",
+];
+
 fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
     validate_x86_first_light_transcript(transcript, "Multiboot/GRUB", "MULTIBOOT")
 }
@@ -3732,7 +3745,18 @@ fn validate_x86_first_light_transcript(
             ));
         }
     }
-    if text.contains("FAIL") || text.contains("TOWER-x86: fatal exception") {
+    for marker in X86_USERLAND_POST_MARKERS {
+        if !text.contains(marker) {
+            return Err(format!(
+                "x86 smoke transcript missing userspace POST {marker:?}:\n{text}"
+            ));
+        }
+    }
+    if text.contains("FAIL")
+        || text.contains("TOWER-x86: fatal exception")
+        || text.contains("drv-fb: bootinfo map fail")
+        || text.contains("sora: console koid fail")
+    {
         return Err(format!("x86 smoke transcript contains a failure:\n{text}"));
     }
     Ok(())
@@ -4164,7 +4188,10 @@ mod fat32_image_tests {
 
 #[cfg(test)]
 mod x86_smoke_tests {
-    use super::{validate_x86_niji_smoke_transcript, validate_x86_smoke_transcript};
+    use super::{
+        validate_x86_niji_smoke_transcript, validate_x86_smoke_transcript,
+        X86_USERLAND_POST_MARKERS,
+    };
 
     const GREEN: &str = "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n\
 MULTIBOOT INITRD   Check     1 module  KUMORD01 9000b  bin/hello 8904b  phys 0x938000   OK\n\
@@ -4209,6 +4236,13 @@ persona-posix: tty read ok\n\
 [  OK  ] ttyd: online, console line discipline\n\
 SORA EL0           Check     5759 int80  wrote 1120b  boot h1  attempts 0  serving   OK\n\
 SORA HANDSHAKE     Check     root channel: \"sora ack\"   OK\n\
+CONSOLE ROUTE      Check     probe 2 svc  via sora   OK\n\
+BLOCK SERVE        Check     2 req  16b  via sora   OK\n\
+BLOCK FAT32        Check     sector 0 BPB  via sora   OK\n\
+BLOCK FILE         Check     HELLO.TXT +4b @1  via sora   OK\n\
+HANDLE XFER        Check     net channel  via sora   OK\n\
+PORT BIND          Check     channel signal  via eng   OK\n\
+NET LOOPBACK       Check     ping +conn +pipe  via sora   OK\n\
 x86_64 MUREX userland online: Sora serving; HALTING.\n";
 
     #[test]
@@ -4259,6 +4293,25 @@ x86_64 MUREX userland online: Sora serving; HALTING.\n";
     }
 
     #[test]
+    fn x86_transcript_requires_every_shared_userland_post() {
+        for marker in X86_USERLAND_POST_MARKERS {
+            assert!(
+                validate_x86_smoke_transcript(GREEN.replace(marker, "missing POST").as_bytes())
+                    .is_err(),
+                "accepted a transcript missing {marker}"
+            );
+        }
+        for failure in [
+            "drv-fb: bootinfo map fail st=0xffffffff",
+            "sora: console koid fail",
+        ] {
+            assert!(
+                validate_x86_smoke_transcript(format!("{GREEN}{failure}\n").as_bytes()).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn x86_transcript_rejects_a_failure_even_after_first_light() {
         let transcript = format!("{GREEN}TOWER-x86: fatal exception; HALT\n");
         assert!(validate_x86_smoke_transcript(transcript.as_bytes()).is_err());
@@ -4270,7 +4323,8 @@ x86_64 MUREX userland online: Sora serving; HALTING.\n";
             "BOOTX64.EFI loaded\nACPI RSDP    : 0x43b7e014 (ACPI 2.0 table, revision 2)\nhandoff      : VALID\n\
 NIJIGUMO PAGE TABLES Check     firmware CR3 0x43c01000  6 frames in 2 runs reserved   OK\n\
 FRAMEBUFFER CONSOLE Check     1280x800 stride 1280 Bgr @0x80000000  4000 KiB write-combining  PAT 0x7040600070406 -> 0x7040100070406  1 split tables   OK\n\
-SERIAL MIRROR      Check     PCI 00:03.0 1b36:0002 PCI 16550  io 0xc000  cmd 0x0007 -> 0x0007   OK\n{}",
+SERIAL MIRROR      Check     PCI 00:03.0 1b36:0002 PCI 16550  io 0xc000  cmd 0x0007 -> 0x0007   OK\n\
+drv-fb: snapshot fb geometry 1280x800\n{}",
             GREEN
                 .replace("first light (Multiboot/GRUB)", "first light (Nijigumo/UEFI)")
                 .replace("MULTIBOOT INITRD", "NIJIGUMO INITRD")
@@ -4290,6 +4344,12 @@ SERIAL MIRROR      Check     PCI 00:03.0 1b36:0002 PCI 16550  io 0xc000  cmd 0x0
         .is_err());
         assert!(validate_x86_niji_smoke_transcript(
             transcript.replace("via Nijigumo", "legacy scan").as_bytes()
+        )
+        .is_err());
+        assert!(validate_x86_niji_smoke_transcript(
+            transcript
+                .replace("drv-fb: snapshot fb geometry ", "missing snapshot ")
+                .as_bytes()
         )
         .is_err());
         // j905: an uncached (or absent) glass is not green.

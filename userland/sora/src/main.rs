@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j893
 //j894
 //j895
 //j911
 //j913
+//j914
 
 extern crate alloc;
 
@@ -5543,7 +5543,7 @@ extern "C" fn sora_main(
     // bootstrap channel pair. drv-fb reads these and paints the text console.
     if fb_va != 0 && bootinfo_vmo != 0 {
         let bi_vmo = Handle(bootinfo_vmo as u32);
-        let bi_va = 0x0000_0000_3000_0000;
+        let bi_va = kumo_rt::USER_WINDOW_BASE + 0x3000_0000;
         let bi_map_st = vmar_map(Handle(0), bi_vmo, 0, bi_va, 4096, (VmarFlags::READ).0);
         if bi_map_st == 0 {
             let bootinfo = unsafe { &*(bi_va as *const BootInfo) };
@@ -5581,7 +5581,14 @@ extern "C" fn sora_main(
                     }
                     _ => u64::MAX,
                 };
-                if fb_res_h != u64::MAX {
+                // A framebuffer can exist before this architecture ships drv-fb. Do not move
+                // Sora's console handle into an unread bootstrap queue. — MILVUS
+                if initrd_find(initrd, kumo_abi::DRV_FB_PATH.as_bytes()).is_none() {
+                    if fb_res_h != u64::MAX {
+                        let _ = handle_close(Handle(fb_res_h as u32));
+                    }
+                    log(b"drv-fb: missing (kernel console retained)\n");
+                } else if fb_res_h != u64::MAX {
                     let (server_chan, client_chan) = channel_create_pair();
                     if server_chan != u64::MAX && client_chan != u64::MAX {
                         let srv = Handle(server_chan as u32);
