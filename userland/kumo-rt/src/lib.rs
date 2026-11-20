@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j894
+//j913
 
 extern crate alloc;
 
@@ -11,6 +12,17 @@ pub use exit_hook::set_exit_hook;
 
 pub mod heap;
 pub mod sys;
+
+/// Where a native process's address-space window starts (j913, PLAN/026 U3a). arm64 programs
+/// link and run inside [0, 512 MiB); AMD64 user space begins at PML4[1], 0x80_0000_0000 (the x86
+/// HAL's `USER_BASE`), where `kumo-user-x86.ld` links every x86 program. A program that maps at a
+/// fixed address, and a parent that sizes a child's window or places its stack, adds this base, so
+/// one constant keeps both architectures' layouts the same shape.
+#[cfg(target_arch = "x86_64")]
+pub const USER_WINDOW_BASE: u64 = 0x0000_0080_0000_0000;
+/// See the x86_64 definition.
+#[cfg(not(target_arch = "x86_64"))]
+pub const USER_WINDOW_BASE: u64 = 0;
 
 pub use sys::*;
 

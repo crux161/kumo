@@ -1,3 +1,4 @@
+#j913
 [package]
 name = "drv-blk"
 version = "0.1.0"
@@ -18,6 +19,7 @@ doctest = false
 
 # Gated to aarch64 (the image target) so `cargo test -p drv-blk` exercises the pure
 # block-device logic on host without dragging in the runtime.
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+# j913: freestanding x86 too (PLAN/026 U3a); the Mac host is aarch64, so host builds keep these.
+[target.'cfg(any(target_arch = "aarch64", target_os = "none"))'.dependencies]
 kumo-rt = { path = "../../kumo-rt" }
 kumo-abi = { path = "../../../lib/kumo-abi" }

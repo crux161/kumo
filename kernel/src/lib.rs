@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j823
 //j904
 //j905
 //j907
 //j912
+//j913
 
 extern crate alloc;
 
@@ -1389,8 +1389,22 @@ unsafe fn x86_multiboot_memory_map(
             .memory_map()
             .map_err(X86MultibootMemoryError::Multiboot2)?
             .ok_or(X86MultibootMemoryError::MissingMemoryMap)?;
-        return bootstrap::multiboot::normalize_multiboot2_memory_map(map, accessible_limit)
-            .map_err(X86MultibootMemoryError::Parse);
+        let regions = bootstrap::multiboot::normalize_multiboot2_memory_map(map, accessible_limit)
+            .map_err(X86MultibootMemoryError::Parse)?;
+        // j913: GRUB places its boot information right after the last module, and the firmware
+        // map calls that RAM usable. With a 3.2 MB initrd the 424-byte structure at 0x41afc0
+        // straddled 0x41b000, the first frame the bootstrap allocator handed out (as a page
+        // table) — the kernel then read back its own page table as Multiboot tags and hung.
+        // Reserve every frame the information touches.
+        let Some(info_span) = bootstrap::multiboot::page_span(mbi, info.total_size() as u64) else {
+            return Err(X86MultibootMemoryError::BadInfo);
+        };
+        return bootstrap::multiboot::normalize_boot_regions(
+            &regions,
+            &[info_span],
+            accessible_limit,
+        )
+        .map_err(X86MultibootMemoryError::Parse);
     }
     if magic != X86_MULTIBOOT1_MAGIC {
         return Err(X86MultibootMemoryError::WrongMagic);

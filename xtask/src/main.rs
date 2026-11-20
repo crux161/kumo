@@ -1,8 +1,8 @@
-//j905
 //j907
 //j909
 //j911
 //j912
+//j913
 
 use std::env;
 use std::fmt;
@@ -1752,13 +1752,74 @@ fn build_x86_sora_image(root: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// The AMD64 boot initrd: the first-light program and the supervisor.
+/// j913 (PLAN/026 U3a): build one native KUMO program for AMD64 (its build.rs links it with the
+/// x86 user script) and check it is an x86_64 ELF.
+fn build_x86_user_bin(root: &Path, package: &str) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            package,
+            "--bin",
+            package,
+            "--target",
+            "x86_64-unknown-none",
+            "--release",
+        ],
+    )?;
+    let source_path = root
+        .join("target/x86_64-unknown-none/release")
+        .join(package);
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_x86_64_kernel_elf(&bytes).map_err(|err| {
+        format!(
+            "validate {} as x86 {package} ELF: {err}",
+            source_path.display()
+        )
+    })?;
+    Ok(bytes)
+}
+
+/// The AMD64 boot initrd: the first-light program, the supervisor and (j913, U3a) the
+/// architecture-neutral services Sora starts — svc-health, ttyd, drv-blk + fatfs over a FAT32
+/// image, identityd and its files, the Lua REPL and the small tools. Board drivers (Mali, xHCI,
+/// NVMe, I2C-HID, thermal, PL011, AX88 netstack), the graphics clients, relibc/std programs and
+/// the Linux persona stay arm64-only for now.
 fn build_x86_initrd(root: &Path) -> Result<Vec<u8>, String> {
     let hello = build_x86_hello_image(root)?;
     let sora = build_x86_sora_image(root)?;
+    let svc_health = build_x86_user_bin(root, "svc-health")?;
+    let ttyd = build_x86_user_bin(root, "ttyd")?;
+    let drv_blk = build_x86_user_bin(root, "drv-blk")?;
+    let fatfs = build_x86_user_bin(root, "fatfs")?;
+    let identityd = build_x86_user_bin(root, "identityd")?;
+    let lua_repl = build_x86_user_bin(root, "lua-repl")?;
+    let ls = build_x86_user_bin(root, "ls")?;
+    let args = build_x86_user_bin(root, "args")?;
+    let cat = build_x86_user_bin(root, "cat")?;
+    let wc = build_x86_user_bin(root, "wc")?;
+    let shadow = identity::shadow_file()?;
+    let fat32_img = build_fat32_image(hello.as_slice(), &[]);
     build_initrd(&[
         (HELLO_PATH, hello.as_slice()),
         (kumo_abi::SORA_INIT_PATH, sora.as_slice()),
+        (SVC_HEALTH_PATH, svc_health.as_slice()),
+        (TTYD_PATH, ttyd.as_slice()),
+        (DRV_BLK_PATH, drv_blk.as_slice()),
+        (FATFS_PATH, fatfs.as_slice()),
+        (FAT32_IMG_PATH, fat32_img.as_slice()),
+        (IDENTITYD_PATH, identityd.as_slice()),
+        (LUA_REPL_PATH, lua_repl.as_slice()),
+        (LS_PATH, ls.as_slice()),
+        (ARGS_PATH, args.as_slice()),
+        (CAT_PATH, cat.as_slice()),
+        (WC_PATH, wc.as_slice()),
+        (HOSTNAME_PATH, identity::HOSTNAME.as_bytes()),
+        (PASSWD_PATH, identity::PASSWD.as_bytes()),
+        (GROUP_PATH, identity::GROUP.as_bytes()),
+        (SHADOW_PATH, shadow.as_bytes()),
     ])
 }
 
@@ -3108,7 +3169,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"SORA HANDSHAKE     Check     root channel: \"sora ack\"   OK",
             b"x86_64 MUREX userland online: Sora serving; HALTING.",
         ],
-        Duration::from_secs(20),
+        Duration::from_secs(40),
     )
     .and_then(|()| validate_x86_smoke_transcript(&transcript));
 
@@ -3654,6 +3715,23 @@ fn validate_x86_first_light_transcript(
             return Err(format!("x86 smoke transcript missing {marker:?}:\n{text}"));
         }
     }
+    // j913 (PLAN/026 U3a): Sora starts the architecture-neutral services on x86 too.
+    for marker in [
+        "[  OK  ] drv-blk: online, initrd block device",
+        "blk-rt: ok",
+        "blk-wr: ok",
+        "fatfs-blk: HELLO.TXT = hello!",
+        "lua-repl: 42",
+        "persona-posix: tty read ok",
+        "[  OK  ] identityd: online, 3 accounts",
+        "[  OK  ] ttyd: online, console line discipline",
+    ] {
+        if !text.contains(marker) {
+            return Err(format!(
+                "x86 smoke transcript missing service line {marker:?}:\n{text}"
+            ));
+        }
+    }
     if text.contains("FAIL") || text.contains("TOWER-x86: fatal exception") {
         return Err(format!("x86 smoke transcript contains a failure:\n{text}"));
     }
@@ -4121,7 +4199,15 @@ USER ELF / ENGINE  Check     2 PT_LOAD  entry 0x8000000000  boot h1  4 int80  wr
 x86_64 MUREX core online, first light reached; starting Sora.\n\
 SORA INITRD        Check     bin/sora 1209504b in a 1218640b KUMORD01 initrd   OK\n\
 hello from Sora via SVC\n\
-SORA EL0           Check     201 int80  wrote 919b  boot h1  attempts 0  serving   OK\n\
+[  OK  ] drv-blk: online, initrd block device\n\
+blk-rt: ok\n\
+blk-wr: ok\n\
+fatfs-blk: HELLO.TXT = hello!\n\
+lua-repl: 42\n\
+persona-posix: tty read ok\n\
+[  OK  ] identityd: online, 3 accounts\n\
+[  OK  ] ttyd: online, console line discipline\n\
+SORA EL0           Check     5759 int80  wrote 1120b  boot h1  attempts 0  serving   OK\n\
 SORA HANDSHAKE     Check     root channel: \"sora ack\"   OK\n\
 x86_64 MUREX userland online: Sora serving; HALTING.\n";
 

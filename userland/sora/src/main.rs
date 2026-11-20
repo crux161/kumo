@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j892
 //j893
 //j894
 //j895
 //j911
+//j913
 
 extern crate alloc;
 
@@ -2056,6 +2056,20 @@ core::arch::global_asm!(
     job_slot = sym ROOT_JOB_HANDLE,
     options(att_syntax),
 );
+
+/// j913 (PLAN/026 U3a): the machine Sora's own programs are built for. persona-linux keeps
+/// `parse_header` arm64-only on purpose; native launches name the architecture explicitly, so an
+/// AMD64 Sora starts AMD64 services and never an arm64 image (or the reverse).
+#[cfg(target_arch = "x86_64")]
+const NATIVE_MACHINE: linux_elf::Machine = linux_elf::Machine::X86_64;
+#[cfg(not(target_arch = "x86_64"))]
+const NATIVE_MACHINE: linux_elf::Machine = linux_elf::Machine::Aarch64;
+
+/// j913: where a native child's address-space window starts (see `kumo_rt::USER_WINDOW_BASE`).
+/// Program launches and their stacks use it; the canned arm64 code smokes keep fixed addresses.
+const CHILD_WINDOW_BASE: u64 = kumo_rt::USER_WINDOW_BASE;
+/// The window's size, the same 512 MiB on both architectures.
+const CHILD_WINDOW_SIZE: u64 = 0x2000_0000;
 
 fn log(msg: &[u8]) {
     debug_write(msg.as_ptr(), msg.len());
@@ -13646,7 +13660,7 @@ fn run_elf_threads_status(
         log(b": hdr read fail\n");
         return false;
     }
-    let elf = match linux_elf::parse_header(&header) {
+    let elf = match linux_elf::parse_header_for_machine(&header, NATIVE_MACHINE) {
         Ok(elf) => elf,
         Err(_) => {
             log(name);
@@ -13777,7 +13791,7 @@ fn run_elf_threads_status(
             }
         }
 
-        let child_as_h = process_create(0, 0x2000_0000);
+        let child_as_h = process_create(CHILD_WINDOW_BASE, CHILD_WINDOW_SIZE);
         if child_as_h == u64::MAX {
             log(name);
             log(b": process fail\n");
@@ -13822,7 +13836,7 @@ fn run_elf_threads_status(
         // `AddressSpaceCreate` takes the arena **top** and maps downward. Thread zero's slice ends
         // at `STACK_TOP`; each peer's slice ends one stride above that.
         // — CORVUS / KESTREL 2026-07-26
-        const STACK_TOP: u64 = 0x1001_0000;
+        const STACK_TOP: u64 = CHILD_WINDOW_BASE + 0x1001_0000;
         const STACK_STRIDE: u64 = 0x1_0000;
         let arena_top = STACK_TOP + u64::from(extra_threads) * STACK_STRIDE;
         let arena_size = arena_top - (STACK_TOP - main_stack);
@@ -14755,7 +14769,7 @@ fn run_initrd_elf_with_channel(
 ) -> Option<(Handle, u64, u64, Handle, Handle)> {
     const PAGE_SIZE: u64 = 4096;
     const MAX_SEGMENTS: usize = 8;
-    const STACK_TOP: u64 = 0x10010000;
+    const STACK_TOP: u64 = CHILD_WINDOW_BASE + 0x1001_0000;
     const STACK_SIZE: u64 = 0x4000;
 
     fn align_down(value: u64) -> u64 {
@@ -14795,7 +14809,7 @@ fn run_initrd_elf_with_channel(
         log(b"svc-health: hdr read fail\n");
         return None;
     }
-    let elf = match linux_elf::parse_header(&header) {
+    let elf = match linux_elf::parse_header_for_machine(&header, NATIVE_MACHINE) {
         Ok(elf) => elf,
         Err(_) => {
             log(b"svc-health: bad hdr\n");
@@ -14892,7 +14906,7 @@ fn run_initrd_elf_with_channel(
             }
         }
 
-        let child_as_h = process_create(0, 0x2000_0000);
+        let child_as_h = process_create(CHILD_WINDOW_BASE, CHILD_WINDOW_SIZE);
         if child_as_h == u64::MAX {
             log(b"svc-health: process fail\n");
             break 'load None;

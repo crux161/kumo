@@ -1,4 +1,5 @@
 #j547
+#j913
 
 [package]
 name = "ls"
@@ -9,7 +10,8 @@ version.workspace = true
 
 # Runtime deps gated to the image target (aarch64), like the other userland bins: the
 # bin is only ever built for aarch64-unknown-none via `cargo xtask image`.
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+# j913: freestanding x86 too (PLAN/026 U3a); the Mac host is aarch64, so host builds keep these.
+[target.'cfg(any(target_arch = "aarch64", target_os = "none"))'.dependencies]
 kumo-rt = { path = "../kumo-rt" }
 kumo-abi.workspace = true
 # j547: the filesystem protocol, for a `/media` path Sora grants a `fatfs` for.

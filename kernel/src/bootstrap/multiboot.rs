@@ -1,6 +1,7 @@
 //! Safe, host-testable Multiboot2 handoff parsing and Multiboot1/2 memory-map normalization.
 
 //j904
+//j913
 
 use alloc::vec::Vec;
 use kumo_abi::{MemRegion, MemRegionKind, Range};
@@ -358,6 +359,18 @@ pub fn normalize_memory_map(
     normalize_parsed_regions(parsed)
 }
 
+/// j913: the whole 4 KiB frames a byte range touches, for reserving a loader structure the
+/// frame allocator must not reuse. `None` for an empty or overflowing range.
+pub fn page_span(start: u64, len: u64) -> Option<Range> {
+    const PAGE: u64 = 0x1000;
+    if len == 0 {
+        return None;
+    }
+    let first = start & !(PAGE - 1);
+    let end = start.checked_add(len)?.checked_add(PAGE - 1)? & !(PAGE - 1);
+    Some(Range::new(first, end - first))
+}
+
 /// Normalize a UEFI loader's BootInfo region list (PLAN/025 X1) through the same policy as the
 /// Multiboot maps: clip to `accessible_limit`, force usable RAM below 1 MiB reserved, and let
 /// the most restrictive kind win on overlap. `reserved` adds ranges the loader still reports
@@ -677,6 +690,22 @@ mod tests {
                 region(0x30_2000, 0x1f_e000, MemRegionKind::Usable),
             ]
         );
+    }
+
+    #[test]
+    fn page_span_covers_every_frame_a_loader_structure_touches() {
+        // GRUB's 424-byte Multiboot2 information at 0x41afc0 straddles two frames (j913).
+        assert_eq!(
+            page_span(0x41_afc0, 424),
+            Some(Range::new(0x41_a000, 0x2000))
+        );
+        assert_eq!(
+            page_span(0x41_b000, 0x1000),
+            Some(Range::new(0x41_b000, 0x1000))
+        );
+        assert_eq!(page_span(0x41_b000, 1), Some(Range::new(0x41_b000, 0x1000)));
+        assert_eq!(page_span(0x41_b000, 0), None);
+        assert_eq!(page_span(u64::MAX - 8, 16), None);
     }
 
     #[test]

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j230
 //j413
 //j414
 //j559
 //j892
+//j913
 //j690
 
 use drv_blk::{
@@ -76,7 +76,8 @@ extern "C" fn main(
     // 0x1001_0000), so mapping a multi-MiB VMO at 0x1000_0000 would remap the
     // stack READ-only and fault on the next push (J168). 0x1100_0000 leaves the
     // full 16 MiB below the 0x2000_0000 child-VMAR boundary.
-    let vmo_va = 0x0000_0000_1100_0000;
+    // j913: offset into this architecture's user window (x86 programs live at 0x80_0000_0000).
+    let vmo_va = kumo_rt::USER_WINDOW_BASE + 0x0000_0000_1100_0000;
     if vmar_map(Handle(0), vmo, 0, vmo_va, map_len, (VmarFlags::READ).0) != 0 {
         log_err(b"drv-blk: map failed\n");
         kumo_rt::process_exit(1);

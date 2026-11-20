@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j549
 //j559
 //j864
 //j891
 //j892
+//j913
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -47,7 +47,8 @@ const MAX_VMO_MAP: u64 = 16 * 1024 * 1024;
 /// Where the backing VMO lands in this process. `drv-blk` picks the same base, and
 /// for the same reason: `run_elf` puts the child stack at [0x1000_C000, 0x1001_0000),
 /// so a multi-MiB map at 0x1000_0000 would remap the stack read-only.
-const VMO_VA: u64 = 0x0000_0000_1100_0000;
+/// j913: offset into this architecture's user window (x86 programs live at 0x80_0000_0000).
+const VMO_VA: u64 = kumo_rt::USER_WINDOW_BASE + 0x0000_0000_1100_0000;
 
 fn fail(message: &[u8]) -> ! {
     log_info(message);

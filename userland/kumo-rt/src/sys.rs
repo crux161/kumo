@@ -1,8 +1,8 @@
-//j881
 //j884
 //j891
 //j894
 //j911
+//j913
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -564,20 +564,14 @@ pub fn channel_try_read_with_handle(
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub fn channel_read_with_handle(channel: Handle, buf: *mut u8, cap: usize) -> (usize, u64) {
-    let mut ret = Syscall::ChannelRead as u64;
-    let mut handle = cap as u64;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inlateout("rax") ret,
-            in("rdi") channel.0 as u64,
-            in("rsi") buf as u64,
-            inlateout("rdx") handle,
-            clobber_abi("C"),
-            options(nostack),
-        );
-    }
-    (ret as usize, handle)
+    // j913: x3 (RCX) is CHANNEL_READ_NONBLOCK's slot. This twin used to leave RCX unset — the
+    // j884 bug the arm64 wrapper had already paid — so a blocking read could answer ShouldWait
+    // (-5) and drv-blk sliced its buffer to 0xffff_fffb. Pass 0 explicitly, as arm64 does.
+    let r = syscall_full(
+        Syscall::ChannelRead,
+        [channel.0 as u64, buf as u64, cap as u64, 0, 0, 0, 0, 0],
+    );
+    (r[0] as usize, r[1])
 }
 
 #[cfg(not(any(

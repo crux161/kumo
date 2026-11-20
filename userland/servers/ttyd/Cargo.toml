@@ -1,3 +1,4 @@
+#j913
 [package]
 name = "ttyd"
 authors.workspace = true
@@ -17,6 +18,7 @@ test = false
 bench = false
 doctest = false
 
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+# j913: freestanding x86 too (PLAN/026 U3a); the Mac host is aarch64, so host builds keep these.
+[target.'cfg(any(target_arch = "aarch64", target_os = "none"))'.dependencies]
 kumo-abi.workspace = true
 kumo-rt = { path = "../../kumo-rt" }
