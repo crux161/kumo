@@ -1,4 +1,5 @@
 //j919
+//j924
 //! SH7-e2 (PLAN/022, the SH7-e cut, S3): Linux signals, delivered.
 //!
 //! **Sending** (`tkill`, `tgkill`, `kill` of this process) sets a bit in the target thread's
@@ -86,6 +87,48 @@ fn bit(sig: u64) -> u64 {
 /// handler, flags, restorer, mask). Guarded by the shim lock.
 static mut SIGACTIONS: [[u64; 4]; 65] = [[0; 4]; 65];
 
+/// j924 (SH7-f): each vfork child's own dispositions (slot 0 unused). musl's `posix_spawn` child
+/// resets every handled signal to SIG_DFL before `execve`; on Linux that child has its own
+/// table (no CLONE_SIGHAND), so the program's handlers must not change. Lock-guarded.
+static mut CHILD_ACTIONS: [[[u64; 4]; 65]; crate::files::MAX_BINDINGS] =
+    [[[0; 4]; 65]; crate::files::MAX_BINDINGS];
+/// The dispositions a process an `execve` starts begins with, copied with the snapshot.
+static mut EXEC_ACTIONS: [[u64; 4]; 65] = [[0; 4]; 65];
+
+/// A vfork child in `slot` starts with the program's dispositions.
+pub fn copy_actions_to(slot: usize) {
+    unsafe {
+        (*core::ptr::addr_of_mut!(CHILD_ACTIONS))[slot] = *core::ptr::addr_of!(SIGACTIONS);
+    }
+}
+
+/// What `execve` keeps of `slot`'s dispositions (0: the program's own): ignored stays ignored,
+/// a handler becomes SIG_DFL (its code is gone). Staged for the snapshot. Lock held.
+pub fn prepare_exec(slot: usize) {
+    let table = if slot == 0 {
+        unsafe { *core::ptr::addr_of!(SIGACTIONS) }
+    } else {
+        unsafe { (*core::ptr::addr_of!(CHILD_ACTIONS))[slot] }
+    };
+    let staged = unsafe { &mut *core::ptr::addr_of_mut!(EXEC_ACTIONS) };
+    for (sig, action) in table.iter().enumerate() {
+        staged[sig] = if action[0] == SIG_IGN {
+            [SIG_IGN, 0, 0, 0]
+        } else {
+            [SIG_DFL, 0, 0, 0]
+        };
+    }
+}
+
+/// In the process an `execve` started: the staged dispositions and an empty thread registry.
+pub fn adopt_exec() {
+    unsafe {
+        *core::ptr::addr_of_mut!(SIGACTIONS) = *core::ptr::addr_of!(EXEC_ACTIONS);
+    }
+    for slot in &THREADS {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
 fn action(sig: u64) -> [u64; 4] {
     unsafe { (*core::ptr::addr_of!(SIGACTIONS))[sig as usize] }
 }
@@ -289,6 +332,19 @@ pub fn rt_sigaction(sig: u64, act: u64, old: u64, size: u64) -> i64 {
     }
     if act != 0 && (sig == SIGKILL || sig == SIGSTOP) {
         return -errno::EINVAL;
+    }
+    let child = crate::files::active();
+    if child != 0 {
+        // j924: a vfork child's own table; nothing is delivered through it.
+        let table = unsafe { &mut (*core::ptr::addr_of_mut!(CHILD_ACTIONS))[child] };
+        let previous = table[sig as usize];
+        if act != 0 {
+            table[sig as usize] = unsafe { core::ptr::read_unaligned(act as *const [u64; 4]) };
+        }
+        if old != 0 {
+            unsafe { core::ptr::write_unaligned(old as *mut [u64; 4], previous) };
+        }
+        return 0;
     }
     let table = unsafe { &mut *core::ptr::addr_of_mut!(SIGACTIONS) };
     let previous = table[sig as usize];

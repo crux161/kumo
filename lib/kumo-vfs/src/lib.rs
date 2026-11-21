@@ -1,9 +1,9 @@
 #![no_std]
-//j547
 //j860
 //j865
 //j869
 //j891
+//j924
 
 //! `kumo-vfs` — the wire protocol for KUMO's filesystem servers.
 //!
@@ -133,6 +133,17 @@ const DIR_RECORD_HEADER: usize = 10;
 /// Maximum path length accepted on the wire. ESP paths are short; this keeps an
 /// `Open` frame bounded and well within the IPC inline ceiling.
 pub const MAX_PATH: usize = 255;
+
+/// j924 (SH7-f): set in the length word of fatfs's image bootstrap (`[base u64][len u64]` +
+/// the image VMO) to ask for the mount-scoped server. The bootstrap channel then stays open as
+/// the session-control channel: each `[b'S'][access]` message on it carries the server end of
+/// one more client session over the same volume.
+pub const IMAGE_MOUNT_FLAG: u64 = 1 << 63;
+/// j924: the session-control grant byte that opens one session; its second byte is the access.
+pub const SESSION_GRANT: u8 = b'S';
+/// j924: the grant's access byte for a session that may mutate the volume (fatfs's
+/// `SESSION_READ_WRITE`); 0 is read-only.
+pub const SESSION_ACCESS_READ_WRITE: u8 = 1;
 
 /// Wire length of a [`Request::Read`] frame: `op(1) + handle(4) + offset(8) + len(4)`.
 pub const READ_REQUEST_LEN: usize = 17;

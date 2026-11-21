@@ -1,8 +1,8 @@
-//j891
 //j894
 //j911
 //j913
 //j922
+//j924
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -653,6 +653,11 @@ pub const STARTUP_TAG_CAP0: u8 = b'c';
 /// j508: a client channel to a filesystem server speaking `kumo-vfs`. A program that
 /// receives one can name files; a program that does not cannot, whatever it asks for.
 pub const STARTUP_TAG_FS: u8 = b'f';
+/// j924 (SH7-f): the session-control channel of a mount-scoped filesystem server, beside a
+/// `STARTUP_TAG_FS` session on it. Its holder opens further sessions on the same volume
+/// (`[kumo_vfs::SESSION_GRANT][access]` + the server end of a fresh channel), one per process
+/// it starts. Only the `linux` launch over the RAM FAT image sends one.
+pub const STARTUP_TAG_FS_MOUNT: u8 = b'm';
 /// A client channel to the process's terminal line-discipline service. This is
 /// separate from stdin/stdout data channels so control RPC replies cannot be
 /// mistaken for stream bytes.
@@ -676,6 +681,7 @@ pub struct Startup {
     pub argv: Option<Handle>,
     pub cap0: Option<Handle>,
     pub fs: Option<Handle>,
+    pub fs_mount: Option<Handle>,
     pub tty: Option<Handle>,
     pub net: Option<Handle>,
     pub env: Option<Handle>,
@@ -692,6 +698,7 @@ impl Startup {
             STARTUP_TAG_ARGV => &mut self.argv,
             STARTUP_TAG_CAP0 => &mut self.cap0,
             STARTUP_TAG_FS => &mut self.fs,
+            STARTUP_TAG_FS_MOUNT => &mut self.fs_mount,
             STARTUP_TAG_TTY => &mut self.tty,
             STARTUP_TAG_NET => &mut self.net,
             STARTUP_TAG_ENV => &mut self.env,
@@ -991,6 +998,23 @@ pub fn vmo_read(_vmo: Handle, _offset: u64, _buf: *mut u8, _len: usize) -> u64 {
 ))]
 pub fn vmar_snapshot(child: Handle) -> u64 {
     syscall(Syscall::VmarSnapshot, child.0 as u64, 0, 0, 0)
+}
+
+/// j924: [`vmar_snapshot`] limited to the mappings wholly inside `[base, base + len)`.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
+pub fn vmar_snapshot_range(child: Handle, base: u64, len: u64) -> u64 {
+    syscall(Syscall::VmarSnapshot, child.0 as u64, base, len, 0)
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
+pub fn vmar_snapshot_range(_child: Handle, _base: u64, _len: u64) -> u64 {
+    u64::MAX
 }
 
 #[cfg(not(any(

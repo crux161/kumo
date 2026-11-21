@@ -1,8 +1,8 @@
-//j916
 //j917
 //j918
 //j919
 //j921
+//j924
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -27,7 +27,7 @@ use kumo_vfs::{
 };
 use persona_linux::stream::ReadTail;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{errno, threads};
 
@@ -39,6 +39,7 @@ const BOUNCE_BYTES: u64 = 1024 * 1024;
 const PATH_MAX: usize = kumo_vfs::MAX_PATH;
 const MAX_FDS: usize = 64;
 const PIPE_CHUNK: usize = 4096;
+const DEV_NULL: &[u8] = b"/dev/null";
 
 const O_ACCMODE: u64 = 3;
 const O_RDONLY: u64 = 0;
@@ -83,6 +84,9 @@ enum Kind {
     Dir {
         next: u32,
     },
+    /// j924 (SH7-f): `/dev/null`, which `std::process::Command` opens for a child's stdin.
+    /// Reads end at once; writes are taken whole and dropped.
+    Null,
 }
 
 #[derive(Clone, Copy)]
@@ -121,11 +125,69 @@ struct Descriptor {
     cloexec: bool,
 }
 
+/// j924 (SH7-f): one Linux process's descriptor table and working directory. The program's own
+/// is slot 0. A `vfork` child gets a copy in its own slot (processes.rs): `dup3` and `close`
+/// in the child must not touch the parent's table, while open files stay shared, as on Linux.
+#[derive(Clone, Copy)]
+pub struct Bindings {
+    fds: [Option<Descriptor>; MAX_FDS],
+    cwd: ([u8; PATH_MAX], usize),
+}
+
+impl Bindings {
+    pub const EMPTY: Self = Self {
+        fds: [None; MAX_FDS],
+        cwd: ([0; PATH_MAX], 0),
+    };
+}
+
+/// The program's table and one per vfork child that has not yet exec'd or exited.
+pub const MAX_BINDINGS: usize = 1 + crate::processes::MAX_VFORK;
+static mut BINDINGS: [Bindings; MAX_BINDINGS] = [Bindings::EMPTY; MAX_BINDINGS];
+/// The table the call being served uses: the caller's slot, set by `persona_dispatch` once it
+/// holds the shim lock and restored whenever a wait takes the lock back (threads::unlocked).
+static ACTIVE: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_active(slot: usize) {
+    ACTIVE.store(slot as u32, Ordering::Relaxed);
+}
+
+pub fn active() -> usize {
+    ACTIVE.load(Ordering::Relaxed) as usize
+}
+
+fn bindings() -> &'static mut Bindings {
+    // SAFETY: as `session()`: the shim lock guards every table.
+    unsafe { &mut (*core::ptr::addr_of_mut!(BINDINGS))[active()] }
+}
+
+/// Give vfork slot `slot` a copy of the active table: every open file gains a reference.
+pub fn copy_bindings_to(slot: usize) {
+    let copy = *bindings();
+    for fd in copy.fds.iter().flatten() {
+        session().files[fd.file].refs += 1;
+    }
+    unsafe { (*core::ptr::addr_of_mut!(BINDINGS))[slot] = copy };
+}
+
+/// Close every descriptor of vfork slot `slot` (its child exec'd, exited or never started).
+pub fn release_bindings(slot: usize) {
+    let table = unsafe { &mut (*core::ptr::addr_of_mut!(BINDINGS))[slot] };
+    for entry in &mut table.fds {
+        if let Some(fd) = entry.take() {
+            release_file(fd.file);
+        }
+    }
+    table.cwd.1 = 0;
+}
+
 struct Session {
     fs: Handle,
+    /// j924: the mount-scoped server's session-control channel, when the launch gave one: each
+    /// process this one starts opens its own session through it.
+    fs_mount: Handle,
     stdin: Handle,
     stdout: Handle,
-    fds: [Option<Descriptor>; MAX_FDS],
     files: [OpenFile; MAX_FDS],
     /// Bytes of the last stdin message a short `read` did not take.
     stdin_carry: [u8; 256],
@@ -139,9 +201,9 @@ struct Session {
 
 static mut SESSION: Session = Session {
     fs: Handle(0),
+    fs_mount: Handle(0),
     stdin: Handle(0),
     stdout: Handle(0),
-    fds: [None; MAX_FDS],
     files: [OpenFile::FREE; MAX_FDS],
     stdin_carry: [0; 256],
     stdin_carry_at: 0,
@@ -187,9 +249,10 @@ fn parked_read(busy: &AtomicU32, channel: Handle, out: &mut [u8]) -> Option<u64>
 }
 
 /// Take the launcher's grants. Handle 0 means "not granted".
-pub fn init(fs: Handle, stdin: Handle, stdout: Handle) {
+pub fn init(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle) {
     let s = session();
     s.fs = fs;
+    s.fs_mount = fs_mount;
     s.stdin = stdin;
     s.stdout = stdout;
     new_fd(Kind::Stdin, &[], O_RDONLY).expect("stdin slot");
@@ -427,7 +490,7 @@ fn resolve(dirfd: i64, path: &[u8], out: &mut [u8; PATH_MAX]) -> Result<usize, i
     if path.first() != Some(&b'/') {
         if dirfd == AT_FDCWD {
             // SH7-e1: relative to the cwd (`chdir`), `/` until the program changes it.
-            let cwd = unsafe { &*core::ptr::addr_of!(CWD) };
+            let cwd = &bindings().cwd;
             push(&cwd.0[..cwd.1], &mut len)?;
         } else {
             let fd = fd_entry(dirfd)?;
@@ -472,7 +535,7 @@ fn resolve(dirfd: i64, path: &[u8], out: &mut [u8; PATH_MAX]) -> Result<usize, i
 // ---- descriptors ---------------------------------------------------------------------------
 
 fn descriptor(fd: i64) -> Result<Descriptor, i64> {
-    session()
+    bindings()
         .fds
         .get(fd as usize)
         .copied()
@@ -487,7 +550,7 @@ fn fd_entry(fd: i64) -> Result<&'static mut OpenFile, i64> {
 
 fn free_fd(min: usize) -> Result<usize, i64> {
     (min..MAX_FDS)
-        .find(|&i| session().fds[i].is_none())
+        .find(|&i| bindings().fds[i].is_none())
         .ok_or(-errno::EMFILE)
 }
 
@@ -505,7 +568,7 @@ fn new_fd(kind: Kind, path: &[u8], flags: u64) -> Result<usize, i64> {
     entry.flags = flags & !O_CLOEXEC;
     entry.path[..path.len()].copy_from_slice(path);
     entry.path_len = path.len();
-    s.fds[fd] = Some(Descriptor {
+    bindings().fds[fd] = Some(Descriptor {
         file,
         cloexec: flags & O_CLOEXEC != 0,
     });
@@ -542,7 +605,7 @@ pub fn dup3(fd: i64, target: i64, flags: u64) -> i64 {
 fn duplicate_to(src: Descriptor, target: usize, cloexec: bool) -> i64 {
     // The shim lock covers replacement. Hold the source across closing an existing alias.
     session().files[src.file].refs += 1;
-    if let Some(old) = session().fds[target].replace(Descriptor {
+    if let Some(old) = bindings().fds[target].replace(Descriptor {
         file: src.file,
         cloexec,
     }) {
@@ -626,6 +689,12 @@ pub fn openat(dirfd: i64, path_ptr: u64, flags: u64) -> i64 {
     let access = flags & O_ACCMODE;
     if access == O_ACCMODE {
         return -errno::EINVAL;
+    }
+    if path == DEV_NULL {
+        return match new_fd(Kind::Null, path, flags) {
+            Ok(fd) => fd as i64,
+            Err(e) => e,
+        };
     }
     let writes = access != O_RDONLY || flags & (O_CREAT | O_TRUNC) != 0;
     if writes {
@@ -724,7 +793,7 @@ fn close_vfs(handle: u32) {
 }
 
 pub fn close(fd: i64) -> i64 {
-    let Some(open) = session().fds.get_mut(fd as usize).and_then(Option::take) else {
+    let Some(open) = bindings().fds.get_mut(fd as usize).and_then(Option::take) else {
         return -errno::EBADF;
     };
     release_file(open.file);
@@ -805,6 +874,7 @@ fn read_from(fd: i64, buf: u64, len: u64, may_block: bool) -> i64 {
         }
         Kind::Stdin => read_stdin(out),
         Kind::Dir { .. } => -errno::EISDIR,
+        Kind::Null => 0,
         _ => -errno::EBADF,
     }
 }
@@ -988,7 +1058,7 @@ pub fn fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
         0 | 1030 => dup(fd, arg, cmd == 1030), // F_DUPFD, F_DUPFD_CLOEXEC
         F_GETFD => i64::from(d.cloexec),
         F_SETFD => {
-            session().fds[fd as usize] = Some(Descriptor {
+            bindings().fds[fd as usize] = Some(Descriptor {
                 cloexec: arg & 1 != 0,
                 ..d
             });
@@ -1002,6 +1072,44 @@ pub fn fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
             0
         }
         _ => -errno::EINVAL,
+    }
+}
+
+/// j924 (SH7-f): `ioctl` for the descriptor requests Rust's std makes. `FIONBIO` sets or clears
+/// O_NONBLOCK (std's `read2` makes a child's stdout and stderr pipes non-blocking before it polls
+/// them; rustc's linker call unwraps that); `FIOCLEX`/`FIONCLEX` set close-on-exec. Terminal
+/// requests stay ENOTTY: no descriptor here is a terminal.
+pub fn ioctl(fd: i64, request: u64, arg: u64) -> i64 {
+    const FIONBIO: u64 = 0x5421;
+    const FIONCLEX: u64 = 0x5450;
+    const FIOCLEX: u64 = 0x5451;
+    let d = match descriptor(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    match request {
+        FIONBIO => {
+            if arg == 0 {
+                return -errno::EFAULT;
+            }
+            // SAFETY: the program's int.
+            let on = unsafe { core::ptr::read_unaligned(arg as *const i32) } != 0;
+            let flags = &mut session().files[d.file].flags;
+            *flags = if on {
+                *flags | O_NONBLOCK
+            } else {
+                *flags & !O_NONBLOCK
+            };
+            0
+        }
+        FIOCLEX | FIONCLEX => {
+            bindings().fds[fd as usize] = Some(Descriptor {
+                cloexec: request == FIOCLEX,
+                ..d
+            });
+            0
+        }
+        _ => -errno::ENOTTY,
     }
 }
 
@@ -1133,12 +1241,49 @@ const POLLNVAL: u16 = 0x20;
 /// `ppoll` without waiting (SH7-d3d): what each descriptor is ready for now. Rust's runtime
 /// polls fds 0-2 with no events and a zero timeout at startup to learn which are open (it aborts
 /// if `poll` is missing). A closed descriptor is POLLNVAL; a write end (stdout, a pipe's writer)
-/// is POLLOUT; a file, a directory or a pipe reader with a held tail is POLLIN. A call that
-/// would have to wait for something not yet ready is not served yet (-ENOSYS, logged).
+/// is POLLOUT; a file, a directory or a pipe reader with a held tail is POLLIN.
+///
+/// j924 (SH7-f): `ppoll` waits. `Command::output()` (rustc's linker call) polls the child's
+/// stdout and stderr pipes together until both reach end of stream. A pipe reader takes what
+/// its channel holds into its tail without blocking: bytes are POLLIN, a closed writer is
+/// POLLHUP. Nothing ready and time left: sleep on a kernel timer with the shim lock released
+/// and look again (a sibling or another process may write meanwhile). Never a spin.
 pub fn ppoll(fds: u64, count: u64, timeout: u64) -> i64 {
     if count > MAX_FDS as u64 * 4 {
         return -errno::EINVAL;
     }
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        let (sec, nsec) = unsafe {
+            (
+                core::ptr::read_unaligned(timeout as *const u64),
+                core::ptr::read_unaligned((timeout + 8) as *const u64),
+            )
+        };
+        Some(
+            kumo_rt::clock_get()
+                .saturating_add(sec.saturating_mul(1_000_000_000))
+                .saturating_add(nsec),
+        )
+    };
+    loop {
+        let ready = poll_once(fds, count);
+        if ready != 0 {
+            return ready;
+        }
+        if deadline.is_some_and(|at| kumo_rt::clock_get() >= at) {
+            return 0;
+        }
+        threads::unlocked(|| kumo_rt::sleep_ns(PPOLL_NAP_NS));
+    }
+}
+
+const PPOLL_NAP_NS: u64 = 5_000_000;
+const POLLHUP: u16 = 0x10;
+
+/// One look at every descriptor `ppoll` names; the count of those with events.
+fn poll_once(fds: u64, count: u64) -> i64 {
     let mut ready = 0i64;
     for i in 0..count {
         let at = fds + i * 8;
@@ -1152,19 +1297,33 @@ pub fn ppoll(fds: u64, count: u64, timeout: u64) -> i64 {
         let revents = if fd < 0 {
             0
         } else {
-            match fd_entry(fd as i64) {
+            match descriptor(fd as i64) {
                 Err(_) => POLLNVAL,
-                Ok(entry) => {
+                Ok(descriptor) => {
+                    let index = descriptor.file;
+                    let entry = &session().files[index];
                     let now = match entry.kind {
                         Kind::Stdout
                         | Kind::Pipe {
                             readable: false, ..
                         } => POLLOUT,
-                        Kind::File { .. } | Kind::Dir { .. } => POLLIN | POLLOUT,
+                        Kind::File { .. } | Kind::Dir { .. } | Kind::Null => POLLIN | POLLOUT,
                         Kind::Pipe { readable: true, .. } if !entry.carry.is_empty() => POLLIN,
+                        Kind::Pipe {
+                            readable: true,
+                            channel,
+                            ..
+                        } if PIPE_READER[index].load(Ordering::Acquire) == 0 => {
+                            match fill_pipe(index, channel, false) {
+                                Ok(true) => POLLIN,
+                                Ok(false) => POLLHUP,
+                                Err(_) => 0,
+                            }
+                        }
                         _ => 0,
                     };
-                    now & events
+                    // POLLHUP is reported whether asked for or not, as on Linux.
+                    now & (events | POLLHUP)
                 }
             }
         };
@@ -1172,15 +1331,6 @@ pub fn ppoll(fds: u64, count: u64, timeout: u64) -> i64 {
         if revents != 0 {
             ready += 1;
         }
-    }
-    let zero_timeout = timeout != 0
-        && unsafe { *(timeout as *const u64) == 0 && *((timeout + 8) as *const u64) == 0 };
-    if ready == 0 && !zero_timeout {
-        log_once(
-            &SAID_PPOLL,
-            b"persona-linux: a waiting ppoll arrives in a later slice (-ENOSYS)\n",
-        );
-        return -errno::ENOSYS;
     }
     ready
 }
@@ -1292,6 +1442,7 @@ pub fn write_out(fd: i64, bytes: &[u8]) -> i64 {
             return written as i64;
         }
         Ok(Kind::File { .. }) => return write_file(fd, bytes, None),
+        Ok(Kind::Null) => return bytes.len() as i64,
         Ok(Kind::Dir { .. }) => return -errno::EBADF,
         Ok(_) => return -errno::EBADF,
         Err(e) => return e,
@@ -1305,16 +1456,6 @@ pub fn write_out(fd: i64, bytes: &[u8]) -> i64 {
         }
     }
     bytes.len() as i64
-}
-
-static SAID_PPOLL: AtomicBool = AtomicBool::new(false);
-
-/// Log `message` the first time `said` is seen unset (j917: one flag per message, atomic now
-/// that Linux threads share the shim).
-fn log_once(said: &AtomicBool, message: &[u8]) {
-    if !said.swap(true, Ordering::Relaxed) {
-        let _ = log_write(kumo_abi::sys::log_level::NOTICE, message);
-    }
 }
 
 // ---- execve --------------------------------------------------------------------------------
@@ -1337,7 +1478,6 @@ pub fn close_handle(handle: u32) {
 
 /// The working directory `resolve` joins relative paths to: absolute and normalized. Guarded by
 /// the shim lock like the rest of the session.
-static mut CWD: ([u8; PATH_MAX], usize) = ([0; PATH_MAX], 0);
 
 /// Write `bytes` to the file behind `fd`: at `at` (pwrite), else at the descriptor's offset (or
 /// the end, with O_APPEND), which then advances. MAX_WRITE_DATA (256) bytes per vfs request; a
@@ -1590,7 +1730,7 @@ pub fn faccessat(dirfd: i64, path_ptr: u64) -> i64 {
 
 /// The cwd as an absolute path.
 fn cwd() -> &'static [u8] {
-    let cwd = unsafe { &*core::ptr::addr_of!(CWD) };
+    let cwd = &bindings().cwd;
     if cwd.1 == 0 {
         b"/"
     } else {
@@ -1643,7 +1783,7 @@ fn set_cwd(path: &[u8]) -> i64 {
     let mut reply = [0u8; 32];
     match vfs_call(&Request::stat(path), &mut reply).map(parse_stat_reply) {
         Some(Ok(stat)) if stat.kind == STAT_KIND_DIRECTORY => {
-            let cwd = unsafe { &mut *core::ptr::addr_of_mut!(CWD) };
+            let cwd = &mut bindings().cwd;
             cwd.0[..path.len()].copy_from_slice(path);
             cwd.1 = path.len();
             0
@@ -1652,4 +1792,305 @@ fn set_cwd(path: &[u8]) -> i64 {
         Some(Err(error)) => status_errno(error),
         None => -errno::ENOENT,
     }
+}
+
+// ---- j924 (SH7-f): descriptors across execve into a new process -----------------------------
+
+/// What a file description becomes in the process an `execve` starts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carried {
+    Stdin,
+    Stdout,
+    Null,
+    /// A pipe end: its channel arrives as the next `'p'` handle, in plan order.
+    Pipe {
+        readable: bool,
+        inode: u64,
+    },
+    /// A file or directory, opened again by path on the new process's own session.
+    Path {
+        directory: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct CarriedFile {
+    what: Carried,
+    flags: u64,
+    offset: u64,
+    path: [u8; PATH_MAX],
+    path_len: usize,
+}
+
+/// The descriptors an `execve` keeps (every one without close-on-exec) and the descriptions
+/// behind them. The parent fills it with the shim lock held, right before the snapshot that
+/// copies it into the child; the child reads its copy before anything else.
+struct SpawnPlan {
+    fds: [Option<u8>; MAX_FDS],
+    files: [CarriedFile; MAX_FDS],
+    count: usize,
+    cwd: ([u8; PATH_MAX], usize),
+}
+
+static mut SPAWN_PLAN: SpawnPlan = SpawnPlan {
+    fds: [None; MAX_FDS],
+    files: [CarriedFile {
+        what: Carried::Null,
+        flags: 0,
+        offset: 0,
+        path: [0; PATH_MAX],
+        path_len: 0,
+    }; MAX_FDS],
+    count: 0,
+    cwd: ([0; PATH_MAX], 0),
+};
+
+fn plan() -> &'static mut SpawnPlan {
+    // SAFETY: the parent writes it under the shim lock; the child reads its private copy
+    // before it has a second thread.
+    unsafe { &mut *core::ptr::addr_of_mut!(SPAWN_PLAN) }
+}
+
+/// The capabilities a new process gets with its plan, as `(tag, handle)` pairs in send order.
+pub struct SpawnHandles {
+    pub list: [(u8, Handle); MAX_FDS + 4],
+    pub len: usize,
+}
+
+impl SpawnHandles {
+    pub const fn new() -> Self {
+        Self {
+            list: [(0, Handle(0)); MAX_FDS + 4],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, tag: u8, handle: Handle) {
+        self.list[self.len] = (tag, handle);
+        self.len += 1;
+    }
+
+    /// Close every handle not sent (a failed spawn).
+    pub fn close_all(&mut self) {
+        for &(_, handle) in &self.list[..self.len] {
+            let _ = handle_close(handle);
+        }
+        self.len = 0;
+    }
+}
+
+fn transferable(handle: Handle) -> Option<Handle> {
+    let rights =
+        Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0);
+    let raw = handle_duplicate(handle, rights);
+    (raw != 0 && raw != u64::MAX).then_some(Handle(raw as u32))
+}
+
+/// Describe the active table's inheritable descriptors in the spawn plan and collect the
+/// handles the new process needs: a fresh session on the same volume (`'f'`), the mount's
+/// control channel (`'m'`), the console ends its descriptors use (`'i'`, `'o'`) and one
+/// channel per carried pipe end (`'p'`). Shim lock held. ENOSYS without a mount to open
+/// sessions on (a `/media` launch); the caller logs it.
+pub fn plan_spawn(out: &mut SpawnHandles) -> Result<(), i64> {
+    let s = session();
+    if s.fs_mount.0 == 0 {
+        return Err(-errno::ENOSYS);
+    }
+    let session_handle = open_session().ok_or(-errno::EAGAIN)?;
+    out.push(b'f', session_handle);
+    let Some(control) = transferable(s.fs_mount) else {
+        out.close_all();
+        return Err(-errno::EAGAIN);
+    };
+    out.push(b'm', control);
+    let table = *bindings();
+    let p = plan();
+    p.fds = [None; MAX_FDS];
+    p.count = 0;
+    p.cwd = table.cwd;
+    // Which plan entry each open-file index became, so aliases stay one description.
+    let mut planned = [u8::MAX; MAX_FDS];
+    let (mut sent_stdin, mut sent_stdout) = (false, false);
+    for (fd, entry) in table.fds.iter().enumerate() {
+        let Some(descriptor) = entry else {
+            continue;
+        };
+        if descriptor.cloexec {
+            continue;
+        }
+        if planned[descriptor.file] == u8::MAX {
+            let open = &s.files[descriptor.file];
+            let what = match open.kind {
+                Kind::Free => continue,
+                Kind::Stdin => {
+                    if !sent_stdin && s.stdin.0 != 0 {
+                        match transferable(s.stdin) {
+                            Some(handle) => out.push(b'i', handle),
+                            None => {
+                                out.close_all();
+                                return Err(-errno::EAGAIN);
+                            }
+                        }
+                        sent_stdin = true;
+                    }
+                    Carried::Stdin
+                }
+                Kind::Stdout => {
+                    if !sent_stdout && s.stdout.0 != 0 {
+                        match transferable(s.stdout) {
+                            Some(handle) => out.push(b'o', handle),
+                            None => {
+                                out.close_all();
+                                return Err(-errno::EAGAIN);
+                            }
+                        }
+                        sent_stdout = true;
+                    }
+                    Carried::Stdout
+                }
+                Kind::Null => Carried::Null,
+                Kind::Pipe {
+                    channel,
+                    readable,
+                    inode,
+                } => {
+                    match transferable(Handle(channel)) {
+                        Some(handle) => out.push(b'p', handle),
+                        None => {
+                            out.close_all();
+                            return Err(-errno::EAGAIN);
+                        }
+                    }
+                    Carried::Pipe { readable, inode }
+                }
+                Kind::File { .. } => Carried::Path { directory: false },
+                Kind::Dir { .. } => Carried::Path { directory: true },
+            };
+            let at = p.count;
+            p.files[at] = CarriedFile {
+                what,
+                flags: open.flags,
+                offset: open.offset,
+                path: open.path,
+                path_len: open.path_len,
+            };
+            planned[descriptor.file] = at as u8;
+            p.count += 1;
+        }
+        p.fds[fd] = Some(planned[descriptor.file]);
+    }
+    Ok(())
+}
+
+/// A new client session on the mount the launch granted: the server end goes over the control
+/// channel with read-write access (the image grant is read-write, cut W1).
+fn open_session() -> Option<Handle> {
+    let (client, server) = kumo_rt::channel_create_pair();
+    if client == u64::MAX || server == u64::MAX {
+        return None;
+    }
+    let grant = [kumo_vfs::SESSION_GRANT, kumo_vfs::SESSION_ACCESS_READ_WRITE];
+    if channel_write_with_handle(
+        session().fs_mount,
+        grant.as_ptr(),
+        grant.len(),
+        Handle(server as u32),
+    ) != 0
+    {
+        let _ = handle_close(Handle(server as u32));
+        let _ = handle_close(Handle(client as u32));
+        return None;
+    }
+    Some(Handle(client as u32))
+}
+
+/// In the new process, before the program: forget the parent's tables (their handle numbers
+/// mean nothing here) and rebuild descriptors from the plan with the handles that came with it.
+/// `pipes` are the `'p'` handles in the order they arrived. A file that cannot be opened again
+/// leaves its descriptors closed.
+pub fn adopt_spawn(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle, pipes: &[Handle]) {
+    let s = session();
+    s.fs = fs;
+    s.fs_mount = fs_mount;
+    s.stdin = stdin;
+    s.stdout = stdout;
+    s.files = [OpenFile::FREE; MAX_FDS];
+    s.stdin_carry_at = 0;
+    s.stdin_carry_len = 0;
+    s.bounce = Handle(0);
+    s.bounce_at = 0;
+    for busy in PIPE_READER.iter().chain(core::iter::once(&STDIN_READER)) {
+        busy.store(0, Ordering::Relaxed);
+    }
+    unsafe { *core::ptr::addr_of_mut!(BINDINGS) = [Bindings::EMPTY; MAX_BINDINGS] };
+    set_active(0);
+    let p = plan();
+    bindings().cwd = p.cwd;
+    let mut pipe_at = 0usize;
+    // Plan entry -> open-file index here, or None when it could not be carried.
+    let mut placed = [None; MAX_FDS];
+    for (index, carried) in p.files[..p.count].iter().enumerate() {
+        let path = &carried.path[..carried.path_len];
+        let kind = match carried.what {
+            Carried::Stdin => Kind::Stdin,
+            Carried::Stdout => Kind::Stdout,
+            Carried::Null => Kind::Null,
+            Carried::Pipe { readable, inode } => {
+                let Some(&channel) = pipes.get(pipe_at) else {
+                    continue;
+                };
+                pipe_at += 1;
+                Kind::Pipe {
+                    channel: channel.0,
+                    readable,
+                    inode,
+                }
+            }
+            Carried::Path { directory: true } => Kind::Dir { next: 0 },
+            Carried::Path { directory: false } => {
+                let mut options = 0;
+                let access = carried.flags & O_ACCMODE;
+                if access != O_WRONLY {
+                    options |= OPEN_READ;
+                }
+                if access != O_RDONLY {
+                    options |= OPEN_WRITE;
+                }
+                let mut reply = [0u8; 64];
+                match vfs_call(&Request::OpenOptions { path, options }, &mut reply)
+                    .map(parse_open_reply)
+                {
+                    Some(Ok((handle, size))) => Kind::File { handle, size },
+                    _ => continue,
+                }
+            }
+        };
+        let Some(slot) = s.files.iter().position(|entry| entry.refs == 0) else {
+            break;
+        };
+        let entry = &mut s.files[slot];
+        *entry = OpenFile::FREE;
+        entry.kind = kind;
+        entry.flags = carried.flags;
+        entry.offset = carried.offset;
+        entry.path[..path.len()].copy_from_slice(path);
+        entry.path_len = path.len();
+        // Its descriptors' count now, so the next description takes another slot.
+        entry.refs = p.fds.iter().filter(|at| **at == Some(index as u8)).count();
+        placed[index] = Some(slot);
+    }
+    for (fd, plan_index) in p.fds.iter().enumerate() {
+        let Some(slot) = plan_index.and_then(|at| placed[at as usize]) else {
+            continue;
+        };
+        bindings().fds[fd] = Some(Descriptor {
+            file: slot,
+            cloexec: false,
+        });
+    }
+}
+
+/// j924: a program-supplied path, resolved against the active table's cwd (execve's path).
+pub fn resolve_user(path_ptr: u64, out: &mut [u8; PATH_MAX]) -> Result<usize, i64> {
+    user_resolved(AT_FDCWD, path_ptr, out)
 }

@@ -1,0 +1,16 @@
+-Zunstable-options
+--edition
+2021
+--target
+/sdk/share/kumo/aarch64-unknown-kumo.json
+--sysroot
+/sdk
+-C
+opt-level=2
+-C
+linker=/tools/rust-lld
+-C
+link-arg=-T/sdk/share/kumo/link.ld
+-o
+/w/hello
+/w/hello.rs

@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j864
 //j891
 //j892
 //j913
 //j917
+//j924
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -45,6 +45,8 @@ kumo_rt::entry!(main);
 /// window over it, so the server's address space stays small and its `ReadVmo` client windows
 /// keep their room. Matches `drv-blk`'s old single-map ceiling.
 const WINDOW_LEN: u64 = 16 * 1024 * 1024;
+/// j924: the image bootstrap's length flag for a mount-scoped (multi-session) server.
+const IMAGE_MOUNT: u64 = kumo_vfs::IMAGE_MOUNT_FLAG;
 
 /// Where the backing VMO lands in this process. `drv-blk` picks the same base, and
 /// for the same reason: `run_elf` puts the child stack at [0x1000_C000, 0x1001_0000),
@@ -244,10 +246,12 @@ fn valid(raw: u64) -> Option<Handle> {
 /// the server end of one client channel, and requests dispatch through the shared server
 /// (per-session open tables, cross-session advisory locks). A closed session releases its
 /// locks and table; a closed control channel with no sessions left ends the process.
-fn serve_mount(control: Handle, blocks: Handle, block_count: u64) -> ! {
-    let mut disk = BlockSectors::new(ChannelBlocks { channel: blocks }, block_count);
+///
+/// j924 (SH7-f): the disk is any sector source: a block channel, or the RAM FAT image a
+/// `linux` launch works on, whose processes each take a session of their own.
+fn serve_mount<D: SectorReader + SectorWriter>(control: Handle, mut disk: D) -> ! {
     let Ok(volume) = FatVolume::mount(&mut disk) else {
-        fail(b"fatfs: mount-scoped block mount failed\n");
+        fail(b"fatfs: mount-scoped mount failed\n");
     };
     let Some(port) = valid(port_create()) else {
         fail(b"fatfs: mount-scoped port create failed\n");
@@ -406,7 +410,13 @@ extern "C" fn main(
     if vmo_raw != 0 && drv_blk::decode_mount_bootstrap(&header[..n.min(header.len())]).is_some() {
         let block_count = drv_blk::decode_mount_bootstrap(&header[..n.min(header.len())])
             .expect("checked mount bootstrap");
-        serve_mount(channel, Handle(vmo_raw as u32), block_count);
+        let disk = BlockSectors::new(
+            ChannelBlocks {
+                channel: Handle(vmo_raw as u32),
+            },
+            block_count,
+        );
+        serve_mount(channel, disk);
     }
     if vmo_raw != 0 {
         if let Some(block_count) = drv_blk::decode_client_bootstrap(&header[..n.min(header.len())])
@@ -419,6 +429,10 @@ extern "C" fn main(
     }
     let base = u64::from_le_bytes(header[..8].try_into().unwrap());
     let map_len = u64::from_le_bytes(header[8..].try_into().unwrap());
+    // j924 (SH7-f): the top bit of the length asks for the mount-scoped server: the bootstrap
+    // channel stays open as its session-control channel instead of carrying vfs frames.
+    let mount = map_len & IMAGE_MOUNT != 0;
+    let map_len = map_len & !IMAGE_MOUNT;
     // `vmar_map` requires a page-aligned length, and the initrd size the launcher
     // computes is not 4 KiB-aligned (the same rounding drv-blk does). j917: no size ceiling;
     // the image is mapped a window at a time.
@@ -433,6 +447,9 @@ extern "C" fn main(
         len: map_len,
         window_at: u64::MAX,
     };
+    if mount {
+        serve_mount(channel, disk);
+    }
     let Ok(volume) = FatVolume::mount(&mut disk) else {
         fail(b"fatfs: mount failed\n");
     };

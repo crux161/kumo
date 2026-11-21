@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j868
 #j869
 #j870
 #j891
 #j917
+#j924
 """AXH: build, boot and check native NET2 loopback/recovery; restore the default image.
 
 No NIC, credentials or board access. Artifacts remain under build/verification. POST is
@@ -243,6 +243,30 @@ def validate(case, text):
     return {"post": post, "known_post_failures": len(failures), "instances": ready, "expected_exit2": case.towers}
 
 
+# j924: QEMU's directory-backed FAT is FAT16 and refuses a tree over 516 MB; the SH7-f toolchain
+# ESP is larger. Past this size the ESP becomes a FAT32 image built with mtools (read-only).
+VVFAT_LIMIT = 480 << 20
+
+
+def esp_drive(work):
+    """The `-drive` file for `work/esp`: the directory itself, or a FAT32 image of it."""
+    esp = work / "esp"
+    size = sum(path.stat().st_size for path in esp.rglob("*") if path.is_file())
+    if size <= VVFAT_LIMIT:
+        return f"file=fat:rw:{esp}"
+    image = work / "esp.img"
+    with image.open("wb") as f:
+        f.truncate(((size >> 20) + 64) << 20)
+    subprocess.run(["mformat", "-i", image, "-F", "-v", "KUMO", "::"], check=True)
+    for path in sorted(esp.rglob("*")):
+        rel = path.relative_to(esp).as_posix()
+        if path.is_dir():
+            subprocess.run(["mmd", "-i", image, f"::/{rel}"], check=True)
+        else:
+            subprocess.run(["mcopy", "-i", image, path, f"::/{rel}"], check=True)
+    return f"file={image},readonly=on"
+
+
 def boot(root, source, case, work, qemu, firmware, timeout, memory_mib=2048):
     work.mkdir()
     shutil.copytree(source, work / "esp")
@@ -255,7 +279,7 @@ def boot(root, source, case, work, qemu, firmware, timeout, memory_mib=2048):
                "-display", "none", "-monitor", "none", "-serial", f"file:{serial}",
                "-drive", f"if=pflash,format=raw,file={firmware / 'edk2-aarch64-code.fd'},readonly=on",
                "-drive", f"if=pflash,format=raw,file={work / 'vars.fd'}",
-               "-drive", f"file=fat:rw:{work / 'esp'},format=raw,if=virtio", "-net", "none"]
+               "-drive", f"{esp_drive(work)},format=raw,if=virtio", "-net", "none"]
     (work / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     started = time.monotonic()
     with (work / "qemu.log").open("wb") as log:

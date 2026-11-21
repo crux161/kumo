@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j911
 //j913
 //j914
 //j917
 //j923
+//j924
 
 extern crate alloc;
 
@@ -31,7 +31,8 @@ use kumo_rt::{
     port_wait, process_create, process_kill, process_run, process_wait, resource_create_child,
     resource_mint_mmio, syscall_handle, thread_create, thread_start, timer_create, vmar_map,
     vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_ENV,
-    STARTUP_TAG_FS, STARTUP_TAG_NET, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
+    STARTUP_TAG_FS, STARTUP_TAG_FS_MOUNT, STARTUP_TAG_NET, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT,
+    STARTUP_TAG_TTY,
 };
 use kumoza::{parse, DirectoryError, WorkingDirectory};
 use persona_linux::elf as linux_elf;
@@ -7501,7 +7502,7 @@ fn eval_command(
         // SH7-d3b: a program under `/media/<vol>/` runs over a read-only session on that
         // volume, and its path becomes volume-relative: the volume is the Linux program's
         // whole filesystem, so its `/lib` and everything else it opens are the volume's.
-        let mut fs = FsGrant::Image;
+        let mut fs = FsGrant::ImageMount;
         match sora::media_route(cmd.args[0].as_bytes()) {
             sora::MediaRoute::Elsewhere => {}
             sora::MediaRoute::Root => {
@@ -7952,6 +7953,75 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
         return None;
     }
     Some(client)
+}
+
+/// j924 (SH7-f): a mount-scoped `fatfs` over the RAM FAT image, for a `linux` launch. Returns
+/// the first client session (read-write, cut W1) and the server's session-control channel, which
+/// the persona shim keeps so every process it starts opens its own session on the same volume.
+/// The server ends when the control channel and every session are closed.
+fn spawn_fatfs_mount(initrd: Handle) -> Option<(Handle, Handle)> {
+    let (control_raw, server_raw) = channel_create_pair();
+    let (session_raw, session_server_raw) = channel_create_pair();
+    let raws = [control_raw, server_raw, session_raw, session_server_raw];
+    let close_all = || {
+        for raw in raws {
+            if raw != u64::MAX {
+                let _ = handle_close(Handle(raw as u32));
+            }
+        }
+    };
+    if raws.contains(&u64::MAX) {
+        close_all();
+        log(b"fatfs: channel unavailable\n");
+        return None;
+    }
+    let control = Handle(control_raw as u32);
+    let Some((image_vmo, map_len)) = fat_image_alias(initrd) else {
+        close_all();
+        return None;
+    };
+    let mut header = [0u8; 16];
+    header[..8].copy_from_slice(&0u64.to_le_bytes());
+    header[8..].copy_from_slice(&(map_len | kumo_vfs::IMAGE_MOUNT_FLAG).to_le_bytes());
+    if channel_write_with_handle(
+        control,
+        header.as_ptr(),
+        header.len(),
+        Handle(image_vmo as u32),
+    ) != Errno::Ok.status()
+    {
+        let _ = handle_close(Handle(image_vmo as u32));
+        close_all();
+        log(b"fatfs: bootstrap queue failed\n");
+        return None;
+    }
+    let grant = [kumo_vfs::SESSION_GRANT, kumo_vfs::SESSION_ACCESS_READ_WRITE];
+    if channel_write_with_handle(
+        control,
+        grant.as_ptr(),
+        grant.len(),
+        Handle(session_server_raw as u32),
+    ) != Errno::Ok.status()
+    {
+        close_all();
+        log(b"fatfs: session grant failed\n");
+        return None;
+    }
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    if !run_elf(
+        initrd,
+        FATFS_PATH.as_bytes(),
+        0,
+        server_raw,
+        flags,
+        b"fatfs",
+    ) {
+        let _ = handle_close(control);
+        let _ = handle_close(Handle(server_raw as u32));
+        let _ = handle_close(Handle(session_raw as u32));
+        return None;
+    }
+    Some((Handle(session_raw as u32), control))
 }
 
 fn nvme_unavailable() {
@@ -8651,11 +8721,69 @@ fn payload_status() {
 
 /// A program's archive and entry: the boot set first, then the payload layer.
 fn find_program(initrd: Handle, path: &[u8]) -> Option<(Handle, u64, u64)> {
+    if path.first() == Some(&b'/') {
+        return fat_program(initrd, path);
+    }
     if let Some((off, len)) = find_initrd_file(initrd, path) {
         return Some((initrd, off, len));
     }
     let layer = payload_layer()?;
     find_initrd_file(layer, path).map(|(off, len)| (layer, off, len))
+}
+
+/// The VMO holding the last program `fat_program` copied out; closed when the next replaces it.
+static FAT_PROGRAM_VMO: AtomicU32 = AtomicU32::new(0);
+
+/// j924 (SH7-f): a native program at absolute `path` on Sora's RAM FAT image, copied whole into
+/// a fresh VMO for the loader: `(vmo, 0, len)`. Read through the image's own volume, not a
+/// fatfs session (Sora owns the backing). This is how `run /w/hello` starts the KUMO
+/// executable the Linux rustc linked on KUMO.
+fn fat_program(initrd: Handle, path: &[u8]) -> Option<(Handle, u64, u64)> {
+    let (alias, map_len) = fat_image_alias(initrd)?;
+    let alias = Handle(alias as u32);
+    let copied = (|| {
+        let mut reader = InitrdSectors {
+            vmo: alias,
+            base: 0,
+            len: map_len,
+        };
+        let volume = FatVolume::mount(&mut reader).ok()?;
+        let entry = volume.resolve_path(&mut reader, path)?;
+        let size = entry.size as u64;
+        if entry.is_dir() || size == 0 {
+            return None;
+        }
+        let raw = vmo_create(size.saturating_add(0xFFF) & !0xFFF);
+        if raw == 0 || raw == u64::MAX {
+            return None;
+        }
+        let out = Handle(raw as u32);
+        let mut chunk = [0u8; 4096];
+        let mut offset = 0u64;
+        while offset < size {
+            let n = volume.read_file_at(&mut reader, &entry, offset, &mut chunk);
+            if n == 0 {
+                let _ = handle_close(out);
+                return None;
+            }
+            for (i, piece) in chunk[..n].chunks(VMO_READ_MAX).enumerate() {
+                let at = offset + (i * VMO_READ_MAX) as u64;
+                if vmo_write(out, at, piece.as_ptr(), piece.len()) != 0 {
+                    let _ = handle_close(out);
+                    return None;
+                }
+            }
+            offset += n as u64;
+        }
+        Some((out, size))
+    })();
+    let _ = handle_close(alias);
+    let (vmo, size) = copied?;
+    let previous = FAT_PROGRAM_VMO.swap(vmo.0, Ordering::AcqRel);
+    if previous != 0 {
+        let _ = handle_close(Handle(previous));
+    }
+    Some((vmo, 0, size))
 }
 
 /// `wait`: drain the background job's output to the console until it exits.
@@ -12796,6 +12924,10 @@ enum FsGrant {
     Image,
     /// Over the USB volume with only the access this launch needs (J550). — KESTREL
     Media(BlockAccess),
+    /// j924 (SH7-f): over the RAM FAT image like `Image`, from a mount-scoped server. The child
+    /// also gets the server's session-control channel (`STARTUP_TAG_FS_MOUNT`), so the processes
+    /// it starts (a Linux `execve` after `vfork`) each open a session on the same volume.
+    ImageMount,
 }
 
 /// How a spawned child gets its standard input.
@@ -12950,10 +13082,15 @@ fn run_with_startup_input_with_env(
     };
     // The filesystem grant is a whole server, not a handle duplicate: spawn it before the
     // child so the vfs channel is live the moment the child's first request lands.
+    let mut fs_control = None;
     let fs_child = match fs {
         FsGrant::None => None,
         FsGrant::Image => spawn_fatfs(initrd),
         FsGrant::Media(access) => media_session(access),
+        FsGrant::ImageMount => spawn_fatfs_mount(initrd).map(|(session, control)| {
+            fs_control = Some(control);
+            session
+        }),
     };
     let tty_child = if grant_tty {
         spawn_ttyd_control(initrd)
@@ -12991,6 +13128,9 @@ fn run_with_startup_input_with_env(
         if let Some(fs) = fs_child {
             let _ = handle_close(fs);
         }
+        if let Some(control) = fs_control {
+            let _ = handle_close(control);
+        }
         if let Some(tty) = tty_child {
             let _ = handle_close(tty);
         }
@@ -13005,7 +13145,7 @@ fn run_with_startup_input_with_env(
 
     // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd], [fs], [tty], [net]. Order
     // is immaterial — the child installs by tag — but kept deterministic for serial diagnosis.
-    let mut tags: [(u8, Handle); 8] = [(0, Handle(0)); 8];
+    let mut tags: [(u8, Handle); 9] = [(0, Handle(0)); 9];
     let mut expected = 0usize;
     if let Some(stdin_read) = stdin_read {
         tags[expected] = (STARTUP_TAG_STDIN, stdin_read);
@@ -13023,6 +13163,10 @@ fn run_with_startup_input_with_env(
     }
     if let Some(fs) = fs_child {
         tags[expected] = (STARTUP_TAG_FS, fs);
+        expected += 1;
+    }
+    if let Some(control) = fs_control {
+        tags[expected] = (STARTUP_TAG_FS_MOUNT, control);
         expected += 1;
     }
     if let Some(tty) = tty_child {
@@ -13560,6 +13704,16 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
 /// `bin/<name>` in `path`, or `None` when the name does not fit.
 fn program_path<'a>(name: &[u8], path: &'a mut [u8; 64]) -> Option<&'a [u8]> {
     const PREFIX: &[u8] = b"bin/";
+    // j924 (SH7-f): an absolute path names a program on the RAM FAT image (`find_program`):
+    // one a Linux toolchain just built there, say.
+    if name.first() == Some(&b'/') {
+        if name.len() > path.len() {
+            debug_write(b"run: path too long\n".as_ptr(), 19);
+            return None;
+        }
+        path[..name.len()].copy_from_slice(name);
+        return Some(&path[..name.len()]);
+    }
     if PREFIX.len() + name.len() > path.len() {
         debug_write(b"run: name too long\n".as_ptr(), 19);
         return None;

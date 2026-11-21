@@ -1,8 +1,8 @@
-//j875
 //j889
 //j912
 //j922
 //j923
+//j924
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -115,6 +115,8 @@ pub enum KernelCall<'a> {
     },
     VmarSnapshot {
         child: Handle,
+        /// j924: `Some((base, len))` copies only the mappings that lie wholly inside it.
+        range: Option<(u64, u64)>,
     },
     VmarMap {
         process_handle: Handle,
@@ -3586,7 +3588,32 @@ impl SyscallEngine {
     /// Copy the caller's VMO-backed mappings into an unstarted child. Only pages accessible
     /// through those mappings belong to the copy. A second alias of a page reuses its copy.
     /// The bootstrap stack is separate and AddressSpaceCreate installs a fresh one.
-    fn vmar_snapshot(&mut self, source: &Process, child: Handle) -> Result<(), Errno> {
+    fn vmar_snapshot(
+        &mut self,
+        source: &Process,
+        child: Handle,
+        range: Option<(u64, u64)>,
+    ) -> Result<(), Errno> {
+        // j924 (SH7-f): a range keeps the mappings wholly inside it and leaves the rest
+        // behind; one that straddles an edge refuses the request. The persona shim copies
+        // only its own image into the process a vfork child's execve starts. — TEAL
+        let inside = |mapping: &Mapping| -> Result<bool, Errno> {
+            let Some((base, len)) = range else {
+                return Ok(true);
+            };
+            let end = base.checked_add(len).ok_or(Errno::InvalidArgs)?;
+            let last = mapping
+                .virt
+                .checked_add(mapping.len)
+                .ok_or(Errno::InvalidArgs)?;
+            if mapping.virt >= base && last <= end {
+                Ok(true)
+            } else if last <= base || mapping.virt >= end {
+                Ok(false)
+            } else {
+                Err(Errno::InvalidArgs)
+            }
+        };
         let id = source
             .handles()
             .require(child, ObjectKind::Process, Rights::WRITE | Rights::MANAGE)
@@ -3614,6 +3641,9 @@ impl SyscallEngine {
             .map_err(|_| Errno::NoMemory)?;
         // Validate the entire layout before allocating a single physical page.
         for &(mapping, old) in source.mappings() {
+            if !inside(&mapping)? {
+                continue;
+            }
             let vmo = self.vmo_by_koid(old).ok_or(Errno::BadState)?;
             if vmo.backing() != crate::mm::VmoBacking::Anonymous
                 || mapping.flags.contains(PageFlags::DEVICE)
@@ -3650,6 +3680,9 @@ impl SyscallEngine {
             .try_reserve(copies.len())
             .map_err(|_| Errno::NoMemory)?;
         for &(mapping, old) in source.mappings() {
+            if !inside(&mapping)? {
+                continue;
+            }
             let original = self.vmo_entry_by_koid(old).unwrap();
             let (_, copy) = copies.iter().find(|(key, _)| *key == old).unwrap();
             if let Err(error) =
@@ -4583,8 +4616,8 @@ impl SyscallEngine {
                     Err(error) => KernelCallResult::Status(error.status()),
                 }
             }
-            KernelCall::VmarSnapshot { child } => KernelCallResult::Status(
-                self.vmar_snapshot(process, child)
+            KernelCall::VmarSnapshot { child, range } => KernelCallResult::Status(
+                self.vmar_snapshot(process, child, range)
                     .err()
                     .unwrap_or(Errno::Ok)
                     .status(),
@@ -8762,12 +8795,15 @@ mod tests {
             .duplicate(child, Rights::WRITE)
             .unwrap();
         assert_eq!(
-            engine.vmar_snapshot(&parent, weak),
+            engine.vmar_snapshot(&parent, weak, None),
             Err(Errno::AccessDenied)
         );
-        assert_eq!(engine.vmar_snapshot(&parent, handle), Err(Errno::WrongType));
+        assert_eq!(
+            engine.vmar_snapshot(&parent, handle, None),
+            Err(Errno::WrongType)
+        );
         let before = engine.vmos.len();
-        engine.vmar_snapshot(&parent, child).unwrap();
+        engine.vmar_snapshot(&parent, child, None).unwrap();
         let target = engine.process_by_koid(id).unwrap();
         assert!(target.handles().get(handle).is_err());
         assert_eq!(target.mappings().len(), parent.mappings().len());
@@ -8777,8 +8813,53 @@ mod tests {
             assert_eq!(src, dst);
             assert_eq!(backing, new);
         }
-        assert_eq!(engine.vmar_snapshot(&parent, child), Err(Errno::BadState));
+        assert_eq!(
+            engine.vmar_snapshot(&parent, child, None),
+            Err(Errno::BadState)
+        );
         assert_eq!(engine.vmos.len(), before + 1);
+    }
+
+    #[test]
+    fn a_ranged_snapshot_copies_only_the_mappings_inside_and_refuses_a_straddle() {
+        let mut engine = SyscallEngine::new();
+        let mut parent = test_process(&mut engine);
+        let page = crate::mm::PAGE_SIZE;
+        let vmar = parent.root_vmar();
+        let job = Job::root(engine.objects_mut());
+        let vmo = Vmo::new(4 * page).unwrap();
+        let handle = engine
+            .root_vmo_create(&mut parent, vmo, Rights::READ)
+            .unwrap();
+        let old = parent.handles().get(handle).unwrap().koid;
+        // Two one-page mappings at pages 1 and 2, and a two-page one at pages 5..7.
+        for (index, len) in [(1u64, page), (2, page), (5, 2 * page)] {
+            let mapping = vmar
+                .map(vmo, 0, vmar.base() + index * page, len, PageFlags::READ)
+                .unwrap();
+            parent.add_mapping(mapping, old);
+        }
+        let base = vmar.base();
+        let child = engine.process_create(&mut parent, &job, vmar).unwrap();
+        let id = parent.handles().get(child).unwrap().koid;
+        // [page 5, page 6) cuts the two-page mapping: refused, nothing published.
+        assert_eq!(
+            engine.vmar_snapshot(&parent, child, Some((base + 5 * page, page))),
+            Err(Errno::InvalidArgs)
+        );
+        assert!(engine.process_by_koid(id).unwrap().mappings().is_empty());
+        // [page 1, page 3) holds exactly the first two.
+        engine
+            .vmar_snapshot(&parent, child, Some((base + page, 2 * page)))
+            .unwrap();
+        let copied: Vec<u64> = engine
+            .process_by_koid(id)
+            .unwrap()
+            .mappings()
+            .iter()
+            .map(|(mapping, _)| mapping.virt)
+            .collect();
+        assert_eq!(copied, [base + page, base + 2 * page]);
     }
 
     #[test]
@@ -8809,14 +8890,17 @@ mod tests {
         }
         let before = engine.vmos.len();
         assert_eq!(
-            engine.vmar_snapshot(&parent, child),
+            engine.vmar_snapshot(&parent, child, None),
             Err(Errno::NotSupported)
         );
         assert!(engine.process_by_koid(id).unwrap().mappings().is_empty());
         let tiny = engine
             .process_create(&mut parent, &job, Vmar::new(vmar.base(), page).unwrap())
             .unwrap();
-        assert_eq!(engine.vmar_snapshot(&parent, tiny), Err(Errno::InvalidArgs));
+        assert_eq!(
+            engine.vmar_snapshot(&parent, tiny, None),
+            Err(Errno::InvalidArgs)
+        );
         assert_eq!(before, engine.vmos.len());
     }
 

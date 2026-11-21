@@ -1,7 +1,3 @@
-//j877
-//j881
-//j882
-//j916
 //j922
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
@@ -28,6 +24,7 @@ static SWEEP_COUNT: AtomicU32 = AtomicU32::new(0);
 static SWEEP_MAX_LATE_NS: AtomicU64 = AtomicU64::new(0);
 
 //j731
+//j924
 //j822
 // Engine census is opt-in through `dmesg -n debug`; lower the level to stop it. Once enabled,
 // print list lengths and dispatch window maxima at most every 10 s as Sora enters `PortWait`.
@@ -2320,6 +2317,7 @@ fn dispatch_object_syscall(
             target,
             KernelCall::VmarSnapshot {
                 child: Handle(r[0] as u32),
+                range: (r[2] != 0).then_some((r[1], r[2])),
             },
         ) {
             KernelCallResult::Status(status) => status as u32 as u64,

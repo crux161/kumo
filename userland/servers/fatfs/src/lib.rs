@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j865
 //j866
 //j869
 //j891
 //j892
+//j924
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -280,9 +280,10 @@ impl Default for FatServer {
     }
 }
 
-/// Sessions the mount-scoped server admits (SH3-c). Small on purpose: every session
-/// reserves an open table, and the first user is a two-process lock/rename proof.
-pub const MAX_SESSIONS: usize = 4;
+/// Sessions the mount-scoped server admits (SH3-c). Every session reserves an open table.
+/// j924 (SH7-f): a Linux process tree on the image (cargo, rustc, rust-lld and the shim each
+/// spawn under) holds one session per process, so the image server admits sixteen.
+pub const MAX_SESSIONS: usize = 16;
 /// Session access byte: reads only (SH3-c2). The launcher's grant stays authoritative:
 /// the shared server holds an rw block channel, so a read-only session is enforced here.
 pub const SESSION_READ_ONLY: u8 = 0;

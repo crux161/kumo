@@ -1,8 +1,8 @@
-//j917
 //j918
 //j919
 //j920
 //j921
+//j924
 
 use std::env;
 use std::fmt;
@@ -1248,6 +1248,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let mali_firmware = build_mali_firmware(&workspace_root()?)?;
             let persona_payloads = build_persona_payloads(&workspace_root()?)?;
             let persona_rustc = build_persona_rustc(&workspace_root()?)?;
+            let persona_link = build_persona_link(&workspace_root()?)?;
             let drv_i2c_hid = build_drv_i2c_hid_image(&workspace_root()?)?;
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
             let drv_nvme = build_drv_nvme_image(&workspace_root()?)?;
@@ -1301,6 +1302,17 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 linux_files.push(("/w/add.rs", include_bytes!("../../persona/add.rs")));
             }
             for (path, bytes) in &persona_rustc {
+                linux_files.push((path, bytes.as_slice()));
+            }
+            // j924 (SH7-f): the opt-in link set and the hello rustc links on KUMO.
+            if !persona_link.is_empty() {
+                linux_files.push(("/w/hello.rs", include_bytes!("../../persona/sh7f-hello.rs")));
+                linux_files.push((
+                    "/w/hello.args",
+                    include_bytes!("../../persona/sh7f-hello.args"),
+                ));
+            }
+            for (path, bytes) in &persona_link {
                 linux_files.push((path, bytes.as_slice()));
             }
             let fat32_img = build_fat32_image(std_smoke.as_slice(), &linux_files);
@@ -2129,7 +2141,7 @@ fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
 /// filesystem grant, as Linux `execve` and musl's loader expect. Each file is checked against the
 /// digest persona/MANIFEST records, so the image carries exactly the bytes that manifest and musl's
 /// COPYRIGHT describe. — TEAL
-const PERSONA_PAYLOADS: [(&str, &str, &str); 14] = [
+const PERSONA_PAYLOADS: [(&str, &str, &str); 15] = [
     (
         "persona/libmd-COPYING",
         "/usr/share/licenses/libmd/COPYING",
@@ -2144,6 +2156,11 @@ const PERSONA_PAYLOADS: [(&str, &str, &str); 14] = [
         "persona/sigprobe",
         "/bin/sigprobe",
         "bf6367753015b26b088eebc72ec6d6251555fa0870e4483e7fceeb97f372e46c",
+    ),
+    (
+        "persona/spawnprobe",
+        "/bin/spawnprobe",
+        "40b10c1cf4a0c2f056ad8fa092debea7133fd89ae93aed3cb953e09b8dc7ec8a",
     ),
     (
         "persona/writeprobe",
@@ -2254,6 +2271,61 @@ const PERSONA_RUSTC: [(&str, &str, &str); 9] = [
         "51696641966b07d28020dca5628f211b81221690b6c547687c09613845d3857d",
     ),
 ];
+
+/// j924 (SH7-f): what the Linux rustc needs on KUMO to link a native `aarch64-unknown-kumo`
+/// executable, packed only when `KUMO_PERSONA_LINK=1` (with `KUMO_PERSONA_RUSTC=1`): the
+/// pinned rustc component's own `rust-lld` (fetched by `scripts/persona-rustc.sh`) at
+/// `/tools/rust-lld`, and the KUMO SDK's target spec, link script, core and compiler_builtins
+/// under `/sdk` (`cargo xtask sdk` builds build/sysroot; its manifest.json pins the same hashes).
+const PERSONA_LINK: [(&str, &str, &str); 7] = [
+    (
+        "build/persona-rustc/tree/opt/rust/lib/rustlib/aarch64-unknown-linux-musl/bin/rust-lld",
+        "/tools/rust-lld",
+        "236909a842ad8970e3f7ab01a9077d254a003cfb047221e5219f211a18919520",
+    ),
+    (
+        "build/sysroot/aarch64-unknown-kumo/share/kumo/aarch64-unknown-kumo.json",
+        "/sdk/share/kumo/aarch64-unknown-kumo.json",
+        "f428c94824d5cc122e9267be9a8e02d6bfdae28a07ce8bd891fc1319217f2a1c",
+    ),
+    (
+        "build/sysroot/aarch64-unknown-kumo/share/kumo/link.ld",
+        "/sdk/share/kumo/link.ld",
+        "1e8facfd30c28139c1b7d5f8d487cf7ae20ef18d4a464a35259dbb9cca9be35f",
+    ),
+    (
+        "build/sysroot/aarch64-unknown-kumo/lib/rustlib/aarch64-unknown-kumo/lib/libcore-28cd1bfd6d024663.rlib",
+        "/sdk/lib/rustlib/aarch64-unknown-kumo/lib/libcore-28cd1bfd6d024663.rlib",
+        "14996fe68c735583a4e69088c06cb5a1c9728b34220d280f66ff40259020379e",
+    ),
+    (
+        "build/sysroot/aarch64-unknown-kumo/lib/rustlib/aarch64-unknown-kumo/lib/libcore-28cd1bfd6d024663.rmeta",
+        "/sdk/lib/rustlib/aarch64-unknown-kumo/lib/libcore-28cd1bfd6d024663.rmeta",
+        "837810e6af3393da2eb421e29ed14a183931a9330b531868f1ac0ad01fa97164",
+    ),
+    (
+        "build/sysroot/aarch64-unknown-kumo/lib/rustlib/aarch64-unknown-kumo/lib/libcompiler_builtins-27c7035795673418.rlib",
+        "/sdk/lib/rustlib/aarch64-unknown-kumo/lib/libcompiler_builtins-27c7035795673418.rlib",
+        "6b00dd313a2e425278a788b1fd8cfbb92361a92ca46935a7bdfcc011933d6d9c",
+    ),
+    (
+        "build/sysroot/aarch64-unknown-kumo/lib/rustlib/aarch64-unknown-kumo/lib/libcompiler_builtins-27c7035795673418.rmeta",
+        "/sdk/lib/rustlib/aarch64-unknown-kumo/lib/libcompiler_builtins-27c7035795673418.rmeta",
+        "cefacb61bbb3b788f26bdd7745cca415618db5050361520f896054452cc80175",
+    ),
+];
+
+/// Read and verify [`PERSONA_LINK`] when `KUMO_PERSONA_LINK=1`; empty otherwise.
+fn build_persona_link(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    if env::var("KUMO_PERSONA_LINK").as_deref() != Ok("1") {
+        return Ok(Vec::new());
+    }
+    pinned_files(
+        root,
+        &PERSONA_LINK,
+        "run scripts/persona-rustc.sh and cargo xtask sdk",
+    )
+}
 
 /// Read and verify [`PERSONA_RUSTC`] when `KUMO_PERSONA_RUSTC=1`; empty otherwise.
 fn build_persona_rustc(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {

@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j916
 //j917
 //j918
 //j919
 //j921
+//j924
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -31,6 +31,7 @@ use kumo_rt::{
 use persona_linux::elf::{self, Machine};
 
 mod files;
+mod processes;
 mod signals;
 mod threads;
 
@@ -70,6 +71,8 @@ mod nr {
     pub const FSTAT: u64 = 80;
     pub const FSYNC: u64 = 82;
     pub const FDATASYNC: u64 = 83;
+    pub const EXECVE: u64 = 221;
+    pub const WAIT4: u64 = 260;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
     pub const SET_TID_ADDRESS: u64 = 96;
@@ -79,6 +82,7 @@ mod nr {
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const SCHED_YIELD: u64 = 124;
+    pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SIGALTSTACK: u64 = 132;
     pub const KILL: u64 = 129;
     pub const TKILL: u64 = 130;
@@ -128,6 +132,8 @@ pub(crate) mod errno {
     pub const ERANGE: i64 = 34;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
+    pub const E2BIG: i64 = 7;
+    pub const ECHILD: i64 = 10;
     pub const ENOTEMPTY: i64 = 39;
     pub const ETIMEDOUT: i64 = 110;
 }
@@ -388,7 +394,11 @@ extern "C" fn persona_dispatch(frame: *mut TrapFrame, rec: *mut threads::ThreadR
         nr::CLONE => threads::clone(rec, &frame.x, a0, a1, a2, a3, a4),
         nr::FUTEX => threads::futex(rec, a0, a1, a2, a3, a5),
         nr::EXIT => threads::exit_thread(rec, a0),
+        // j924: a vfork child's exit_group ends that child, not the program it borrowed.
+        nr::EXIT_GROUP if rec.child != 0 => processes::child_exit(rec, a0),
         nr::EXIT_GROUP => process_exit(a0 & 0xff),
+        nr::EXECVE => processes::execve(rec, a0, a1, a2),
+        nr::WAIT4 => processes::wait4(rec, a0 as i64, a1, a2, a3),
         nr::GETTID => threads::gettid(rec),
         nr::GETPID => threads::getpid(),
         nr::SET_TID_ADDRESS => threads::set_tid_address(rec, a0),
@@ -405,8 +415,11 @@ extern "C" fn persona_dispatch(frame: *mut TrapFrame, rec: *mut threads::ThreadR
         nr::PRCTL => threads::prctl(a0, a1),
         nr::GETRANDOM => threads::getrandom(a0, a1, a2),
         nr::MEMBARRIER => threads::membarrier(a0, a1),
+        nr::SCHED_GETAFFINITY => sched_getaffinity(a1, a2),
         number => {
             threads::lock();
+            // j924: a vfork child's calls use its own descriptor table.
+            files::set_active(rec.child as usize);
             let result = match number {
                 // j919: sending needs the registry and the dispositions, both lock-guarded.
                 nr::TKILL => signals::tgkill(0, a0, a1, rec),
@@ -446,7 +459,7 @@ fn serve_locked(number: u64, frame: &[u64; 31]) -> i64 {
         nr::DUP => files::dup(a0 as i64, 0, false),
         nr::DUP3 => files::dup3(a0 as i64, a1 as i64, a2),
         nr::FCNTL => files::fcntl(a0 as i64, a1, a2),
-        nr::IOCTL => -errno::ENOTTY,
+        nr::IOCTL => files::ioctl(a0 as i64, a1, a2),
         nr::RT_SIGACTION => signals::rt_sigaction(a0, a1, a2, frame[3]),
         nr::READLINKAT => files::readlinkat(a0 as i64, a1, a2, frame[3]),
         nr::PPOLL => files::ppoll(a0, a1, a2),
@@ -478,6 +491,21 @@ fn serve_locked(number: u64, frame: &[u64; 31]) -> i64 {
             -errno::ENOSYS
         }
     }
+}
+
+/// j924: `sched_getaffinity(pid, size, mask)`: one CPU, the one the scheduler runs Linux programs
+/// on (membarrier makes the same claim). rust-lld sizes its thread pool from it. Returns the
+/// kernel mask's size, as Linux does.
+fn sched_getaffinity(size: u64, mask: u64) -> i64 {
+    if size < 8 || mask == 0 {
+        return -errno::EINVAL;
+    }
+    // SAFETY: the program's `cpu_set_t` of `size` bytes.
+    unsafe {
+        core::ptr::write_bytes(mask as *mut u8, 0, size as usize);
+        core::ptr::write_unaligned(mask as *mut u64, 1);
+    }
+    8
 }
 
 /// Standard output and error: the launcher's stdout channel (SH7-d2), else the kernel log.
@@ -711,6 +739,101 @@ const ARGV_BYTES: usize = 256;
 static mut ARGV_BUF: [u8; ARGV_BYTES] = [0; ARGV_BYTES];
 static mut ENV_BUF: [u8; ARGV_BYTES] = [0; ARGV_BYTES];
 
+/// j924 (SH7-f): what `execve` loads: the program's path, argv and envp, packed. The launcher's
+/// argv fills it for the first program; a vfork child's `execve` fills it before the snapshot
+/// that carries it into the new process. A linker command line runs to kilobytes.
+const EXEC_BYTES: usize = 128 * 1024;
+const EXEC_ARGS: usize = 1024;
+const EXEC_ENVS: usize = 256;
+
+pub(crate) struct ExecArgs {
+    bytes: [u8; EXEC_BYTES],
+    used: usize,
+    path: (u32, u32),
+    args: [(u32, u32); EXEC_ARGS],
+    argc: usize,
+    envs: [(u32, u32); EXEC_ENVS],
+    envc: usize,
+}
+
+static mut EXEC: ExecArgs = ExecArgs {
+    bytes: [0; EXEC_BYTES],
+    used: 0,
+    path: (0, 0),
+    args: [(0, 0); EXEC_ARGS],
+    argc: 0,
+    envs: [(0, 0); EXEC_ENVS],
+    envc: 0,
+};
+
+/// The staging area (shim lock held, or before the program has a second thread).
+pub(crate) fn exec_args() -> &'static mut ExecArgs {
+    unsafe { &mut *core::ptr::addr_of_mut!(EXEC) }
+}
+
+impl ExecArgs {
+    pub(crate) fn clear(&mut self) {
+        self.used = 0;
+        self.argc = 0;
+        self.envc = 0;
+        self.path = (0, 0);
+    }
+
+    fn store(&mut self, value: &[u8]) -> Option<(u32, u32)> {
+        let end = self.used.checked_add(value.len())?;
+        if end > self.bytes.len() {
+            return None;
+        }
+        self.bytes[self.used..end].copy_from_slice(value);
+        let at = (self.used as u32, value.len() as u32);
+        self.used = end;
+        Some(at)
+    }
+
+    pub(crate) fn set_path(&mut self, path: &[u8]) -> bool {
+        self.store(path).map(|at| self.path = at).is_some()
+    }
+
+    /// Append one argv string, or (`env`) one `K=V` pair.
+    pub(crate) fn push(&mut self, value: &[u8], env: bool) -> bool {
+        let full = if env {
+            self.envc == self.envs.len()
+        } else {
+            self.argc == self.args.len()
+        };
+        if full {
+            return false;
+        }
+        let Some(at) = self.store(value) else {
+            return false;
+        };
+        if env {
+            self.envs[self.envc] = at;
+            self.envc += 1;
+        } else {
+            self.args[self.argc] = at;
+            self.argc += 1;
+        }
+        true
+    }
+
+    fn get(&self, (at, len): (u32, u32)) -> &[u8] {
+        &self.bytes[at as usize..(at + len) as usize]
+    }
+
+    fn path(&self) -> &[u8] {
+        self.get(self.path)
+    }
+
+    fn arg(&self, index: usize) -> &[u8] {
+        self.get(self.args[index])
+    }
+
+    fn env(&self, index: usize) -> &[u8] {
+        self.get(self.envs[index])
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn main(
     bootstrap: u64,
@@ -726,6 +849,7 @@ extern "C" fn main(
     let startup = kumo_rt::startup(Handle(bootstrap as u32));
     files::init(
         startup.fs.unwrap_or(Handle(0)),
+        startup.fs_mount.unwrap_or(Handle(0)),
         startup.stdin.unwrap_or(Handle(0)),
         startup.stdout.unwrap_or(Handle(0)),
     );
@@ -747,37 +871,39 @@ extern "C" fn main(
         }
     }
     // argv[0] is the shim itself; argv[1] is the program, which is also the program's argv[0].
-    let mut linux_argv: [&[u8]; 16] = [b""; 16];
-    let mut argc = 0usize;
-    for arg in kumo_abi::unpack_argv(&argv_buf[..])
-        .skip(1)
-        .take(linux_argv.len())
-    {
-        linux_argv[argc] = arg;
-        argc += 1;
+    let args = exec_args();
+    args.clear();
+    for arg in kumo_abi::unpack_argv(&argv_buf[..]).skip(1).take(16) {
+        if args.argc == 0 && !args.set_path(arg) {
+            fail("program path too long");
+        }
+        args.push(arg, false);
     }
-    if argc == 0 {
+    if args.argc == 0 {
         fail("usage: linux <path> [args...]");
     }
-    let mut envp: [&[u8]; 16] = [b""; 16];
-    let mut envc = 0usize;
-    for pair in kumo_abi::unpack_argv(&env_buf[..]).take(envp.len()) {
-        envp[envc] = pair;
-        envc += 1;
+    for pair in kumo_abi::unpack_argv(&env_buf[..]).take(16) {
+        args.push(pair, true);
     }
+    exec_staged()
+}
 
-    // execve: the program by path, then the interpreter its PT_INTERP names.
-    // SH7-d3d (j917): `/proc/self/exe` is the program's path (cwd is `/`).
-    files::set_exec_path(linux_argv[0]);
-    let program = read_image(linux_argv[0]);
+/// Load the staged program and enter it: Linux `execve`'s loading, by the shim, in this
+/// process. The first program and (j924) every process a vfork child's `execve` starts come
+/// here. The program by path, then the interpreter its PT_INTERP names.
+pub(crate) fn exec_staged() -> ! {
+    let args = exec_args();
+    // SH7-d3d (j917): `/proc/self/exe` is the program's path.
+    files::set_exec_path(args.path());
+    let program = read_image(args.path());
     let header = match elf::parse_linux_image(program.bytes, Machine::Aarch64) {
         Ok(header) => header,
-        Err(_) => fail_path("not an aarch64 Linux executable", linux_argv[0]),
+        Err(_) => fail_path("not an aarch64 Linux executable", args.path()),
     };
     let interp = match elf::interpreter(program.bytes, &header) {
         Ok(Some(path)) => Some(read_image(path)),
         Ok(None) => None,
-        Err(_) => fail_path("bad PT_INTERP", linux_argv[0]),
+        Err(_) => fail_path("bad PT_INTERP", args.path()),
     };
     let loaded = load(program.bytes, interp.as_ref().map(|image| image.bytes));
     program.release();
@@ -787,7 +913,7 @@ extern "C" fn main(
     let program_state = unsafe { &mut *core::ptr::addr_of_mut!(PROGRAM) };
     program_state.brk_end = loaded.image_end.next_multiple_of(PAGE);
 
-    let sp = build_stack(&loaded, &linux_argv[..argc], &envp[..envc]);
+    let sp = build_stack(&loaded, args);
 
     // SH7-d3c-2: the main thread's record sits on top of its trap stack; its tid is the pid.
     if !threads::register_main() {
@@ -967,9 +1093,12 @@ fn load_segment(image: &[u8], ph: &elf::ProgramHeader, bias: u64) {
     let _ = kumo_rt::handle_close(vmo);
 }
 
+static mut ARGV_AT: [u64; EXEC_ARGS] = [0; EXEC_ARGS];
+static mut ENVP_AT: [u64; EXEC_ENVS] = [0; EXEC_ENVS];
+
 /// The Linux initial stack (SysV aarch64): argc, argv[], NULL, envp[], NULL, auxv, with the strings
 /// and AT_RANDOM's 16 bytes above them. Returns the 16-byte-aligned SP that points at argc.
-fn build_stack(loaded: &Loaded, argv: &[&[u8]], envp: &[&[u8]]) -> u64 {
+fn build_stack(loaded: &Loaded, args: &ExecArgs) -> u64 {
     let Some(vmo) = vmo(LINUX_STACK_SIZE) else {
         fail("no memory for the stack");
     };
@@ -987,15 +1116,20 @@ fn build_stack(loaded: &Loaded, argv: &[&[u8]], envp: &[&[u8]]) -> u64 {
         unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), top as *mut u8, s.len()) };
         top
     };
-    let mut argv_at = [0u64; 16];
-    for (slot, arg) in argv_at.iter_mut().zip(argv) {
-        *slot = place(arg);
+    // j924: where each string landed, kept beside the staged strings (a linker's argv is long).
+    let (argv_at, envp_at) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(ARGV_AT),
+            &mut *core::ptr::addr_of_mut!(ENVP_AT),
+        )
+    };
+    for index in 0..args.argc {
+        argv_at[index] = place(args.arg(index));
     }
-    let mut envp_at = [0u64; 16];
-    for (slot, pair) in envp_at.iter_mut().zip(envp) {
-        *slot = place(pair);
+    for index in 0..args.envc {
+        envp_at[index] = place(args.env(index));
     }
-    let execfn = argv_at[0];
+    let execfn = place(args.path());
     top = (top - 32) & !15;
     let random_at = top;
     let seed = kumo_rt::clock_get();
@@ -1022,19 +1156,20 @@ fn build_stack(loaded: &Loaded, argv: &[&[u8]], envp: &[&[u8]]) -> u64 {
         (AT_EXECFN, execfn),
         (AT_NULL, 0),
     ];
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + auxv.len() * 2;
+    let (argc, envc) = (args.argc, args.envc);
+    let words = 1 + argc + 1 + envc + 1 + auxv.len() * 2;
     let sp = (top - words as u64 * 8) & !15;
     let mut at = sp;
     let mut push = |value: u64| {
         unsafe { (at as *mut u64).write(value) };
         at += 8;
     };
-    push(argv.len() as u64);
-    for &arg in &argv_at[..argv.len()] {
+    push(argc as u64);
+    for &arg in &argv_at[..argc] {
         push(arg);
     }
     push(0);
-    for &pair in &envp_at[..envp.len()] {
+    for &pair in &envp_at[..envc] {
         push(pair);
     }
     push(0);

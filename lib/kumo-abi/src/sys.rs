@@ -1,8 +1,8 @@
-//j877
 //j881
 //j916
 //j919
 //j922
+//j924
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +222,8 @@ pub enum Syscall {
     /// (MANAGE | WRITE). Preserves addresses, access and aliases. The child receives
     /// independent backing and no handles. AddressSpaceCreate supplies its new stack.
     /// A device or physical mapping refuses the whole operation. Returns a status.
+    /// j924: a non-zero length in x2 limits the copy to the mappings wholly inside
+    /// `[x1, x1 + x2)`; a mapping that straddles its edge refuses the request.
     VmarSnapshot = 66,
 }
 

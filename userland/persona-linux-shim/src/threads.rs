@@ -1,6 +1,7 @@
 //j916
 //j917
 //j919
+//j924
 //! SH7-d3c-2: the minimum Linux thread (the ratified SH7-d3 cut, T1).
 //!
 //! **Threads.** A Linux `clone` with musl's pthread flag set becomes a KUMO `ThreadSpawn` in
@@ -75,6 +76,9 @@ pub struct ThreadRec {
     /// This thread's alert channel: senders write `alert_send`, its waits watch `alert_recv`.
     pub alert_recv: u32,
     pub alert_send: u32,
+    /// j924 (SH7-f): the vfork child slot this thread runs as (processes.rs), 0 for the
+    /// program's own threads. Its descriptors and dispositions are that slot's.
+    pub child: u64,
 }
 
 const _: () = {
@@ -105,6 +109,7 @@ impl ThreadRec {
         waiting_on: AtomicU64::new(0),
         alert_recv: 0,
         alert_send: 0,
+        child: 0,
     };
 }
 
@@ -148,9 +153,12 @@ pub fn unlock() {
 
 /// Run `wait` with the shim lock released: the caller holds it and gets it back.
 pub fn unlocked<T>(wait: impl FnOnce() -> T) -> T {
+    // j924: another thread's call may switch the active descriptor table meanwhile.
+    let active = crate::files::active();
     unlock();
     let out = wait();
     lock();
+    crate::files::set_active(active);
     out
 }
 
@@ -274,7 +282,10 @@ pub fn register_main() -> bool {
         return false;
     };
     rec.tid = tid as u64;
-    PID.store(tid as u32, Ordering::Relaxed);
+    // j924: a spawned process keeps the pid its parent's `clone` returned.
+    if PID.load(Ordering::Relaxed) == 0 {
+        PID.store(tid as u32, Ordering::Relaxed);
+    }
     // j919: the program has no other thread yet, so the registry needs no lock here.
     crate::signals::register(rec) && register(rec)
 }
@@ -319,7 +330,8 @@ fn child_failed(what: &str) -> ! {
 
 // ---- the calls -----------------------------------------------------------------------------
 
-/// Linux `clone(flags, stack, parent_tid, tls, child_tid)`: a sibling thread only.
+/// Linux `clone(flags, stack, parent_tid, tls, child_tid)`: a sibling thread, or (j924) the
+/// `CLONE_VM | CLONE_VFORK` child musl's `posix_spawn` makes (processes.rs).
 pub fn clone(
     parent: &ThreadRec,
     frame: &[u64; 31],
@@ -329,6 +341,9 @@ pub fn clone(
     tls: u64,
     ctid: u64,
 ) -> i64 {
+    if crate::processes::is_vfork(flags) {
+        return crate::processes::vfork(parent, frame, stack);
+    }
     let Some(kind) = thread::thread_clone(flags) else {
         log(format_args!(
             "persona-linux: clone flags {:#x} are not a thread (-EINVAL)\n",
@@ -336,52 +351,19 @@ pub fn clone(
         ));
         return -errno::EINVAL;
     };
-    let (status, pc, parent_sp, x8) = persona_context(kumo_abi::sys::PERSONA_CONTEXT_GET, 0, 0, 0);
-    if status != 0 {
-        return -errno::EINVAL;
-    }
-    // The child's trap stack, with its record on top.
-    let region_len = (TRAP_STACK_BYTES + core::mem::size_of::<ThreadRec>())
-        .next_multiple_of(crate::PAGE as usize) as u64;
-    let Some(region) = vmo(region_len) else {
-        return -errno::EAGAIN;
+    let current: u64;
+    unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) current) };
+    let setup = Start {
+        tls: if kind.set_tls { tls } else { current },
+        stack,
+        clear_tid: if kind.child_clear_tid { ctid } else { 0 },
+        parent_tid_at: if kind.parent_set_tid { ptid } else { 0 },
+        child_tid_at: if kind.child_set_tid { ctid } else { 0 },
+        child: parent.child,
     };
-    let mapped = vmar_map_anywhere(region, region_len, crate::MAP_R | crate::MAP_W);
-    let _ = kumo_rt::handle_close(region);
-    let region_base = match mapped {
-        (0, at) if at != 0 => at,
-        _ => return -errno::EAGAIN,
-    };
-    let rec_at = (region_base + region_len - core::mem::size_of::<ThreadRec>() as u64) & !15;
-    let rec = unsafe { &mut *(rec_at as *mut ThreadRec) };
-    *rec = ThreadRec::EMPTY;
-    rec.frame = *frame;
-    rec.tls = if kind.set_tls {
-        tls
-    } else {
-        let current: u64;
-        unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) current) };
-        current
-    };
-    rec.pc = pc;
-    rec.sp = if stack == 0 { parent_sp } else { stack };
-    rec.x8 = x8;
-    rec.clear_tid = if kind.child_clear_tid { ctid } else { 0 };
-    rec.region_base = region_base;
-    rec.region_len = region_len;
-    rec.parent_tid_at = if kind.parent_set_tid { ptid } else { 0 };
-    rec.child_tid_at = if kind.child_set_tid { ctid } else { 0 };
-    rec.sigmask = parent.sigmask;
-    // A clone starts with nothing pending and no alternate stack (Linux, CLONE_VM).
-
-    let (status, koid) = thread_spawn(persona_thread_entry as *const () as u64, rec_at, rec_at);
-    if status != 0 {
-        let _ = vmar_unmap(region_base, region_len);
-        return -errno::EAGAIN;
-    }
-    let Some(tid) = thread::tid_of_koid(koid) else {
-        // The child ends the process itself (child_failed); nothing to hand back.
-        return -errno::EAGAIN;
+    let tid = match start(parent, frame, &setup) {
+        Ok(tid) => tid,
+        Err(e) => return e,
     };
     if kind.parent_set_tid && ptid != 0 {
         unsafe { (ptid as *const AtomicU32).as_ref() }
@@ -391,10 +373,76 @@ pub fn clone(
     tid as i64
 }
 
+/// How a new shim thread starts: what `clone` gives it beyond the parent's registers.
+pub struct Start {
+    pub tls: u64,
+    /// The program's stack for it, or 0 for the parent's.
+    pub stack: u64,
+    pub clear_tid: u64,
+    pub parent_tid_at: u64,
+    pub child_tid_at: u64,
+    pub child: u64,
+}
+
+/// Start a thread that resumes the program where `parent`'s open call returns, with x0 = 0:
+/// its own trap stack with its record on top. Returns its Linux tid.
+pub fn start(parent: &ThreadRec, frame: &[u64; 31], setup: &Start) -> Result<u32, i64> {
+    let (status, pc, parent_sp, x8) = persona_context(kumo_abi::sys::PERSONA_CONTEXT_GET, 0, 0, 0);
+    if status != 0 {
+        return Err(-errno::EINVAL);
+    }
+    // The child's trap stack, with its record on top.
+    let region_len = (TRAP_STACK_BYTES + core::mem::size_of::<ThreadRec>())
+        .next_multiple_of(crate::PAGE as usize) as u64;
+    let Some(region) = vmo(region_len) else {
+        return Err(-errno::EAGAIN);
+    };
+    let mapped = vmar_map_anywhere(region, region_len, crate::MAP_R | crate::MAP_W);
+    let _ = kumo_rt::handle_close(region);
+    let region_base = match mapped {
+        (0, at) if at != 0 => at,
+        _ => return Err(-errno::EAGAIN),
+    };
+    let rec_at = (region_base + region_len - core::mem::size_of::<ThreadRec>() as u64) & !15;
+    let rec = unsafe { &mut *(rec_at as *mut ThreadRec) };
+    *rec = ThreadRec::EMPTY;
+    rec.frame = *frame;
+    rec.tls = setup.tls;
+    rec.pc = pc;
+    rec.sp = if setup.stack == 0 {
+        parent_sp
+    } else {
+        setup.stack
+    };
+    rec.x8 = x8;
+    rec.clear_tid = setup.clear_tid;
+    rec.region_base = region_base;
+    rec.region_len = region_len;
+    rec.parent_tid_at = setup.parent_tid_at;
+    rec.child_tid_at = setup.child_tid_at;
+    rec.sigmask = parent.sigmask;
+    rec.child = setup.child;
+    // A clone starts with nothing pending and no alternate stack (Linux, CLONE_VM).
+
+    let (status, koid) = thread_spawn(persona_thread_entry as *const () as u64, rec_at, rec_at);
+    if status != 0 {
+        let _ = vmar_unmap(region_base, region_len);
+        return Err(-errno::EAGAIN);
+    }
+    // When the koid is no tid, the child ends the process itself (child_failed).
+    thread::tid_of_koid(koid)
+        .map(|tid| tid as u32)
+        .ok_or(-errno::EAGAIN)
+}
+
 /// Linux `exit`: this thread only. CLONE_CHILD_CLEARTID's word is zeroed and woken (musl's
 /// `pthread_join` and its thread-list lock wait on it), then the thread ends and its trap stack
 /// goes with it. The last thread ending this way ends the process with its status.
 pub fn exit_thread(rec: &ThreadRec, status: u64) -> ! {
+    if rec.child != 0 {
+        // j924: a vfork child's `_exit` ends that child, not the program it borrowed.
+        crate::processes::child_exit(rec, status);
+    }
     if rec.clear_tid != 0 {
         let word = unsafe { &*(rec.clear_tid as *const AtomicU32) };
         word.store(0, Ordering::Release);
@@ -408,6 +456,24 @@ pub fn exit_thread(rec: &ThreadRec, status: u64) -> ! {
     crate::signals::unregister(rec);
     unlock();
     thread_exit(rec.region_base, rec.region_len)
+}
+
+/// j924: end the calling thread (lock not held) and free its trap stack: a vfork child after
+/// its `execve` started the new process, or after its `_exit`.
+pub fn retire(rec: &ThreadRec) -> ! {
+    lock();
+    crate::signals::unregister(rec);
+    unlock();
+    thread_exit(rec.region_base, rec.region_len)
+}
+
+/// j924: in a process an `execve` started, before its program: one thread, no lock held, no
+/// registry, the pid the parent gave it (processes.rs).
+pub fn reset_for_spawn(pid: u32) {
+    LOCK.store(0, Ordering::Relaxed);
+    PID.store(pid, Ordering::Relaxed);
+    let rec = unsafe { &mut *core::ptr::addr_of_mut!(MAIN_TRAP.rec) };
+    *rec = ThreadRec::EMPTY;
 }
 
 pub fn gettid(rec: &ThreadRec) -> i64 {
