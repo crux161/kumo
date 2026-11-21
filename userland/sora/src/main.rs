@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j924
 //j925
 //j928
 //j929
 //j930
+//j931
 
 extern crate alloc;
 
@@ -7311,7 +7311,16 @@ fn eval_command(
     }
     #[cfg(feature = "fsd-crash-proof")]
     if cmd.name == "fsd-crash-proof" {
-        fsd_crash_proof();
+        fsd_crash_proof(
+            cmd.args
+                .first()
+                .map_or(b"/sh8c/armed".as_slice(), |s| s.as_bytes()),
+            cmd.args
+                .get(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0),
+            cmd.args.get(2).map(|s| s.as_bytes()),
+        );
         return true;
     }
     #[cfg(feature = "netstack-restart-proof")]
@@ -7543,7 +7552,7 @@ fn eval_command(
         }
         return true;
     } else if cmd.name == "linux" {
-        run_linux(initrd, &cmd.args, &[], cwd);
+        run_linux(initrd, &cmd.args, &[], cwd, false);
         return true;
     } else if cmd.name == "kilo" {
         // The first third-party C program on KUMO, byte-identical to antirez's upstream
@@ -7724,7 +7733,10 @@ fn eval_command(
             Some((launcher, program)) if !program.is_empty() && launcher == "media" => {
                 run_program_media_background(initrd, program)
             }
-            _ => usage(b"usage: bg run|net|media <program> [args...]\n"),
+            Some((launcher, program)) if !program.is_empty() && launcher == "linux" => {
+                run_linux(initrd, program, &[], cwd, true)
+            }
+            _ => usage(b"usage: bg run|net|media|linux <program> [args...]\n"),
         }
     } else if cmd.name == "media" {
         // media <program> [args...]: `run`, plus a read-write session on the mounted volume
@@ -8250,9 +8262,17 @@ fn run_linux(
     args: &[alloc::string::String],
     granted: &[&[u8]],
     cwd: &WorkingDirectory,
+    background: bool,
 ) {
+    let writable = args.first().is_some_and(|arg| arg == "--rw");
+    let args = if writable { &args[1..] } else { args };
     if args.is_empty() {
-        usage(b"usage: linux <path> [args...]\n");
+        usage(b"usage: linux [--rw] <path> [args...]\n");
+        return;
+    }
+    if background && BG_STDOUT.load(Ordering::Relaxed) != 0 {
+        log(b"bg: a background job is still running; `wait` for it first\n");
+        fail_status(1);
         return;
     }
     let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
@@ -8272,7 +8292,13 @@ fn run_linux(
     // whole filesystem, so its `/lib` and everything else it opens are the volume's.
     let mut fs = FsGrant::ImageMount;
     match sora::media_route(args[0].as_bytes()) {
-        sora::MediaRoute::Elsewhere => {}
+        sora::MediaRoute::Elsewhere => {
+            if writable {
+                usage(b"linux: --rw requires /media/<volume>/<program>\n");
+                fail_status(1);
+                return;
+            }
+        }
         sora::MediaRoute::Root => {
             log(b"linux: /media: is a directory\n");
             return;
@@ -8291,10 +8317,14 @@ fn run_linux(
                 return;
             }
             slots[1] = path;
-            fs = FsGrant::Media(BlockAccess::ReadOnly);
+            fs = FsGrant::Media(if writable {
+                BlockAccess::ReadWrite
+            } else {
+                BlockAccess::ReadOnly
+            });
         }
     }
-    run_with_startup_input_with_env(
+    let child = run_with_startup_input_with_env(
         initrd,
         kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
         b"linux",
@@ -8303,10 +8333,27 @@ fn run_linux(
         fs,
         false,
         false,
-        StdinMode::None,
+        if background {
+            StdinMode::Interactive
+        } else {
+            StdinMode::None
+        },
         false,
         Some(&env),
     );
+    if background {
+        if let Some(child) = child {
+            let _ = handle_close(child.stdin);
+            BG_STDOUT.store(child.stdout.0, Ordering::Relaxed);
+            BG_PROCESS.store(child.process.map_or(0, |p| p.0), Ordering::Relaxed);
+            log(b"bg: started linux ");
+            log(args[0].as_bytes());
+            log(b"\n");
+        } else {
+            fail_status(1);
+        }
+        return;
+    }
     log(b"linux: ");
     log(args[0].as_bytes());
     if LAST_STATUS.load(Ordering::Relaxed) == 0 {
@@ -8337,7 +8384,11 @@ fn run_env_command(initrd: Handle, cmd: &kumoza::Command, cwd: &WorkingDirectory
     }
     let program: alloc::vec::Vec<alloc::string::String> = cmd.args[index..].to_vec();
     if program[0] == "linux" {
-        run_linux(initrd, &program[1..], &env, cwd);
+        run_linux(initrd, &program[1..], &env, cwd, false);
+        return;
+    }
+    if program.len() >= 3 && program[0] == "bg" && program[1] == "linux" {
+        run_linux(initrd, &program[2..], &env, cwd, true);
         return;
     }
     run_program_granted_with_env(initrd, &program, false, Some(&env));
@@ -8810,6 +8861,11 @@ fn payload_status() {
 
 /// A program's archive and entry: the boot set first, then the payload layer.
 fn find_program(initrd: Handle, path: &[u8]) -> Option<(Handle, u64, u64)> {
+    match sora::media_route(path) {
+        sora::MediaRoute::Root => return None,
+        sora::MediaRoute::Volume { name, path } => return volume_program(name, path),
+        sora::MediaRoute::Elsewhere => {}
+    }
     if path.first() == Some(&b'/') {
         return fat_program(initrd, path);
     }
@@ -8820,8 +8876,8 @@ fn find_program(initrd: Handle, path: &[u8]) -> Option<(Handle, u64, u64)> {
     find_initrd_file(layer, path).map(|(off, len)| (layer, off, len))
 }
 
-/// The VMO holding the last program `fat_program` copied out; closed when the next replaces it.
-static FAT_PROGRAM_VMO: AtomicU32 = AtomicU32::new(0);
+/// The VMO holding the last filesystem program copied out; closed when the next replaces it.
+static FILE_PROGRAM_VMO: AtomicU32 = AtomicU32::new(0);
 
 /// j924 (SH7-f): a native program at absolute `path` on Sora's RAM FAT image, copied whole into
 /// a fresh VMO for the loader: `(vmo, 0, len)`. Read through the image's own volume, not a
@@ -8868,7 +8924,68 @@ fn fat_program(initrd: Handle, path: &[u8]) -> Option<(Handle, u64, u64)> {
     })();
     let _ = handle_close(alias);
     let (vmo, size) = copied?;
-    let previous = FAT_PROGRAM_VMO.swap(vmo.0, Ordering::AcqRel);
+    let previous = FILE_PROGRAM_VMO.swap(vmo.0, Ordering::AcqRel);
+    if previous != 0 {
+        let _ = handle_close(Handle(previous));
+    }
+    Some((vmo, 0, size))
+}
+
+/// Snapshot a native executable from the named mount through a read-only VFS session.
+/// The child receives its executable bytes, with no filesystem capability from `run`.
+/// The 64 MiB limit bounds the loader's temporary copy. — KESTREL
+fn volume_program(name: &[u8], path: &[u8]) -> Option<(Handle, u64, u64)> {
+    media().filter(|m| m.name.as_bytes() == name)?;
+    let fs = media_session(BlockAccess::ReadOnly)?;
+    let copied = (|| {
+        let mut frame = [0; kumo_vfs::MAX_PATH + 8];
+        let mut reply = [0; 257];
+        let exchange = |request: kumo_vfs::Request<'_>, frame: &mut [u8], reply: &mut [u8]| {
+            let n = request.encode_into(frame)?;
+            if channel_write(fs, frame.as_ptr(), n) != 0 {
+                return None;
+            }
+            read_channel_ready(fs, reply).filter(|n| *n != 0)
+        };
+        let n = exchange(kumo_vfs::Request::open(path), &mut frame, &mut reply)?;
+        let (file, size) = kumo_vfs::parse_open_reply(&reply[..n]).ok()?;
+        if size == 0 || size > 64 * 1024 * 1024 {
+            return None;
+        }
+        let out = syscall_handle(vmo_create((size + 4095) & !4095))?;
+        let result = (|| {
+            let mut offset = 0;
+            while offset < size {
+                let want = (size - offset).min(256) as u32;
+                let n = exchange(
+                    kumo_vfs::Request::read(file, offset, want),
+                    &mut frame,
+                    &mut reply,
+                )?;
+                let data = kumo_vfs::read_payload(&reply[..n]).ok()?;
+                if data.is_empty()
+                    || data.len() > want as usize
+                    || vmo_write(out, offset, data.as_ptr(), data.len()) != 0
+                {
+                    return None;
+                }
+                offset += data.len() as u64;
+            }
+            Some((out, size))
+        })();
+        let _ = exchange(
+            kumo_vfs::Request::Close { handle: file },
+            &mut frame,
+            &mut reply,
+        );
+        if result.is_none() {
+            let _ = handle_close(out);
+        }
+        result
+    })();
+    let _ = handle_close(fs);
+    let (vmo, size) = copied?;
+    let previous = FILE_PROGRAM_VMO.swap(vmo.0, Ordering::AcqRel);
     if previous != 0 {
         let _ = handle_close(Handle(previous));
     }
@@ -13220,17 +13337,18 @@ fn start_redoxfsd(
 /// has created `/sh8c/armed`, kill the mount's redoxfsd while the probe holds open handles, and
 /// let the supervisor bring a replacement up on the same control endpoint. — TEAL
 #[cfg(feature = "fsd-crash-proof")]
-fn fsd_crash_proof() {
-    const ATTEMPTS: u32 = 400;
+fn fsd_crash_proof(armed_path: &[u8], minimum_size: u64, must_be_absent: Option<&[u8]>) {
+    let attempts = if minimum_size == 0 && must_be_absent.is_none() {
+        400
+    } else {
+        12000
+    };
     let armed = (|| {
         let session = media_session(BlockAccess::ReadOnly)?;
-        let mut frame = [0u8; 64];
-        let n = kumo_vfs::Request::Stat {
-            path: b"/sh8c/armed",
-        }
-        .encode_into(&mut frame)?;
+        let mut frame = [0u8; kumo_vfs::MAX_PATH + 8];
+        let n = kumo_vfs::Request::Stat { path: armed_path }.encode_into(&mut frame)?;
         let mut found = false;
-        for _ in 0..ATTEMPTS {
+        for _ in 0..attempts {
             let mut reply = [0u8; 32];
             if channel_write(session, frame.as_ptr(), n) != 0
                 || !wait_readable(session, 1_000_000_000)
@@ -13238,11 +13356,35 @@ fn fsd_crash_proof() {
                 break;
             }
             let got = channel_read(session, reply.as_mut_ptr(), reply.len());
-            if got != 0 && got != u64::MAX && reply[0] == kumo_vfs::VFS_OK {
+            if got != 0
+                && got <= reply.len() as u64
+                && kumo_vfs::parse_stat_reply(&reply[..got as usize])
+                    .is_ok_and(|stat| stat.size >= minimum_size)
+            {
                 found = true;
                 break;
             }
             let _ = kumo_rt::sleep_ns(50_000_000);
+        }
+        if found {
+            if let Some(path) = must_be_absent {
+                // Background stdout is drained later. Check the disk before killing, so a
+                // completed build cannot pass merely through buffered output. — KESTREL
+                let n = kumo_vfs::Request::Stat { path }.encode_into(&mut frame)?;
+                let mut reply = [0; 32];
+                found = channel_write(session, frame.as_ptr(), n) == 0
+                    && wait_readable(session, 1_000_000_000)
+                    && channel_read(session, reply.as_mut_ptr(), reply.len()) == 1
+                    && reply[0] == kumo_vfs::VFS_NOT_FOUND;
+                if found {
+                    log(b"fsd-crash-proof: final artifact absent before kill\n");
+                } else {
+                    log_line(
+                        &[b"fsd-crash-proof: FAIL final artifact already present or unreadable\n"],
+                        1,
+                    );
+                }
+            }
         }
         let _ = handle_close(session);
         Some(found)
@@ -13251,6 +13393,9 @@ fn fsd_crash_proof() {
         log_line(&[b"fsd-crash-proof: FAIL the probe never armed\n"], 1);
         return;
     }
+    log(b"fsd-crash-proof: observed ");
+    log(armed_path);
+    log(b"\n");
     let Some(media) = media() else {
         log_line(&[b"fsd-crash-proof: FAIL nothing mounted\n"], 1);
         return;

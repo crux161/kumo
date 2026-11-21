@@ -2,6 +2,7 @@
 #j928
 #j929
 #j930
+#j931
 """SH8-b: one QEMU boot proving RedoxFS through the VFS (PLAN/008 S5, PLAN/022 SH8).
 
 The autoexec makes the RAM work volume (`workvol`), which Sora mounts at /media/WORK with
@@ -169,7 +170,7 @@ def zero_header_ring(image):
     image.write_bytes(bytes(data))
 
 
-def boot_with_disk(axh, case, work, qemu, firmware, timeout, disk):
+def boot_with_disk(axh, case, work, qemu, firmware, timeout, disk, memory_mib=2048):
     """axh.boot with a modern virtio-mmio block device on `disk`."""
     import time
     source = ROOT / "build/images/qemu-virt-aarch64"
@@ -180,7 +181,7 @@ def boot_with_disk(axh, case, work, qemu, firmware, timeout, disk):
     (work / "autoexec.txt").write_bytes(case.script)
     shutil.copyfile(firmware / "edk2-arm-vars.fd", work / "vars.fd")
     serial = work / "serial.log"
-    command = [qemu, "-machine", "virt,gic-version=3", "-cpu", "cortex-a72", "-m", "2048",
+    command = [qemu, "-machine", "virt,gic-version=3", "-cpu", "cortex-a72", "-m", str(memory_mib),
                "-display", "none", "-monitor", "none", "-serial", f"file:{serial}",
                "-drive", f"if=pflash,format=raw,file={firmware / 'edk2-aarch64-code.fd'},readonly=on",
                "-drive", f"if=pflash,format=raw,file={work / 'vars.fd'}",

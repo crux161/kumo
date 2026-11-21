@@ -1,8 +1,8 @@
-//j919
 //j921
 //j924
 //j925
 //j929
+//j931
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -277,6 +277,7 @@ pub fn init(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle) {
 struct ShimLink {
     fs: Handle,
     control: Handle,
+    write_vmo_unsupported: bool,
 }
 
 impl SessionLink for ShimLink {
@@ -351,6 +352,7 @@ impl SessionLink for ShimLink {
 static mut VFS: Reconnecting<ShimLink, MAX_FDS> = Reconnecting::new(ShimLink {
     fs: Handle(0),
     control: Handle(0),
+    write_vmo_unsupported: false,
 });
 
 fn vfs() -> &'static mut Reconnecting<ShimLink, MAX_FDS> {
@@ -363,6 +365,7 @@ fn vfs_reset(fs: Handle, fs_mount: Handle) {
     *vfs() = Reconnecting::new(ShimLink {
         fs,
         control: fs_mount,
+        write_vmo_unsupported: false,
     });
 }
 
@@ -1590,8 +1593,8 @@ pub fn close_handle(handle: u32) {
 /// the shim lock like the rest of the session.
 
 /// Write `bytes` to the file behind `fd`: at `at` (pwrite), else at the descriptor's offset (or
-/// the end, with O_APPEND), which then advances. MAX_WRITE_DATA (256) bytes per vfs request; a
-/// short count from the server ends the call there, as a short write does on Linux.
+/// the end, with O_APPEND), which then advances. Large writes use the private bounce VMO;
+/// servers without WriteVmo fall back to inline writes. A short count ends the Linux call.
 fn write_file(fd: i64, bytes: &[u8], at: Option<u64>) -> i64 {
     let entry = match fd_entry(fd) {
         Ok(entry) => entry,
@@ -1616,22 +1619,56 @@ fn write_file(fd: i64, bytes: &[u8], at: Option<u64>) -> i64 {
         return -errno::EFBIG;
     }
     let mut written = 0usize;
-    for chunk in bytes.chunks(MAX_WRITE_DATA) {
+    while written < bytes.len() {
+        let remaining = &bytes[written..];
         let mut reply = [0u8; 16];
-        let request = Request::Write {
-            handle,
-            offset,
-            data: chunk,
+        let (got, want) = if remaining.len() > MAX_WRITE_DATA && !vfs().link.write_vmo_unsupported {
+            if let Some((vmo, address)) = bounce() {
+                let want = remaining.len().min(BOUNCE_BYTES as usize);
+                // The shim lock protects the window through the exchange and every retry.
+                // Reconnecting sends a fresh handle alias each time. — KESTREL
+                unsafe {
+                    core::ptr::copy_nonoverlapping(remaining.as_ptr(), address as *mut u8, want);
+                }
+                let request = Request::WriteVmo {
+                    handle,
+                    offset,
+                    len: want as u32,
+                    vmo_offset: 0,
+                };
+                let mut frame = [0u8; kumo_vfs::READ_VMO_REQUEST_LEN];
+                let n = request.encode_into(&mut frame).expect("bounded WriteVmo");
+                let got = vfs().call(&frame[..n], vmo.0, &mut reply);
+                if reply[..got].first() == Some(&VFS_NOT_SUPPORTED) {
+                    vfs().link.write_vmo_unsupported = true;
+                    continue;
+                }
+                (Some(parse_write_reply(&reply[..got])), want)
+            } else {
+                vfs().link.write_vmo_unsupported = true;
+                continue;
+            }
+        } else {
+            let chunk = &remaining[..remaining.len().min(MAX_WRITE_DATA)];
+            let request = Request::Write {
+                handle,
+                offset,
+                data: chunk,
+            };
+            (
+                vfs_call(&request, &mut reply).map(parse_write_reply),
+                chunk.len(),
+            )
         };
-        let n = match vfs_call(&request, &mut reply).map(parse_write_reply) {
-            Some(Ok(n)) => n as usize,
+        let n = match got {
+            Some(Ok(n)) if n as usize <= want => n as usize,
             Some(Err(error)) if written == 0 => return status_errno(error),
-            None if written == 0 => return -errno::EIO,
+            _ if written == 0 => return -errno::EIO,
             _ => break,
         };
         written += n;
         offset += n as u64;
-        if n < chunk.len() {
+        if n < want {
             break;
         }
     }

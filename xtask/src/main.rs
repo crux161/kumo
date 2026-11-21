@@ -1,8 +1,8 @@
-//j924
 //j925
 //j928
 //j929
 //j930
+//j931
 
 use std::env;
 use std::fmt;
@@ -2355,6 +2355,10 @@ fn build_persona_cargo(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, Stri
     if env::var("KUMO_PERSONA_CARGO").as_deref() != Ok("1") {
         return Ok(Vec::new());
     }
+    persona_cargo_files(root)
+}
+
+fn persona_cargo_files(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
     let mut list: Vec<(&str, &'static str, &str)> = Vec::new();
     for line in include_str!("../../persona/sh7g-tree.sha256").lines() {
         if line.starts_with('#') || line.trim().is_empty() {
