@@ -3,11 +3,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{BootInfo, MemRegion, MemRegionKind, Range};
 use kumo_hal::PageFlags;
 
-//j616
 //j620
 //j743
 //j822
 //j825
+//j923
 
 pub mod heap;
 
@@ -275,9 +275,9 @@ pub unsafe fn alloc_contiguous_frames_excluding(
 ///
 /// # Safety
 /// Same boot ranges and active identity-map requirements as contiguous DMA allocation.
-pub unsafe fn alloc_dma_pages_excluding(
+pub(crate) unsafe fn alloc_dma_pages_excluding(
     boot: &BootInfo,
-    pages: &mut [Option<u64>],
+    pages: &mut [FrameSlot],
     excluded: &[Range],
 ) -> usize {
     let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
@@ -304,7 +304,7 @@ pub unsafe fn alloc_dma_pages_excluding(
         ISSUED_FRAMES.fetch_add(1, Ordering::Relaxed);
         unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
         kumo_hal::active::clean_dcache_to_poc(frame as usize, PAGE_SIZE as usize);
-        pages[filled] = Some(frame);
+        pages[filled] = FrameSlot::occupied(frame);
         filled += 1;
     }
     filled
@@ -647,6 +647,25 @@ pub enum MemoryError {
     InvalidRange,
     Unaligned,
     OutOfBounds,
+}
+
+/// A VMO page's physical frame address, or an empty slot. Every frame is aligned,
+/// so the all-ones value is outside the address domain (physical page zero is valid).
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FrameSlot(u64);
+
+impl FrameSlot {
+    pub(crate) const EMPTY: Self = Self(u64::MAX);
+
+    pub(crate) fn occupied(address: u64) -> Self {
+        debug_assert_eq!(address % PAGE_SIZE, 0);
+        Self(address)
+    }
+
+    pub(crate) fn address(self) -> Option<u64> {
+        (self != Self::EMPTY).then_some(self.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

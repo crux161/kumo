@@ -1,8 +1,8 @@
-//j871
 //j875
 //j889
 //j912
 //j922
+//j923
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -35,7 +35,7 @@ use kumo_hal::PageFlags;
 use kumo_ipc::Message;
 
 use crate::ipc::{IpcError, IpcRegistry, KernelMessage, PortPacket};
-use crate::mm::{Mapping, Vmar, Vmo};
+use crate::mm::{FrameSlot, Mapping, Vmar, Vmo};
 use crate::object::{HandleReferences, HandleTable, ObjectError, ObjectManager, StagedHandleGrant};
 use crate::task::{Job, Process, Thread};
 
@@ -693,7 +693,7 @@ struct VmoEntry {
     koid: KoId,
     vmo: Vmo,
     #[allow(dead_code)]
-    frames: RefCell<Vec<Option<u64>>>,
+    frames: RefCell<Vec<FrameSlot>>,
 }
 
 /// Own the VMO identity and its materialized page list, independent of user handles.
@@ -882,8 +882,7 @@ fn ensure_anonymous_frame(
             .frames
             .borrow()
             .get(page_index)
-            .copied()
-            .flatten()
+            .and_then(|slot| slot.address())
             .ok_or(Errno::BadState);
     }
     ensure_vmo_frame(entry, page_index, || alloc_anonymous_frame(boot))
@@ -900,7 +899,7 @@ fn copy_snapshot_range(
     let end = ((mapping.vmo_offset + mapping.len) / PAGE_SIZE) as usize;
     let end = end.min(source.frames.borrow().len());
     for page in first..end {
-        let Some(original) = source.frames.borrow()[page] else {
+        let Some(original) = source.frames.borrow()[page].address() else {
             continue;
         };
         // ensure_vmo_frame invokes the closure once even for overlapping aliases.
@@ -925,14 +924,24 @@ fn ensure_vmo_frame(
     mut allocate: impl FnMut() -> Result<u64, Errno>,
 ) -> Result<u64, Errno> {
     let mut frames = entry.frames.borrow_mut();
-    if frames.len() <= page_index {
-        let additional = page_index + 1 - frames.len();
-        frames
-            .try_reserve(additional)
-            .map_err(|_| Errno::NoMemory)?;
-        frames.resize(page_index + 1, None);
+    let required = page_index.checked_add(1).ok_or(Errno::InvalidArgs)?;
+    let limit = entry.vmo.frame_count() as usize;
+    if required > limit {
+        return Err(Errno::InvalidArgs);
     }
-    if let Some(frame) = frames[page_index] {
+    if required > frames.capacity() {
+        // Geometric growth, capped at the actual VMO. A 592 MiB boot image needs
+        // 151,552 slots. Rounding up to 262,144 needlessly strains the kernel heap.
+        let capacity = required.max(frames.capacity().saturating_mul(2)).min(limit);
+        let additional = capacity - frames.len();
+        frames
+            .try_reserve_exact(additional)
+            .map_err(|_| Errno::NoMemory)?;
+    }
+    if required > frames.len() {
+        frames.resize(required, FrameSlot::EMPTY);
+    }
+    if let Some(frame) = frames[page_index].address() {
         return Ok(frame);
     }
     // Retained-domain checks inspect this cache during physical allocation. Do not
@@ -940,10 +949,10 @@ fn ensure_vmo_frame(
     drop(frames);
     let frame = allocate()?;
     let mut frames = entry.frames.borrow_mut();
-    if let Some(existing) = frames[page_index] {
+    if let Some(existing) = frames[page_index].address() {
         return Ok(existing);
     }
-    frames[page_index] = Some(frame);
+    frames[page_index] = FrameSlot::occupied(frame);
     Ok(frame)
 }
 
@@ -1039,11 +1048,13 @@ impl DeviceState {
                             return false;
                         };
                         for offset in (map.vmo_offset..end).step_by(PAGE_SIZE as usize) {
-                            let Some(Some(frame)) = frames.get((offset / PAGE_SIZE) as usize)
+                            let Some(frame) = frames
+                                .get((offset / PAGE_SIZE) as usize)
+                                .and_then(|slot| slot.address())
                             else {
                                 return false;
                             };
-                            if ranges_overlap(base, len, *frame, PAGE_SIZE) {
+                            if ranges_overlap(base, len, frame, PAGE_SIZE) {
                                 return false;
                             }
                         }
@@ -1608,8 +1619,7 @@ impl SyscallEngine {
                     |i| {
                         frames
                             .get(i as usize)
-                            .copied()
-                            .flatten()
+                            .and_then(|slot| slot.address())
                             .is_some_and(|page| {
                                 let (start, bytes) = if coarse {
                                     (page & !((1 << 21) - 1), 1 << 21)
@@ -2928,8 +2938,13 @@ impl SyscallEngine {
             if anonymous {
                 // Free after the entry is detached and every reference gate has passed.
                 // Frames are only ever identified by physical address here, never read.
-                for frame in entry.frames.borrow().iter().flatten() {
-                    let _ = crate::mm::free_frame(*frame);
+                for frame in entry
+                    .frames
+                    .borrow()
+                    .iter()
+                    .filter_map(|slot| slot.address())
+                {
+                    let _ = crate::mm::free_frame(frame);
                 }
             }
             removed += 1;
@@ -2940,13 +2955,13 @@ impl SyscallEngine {
     // Capacity must be reserved by the caller before releasing ownership. Coalesce adjacent
     // pages so reusing a large BO does not turn the free list into a quadratic page queue.
     // — KESTREL
-    fn return_dma_pages(&mut self, pages: &[Option<u64>]) {
+    fn return_dma_pages(&mut self, pages: &[FrameSlot]) {
         let mut runs = self.free_dma_runs.borrow_mut();
-        for page in pages.iter().flatten() {
-            if let Some(last) = runs.last_mut().filter(|run| run.start + run.len == *page) {
+        for page in pages.iter().filter_map(|slot| slot.address()) {
+            if let Some(last) = runs.last_mut().filter(|run| run.start + run.len == page) {
                 last.len += crate::mm::PAGE_SIZE;
             } else {
-                runs.push(kumo_abi::Range::new(*page, crate::mm::PAGE_SIZE));
+                runs.push(kumo_abi::Range::new(page, crate::mm::PAGE_SIZE));
             }
         }
     }
@@ -3004,7 +3019,7 @@ impl SyscallEngine {
         frames
             .try_reserve_exact(count)
             .map_err(|_| Errno::NoMemory)?;
-        frames.resize(count, None);
+        frames.resize(count, FrameSlot::EMPTY);
         // Capacity for the complete rollback is secured before removing a single free page.
         self.free_dma_runs
             .borrow_mut()
@@ -3020,7 +3035,7 @@ impl SyscallEngine {
                 break;
             };
             zero_reclaimed_run(page, crate::mm::PAGE_SIZE);
-            frames[have] = Some(page);
+            frames[have] = FrameSlot::occupied(page);
             have += 1;
         }
         if have < count {
@@ -3060,7 +3075,7 @@ impl SyscallEngine {
                     .koid;
                 let entry = self.vmo_entry_by_koid(koid).ok_or(Errno::Internal)?;
                 for (dest, page) in output.iter_mut().zip(&frames) {
-                    *dest = page.expect("complete DMA page list");
+                    *dest = page.address().expect("complete DMA page list");
                 }
                 entry.frames.replace(frames);
                 Ok(handle)
@@ -3641,7 +3656,12 @@ impl SyscallEngine {
                 copy_snapshot_range(original, copy, mapping, self.boot_info.as_ref())
             {
                 for (_, entry) in &copies {
-                    for &frame in entry.frames.borrow().iter().flatten() {
+                    for frame in entry
+                        .frames
+                        .borrow()
+                        .iter()
+                        .filter_map(|slot| slot.address())
+                    {
                         crate::mm::free_frame(frame);
                     }
                 }
@@ -4403,8 +4423,11 @@ impl SyscallEngine {
                                             let page_off = (pos % crate::mm::PAGE_SIZE) as usize;
                                             let chunk = (len - copied)
                                                 .min(crate::mm::PAGE_SIZE as usize - page_off);
-                                            if let Some(Some(frame)) =
-                                                vmo_entry.frames.borrow().get(page_index)
+                                            if let Some(frame) = vmo_entry
+                                                .frames
+                                                .borrow()
+                                                .get(page_index)
+                                                .and_then(|slot| slot.address())
                                             {
                                                 kumo_hal::active::read_phys(
                                                     frame + page_off as u64,
@@ -6973,7 +6996,7 @@ mod tests {
             let koid = process.handles().get(handle).unwrap().koid;
             let entry = engine.vmos.iter().find(|e| e.koid == koid).unwrap().clone();
             assert_eq!(entry.vmo.backing(), crate::mm::VmoBacking::DmaPaged);
-            assert_eq!(*entry.frames.borrow(), physical.map(Some));
+            assert_eq!(*entry.frames.borrow(), physical.map(FrameSlot::occupied));
             let duplicate = process
                 .handles_mut()
                 .duplicate(handle, Rights::READ)
@@ -7043,7 +7066,7 @@ mod tests {
             engine.vmos.push(Rc::new(VmoEntry {
                 koid,
                 vmo: Vmo::new(PAGE_SIZE).unwrap(),
-                frames: RefCell::new(alloc::vec![Some(frame), None]),
+                frames: RefCell::new(alloc::vec![FrameSlot::occupied(frame), FrameSlot::EMPTY]),
             }));
             let handle = process.handles_mut().insert(object, Rights::READ).unwrap();
             // A handle still names it: the entry and its frame stay. The holder is passed
@@ -7536,7 +7559,7 @@ mod tests {
                 let backing = Rc::new(VmoEntry {
                     koid: KoId(99),
                     vmo: Vmo::new(2 * PAGE_SIZE).unwrap(),
-                    frames: RefCell::new(vec![None, Some(frame)]),
+                    frames: RefCell::new(vec![FrameSlot::EMPTY, FrameSlot::occupied(frame)]),
                 });
                 engine.devices.device_vmar_mappings.push(DeviceVmarMapping {
                     ctx_koid: koid,
@@ -8413,7 +8436,14 @@ mod tests {
             });
             assert!(matches!(failed, Err(Errno::NoMemory)));
             assert_eq!(weak.strong_count(), 1);
-            assert_eq!(*entry.frames.borrow(), [None, Some(0x2000_0000), None]);
+            assert_eq!(
+                *entry.frames.borrow(),
+                [
+                    FrameSlot::EMPTY,
+                    FrameSlot::occupied(0x2000_0000),
+                    FrameSlot::EMPTY
+                ]
+            );
             let first =
                 VmoPin::new(entry.clone(), PAGE_SIZE, 2 * PAGE_SIZE, || Ok(0x3000_0000)).unwrap();
             let second = VmoPin::new(entry.clone(), PAGE_SIZE, 2 * PAGE_SIZE, || {
@@ -8448,7 +8478,7 @@ mod tests {
             let anon = Rc::new(VmoEntry {
                 koid: KoId(100),
                 vmo: Vmo::new(PAGE_SIZE).unwrap(),
-                frames: RefCell::new(vec![Some(1 << 32)]),
+                frames: RefCell::new(vec![FrameSlot::occupied(1 << 32)]),
             });
             assert!(matches!(
                 VmoPin::new(anon.clone(), 0, PAGE_SIZE, || unreachable!()),
@@ -8673,6 +8703,34 @@ mod tests {
         let job = crate::task::Job::root(engine.objects_mut());
         let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
         Process::new(engine.objects_mut(), &job, vmar)
+    }
+
+    #[test]
+    fn a_large_anonymous_vmo_keeps_one_word_per_page_and_stops_growing_at_its_end() {
+        use crate::mm::PAGE_SIZE;
+        const COUNT: usize = 151_552;
+        assert_eq!(
+            core::mem::size_of::<FrameSlot>(),
+            core::mem::size_of::<u64>()
+        );
+        let entry = VmoEntry {
+            koid: KoId(1),
+            vmo: Vmo::new(COUNT as u64 * PAGE_SIZE).unwrap(),
+            frames: RefCell::new(Vec::new()),
+        };
+        let boundary = (512 * 1024 * 1024 / PAGE_SIZE) as usize;
+        ensure_vmo_frame(&entry, boundary - 1, || Ok(0)).unwrap();
+        ensure_vmo_frame(&entry, boundary, || Ok(PAGE_SIZE)).unwrap();
+        let frames = entry.frames.borrow();
+        assert_eq!(frames[0].address(), None);
+        assert_eq!(frames[boundary - 1].address(), Some(0));
+        assert_eq!(frames[boundary].address(), Some(PAGE_SIZE));
+        assert_eq!(frames.capacity(), COUNT);
+        drop(frames);
+        assert_eq!(
+            ensure_vmo_frame(&entry, COUNT, || unreachable!()),
+            Err(Errno::InvalidArgs)
+        );
     }
 
     #[test]

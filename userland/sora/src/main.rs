@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j895
 //j911
 //j913
 //j914
 //j917
+//j923
 
 extern crate alloc;
 
@@ -12859,11 +12859,15 @@ fn run_with_startup_input_with_env(
     grant_net: bool,
     env: Option<&[&[u8]]>,
 ) -> Option<InteractiveChild> {
+    let refused = |reason: &[u8]| {
+        fail_status(1);
+        log(name);
+        log(reason);
+        None
+    };
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
     if stdout_read_raw == u64::MAX || stdout_write_raw == u64::MAX {
-        log(name);
-        log(b": stdout unavailable\n");
-        return None;
+        return refused(b": stdout unavailable\n");
     }
     let stdout_read = Handle(stdout_read_raw as u32);
     let stdout_write = Handle(stdout_write_raw as u32);
@@ -12872,9 +12876,7 @@ fn run_with_startup_input_with_env(
     if bootstrap_send_raw == u64::MAX || bootstrap_child_raw == u64::MAX {
         let _ = handle_close(stdout_read);
         let _ = handle_close(stdout_write);
-        log(name);
-        log(b": bootstrap unavailable\n");
-        return None;
+        return refused(b": bootstrap unavailable\n");
     }
     let bootstrap_send = Handle(bootstrap_send_raw as u32);
     let bootstrap_child = Handle(bootstrap_child_raw as u32);
@@ -12889,18 +12891,14 @@ fn run_with_startup_input_with_env(
                 for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
                     let _ = handle_close(handle);
                 }
-                log(name);
-                log(b": stdin too long\n");
-                return None;
+                return refused(b": stdin too long\n");
             }
             let (read_raw, write_raw) = channel_create_pair();
             if read_raw == u64::MAX || write_raw == u64::MAX {
                 for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
                     let _ = handle_close(handle);
                 }
-                log(name);
-                log(b": stdin unavailable\n");
-                return None;
+                return refused(b": stdin unavailable\n");
             }
             let read = Handle(read_raw as u32);
             let write = Handle(write_raw as u32);
@@ -12911,9 +12909,7 @@ fn run_with_startup_input_with_env(
                 for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
                     let _ = handle_close(handle);
                 }
-                log(name);
-                log(b": stdin queue failed\n");
-                return None;
+                return refused(b": stdin queue failed\n");
             }
             Some(read)
         }
@@ -12923,9 +12919,7 @@ fn run_with_startup_input_with_env(
                 for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
                     let _ = handle_close(handle);
                 }
-                log(name);
-                log(b": stdin unavailable\n");
-                return None;
+                return refused(b": stdin unavailable\n");
             }
             stdin_writer = Some(Handle(write_raw as u32));
             Some(Handle(read_raw as u32))
@@ -13006,9 +13000,7 @@ fn run_with_startup_input_with_env(
         if let Some(writer) = stdin_writer {
             let _ = handle_close(writer);
         }
-        log(name);
-        log(b": startup grant unavailable\n");
-        return None;
+        return refused(b": startup grant unavailable\n");
     }
 
     // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd], [fs], [tty], [net]. Order
@@ -13063,9 +13055,7 @@ fn run_with_startup_input_with_env(
         if let Some(writer) = stdin_writer {
             let _ = handle_close(writer);
         }
-        log(name);
-        log(b": startup queue failed\n");
-        return None;
+        return refused(b": startup queue failed\n");
     }
 
     // Bind the child's stdout to the serve port BEFORE admitting it. `port_bind` only wakes
@@ -13084,9 +13074,7 @@ fn run_with_startup_input_with_env(
             if let Some(writer) = stdin_writer {
                 let _ = handle_close(writer);
             }
-            log(name);
-            log(b": stdout bind failed\n");
-            return None;
+            return refused(b": stdout bind failed\n");
         }
         KILO_STDOUT_KOID.store(koid, Ordering::Relaxed);
     }
