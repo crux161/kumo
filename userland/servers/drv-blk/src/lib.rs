@@ -1,9 +1,9 @@
 #![no_std]
-//j550
 //j803
 //j864
 //j892
 //j928
+//j929
 
 //! `drv-blk` — a minimal ramdisk block device over a VMO.
 //!
@@ -440,6 +440,11 @@ pub fn encode_mount_bootstrap(block_count: u64) -> [u8; CLIENT_BOOTSTRAP_LEN] {
 pub const MOUNT_FORMAT: u8 = 1 << 0;
 /// Wire length of a mount bootstrap with flags: `[CLIENT_MOUNT_TAG][block_count][flags]`.
 pub const MOUNT_FLAGS_BOOTSTRAP_LEN: usize = CLIENT_BOOTSTRAP_LEN + 1;
+
+/// j929 (SH8-c): the one-byte message that follows a flagged mount bootstrap on a server's own
+/// bootstrap channel and carries the mount's control endpoint. The server then serves sessions
+/// from that endpoint, which Sora keeps alive across the server's restarts. — TEAL
+pub const MOUNT_CONTROL_TAG: u8 = b'K';
 
 /// [`encode_mount_bootstrap`] plus a flags byte, for the servers that read one (redoxfsd).
 pub fn encode_mount_bootstrap_flags(

@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j928
+//j929
 //! `redoxfsd`, the RedoxFS-backed `kumo-vfs` handler core (SH8-b, PLAN/008 S5/S6).
 //!
 //! It is the mount-scoped `fatfs` server's protocol with RedoxFS underneath. One process
@@ -8,19 +9,16 @@
 //! locks are shared across sessions. The volume's bytes are authoritative; everything in
 //! this crate is reconnectable soft state that a restart drops (DESIGN/002).
 //!
-//! RedoxFS is copy-on-write in 128 KiB records, and the VFS writes at most 256 bytes per
-//! request, so a write per transaction would rewrite a whole record for every 256 bytes.
-//! Three pieces of soft state make the server usable:
+//! SH8-c (j929): **every acknowledgement is a committed transaction.** j928 acknowledged writes
+//! before committing them (coalescing up to 64 KiB); a crash lost acknowledged bytes, which
+//! DESIGN/002's hard rule forbids. Now `Write` commits before it replies, and `WriteVmo` moves
+//! up to 4 MiB in one committed transaction for bulk writers. A server killed at any moment
+//! leaves only what it had acknowledged, and its clients retry the rest (DESIGN/002 §2).
+//!
+//! What stays is soft state over committed bytes:
 //! - [`CachedDisk`] is a write-through block cache. It never delays a write, so the volume's
 //!   commit order (data, flush, header, flush) is exactly the one `kumo-redoxfs` proves.
-//! - Contiguous writes to one open handle coalesce into a single transaction of up to
-//!   [`WRITE_COALESCE_MAX`] bytes. Any other request commits them first. A commit failure is
-//!   kept on the handle and reported by its next write, flush or close (Linux reports
-//!   writeback errors at fsync/close).
 //! - Sequential reads are served from a [`READ_AHEAD_MAX`] buffer that every mutation drops.
-//!
-//! Every acknowledged `Flush` and `Close` is therefore a committed RedoxFS transaction.
-//! A write that is only acknowledged is as durable as Linux's page cache.
 
 extern crate alloc;
 
@@ -61,8 +59,6 @@ pub const REQUEST_BUF_BYTES: usize = WRITE_HEADER_LEN + MAX_WRITE_DATA;
 pub const REPLY_BUF_BYTES: usize = 1024;
 /// Inline read payload cap (fatfs parity), plus the status byte.
 pub const READ_REPLY_BYTES: usize = 1 + 256;
-/// Contiguous writes to one handle coalesce up to this many bytes per transaction.
-pub const WRITE_COALESCE_MAX: usize = 64 * 1024;
 /// One read-ahead fill.
 pub const READ_AHEAD_MAX: usize = 64 * 1024;
 /// Blocks [`CachedDisk`] holds by default (4 MiB).
@@ -229,8 +225,6 @@ struct OpenFile {
     node: u32,
     readable: bool,
     writable: bool,
-    /// A deferred write's failure, reported by the handle's next write, flush or close.
-    error: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,10 +260,6 @@ impl OpenTable {
         self.slots[Self::index(handle)?]
     }
 
-    fn get_mut(&mut self, handle: u32) -> Option<&mut OpenFile> {
-        self.slots[Self::index(handle)?].as_mut()
-    }
-
     fn remove(&mut self, handle: u32) -> Option<OpenFile> {
         self.slots[Self::index(handle)?].take()
     }
@@ -280,15 +270,6 @@ struct LockEntry {
     node: u32,
     session: usize,
     mode: u8,
-}
-
-/// Contiguous writes waiting to become one transaction.
-struct Pending {
-    session: usize,
-    handle: u32,
-    node: u32,
-    offset: u64,
-    data: Vec<u8>,
 }
 
 /// File bytes `[offset, offset + len)` of `node`, read ahead.
@@ -308,11 +289,10 @@ pub struct RedoxServer<D: Disk> {
     sessions: [OpenTable; MAX_SESSIONS],
     access: [u8; MAX_SESSIONS],
     locks: [Option<LockEntry>; MAX_LOCKS],
-    pending: Option<Pending>,
     ahead: Option<Ahead>,
     ahead_buf: Vec<u8>,
     clock: Clock,
-    /// Transactions committed for deferred writes, for tests and diagnostics.
+    /// Transactions committed for writes (`Write` and `WriteVmo`), for tests and diagnostics.
     pub write_commits: u64,
 }
 
@@ -323,7 +303,6 @@ impl<D: Disk> RedoxServer<D> {
             sessions: [OpenTable::new(); MAX_SESSIONS],
             access: [SESSION_READ_ONLY; MAX_SESSIONS],
             locks: [None; MAX_LOCKS],
-            pending: None,
             ahead: None,
             ahead_buf: Vec::new(),
             clock,
@@ -342,13 +321,12 @@ impl<D: Disk> RedoxServer<D> {
         }
     }
 
-    /// A session's channel closed: commit what it wrote, close every handle it held
-    /// (an unlinked node it held open is released now) and drop its locks.
+    /// A session's channel closed: close every handle it held (an unlinked node it held open
+    /// is released now) and drop its locks. Everything it was told is written is committed.
     pub fn close_session(&mut self, session: usize) {
         if session >= MAX_SESSIONS {
             return;
         }
-        let _ = self.commit_pending();
         let table = core::mem::replace(&mut self.sessions[session], OpenTable::new());
         for file in table.slots.iter().flatten() {
             let _ = self
@@ -362,37 +340,6 @@ impl<D: Disk> RedoxServer<D> {
         }
         self.access[session] = SESSION_READ_ONLY;
         self.ahead = None;
-    }
-
-    /// Commit coalesced writes now. A failure is recorded on the handle that wrote them.
-    pub fn commit_pending(&mut self) -> core::result::Result<(), u8> {
-        let Some(pending) = self.pending.take() else {
-            return Ok(());
-        };
-        self.ahead = None;
-        let (secs, nsec) = (self.clock)();
-        let result = self.fs.tx(|tx| {
-            tx.write_node(
-                TreePtr::new(pending.node),
-                pending.offset,
-                &pending.data,
-                secs,
-                nsec,
-            )
-        });
-        self.write_commits += 1;
-        match result {
-            Ok(n) if n == pending.data.len() => Ok(()),
-            Ok(_) => self.defer_error(&pending, VFS_IO_ERROR),
-            Err(error) => self.defer_error(&pending, status_of(error)),
-        }
-    }
-
-    fn defer_error(&mut self, pending: &Pending, status: u8) -> core::result::Result<(), u8> {
-        if let Some(file) = self.sessions[pending.session].get_mut(pending.handle) {
-            file.error.get_or_insert(status);
-        }
-        Err(status)
     }
 
     /// Handle one request frame from `session` and write the reply. `vmo` is the handle the
@@ -415,16 +362,6 @@ impl<D: Disk> RedoxServer<D> {
         if writes && self.access[session] == SESSION_READ_ONLY {
             return write_status(reply, VFS_ACCESS_DENIED);
         }
-        if let Request::Write {
-            handle,
-            offset,
-            data,
-        } = request
-        {
-            return self.write(session, handle, offset, data, reply);
-        }
-        // Everything but a write sees the volume with coalesced writes committed.
-        let _ = self.commit_pending();
         if writes {
             self.ahead = None;
         }
@@ -442,7 +379,17 @@ impl<D: Disk> RedoxServer<D> {
                 len,
                 vmo_offset,
             } => self.read_vmo(session, handle, offset, len, vmo, vmo_offset, window, reply),
-            Request::Write { .. } => unreachable!("handled above"),
+            Request::Write {
+                handle,
+                offset,
+                data,
+            } => self.write(session, handle, offset, data, reply),
+            Request::WriteVmo {
+                handle,
+                offset,
+                len,
+                vmo_offset,
+            } => self.write_vmo(session, handle, offset, len, vmo, vmo_offset, window, reply),
             Request::SetLen { handle, len } => self.set_len(session, handle, len, reply),
             Request::Flush { handle } => self.flush(session, handle, reply),
             Request::ReadDir { path, start } => self.read_dir(path, start, reply),
@@ -497,7 +444,6 @@ impl<D: Disk> RedoxServer<D> {
             node,
             readable: options & OPEN_READ != 0,
             writable: options & OPEN_WRITE != 0,
-            error: None,
         };
         match self.sessions[session].insert(file) {
             Some(handle) => write_frame(reply, &encode_open_ok(handle, size)),
@@ -613,6 +559,7 @@ impl<D: Disk> RedoxServer<D> {
         }
     }
 
+    /// Commit `data` at `offset` before replying: the acknowledgement IS the commit.
     fn write(
         &mut self,
         session: usize,
@@ -621,78 +568,105 @@ impl<D: Disk> RedoxServer<D> {
         data: &[u8],
         reply: &mut [u8],
     ) -> usize {
-        // Append to the waiting run when this write continues it.
-        if let Some(pending) = self.pending.as_mut() {
-            if pending.session == session
-                && pending.handle == handle
-                && pending.offset.checked_add(pending.data.len() as u64) == Some(offset)
-                && pending.data.len() + data.len() <= WRITE_COALESCE_MAX
-            {
-                pending.data.extend_from_slice(data);
-                return write_frame(reply, &encode_write_ok(data.len() as u32));
-            }
-        }
-        let _ = self.commit_pending();
-        self.ahead = None;
-        let Some(file) = self.sessions[session].get_mut(handle) else {
-            return write_status(reply, VFS_BAD_HANDLE);
+        let node = match self.writable(session, handle) {
+            Ok(node) => node,
+            Err(status) => return write_status(reply, status),
         };
-        if !file.writable {
-            return write_status(reply, VFS_ACCESS_DENIED);
+        match self.commit_write(node, offset, data) {
+            Ok(()) => write_frame(reply, &encode_write_ok(data.len() as u32)),
+            Err(status) => write_status(reply, status),
         }
-        if let Some(status) = file.error.take() {
-            return write_status(reply, status);
-        }
-        if offset.checked_add(data.len() as u64).is_none() {
-            return write_status(reply, VFS_BAD_REQUEST);
-        }
-        let mut buffered = Vec::with_capacity(WRITE_COALESCE_MAX.min(data.len().max(4096)));
-        buffered.extend_from_slice(data);
-        self.pending = Some(Pending {
-            session,
-            handle,
-            node: file.node,
-            offset,
-            data: buffered,
-        });
-        write_frame(reply, &encode_write_ok(data.len() as u32))
     }
 
-    /// A handle's deferred-write error, taken: it is reported once.
-    fn take_error(&mut self, session: usize, handle: u32) -> core::result::Result<OpenFile, u8> {
-        let file = self.sessions[session]
-            .get_mut(handle)
-            .ok_or(VFS_BAD_HANDLE)?;
-        match file.error.take() {
-            Some(status) => Err(status),
-            None => Ok(*file),
+    /// `WriteVmo`: up to [`READ_VMO_MAX`] bytes of the carried VMO in ONE committed transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn write_vmo<W: BulkWindow>(
+        &mut self,
+        session: usize,
+        handle: u32,
+        offset: u64,
+        len: u32,
+        vmo: u32,
+        vmo_offset: u64,
+        window: &mut W,
+        reply: &mut [u8],
+    ) -> usize {
+        if vmo == 0 || len > READ_VMO_MAX {
+            return write_status(reply, VFS_BAD_REQUEST);
+        }
+        let node = match self.writable(session, handle) {
+            Ok(node) => node,
+            Err(status) => return write_status(reply, status),
+        };
+        if len == 0 {
+            return write_frame(reply, &encode_write_ok(0));
+        }
+        let mut result = Err(VFS_BAD_REQUEST);
+        let mapped = window.fill(vmo, vmo_offset, len as usize, &mut |bytes| {
+            result = self.commit_write(node, offset, bytes);
+            0
+        });
+        match (mapped, result) {
+            (Some(_), Ok(())) => write_frame(reply, &encode_write_ok(len)),
+            (Some(_), Err(status)) => write_status(reply, status),
+            (None, _) => write_status(reply, VFS_BAD_REQUEST),
+        }
+    }
+
+    /// The node an open, writable `handle` names.
+    fn writable(&self, session: usize, handle: u32) -> core::result::Result<u32, u8> {
+        let file = self.sessions[session].get(handle).ok_or(VFS_BAD_HANDLE)?;
+        if !file.writable {
+            return Err(VFS_ACCESS_DENIED);
+        }
+        Ok(file.node)
+    }
+
+    /// One transaction: write `data` at `offset` of `node`, committed (data, flush, header,
+    /// flush) before this returns.
+    fn commit_write(
+        &mut self,
+        node: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> core::result::Result<(), u8> {
+        if offset.checked_add(data.len() as u64).is_none() {
+            return Err(VFS_BAD_REQUEST);
+        }
+        self.ahead = None;
+        let (secs, nsec) = (self.clock)();
+        self.write_commits += 1;
+        match self
+            .fs
+            .tx(|tx| tx.write_node(TreePtr::new(node), offset, data, secs, nsec))
+        {
+            Ok(n) if n == data.len() => Ok(()),
+            Ok(_) => Err(VFS_IO_ERROR),
+            Err(error) => Err(status_of(error)),
         }
     }
 
     fn set_len(&mut self, session: usize, handle: u32, len: u64, reply: &mut [u8]) -> usize {
-        let file = match self.take_error(session, handle) {
-            Ok(file) => file,
+        let node = match self.writable(session, handle) {
+            Ok(node) => node,
             Err(status) => return write_status(reply, status),
         };
-        if !file.writable {
-            return write_status(reply, VFS_ACCESS_DENIED);
-        }
         let (secs, nsec) = (self.clock)();
         match self
             .fs
-            .tx(|tx| tx.truncate_node(TreePtr::new(file.node), len, secs, nsec))
+            .tx(|tx| tx.truncate_node(TreePtr::new(node), len, secs, nsec))
         {
             Ok(()) => write_status(reply, VFS_OK),
             Err(error) => write_status(reply, status_of(error)),
         }
     }
 
-    /// Every transaction already ended in a device flush; a flush only reports what a
-    /// deferred write left behind.
+    /// Every acknowledged mutation already ended in a device flush, so a flush has nothing
+    /// left to make durable.
     fn flush(&mut self, session: usize, handle: u32, reply: &mut [u8]) -> usize {
-        match self.take_error(session, handle) {
-            Ok(_) => write_status(reply, VFS_OK),
-            Err(status) => write_status(reply, status),
+        match self.sessions[session].get(handle) {
+            Some(_) => write_status(reply, VFS_OK),
+            None => write_status(reply, VFS_BAD_HANDLE),
         }
     }
 
@@ -876,11 +850,9 @@ impl<D: Disk> RedoxServer<D> {
                 *lock = None;
             }
         }
-        let released = self.fs.tx(|tx| tx.on_close_node(TreePtr::new(file.node)));
-        match (file.error, released) {
-            (Some(status), _) => write_status(reply, status),
-            (None, Ok(())) => write_status(reply, VFS_OK),
-            (None, Err(error)) => write_status(reply, status_of(error)),
+        match self.fs.tx(|tx| tx.on_close_node(TreePtr::new(file.node))) {
+            Ok(()) => write_status(reply, VFS_OK),
+            Err(error) => write_status(reply, status_of(error)),
         }
     }
 }
@@ -893,6 +865,7 @@ fn request_writes(request: &Request<'_>) -> bool {
     ) || matches!(
         request,
         Request::Write { .. }
+            | Request::WriteVmo { .. }
             | Request::SetLen { .. }
             | Request::Mkdir { .. }
             | Request::Unlink { .. }

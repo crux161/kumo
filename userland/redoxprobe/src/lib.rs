@@ -1,5 +1,6 @@
 #![no_std]
 //j928
+//j929
 //! `redoxprobe`, the SH8-b gate as a client sees it. Everything goes through one `kumo-vfs`
 //! session: no block, no RedoxFS and no server internals. The same sequence runs on the host
 //! against redoxfsd's handler (this crate's tests) and on KUMO behind `media`.
@@ -7,6 +8,7 @@
 //! `write` builds a known tree under `/sh8` and checks every step on the way. `verify`
 //! finds exactly that tree, with exactly those bytes, after the server has been replaced.
 
+use kumo_vfs::reconnect::{Reconnecting, SessionLink};
 use kumo_vfs::{
     parse_dir_reply, parse_open_reply, parse_stat_reply, parse_write_reply, read_payload, Request,
     VfsError, MAX_WRITE_DATA, OPEN_CREATE, OPEN_READ, OPEN_WRITE, STAT_KIND_DIRECTORY,
@@ -352,6 +354,251 @@ pub fn verify_phase<V: Vfs>(vfs: &mut V) -> Result<(), Fail> {
     })?;
     s.close(h, "close small")?;
     s.missing(b"/sh8/tmp", "tmp gone")
+}
+
+// --- SH8-c (j929): gate II, the crash phase ---
+
+/// A reconnecting session is a probe transport like any other.
+impl<L: SessionLink, const N: usize> Vfs for Reconnecting<L, N> {
+    fn call(&mut self, request: &[u8], reply: &mut [u8]) -> Option<usize> {
+        Some(Reconnecting::call(self, request, 0, reply))
+    }
+}
+
+/// Byte `i` of `/sh8c/a.bin`: a mixed hash of the offset, so every byte is known at any
+/// offset and no record compresses.
+pub fn crash_byte(i: u64) -> u8 {
+    let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+    x ^= x >> 29;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    (x >> 32) as u8
+}
+
+/// Part A: 256-byte writes.
+pub const CRASH_A: u64 = 64 * 1024;
+/// Part B: one `WriteVmo` (or 256-byte writes where the server has none).
+pub const CRASH_B: u64 = 192 * 1024;
+/// Part C: written one 256-byte chunk per pause, while the server is killed.
+pub const CRASH_C_CHUNKS: u64 = 160;
+pub const CRASH_LEN: u64 = CRASH_A + CRASH_B + CRASH_C_CHUNKS * 256;
+/// Pauses the probe waits, after part C, for a crash it has not yet seen.
+pub const CRASH_WAIT_PAUSES: u32 = 500;
+
+/// What the platform gives the crash phase.
+pub trait CrashHost {
+    /// Wait a moment (20 ms on KUMO; the host test kills the server here).
+    fn pause(&mut self);
+    /// A VMO of `len` bytes, filled piece by piece by `fill(piece, offset_in_vmo)`, for a
+    /// `WriteVmo` (0 when there is none). Nothing this large ever lives on the probe's stack.
+    fn vmo_filled(&mut self, len: usize, fill: &dyn Fn(&mut [u8], u64)) -> u32;
+    fn release(&mut self, vmo: u32);
+}
+
+fn crash_fill(out: &mut [u8], offset: u64) {
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = crash_byte(offset + i as u64);
+    }
+}
+
+/// Write `/sh8c/a.bin` through `rc` while the platform kills the server, then check it.
+/// Returns how many sessions the client had to mint (at least one: the crash was seen).
+pub fn crash_phase<L: SessionLink, const N: usize, H: CrashHost>(
+    rc: &mut Reconnecting<L, N>,
+    host: &mut H,
+) -> Result<u32, Fail> {
+    {
+        let s = &mut Session {
+            vfs: &mut *rc,
+            reply: [0; 1024],
+        };
+        for path in [&b"/sh8c/a.bin"[..], b"/sh8c/armed", b"/sh8c/held.tmp"] {
+            s.status(Request::Unlink { path }, "clean")?;
+        }
+        s.status(Request::Rmdir { path: b"/sh8c" }, "clean")?;
+        s.ok(Request::Mkdir { path: b"/sh8c" }, "mkdir")?;
+    }
+    let (file, held) = {
+        let s = &mut Session {
+            vfs: &mut *rc,
+            reply: [0; 1024],
+        };
+        let (file, _) = s.open(
+            b"/sh8c/a.bin",
+            OPEN_READ | OPEN_WRITE | OPEN_CREATE,
+            "create",
+        )?;
+        let mut chunk = [0u8; MAX_WRITE_DATA];
+        let mut at = 0;
+        while at < CRASH_A {
+            crash_fill(&mut chunk, at);
+            s.write(file, at, &chunk, "write A")?;
+            at += MAX_WRITE_DATA as u64;
+        }
+        // An unlinked file held open across the crash: it cannot come back.
+        let (held, _) = s.open(
+            b"/sh8c/held.tmp",
+            OPEN_READ | OPEN_WRITE | OPEN_CREATE,
+            "create held",
+        )?;
+        s.write(held, 0, b"held", "write held")?;
+        s.ok(
+            Request::Unlink {
+                path: b"/sh8c/held.tmp",
+            },
+            "unlink held",
+        )?;
+        (file, held)
+    };
+    let sessions_at_unlink = rc.reconnects;
+    // Part B in one committed transaction.
+    let vmo = host.vmo_filled(CRASH_B as usize, &|piece, offset| {
+        crash_fill(piece, CRASH_A + offset)
+    });
+    let bulk = if vmo == 0 {
+        None
+    } else {
+        let mut frame = [0u8; 64];
+        let n = Request::WriteVmo {
+            handle: file,
+            offset: CRASH_A,
+            len: CRASH_B as u32,
+            vmo_offset: 0,
+        }
+        .encode_into(&mut frame)
+        .ok_or("write B")?;
+        let mut reply = [0u8; 16];
+        let len = rc.call(&frame[..n], vmo, &mut reply);
+        host.release(vmo);
+        Some(parse_write_reply(&reply[..len]))
+    };
+    {
+        let s = &mut Session {
+            vfs: &mut *rc,
+            reply: [0; 1024],
+        };
+        match bulk {
+            Some(Ok(n)) if n == CRASH_B as u32 => {}
+            Some(Err(VfsError::Status(kumo_vfs::VFS_NOT_SUPPORTED))) | None => {
+                let mut piece = [0u8; MAX_WRITE_DATA];
+                let mut at = CRASH_A;
+                while at < CRASH_A + CRASH_B {
+                    crash_fill(&mut piece, at);
+                    s.write(file, at, &piece, "write B")?;
+                    at += MAX_WRITE_DATA as u64;
+                }
+            }
+            _ => return Err("write B"),
+        }
+        s.ok(Request::Flush { handle: file }, "flush")?;
+        let (armed, _) = s.open(b"/sh8c/armed", OPEN_WRITE | OPEN_CREATE, "arm")?;
+        s.close(armed, "arm")?;
+    }
+    // Part C: the server dies somewhere in here.
+    for k in 0..CRASH_C_CHUNKS {
+        host.pause();
+        let at = CRASH_A + CRASH_B + k * 256;
+        let mut chunk = [0u8; 256];
+        crash_fill(&mut chunk, at);
+        let s = &mut Session {
+            vfs: &mut *rc,
+            reply: [0; 1024],
+        };
+        s.write(file, at, &chunk, "write C")?;
+        let reply = s.call(
+            Request::Read {
+                handle: file,
+                offset: at,
+                len: 256,
+            },
+            "read C",
+        )?;
+        if read_payload(reply).map_err(|_| "read C")? != chunk {
+            return Err("read C");
+        }
+    }
+    let mut waited = 0;
+    while rc.reconnects == 0 && waited < CRASH_WAIT_PAUSES {
+        host.pause();
+        let s = &mut Session {
+            vfs: &mut *rc,
+            reply: [0; 1024],
+        };
+        s.stat(b"/sh8c/a.bin", "wait")?;
+        waited += 1;
+    }
+    if rc.reconnects == 0 {
+        return Err("no crash seen");
+    }
+    let s = &mut Session {
+        vfs: &mut *rc,
+        reply: [0; 1024],
+    };
+    // An unlinked file cannot be reopened after a crash: stale, and closing it still succeeds.
+    // Without a crash since its unlink it still reads (Linux's unlink-while-open).
+    let held_reads = s.status(
+        Request::Read {
+            handle: held,
+            offset: 0,
+            len: 4,
+        },
+        "held",
+    )? == VFS_OK;
+    if held_reads == (s.vfs.reconnects > sessions_at_unlink) {
+        return Err("held handle");
+    }
+    s.close(held, "close held")?;
+    s.ok(
+        Request::Unlink {
+            path: b"/sh8c/armed",
+        },
+        "disarm",
+    )?;
+    s.close(file, "close")?;
+    crash_file_is_whole(s)?;
+    Ok(rc.reconnects)
+}
+
+fn crash_file_is_whole<V: Vfs>(s: &mut Session<'_, V>) -> Result<(), Fail> {
+    let (h, size) = s.open(b"/sh8c/a.bin", OPEN_READ, "reread")?;
+    if size != CRASH_LEN {
+        return Err("size");
+    }
+    let mut at = 0u64;
+    let read = s.read(h, "reread", |data| {
+        let same = data
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == crash_byte(at + i as u64));
+        at += data.len() as u64;
+        same
+    })?;
+    if read != CRASH_LEN {
+        return Err("reread");
+    }
+    s.close(h, "reread")
+}
+
+/// A fresh process and session: exactly the crash phase's file, and nothing else left.
+pub fn verify_crash_phase<V: Vfs>(vfs: &mut V) -> Result<(), Fail> {
+    let s = &mut Session {
+        vfs,
+        reply: [0; 1024],
+    };
+    crash_file_is_whole(s)?;
+    s.missing(b"/sh8c/armed", "armed left")?;
+    s.missing(b"/sh8c/held.tmp", "held left")?;
+    let reply = s.call(
+        Request::ReadDir {
+            path: b"/sh8c",
+            start: 0,
+        },
+        "readdir",
+    )?;
+    let (count, mut records) = parse_dir_reply(reply).map_err(|_| "readdir")?;
+    match (count, records.next()) {
+        (1, Some(r)) if r.name == b"a.bin" && r.size == CRASH_LEN => Ok(()),
+        _ => Err("readdir"),
+    }
 }
 
 #[cfg(test)]

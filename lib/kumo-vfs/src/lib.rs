@@ -1,9 +1,9 @@
 #![no_std]
-//j860
 //j865
 //j869
 //j891
 //j924
+//j929
 
 //! `kumo-vfs` — the wire protocol for KUMO's filesystem servers.
 //!
@@ -28,6 +28,8 @@
 //! request carries a VMO and the server writes the bytes into it.
 
 /// Op code: open a file by absolute path. Reply: `(handle, size)` on success.
+pub mod reconnect;
+
 pub const OP_OPEN: u8 = 0x00;
 /// Op code: read bytes from an open handle. Reply: `[VFS_OK][data…]`.
 pub const OP_READ: u8 = 0x01;
@@ -71,6 +73,13 @@ pub const OP_CLOSE: u8 = 0x0f;
 /// `vmo_offset`, closes its copy of the VMO, and answers `[status][count: u32 LE]`. `len` is at
 /// most [`READ_VMO_MAX`]. A request without a VMO answers [`VFS_BAD_REQUEST`].
 pub const OP_READ_VMO: u8 = 0x10;
+/// Op code: write `len` file bytes from a VMO the request carries (SH8-c, j929), the mirror of
+/// [`OP_READ_VMO`]: the same [`READ_VMO_REQUEST_LEN`] frame and [`READ_VMO_MAX`] bound. The server
+/// writes bytes `[vmo_offset, vmo_offset + len)` of the VMO to `handle` at `offset` and answers
+/// like [`OP_WRITE`] (`[status][written: u32 LE]`). A server that commits answers only after the
+/// write is committed. One that cannot answers [`VFS_NOT_SUPPORTED`], and the client falls back
+/// to [`OP_WRITE`].
+pub const OP_WRITE_VMO: u8 = 0x11;
 
 /// Open option: the returned handle may read.
 pub const OPEN_READ: u8 = 1 << 0;
@@ -214,6 +223,14 @@ pub enum Request<'a> {
     /// Read up to `len` bytes of `handle` from `offset` into the VMO the message carries, at
     /// `vmo_offset` (SH7-d3a).
     ReadVmo {
+        handle: u32,
+        offset: u64,
+        len: u32,
+        vmo_offset: u64,
+    },
+    /// Write `len` bytes of the VMO the message carries, from `vmo_offset`, to `handle` at
+    /// `offset` (SH8-c).
+    WriteVmo {
         handle: u32,
         offset: u64,
         len: u32,
@@ -430,12 +447,22 @@ impl<'a> Request<'a> {
                 offset,
                 len,
                 vmo_offset,
+            }
+            | Request::WriteVmo {
+                handle,
+                offset,
+                len,
+                vmo_offset,
             } => {
                 if len > READ_VMO_MAX {
                     return None;
                 }
                 let out = buf.get_mut(..READ_VMO_REQUEST_LEN)?;
-                out[0] = OP_READ_VMO;
+                out[0] = if matches!(self, Request::ReadVmo { .. }) {
+                    OP_READ_VMO
+                } else {
+                    OP_WRITE_VMO
+                };
                 out[1..5].copy_from_slice(&handle.to_le_bytes());
                 out[5..13].copy_from_slice(&offset.to_le_bytes());
                 out[13..17].copy_from_slice(&len.to_le_bytes());
@@ -571,17 +598,29 @@ impl<'a> Request<'a> {
                 let handle = u32::from_le_bytes(raw.get(1..5)?.try_into().ok()?);
                 Some(Request::Close { handle })
             }
-            OP_READ_VMO => {
+            op @ (OP_READ_VMO | OP_WRITE_VMO) => {
                 let b = raw.get(..READ_VMO_REQUEST_LEN)?;
                 let len = u32::from_le_bytes(b[13..17].try_into().ok()?);
                 if len > READ_VMO_MAX {
                     return None;
                 }
-                Some(Request::ReadVmo {
-                    handle: u32::from_le_bytes(b[1..5].try_into().ok()?),
-                    offset: u64::from_le_bytes(b[5..13].try_into().ok()?),
-                    len,
-                    vmo_offset: u64::from_le_bytes(b[17..25].try_into().ok()?),
+                let handle = u32::from_le_bytes(b[1..5].try_into().ok()?);
+                let offset = u64::from_le_bytes(b[5..13].try_into().ok()?);
+                let vmo_offset = u64::from_le_bytes(b[17..25].try_into().ok()?);
+                Some(if op == OP_READ_VMO {
+                    Request::ReadVmo {
+                        handle,
+                        offset,
+                        len,
+                        vmo_offset,
+                    }
+                } else {
+                    Request::WriteVmo {
+                        handle,
+                        offset,
+                        len,
+                        vmo_offset,
+                    }
                 })
             }
             OP_CHMOD => {
@@ -838,6 +877,27 @@ pub fn parse_stat_reply(resp: &[u8]) -> Result<StatReply, VfsError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn write_vmo_round_trips_as_its_own_op() {
+        let request = Request::WriteVmo {
+            handle: 9,
+            offset: 77,
+            len: READ_VMO_MAX,
+            vmo_offset: 0x1000,
+        };
+        let mut buf = [0u8; 64];
+        let n = request.encode_into(&mut buf).unwrap();
+        assert_eq!((n, buf[0]), (READ_VMO_REQUEST_LEN, OP_WRITE_VMO));
+        assert_eq!(Request::decode(&buf[..n]), Some(request));
+        let too_big = Request::WriteVmo {
+            handle: 9,
+            offset: 0,
+            len: READ_VMO_MAX + 1,
+            vmo_offset: 0,
+        };
+        assert_eq!(too_big.encode_into(&mut buf), None);
+    }
+
     #[test]
     fn read_vmo_round_trips_and_refuses_oversized_windows() {
         let request = Request::ReadVmo {

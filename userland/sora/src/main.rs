@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j917
 //j923
 //j924
 //j925
 //j928
+//j929
 
 extern crate alloc;
 
@@ -2674,8 +2674,13 @@ struct Media {
     control: Handle,
     /// Its storage controller, the `N` of `/dev/disk<N>s1` (J766).
     device: usize,
-    /// The mount-scoped `fatfs` server process (SH3-c2), killed on umount or device loss.
+    /// The mount-scoped server process (SH3-c2), killed on umount or device loss.
     process: Handle,
+    /// Its koid, for the serve loop's termination watch (SH8-c).
+    process_koid: u64,
+    /// j929 (SH8-c): Sora's duplicate of the control channel's server end, which keeps the
+    /// endpoint alive across a redoxfsd crash; 0 for an unsupervised fatfs mount.
+    server_end: Handle,
 }
 
 /// J766: the volume each storage controller's driver offers, mounted or not. `mount` mounts one
@@ -2700,16 +2705,33 @@ fn set_device(index: usize, device: Option<Device>) {
 /// client gets a session on it, which is what makes advisory locks and renames shared.
 fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaName) {
     let filesystem = sora::StorageTransport::of(index).filesystem();
-    let Some((control, process)) = spawn_mount_server(initrd, device, filesystem) else {
+    let Some((control, process, server_end)) = spawn_mount_server(initrd, device, filesystem)
+    else {
         log(b"media: mount-scoped server unavailable\n");
         return;
     };
+    let process_koid = handle_koid(process);
+    if server_end.0 != 0 {
+        let mut supervisor = MEDIA_SUPERVISOR.get();
+        supervisor.initrd = initrd;
+        supervisor.intensity = sora::RestartIntensity::new(10_000_000_000);
+        supervisor.backoff = sora::RestartBackoff::new(50_000_000, 400_000_000);
+        supervisor.instance = 1;
+        MEDIA_SUPERVISOR.set(supervisor);
+        media_watch(process);
+        let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+        if port.0 != 0 {
+            let _ = port_bind(port, process);
+        }
+    }
     set_media(Some(Media {
         name,
         ready: device.ready,
         control,
         device: index,
         process,
+        process_koid,
+        server_end,
     }));
     notice(&[
         b"media: ",
@@ -6606,6 +6628,7 @@ extern "C" fn sora_main(
                     gpu_client_process.is_some() || gpu_restart_timer.is_some(),
                 )
                 || netstack_event(raw_source)
+                || media_event(raw_source)
             {
                 continue;
             }
@@ -7258,6 +7281,11 @@ fn eval_command(
                 ax4_gate_arm(port, initrd, root);
             }
         }
+        return true;
+    }
+    #[cfg(feature = "fsd-crash-proof")]
+    if cmd.name == "fsd-crash-proof" {
+        fsd_crash_proof();
         return true;
     }
     #[cfg(feature = "netstack-restart-proof")]
@@ -8007,6 +8035,9 @@ fn media_offered(
         }
         if let Some(gone) = media().filter(|media| media.control == control) {
             set_media(None);
+            if gone.server_end.0 != 0 {
+                let _ = handle_close(gone.server_end);
+            }
             if gone.process.0 != 0 {
                 let _ = process_kill(gone.process);
                 let _ = handle_close(gone.process);
@@ -12593,6 +12624,14 @@ fn umount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
         return;
     }
     set_media(None);
+    // A planned unmount: `media` is already clear, so the supervisor never restarts it.
+    let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+    if port.0 != 0 && media.server_end.0 != 0 {
+        let _ = port_unbind(port, media.process);
+    }
+    if media.server_end.0 != 0 {
+        let _ = handle_close(media.server_end);
+    }
     if media.process.0 != 0 {
         let _ = process_kill(media.process);
         let _ = handle_close(media.process);
@@ -12851,11 +12890,14 @@ fn check_volume_directory(fs: Option<Handle>, path: &[u8]) -> Result<(), Directo
 /// the same mount bootstrap and session grants. Only the work volume, which Sora made blank
 /// itself, is handed over with permission to format; redoxfsd still mounts a RedoxFS it finds
 /// there, so a respawn never erases the tree. — TEAL
+/// j929 (SH8-c): for redoxfsd, Sora also keeps a duplicate of the control channel's server end
+/// (the third value; 0 for fatfs). Clients' control ends then outlive a crashed server, and a
+/// respawned one inherits the same endpoint with any grants still queued in it (DESIGN/010 §3).
 fn spawn_mount_server(
     initrd: Handle,
     device: Device,
     filesystem: sora::Filesystem,
-) -> Option<(Handle, Handle)> {
+) -> Option<(Handle, Handle, Handle)> {
     let (control_raw, server_raw) = channel_create_pair();
     if control_raw == u64::MAX || server_raw == u64::MAX {
         for end in [control_raw, server_raw] {
@@ -12868,43 +12910,26 @@ fn spawn_mount_server(
     }
     let control = Handle(control_raw as u32);
     let server = Handle(server_raw as u32);
-    let (block_client_raw, block_server_raw) = channel_create_pair();
-    if block_client_raw == u64::MAX || block_server_raw == u64::MAX {
-        for end in [control_raw, server_raw, block_client_raw, block_server_raw] {
-            if end != u64::MAX {
-                let _ = handle_close(Handle(end as u32));
-            }
-        }
-        log(b"media: block channel unavailable\n");
-        return None;
+    if filesystem == sora::Filesystem::RedoxFs {
+        let Some(keep) = syscall_handle(handle_duplicate(server, CONTROL_RIGHTS)) else {
+            let _ = handle_close(control);
+            let _ = handle_close(server);
+            log(b"media: control endpoint could not be kept\n");
+            return None;
+        };
+        let Some(process) = start_redoxfsd(initrd, device, server, drv_blk::MOUNT_FORMAT) else {
+            let _ = handle_close(control);
+            let _ = handle_close(keep);
+            return None;
+        };
+        return Some((control, process, keep));
     }
-    let block_client = Handle(block_client_raw as u32);
-    let access = if device.ready.read_only {
-        BlockAccess::ReadOnly
-    } else {
-        BlockAccess::ReadWrite
-    };
-    let connect = drv_blk::encode_connect(access);
-    if channel_write_with_handle(
-        device.control,
-        connect.as_ptr(),
-        connect.len(),
-        Handle(block_server_raw as u32),
-    ) != Errno::Ok.status()
-    {
+    let Some(block_client) = connect_block_client(device) else {
         let _ = handle_close(control);
         let _ = handle_close(server);
-        let _ = handle_close(block_client);
-        log(b"media: driver connect failed\n");
         return None;
-    }
-    let flagged =
-        drv_blk::encode_mount_bootstrap_flags(device.ready.block_count, drv_blk::MOUNT_FORMAT);
-    let plain = drv_blk::encode_mount_bootstrap(device.ready.block_count);
-    let (bootstrap, image, name): (&[u8], &str, &[u8]) = match filesystem {
-        sora::Filesystem::Fat32 => (&plain, FATFS_PATH, b"fatfs"),
-        sora::Filesystem::RedoxFs => (&flagged, REDOXFSD_PATH, b"redoxfsd"),
     };
+    let bootstrap = drv_blk::encode_mount_bootstrap(device.ready.block_count);
     if channel_write_with_handle(control, bootstrap.as_ptr(), bootstrap.len(), block_client)
         != Errno::Ok.status()
     {
@@ -12918,11 +12943,11 @@ fn spawn_mount_server(
     let mut kept = None;
     if !run_elf_threads(
         initrd,
-        image.as_bytes(),
+        FATFS_PATH.as_bytes(),
         0,
         server_raw,
         flags,
-        name,
+        b"fatfs",
         0,
         Some(&mut kept),
     ) {
@@ -12935,12 +12960,320 @@ fn spawn_mount_server(
         let _ = handle_close(server);
         return None;
     };
-    Some((control, process))
+    Some((control, process, Handle(0)))
+}
+
+/// What Sora keeps, and hands, of a mount's control endpoint.
+const CONTROL_RIGHTS: Rights = Rights(
+    Rights::READ.0 | Rights::WRITE.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0 | Rights::WAIT.0,
+);
+
+/// A new client channel on the device's driver, with the access the device allows.
+fn connect_block_client(device: Device) -> Option<Handle> {
+    let (client_raw, server_raw) = channel_create_pair();
+    if client_raw == u64::MAX || server_raw == u64::MAX {
+        for end in [client_raw, server_raw] {
+            if end != u64::MAX {
+                let _ = handle_close(Handle(end as u32));
+            }
+        }
+        log(b"media: block channel unavailable\n");
+        return None;
+    }
+    let access = if device.ready.read_only {
+        BlockAccess::ReadOnly
+    } else {
+        BlockAccess::ReadWrite
+    };
+    let connect = drv_blk::encode_connect(access);
+    if channel_write_with_handle(
+        device.control,
+        connect.as_ptr(),
+        connect.len(),
+        Handle(server_raw as u32),
+    ) != Errno::Ok.status()
+    {
+        let _ = handle_close(Handle(client_raw as u32));
+        let _ = handle_close(Handle(server_raw as u32));
+        log(b"media: driver connect failed\n");
+        return None;
+    }
+    Some(Handle(client_raw as u32))
+}
+
+/// j929 (SH8-c): start one redoxfsd instance. Its bootstrap travels on a fresh channel, never the
+/// shared control channel (where client grants may already be queued): first the mount
+/// bootstrap carrying a new block channel, then `[K]` carrying `control_server`, the control
+/// endpoint the instance serves sessions from. `control_server` is consumed. — TEAL
+fn start_redoxfsd(
+    initrd: Handle,
+    device: Device,
+    control_server: Handle,
+    flags: u8,
+) -> Option<Handle> {
+    let Some(block_client) = connect_block_client(device) else {
+        let _ = handle_close(control_server);
+        return None;
+    };
+    let (boot_raw, child_raw) = channel_create_pair();
+    if boot_raw == u64::MAX || child_raw == u64::MAX {
+        for end in [boot_raw, child_raw] {
+            if end != u64::MAX {
+                let _ = handle_close(Handle(end as u32));
+            }
+        }
+        let _ = handle_close(block_client);
+        let _ = handle_close(control_server);
+        log(b"media: bootstrap channel unavailable\n");
+        return None;
+    }
+    let boot = Handle(boot_raw as u32);
+    let bootstrap = drv_blk::encode_mount_bootstrap_flags(device.ready.block_count, flags);
+    let control_tag = [drv_blk::MOUNT_CONTROL_TAG];
+    let sent = channel_write_with_handle(boot, bootstrap.as_ptr(), bootstrap.len(), block_client)
+        == Errno::Ok.status();
+    if !sent {
+        let _ = handle_close(block_client);
+    }
+    let sent = sent
+        && channel_write_with_handle(boot, control_tag.as_ptr(), 1, control_server)
+            == Errno::Ok.status();
+    let _ = handle_close(boot);
+    if !sent {
+        let _ = handle_close(control_server);
+        let _ = handle_close(Handle(child_raw as u32));
+        log(b"media: mount bootstrap failed\n");
+        return None;
+    }
+    let run = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    let mut kept = None;
+    if !run_elf_threads(
+        initrd,
+        REDOXFSD_PATH.as_bytes(),
+        0,
+        child_raw,
+        run,
+        b"redoxfsd",
+        0,
+        Some(&mut kept),
+    ) {
+        return None;
+    }
+    kept
+}
+
+/// j929 (SH8-c) gate II proof: wait (through a session of Sora's own) until the background probe
+/// has created `/sh8c/armed`, kill the mount's redoxfsd while the probe holds open handles, and
+/// let the supervisor bring a replacement up on the same control endpoint. — TEAL
+#[cfg(feature = "fsd-crash-proof")]
+fn fsd_crash_proof() {
+    const ATTEMPTS: u32 = 400;
+    let armed = (|| {
+        let session = media_session(BlockAccess::ReadOnly)?;
+        let mut frame = [0u8; 64];
+        let n = kumo_vfs::Request::Stat {
+            path: b"/sh8c/armed",
+        }
+        .encode_into(&mut frame)?;
+        let mut found = false;
+        for _ in 0..ATTEMPTS {
+            let mut reply = [0u8; 32];
+            if channel_write(session, frame.as_ptr(), n) != 0
+                || !wait_readable(session, 1_000_000_000)
+            {
+                break;
+            }
+            let got = channel_read(session, reply.as_mut_ptr(), reply.len());
+            if got != 0 && got != u64::MAX && reply[0] == kumo_vfs::VFS_OK {
+                found = true;
+                break;
+            }
+            let _ = kumo_rt::sleep_ns(50_000_000);
+        }
+        let _ = handle_close(session);
+        Some(found)
+    })();
+    if armed != Some(true) {
+        log_line(&[b"fsd-crash-proof: FAIL the probe never armed\n"], 1);
+        return;
+    }
+    let Some(media) = media() else {
+        log_line(&[b"fsd-crash-proof: FAIL nothing mounted\n"], 1);
+        return;
+    };
+    if process_kill(media.process) != 0 {
+        log_line(&[b"fsd-crash-proof: FAIL kill refused\n"], 1);
+        return;
+    }
+    log(b"fsd-crash-proof: redoxfsd killed with the probe's handles open\n");
+    if !media_process_exited(media.process, 5_000_000_000) {
+        log_line(&[b"fsd-crash-proof: FAIL the kill was never observed\n"], 1);
+        return;
+    }
+    // The supervisor's own check would consume the queued termination again: say it died.
+    if !media_respawn_after_exit() {
+        log_line(&[b"fsd-crash-proof: FAIL no replacement\n"], 1);
+        return;
+    }
+    log(b"fsd-crash-proof: replacement serving\n");
+}
+
+/// j929 (SH8-c): the mount server's supervisor (DESIGN/002, PLAN/021 AX7): restarts inside an
+/// intensity window, with backoff, then give-up.
+#[derive(Clone, Copy)]
+struct MediaSupervisor {
+    initrd: Handle,
+    intensity: sora::RestartIntensity<3>,
+    backoff: sora::RestartBackoff,
+    instance: u32,
+}
+
+static MEDIA_SUPERVISOR: Shared<MediaSupervisor> =
+    Shared(core::cell::UnsafeCell::new(MediaSupervisor {
+        initrd: Handle(0),
+        intensity: sora::RestartIntensity::new(10_000_000_000),
+        backoff: sora::RestartBackoff::new(50_000_000, 400_000_000),
+        instance: 0,
+    }));
+
+/// The mount server's watch port. Each instance is bound to it when it starts, because a
+/// port bound only after a kill can miss TERMINATED once the kernel clears the dead slot.
+static MEDIA_PORT: AtomicU32 = AtomicU32::new(0);
+
+fn media_port() -> Option<Handle> {
+    let mut port = Handle(MEDIA_PORT.load(Ordering::Relaxed));
+    if port.0 == 0 {
+        port = syscall_handle(port_create())?;
+        MEDIA_PORT.store(port.0, Ordering::Relaxed);
+    }
+    Some(port)
+}
+
+/// Watch a new mount server instance for its termination.
+fn media_watch(process: Handle) {
+    if let Some(port) = media_port() {
+        let _ = port_bind(port, process);
+    }
+}
+
+/// Wait up to `ns` for `process` (watched since it started) to terminate. A deadline of a
+/// microsecond is a non-blocking check: a termination already queued wakes the port first.
+fn media_process_exited(process: Handle, ns: u64) -> bool {
+    let Some(port) = media_port() else {
+        return false;
+    };
+    let koid = handle_koid(process);
+    let Some(timer) = syscall_handle(timer_create(ns)) else {
+        return false;
+    };
+    let timer_koid = handle_koid(timer);
+    if koid == u64::MAX || timer_koid == u64::MAX || port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return false;
+    }
+    let mut exited = false;
+    loop {
+        let source = port_wait(port);
+        if source == koid {
+            exited = true;
+            if ns > 1_000 {
+                break;
+            }
+        } else if source == timer_koid || source == u64::MAX {
+            break;
+        }
+        // Anything else is an earlier instance's termination, already handled.
+    }
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    if exited {
+        let _ = port_unbind(port, process);
+    }
+    exited
+}
+
+/// The serve loop's hook: the supervised mount server died.
+fn media_event(source: u64) -> bool {
+    let Some(media) = media() else {
+        return false;
+    };
+    if media.server_end.0 == 0 || media.process_koid != source {
+        return false;
+    }
+    let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+    if port.0 != 0 {
+        let _ = port_unbind(port, media.process);
+    }
+    media_supervise();
+    true
+}
+
+/// Restart the mount's redoxfsd if it has died (a crash, never an `umount`, which clears
+/// `media` first). Called from the serve loop's watch and lazily before every new session,
+/// because autoexec runs outside the serve loop. Returns whether a live server is mounted.
+fn media_supervise() -> bool {
+    let Some(media) = media() else {
+        return false;
+    };
+    if media.server_end.0 == 0 || !media_process_exited(media.process, 1_000) {
+        return true;
+    }
+    media_respawn_after_exit()
+}
+
+/// The mount's server is known dead: restart it within the budget, or give the mount up.
+fn media_respawn_after_exit() -> bool {
+    let Some(mut media) = media() else {
+        return false;
+    };
+    let _ = handle_close(media.process);
+    log(b"redoxfsd: terminated; sessions invalidated, the control endpoint kept\n");
+    let mut supervisor = MEDIA_SUPERVISOR.get();
+    let device = DEVICES.get()[media.device];
+    let budget = supervisor.intensity.try_consume(kumo_rt::clock_get());
+    let replacement = match (budget, device) {
+        (true, Some(device)) => {
+            let _ = kumo_rt::sleep_ns(supervisor.backoff.next_delay_ns());
+            syscall_handle(handle_duplicate(media.server_end, CONTROL_RIGHTS))
+                .and_then(|server| start_redoxfsd(supervisor.initrd, device, server, 0))
+        }
+        _ => None,
+    };
+    let Some(process) = replacement else {
+        MEDIA_SUPERVISOR.set(supervisor);
+        set_media(None);
+        let _ = handle_close(media.server_end);
+        let _ = handle_close(media.control);
+        notice(&[
+            b"redoxfsd: giving up (restart intensity or resources exhausted); /media/",
+            media.name.as_bytes(),
+            b" unmounted\n",
+        ]);
+        return false;
+    };
+    supervisor.instance += 1;
+    MEDIA_SUPERVISOR.set(supervisor);
+    media_watch(process);
+    media.process = process;
+    media.process_koid = handle_koid(process);
+    let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+    if port.0 != 0 {
+        let _ = port_bind(port, process);
+    }
+    set_media(Some(media));
+    log(b"redoxfsd: supervised instance ");
+    log_dec(u64::from(supervisor.instance));
+    log(b" ready\n");
+    true
 }
 
 /// Mint one client session on the mount-scoped server (SH3-c2): `[b'S'][access]` carries
 /// the server end over the control channel; the client end becomes the program's fs grant.
 fn media_session(access: BlockAccess) -> Option<Handle> {
+    // j929: a crashed redoxfsd is restarted before anyone is handed a session on it.
+    if !media_supervise() {
+        return None;
+    }
     let media = media()?;
     let (client_raw, server_raw) = channel_create_pair();
     if client_raw == u64::MAX || server_raw == u64::MAX {
@@ -13291,7 +13624,15 @@ fn run_with_startup_input_with_env(
     let fs_child = match fs {
         FsGrant::None => None,
         FsGrant::Image => spawn_fatfs(initrd),
-        FsGrant::Media(access) => media_session(access),
+        FsGrant::Media(access) => media_session(access).inspect(|_| {
+            // j929 (SH8-c, D6): a read-write client of a supervised mount also gets the
+            // control endpoint, so it can mint a new session after a server crash.
+            if access == BlockAccess::ReadWrite {
+                fs_control = media()
+                    .filter(|m| m.server_end.0 != 0)
+                    .and_then(|m| syscall_handle(handle_duplicate(m.control, CONTROL_RIGHTS)));
+            }
+        }),
         FsGrant::ImageMount => spawn_fatfs_mount(initrd).map(|(session, control)| {
             fs_control = Some(control);
             session

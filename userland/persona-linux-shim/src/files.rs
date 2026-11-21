@@ -1,8 +1,8 @@
-//j918
 //j919
 //j921
 //j924
 //j925
+//j929
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -19,6 +19,7 @@ use kumo_rt::{
     channel_write_with_handle, handle_close, handle_duplicate, log_write, vmar_map_anywhere,
     vmo_create,
 };
+use kumo_vfs::reconnect::{LinkError, Reconnecting, SessionLink};
 use kumo_vfs::{
     parse_dir_reply, parse_open_reply, parse_read_vmo_reply, parse_stat_reply, parse_write_reply,
     read_payload, Request, VfsError, MAX_WRITE_DATA, OPEN_CREATE, OPEN_READ, OPEN_WRITE,
@@ -257,6 +258,7 @@ pub fn init(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle) {
     let s = session();
     s.fs = fs;
     s.fs_mount = fs_mount;
+    vfs_reset(fs, fs_mount);
     s.stdin = stdin;
     s.stdout = stdout;
     new_fd(Kind::Stdin, &[], O_RDONLY).expect("stdin slot");
@@ -266,22 +268,116 @@ pub fn init(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle) {
 
 // ---- the vfs session -----------------------------------------------------------------------
 
-/// One request/reply exchange with the filesystem. `None` when there is no grant or it is gone.
+/// j929 (SH8-c): the shim's filesystem session, as a [`Reconnecting`] one. When the launch
+/// granted the mount's control endpoint (`fs_mount`) and the mount's server is restarted by
+/// its supervisor, the next request mints a new session, reopens every open file by path and
+/// retries (DESIGN/002 §2). Without a control endpoint a dead session answers EIO, as before.
+/// Every vfs request goes through here, so the handles the shim stores are this wrapper's
+/// stable ones. — TEAL
+struct ShimLink {
+    fs: Handle,
+    control: Handle,
+}
+
+impl SessionLink for ShimLink {
+    fn exchange(&mut self, request: &[u8], vmo: u32, reply: &mut [u8]) -> Result<usize, LinkError> {
+        let sent = if vmo == 0 {
+            channel_write(self.fs, request.as_ptr(), request.len())
+        } else {
+            // A copy travels, so a retry can carry the VMO again. DUPLICATE stays (SH7-d3b): a
+            // block-backed fatfs hands a copy to the block driver.
+            let raw = handle_duplicate(
+                Handle(vmo),
+                Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0),
+            );
+            if raw == 0 || raw == u64::MAX {
+                read_vmo_trouble(b"duplicate", raw);
+                return Err(LinkError::Failed);
+            }
+            let status = channel_write_with_handle(
+                self.fs,
+                request.as_ptr(),
+                request.len(),
+                Handle(raw as u32),
+            );
+            if status != 0 {
+                let _ = handle_close(Handle(raw as u32));
+            }
+            status
+        };
+        if sent != 0 {
+            return Err(LinkError::Closed);
+        }
+        let n = channel_read(self.fs, reply.as_mut_ptr(), reply.len());
+        if n == 0 || n == u64::MAX {
+            return Err(LinkError::Closed);
+        }
+        if n > reply.len() as u64 {
+            return Err(LinkError::Failed);
+        }
+        Ok(n as usize)
+    }
+
+    fn reconnect(&mut self) -> bool {
+        if self.control.0 == 0 {
+            return false;
+        }
+        let (client, server) = channel_create_pair();
+        if client == u64::MAX || server == u64::MAX {
+            return false;
+        }
+        let grant = [kumo_vfs::SESSION_GRANT, kumo_vfs::SESSION_ACCESS_READ_WRITE];
+        if channel_write_with_handle(
+            self.control,
+            grant.as_ptr(),
+            grant.len(),
+            Handle(server as u32),
+        ) != 0
+        {
+            let _ = handle_close(Handle(server as u32));
+            let _ = handle_close(Handle(client as u32));
+            return false;
+        }
+        let _ = handle_close(self.fs);
+        self.fs = Handle(client as u32);
+        log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"persona-linux: filesystem session lost; reconnected over the mount control endpoint\n",
+        );
+        true
+    }
+}
+
+static mut VFS: Reconnecting<ShimLink, MAX_FDS> = Reconnecting::new(ShimLink {
+    fs: Handle(0),
+    control: Handle(0),
+});
+
+fn vfs() -> &'static mut Reconnecting<ShimLink, MAX_FDS> {
+    // SAFETY: as `session()`: every caller holds the shim lock.
+    unsafe { &mut *core::ptr::addr_of_mut!(VFS) }
+}
+
+/// Start over on a (new) session: no handles, no reconnects.
+fn vfs_reset(fs: Handle, fs_mount: Handle) {
+    *vfs() = Reconnecting::new(ShimLink {
+        fs,
+        control: fs_mount,
+    });
+}
+
+/// One request/reply exchange with the filesystem. `None` when there is no grant.
 fn vfs_call<'r>(request: &Request<'_>, reply: &'r mut [u8]) -> Option<&'r [u8]> {
-    let fs = session().fs;
-    if fs.0 == 0 {
+    if session().fs.0 == 0 {
         return None;
     }
     let mut frame = [0u8; 16 + PATH_MAX * 2];
     let len = request.encode_into(&mut frame)?;
-    if channel_write(fs, frame.as_ptr(), len) != 0 {
+    let n = vfs().call(&frame[..len], 0, reply);
+    if n == 0 {
         return None;
     }
-    let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
-    if n == 0 || n == u64::MAX {
-        return None;
-    }
-    Some(&reply[..n as usize])
+    Some(&reply[..n])
 }
 
 fn status_errno(error: VfsError) -> i64 {
@@ -316,8 +412,7 @@ fn vfs_status(request: &Request<'_>) -> i64 {
 /// which fatfs maps for that request alone and closes. Returns how many bytes landed (short
 /// only at end of file), or a negative errno.
 pub fn vfs_read_vmo(handle: u32, offset: u64, vmo: Handle, vmo_offset: u64, len: u64) -> i64 {
-    let fs = session().fs;
-    if fs.0 == 0 {
+    if session().fs.0 == 0 {
         return -errno::EIO;
     }
     let mut done = 0u64;
@@ -333,30 +428,10 @@ pub fn vfs_read_vmo(handle: u32, offset: u64, vmo: Handle, vmo_offset: u64, len:
         .encode_into(&mut frame) else {
             return -errno::EINVAL;
         };
-        // The rights VmoCreate gave. DUPLICATE stays (SH7-d3b): a block-backed fatfs hands a
-        // copy to the block driver, which writes the sectors into it directly.
-        let raw = handle_duplicate(
-            vmo,
-            Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0),
-        );
-        if raw == 0 || raw == u64::MAX {
-            read_vmo_trouble(b"duplicate", raw);
-            return -errno::ENOMEM;
-        }
-        let carried = Handle(raw as u32);
-        let status = channel_write_with_handle(fs, frame.as_ptr(), n, carried);
-        if status != 0 {
-            read_vmo_trouble(b"send", status as u64);
-            let _ = handle_close(carried);
-            return -errno::EIO;
-        }
+        // j929: the reconnecting session carries a fresh copy of `vmo` on every attempt.
         let mut reply = [0u8; kumo_vfs::READ_VMO_REPLY_LEN];
-        let got = channel_read(fs, reply.as_mut_ptr(), reply.len());
-        if got == 0 || got == u64::MAX {
-            read_vmo_trouble(b"reply", got);
-            return -errno::EIO;
-        }
-        let count = match parse_read_vmo_reply(&reply[..got as usize]) {
+        let got = vfs().call(&frame[..n], vmo.0, &mut reply);
+        let count = match parse_read_vmo_reply(&reply[..got]) {
             Ok(count) => count as u64,
             Err(error) => {
                 read_vmo_trouble(b"status", reply[0] as u64);
@@ -2063,6 +2138,7 @@ pub fn adopt_spawn(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle, 
     let s = session();
     s.fs = fs;
     s.fs_mount = fs_mount;
+    vfs_reset(fs, fs_mount);
     s.stdin = stdin;
     s.stdout = stdout;
     s.files = [OpenFile::FREE; MAX_FDS];

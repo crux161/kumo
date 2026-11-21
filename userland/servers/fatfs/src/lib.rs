@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j869
 //j891
 //j892
 //j924
 //j925
+//j929
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -639,6 +639,8 @@ pub fn dispatch_shared_bulk<R: SectorReader + SectorWriter, W: BulkWindow>(
             chmod_shared(volume, io, &mut server.modes, path, mode, reply)
         }
         Some(Request::Link { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
+        // SH8-c (j929): bulk writes are RedoxFS's; FAT clients fall back to `Write`.
+        Some(Request::WriteVmo { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
         None => write_status(reply, VFS_BAD_REQUEST),
     }
 }
@@ -771,6 +773,7 @@ pub fn dispatch_bulk<R: SectorReader + SectorWriter, W: BulkWindow>(
         Some(Request::Chmod { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
         // FAT has no hard links; the documented fallback lives in the client.
         Some(Request::Link { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
+        Some(Request::WriteVmo { .. }) => write_status(reply, VFS_NOT_SUPPORTED),
         None => write_status(reply, VFS_BAD_REQUEST),
     }
 }

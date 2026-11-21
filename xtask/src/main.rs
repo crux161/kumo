@@ -1,8 +1,8 @@
-//j920
 //j921
 //j924
 //j925
 //j928
+//j929
 
 use std::env;
 use std::fmt;
@@ -1520,6 +1520,10 @@ fn build_sora_image(root: &Path, board: &str) -> Result<Vec<u8>, String> {
     };
     if net_restart_proof_enabled(proof.as_deref(), board)? {
         args.extend(["--features", "netstack-restart-proof"]);
+    }
+    // j929 (SH8-c): the RedoxFS proof image carries the probe and the crash word together.
+    if env::var("KUMO_REDOXPROBE").as_deref() == Ok("1") {
+        args.extend(["--features", "fsd-crash-proof"]);
     }
     run_cargo(root, &args)?;
 

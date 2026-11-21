@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 //j928
+//j929
 //! The resident `redoxfsd`: the tested handler in this crate's library over a `drv-blk`
 //! volume channel, serving `kumo-vfs` sessions exactly as fatfs's mount-scoped server does
 //! (SH8-b).
@@ -171,7 +172,6 @@ fn serve(control: Handle, fs: FileSystem<Disk>) -> ! {
             if n == 0 {
                 let _ = port_unbind(port, control);
                 if sessions.iter().all(Option::is_none) {
-                    let _ = server.commit_pending();
                     kumo_rt::process_exit(0);
                 }
                 continue;
@@ -224,10 +224,6 @@ fn serve(control: Handle, fs: FileSystem<Disk>) -> ! {
                 sessions[index] = None;
                 server.close_session(index);
                 log_info(b"redoxfsd: session closed\n");
-                if sessions.iter().all(Option::is_none) {
-                    // Nobody is left to ask for a flush: commit coalesced writes now.
-                    let _ = server.commit_pending();
-                }
                 continue;
             }
             let reply_len = server.dispatch(
@@ -259,9 +255,9 @@ extern "C" fn main(
     _arg7: u64,
 ) -> ! {
     log_info(b"redoxfsd starting\n");
-    let control = Handle(bootstrap_channel as u32);
+    let bootstrap = Handle(bootstrap_channel as u32);
     let mut header = [0u8; drv_blk::MOUNT_FLAGS_BOOTSTRAP_LEN];
-    let (n, raw) = channel_read_with_handle(control, header.as_mut_ptr(), header.len());
+    let (n, raw) = channel_read_with_handle(bootstrap, header.as_mut_ptr(), header.len());
     let Some(blocks) = valid(raw) else {
         fail(b"redoxfsd: bootstrap carried no volume channel\n");
     };
@@ -271,5 +267,17 @@ extern "C" fn main(
         fail(b"redoxfsd: bootstrap is not a mount bootstrap\n");
     };
     let fs = mount(blocks, block_count, flags);
-    serve(control, fs)
+    // j929 (SH8-c): the launcher sends the control endpoint next, on this private bootstrap
+    // channel, so a restarted instance never mistakes a client's queued grant for its bootstrap.
+    let mut tag = [0u8; 1];
+    let (n, raw) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
+    let _ = handle_close(bootstrap);
+    match valid(raw) {
+        Some(endpoint) if n == 1 && tag[0] == drv_blk::MOUNT_CONTROL_TAG => serve(endpoint, fs),
+        Some(extra) => {
+            let _ = handle_close(extra);
+            fail(b"redoxfsd: unexpected bootstrap message\n")
+        }
+        None => fail(b"redoxfsd: bootstrap carried no control endpoint\n"),
+    }
 }

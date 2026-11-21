@@ -1,4 +1,5 @@
 //j928
+//j929
 //! Host proofs for redoxfsd's VFS handler, over the drv-blk protocol and a driver with a
 //! volatile write cache (KESTREL's j926 model: only CMD_FLUSH makes bytes stable).
 use super::*;
@@ -243,11 +244,10 @@ fn a_tree_written_through_the_vfs_survives_power_loss_and_remount() {
         c.write_all(h, 0, b"[package]\nname = \"ws\"\n");
         assert_eq!(c.status(Request::Close { handle: h }), VFS_OK);
     }
-    // 256-byte VFS writes coalesce: a few commits per 64 KiB, not one per write.
-    assert!(
-        server.write_commits <= (big.len() / WRITE_COALESCE_MAX + 3) as u64,
-        "{} commits",
-        server.write_commits
+    // SH8-c: every 256-byte VFS write is its own committed transaction.
+    assert_eq!(
+        server.write_commits,
+        (big.len().div_ceil(MAX_WRITE_DATA) + 1) as u64
     );
     let mut server = remount(server);
     let mut c = Client::on(&mut server, 0);
@@ -309,21 +309,21 @@ fn a_tree_written_through_the_vfs_survives_power_loss_and_remount() {
 }
 
 #[test]
-fn acknowledged_but_unflushed_writes_are_page_cache_not_disk() {
+fn an_acknowledged_write_survives_power_loss_without_flush_or_close() {
     let mut server = fresh();
     let mut c = Client::on(&mut server, 0);
     let h = c.create("/draft");
-    c.write_all(h, 0, b"not yet");
-    // The handle is still open and nothing else ran: the bytes wait in the coalescing buffer.
-    let server = remount(server);
-    let mut server = server;
-    let mut c = Client::on(&mut server, 0);
-    let (_, size) = c.open("/draft", OPEN_READ).unwrap();
-    assert_eq!(size, 0, "the create committed; the unflushed write did not");
+    c.write_all(h, 0, b"already on disk");
+    // No flush, no close, nothing else ran: the acknowledgement was the commit.
+    let mut server = remount(server);
+    assert_eq!(
+        Client::on(&mut server, 0).read_file("/draft"),
+        b"already on disk"
+    );
 }
 
 #[test]
-fn a_deferred_write_failure_is_reported_once_by_flush_and_never_corrupts() {
+fn a_failed_write_is_its_own_answer_and_never_corrupts() {
     let mut server = fresh();
     {
         let mut c = Client::on(&mut server, 0);
@@ -332,13 +332,16 @@ fn a_deferred_write_failure_is_reported_once_by_flush_and_never_corrupts() {
         assert_eq!(c.status(Request::Close { handle: h }), VFS_OK);
         let (h, _) = c.open("/kept", OPEN_READ | OPEN_WRITE).unwrap();
         c.server.fs.disk.inner_mut().transport_mut().writes_left = Some(0);
-        c.write_all(h, 0, b"doomed rewrite!");
-        assert_eq!(c.status(Request::Flush { handle: h }), VFS_IO_ERROR);
         assert_eq!(
-            c.status(Request::Flush { handle: h }),
-            VFS_OK,
-            "reported once"
+            c.status(Request::Write {
+                handle: h,
+                offset: 0,
+                data: b"doomed rewrite!"
+            }),
+            VFS_IO_ERROR,
+            "the failure answers the write itself"
         );
+        assert_eq!(c.status(Request::Flush { handle: h }), VFS_OK);
         c.server.fs.disk.inner_mut().transport_mut().writes_left = None;
         assert_eq!(c.read_all(h), b"committed bytes");
         assert_eq!(c.status(Request::Close { handle: h }), VFS_OK);
@@ -351,13 +354,34 @@ fn a_deferred_write_failure_is_reported_once_by_flush_and_never_corrupts() {
 }
 
 #[test]
-fn a_failed_commit_at_close_is_the_close_status() {
+fn write_vmo_is_one_committed_transaction() {
     let mut server = fresh();
-    let mut c = Client::on(&mut server, 0);
-    let h = c.create("/f");
-    c.server.fs.disk.inner_mut().transport_mut().writes_left = Some(0);
-    c.write_all(h, 0, &[1; 600]);
-    assert_eq!(c.status(Request::Close { handle: h }), VFS_IO_ERROR);
+    let data = pattern(3 * 128 * 1024 + 999, 5);
+    let mut window = BufWindow(data.clone());
+    let h = Client::on(&mut server, 0).create("/bulk");
+    let commits = server.write_commits;
+    let mut frame = [0u8; REQUEST_BUF_BYTES];
+    let n = Request::WriteVmo {
+        handle: h,
+        offset: 10,
+        len: data.len() as u32,
+        vmo_offset: 0,
+    }
+    .encode_into(&mut frame)
+    .unwrap();
+    let mut reply = [0u8; REPLY_BUF_BYTES];
+    let len = server.dispatch(0, &frame[..n], 7, &mut window, &mut reply);
+    assert_eq!(parse_write_reply(&reply[..len]), Ok(data.len() as u32));
+    assert_eq!(server.write_commits, commits + 1);
+    let len = server.dispatch(0, &frame[..n], 0, &mut window, &mut reply);
+    assert_eq!(reply[..len], [VFS_BAD_REQUEST], "no VMO carried");
+    server.set_access(1, SESSION_READ_ONLY);
+    let len = server.dispatch(1, &frame[..n], 7, &mut window, &mut reply);
+    assert_eq!(reply[..len], [VFS_ACCESS_DENIED]);
+    let mut server = remount(server);
+    let back = Client::on(&mut server, 0).read_file("/bulk");
+    assert_eq!(&back[..10], &[0u8; 10]);
+    assert_eq!(&back[10..], &data[..]);
 }
 
 #[test]

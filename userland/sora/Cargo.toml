@@ -1,8 +1,8 @@
-#j649
 #j798
 #j805
 #j820
 #j893
+#j929
 
 [package]
 name = "sora"
@@ -55,3 +55,5 @@ doctest = false
 [features]
 nvme-write-proof = []
 netstack-restart-proof = []
+# j929 (SH8-c): the `fsd-crash-proof` word, for the redoxfs-smoke --crash image only.
+fsd-crash-proof = []
