@@ -1,4 +1,5 @@
 //j924
+//j925
 //! j924 (SH7-f): the Linux processes a persona program starts, and waiting for them.
 //!
 //! musl's `posix_spawn` (what Rust's `Command` and rustc's linker launch use) is
@@ -13,13 +14,13 @@
 //! and `wait4` collects its status through `ProcessWait`. The kernel interprets no Linux
 //! number and holds no Linux state. — TEAL
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use kumo_abi::{Handle, ProcessRunFlags};
 use kumo_rt::{
     address_space_create, channel_create_pair, channel_read_with_handle, channel_write_with_handle,
     futex_wait, futex_wake, handle_close, handle_koid, process_create, process_run,
-    process_wait_reaped, vmar_snapshot_range,
+    process_wait_reaped, vmar_snapshot, vmar_snapshot_range,
 };
 
 use crate::{errno, files, log, signals, threads};
@@ -167,13 +168,11 @@ pub fn child_exit(rec: &threads::ThreadRec, status: u64) -> ! {
 // ---- execve ----------------------------------------------------------------------------------
 
 /// `execve(path, argv, envp)`. In a vfork child it starts the new process and ends the child
-/// thread; it returns only with an error (the program's own `execve` is SH7-g's).
+/// thread; in the program itself (j925: a fork child, as Cargo's `Command` with `pre_exec`
+/// makes) it replaces the program in this process. Returns only with an error.
 pub fn execve(rec: &threads::ThreadRec, path: u64, argv: u64, envp: u64) -> i64 {
     if rec.child == 0 {
-        log(format_args!(
-            "persona-linux: execve outside a vfork child is not served yet (-ENOSYS)\n"
-        ));
-        return -errno::ENOSYS;
+        return execve_here(rec, path, argv, envp);
     }
     threads::lock();
     files::set_active(rec.child as usize);
@@ -199,6 +198,188 @@ pub fn execve(rec: &threads::ThreadRec, path: u64, argv: u64, envp: u64) -> i64 
             threads::unlock();
             e
         }
+    }
+}
+
+/// j925 (SH7-g): `execve` in this process. The new program's strings are staged first (they live
+/// in the memory about to go), then everything the old program had is unmapped: each gap around
+/// the shim's own image and the calling thread's trap stack, across the persona window.
+/// Close-on-exec descriptors close here; the rest stay as they are. Other threads are not
+/// stopped: this serves a fork child, which has one.
+fn execve_here(rec: &threads::ThreadRec, path: u64, argv: u64, envp: u64) -> i64 {
+    threads::lock();
+    files::set_active(0);
+    if let Err(e) = stage_exec(path, argv, envp) {
+        threads::unlock();
+        return e;
+    }
+    signals::prepare_exec(0);
+    files::close_on_exec();
+    let base = core::ptr::addr_of!(__ehdr_start) as u64;
+    let end = (core::ptr::addr_of!(_end) as u64).next_multiple_of(crate::PAGE);
+    // Ascending, so each gap runs from the end of one kept range to the start of the next.
+    let mut keep = [
+        (base, end),
+        (rec.region_base, rec.region_base + rec.region_len),
+    ];
+    if keep[1].0 < keep[0].0 {
+        keep.swap(0, 1);
+    }
+    let mut at = 0u64;
+    for (start, stop) in keep {
+        if stop > start {
+            if start > at {
+                let _ = kumo_rt::vmar_unmap(at, start - at);
+            }
+            at = at.max(stop);
+        }
+    }
+    if PERSONA_WINDOW > at {
+        let _ = kumo_rt::vmar_unmap(at, PERSONA_WINDOW - at);
+    }
+    files::forget_bounce();
+    signals::adopt_exec();
+    threads::reset_for_exec();
+    threads::unlock();
+    crate::exec_staged()
+}
+
+/// j925 (SH7-g): `clone(SIGCHLD)` with no new stack, i.e. `fork`. The child is a new process with
+/// a private copy of every mapping (J922's whole `VmarSnapshot`), one thread that resumes the
+/// program where this call returns (with 0), every descriptor (close-on-exec ones too, flags
+/// kept) on handles of its own, and the same dispositions. Returns the child's pid. Called
+/// without the shim lock.
+pub fn fork(parent: &threads::ThreadRec, frame: &[u64; 31]) -> i64 {
+    threads::lock();
+    files::set_active(parent.child as usize);
+    let result = fork_locked(parent, frame);
+    threads::unlock();
+    result
+}
+
+fn fork_locked(parent: &threads::ThreadRec, frame: &[u64; 31]) -> i64 {
+    // The child's thread record and trap stack, prepared here so the snapshot carries them.
+    let (rec_at, region_base, region_len) = match threads::prepare_fork_thread(parent, frame) {
+        Ok(prepared) => prepared,
+        Err(e) => return e,
+    };
+    let release = || {
+        let _ = kumo_rt::vmar_unmap(region_base, region_len);
+    };
+    let mut handles = files::SpawnHandles::new();
+    if let Err(e) = files::plan_fork(&mut handles) {
+        release();
+        if e == -errno::ENOSYS {
+            log(format_args!(
+                "persona-linux: fork needs the image mount (a `linux` launch on the image)\n"
+            ));
+        }
+        return e;
+    }
+    let raw = process_create(0, PERSONA_WINDOW);
+    if raw == 0 || raw == u64::MAX {
+        handles.close_all();
+        release();
+        return -errno::EAGAIN;
+    }
+    let process = Handle(raw as u32);
+    let koid = handle_koid(process);
+    let Some(pid) = threads::tid_of(koid) else {
+        handles.close_all();
+        let _ = handle_close(process);
+        release();
+        return -errno::EAGAIN;
+    };
+    SPAWN_PID.store(pid, Ordering::Relaxed);
+    FORK_REC.store(rec_at, Ordering::Relaxed);
+    let started = vmar_snapshot(process) == 0
+        && address_space_create(process, SPAWN_STACK_TOP, SPAWN_STACK_SIZE) != u64::MAX
+        && start_with(
+            process,
+            &mut handles,
+            persona_fork_entry as *const () as u64,
+        );
+    // The parent's copy of the child's record is not needed here.
+    release();
+    if !started {
+        handles.close_all();
+        let _ = handle_close(process);
+        return -errno::EAGAIN;
+    }
+    if !record(Child {
+        pid,
+        process: process.0,
+        koid,
+        done: false,
+        status: 0,
+    }) {
+        let _ = handle_close(process);
+    }
+    pid as i64
+}
+
+/// Queue `handles` on a bootstrap channel and run `process` at `entry` on its fresh stack with
+/// the channel in x0. Closes every handle not sent.
+fn start_with(process: Handle, handles: &mut files::SpawnHandles, entry: u64) -> bool {
+    let (send_raw, recv_raw) = channel_create_pair();
+    if send_raw == u64::MAX || recv_raw == u64::MAX {
+        return false;
+    }
+    let send = Handle(send_raw as u32);
+    let recv = Handle(recv_raw as u32);
+    let mut queued = true;
+    for &(tag, handle) in &handles.list[..handles.len] {
+        if channel_write_with_handle(send, &tag, 1, handle) != 0 {
+            queued = false;
+            let _ = handle_close(handle);
+        }
+    }
+    handles.len = 0;
+    let _ = handle_close(send);
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
+    if !queued
+        || process_run(
+            process,
+            entry,
+            SPAWN_STACK_TOP - 16,
+            recv.0 as u64,
+            0,
+            flags,
+        ) != 0
+    {
+        let _ = handle_close(recv);
+        return false;
+    }
+    true
+}
+
+/// The fork child's thread record (its address in the child), copied with the snapshot.
+static FORK_REC: AtomicU64 = AtomicU64::new(0);
+
+/// The fork child's first instruction (ProcessRun: x0 = its bootstrap channel, on the fresh
+/// stack). Its memory is the parent's, as the snapshot found it: reset what belonged to the
+/// parent's other threads and processes, take the capabilities, then become the thread the
+/// prepared record describes and return into the program.
+#[unsafe(no_mangle)]
+extern "C" fn persona_fork_entry(bootstrap: u64) -> ! {
+    threads::reset_for_fork(SPAWN_PID.load(Ordering::Relaxed));
+    signals::adopt_fork();
+    for state in &SLOT_STATE {
+        state.store(FREE, Ordering::Relaxed);
+    }
+    *children() = [None; MAX_CHILDREN];
+    take_capabilities(Handle(bootstrap as u32));
+    let rec = FORK_REC.load(Ordering::Relaxed);
+    // SAFETY: the record is the prepared one on its own trap stack; `persona_thread_entry`
+    // registers it, seeds its open call and returns into the program with x0 = 0.
+    unsafe {
+        core::arch::asm!(
+            "mov sp, {rec}",
+            "mov x0, {rec}",
+            "b persona_thread_entry",
+            rec = in(reg) rec,
+            options(noreturn),
+        )
     }
 }
 
@@ -282,40 +463,13 @@ fn spawn(pid: u32) -> Result<(Handle, u64), i64> {
         let _ = handle_close(process);
         return Err(-errno::ENOMEM);
     }
-    let (send_raw, recv_raw) = channel_create_pair();
-    if send_raw == u64::MAX || recv_raw == u64::MAX {
-        handles.close_all();
-        let _ = handle_close(process);
-        return Err(-errno::EAGAIN);
-    }
-    let send = Handle(send_raw as u32);
-    let recv = Handle(recv_raw as u32);
-    let mut queued = true;
-    for &(tag, handle) in &handles.list[..handles.len] {
-        if channel_write_with_handle(send, &tag, 1, handle) != 0 {
-            queued = false;
-            let _ = handle_close(handle);
-        }
-    }
-    let _ = handle_close(send);
-    if !queued {
-        let _ = handle_close(recv);
-        let _ = handle_close(process);
-        return Err(-errno::EAGAIN);
-    }
     let koid = handle_koid(process);
-    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
-    let entry = persona_spawn_entry as *const () as u64;
-    if process_run(
+    if !start_with(
         process,
-        entry,
-        SPAWN_STACK_TOP - 16,
-        recv.0 as u64,
-        0,
-        flags,
-    ) != 0
-    {
-        let _ = handle_close(recv);
+        &mut handles,
+        persona_spawn_entry as *const () as u64,
+    ) {
+        handles.close_all();
         let _ = handle_close(process);
         return Err(-errno::EAGAIN);
     }
@@ -334,7 +488,14 @@ extern "C" fn persona_spawn_entry(bootstrap: u64) -> ! {
     }
     *children() = [None; MAX_CHILDREN];
 
-    let bootstrap = Handle(bootstrap as u32);
+    take_capabilities(Handle(bootstrap as u32));
+    crate::exec_staged()
+}
+
+/// Read a new process's bootstrap channel to its end and rebuild its descriptors from the plan
+/// the snapshot carried: `'f'` session, `'m'` mount control, `'i'`/`'o'` console ends and the
+/// `'p'` pipe and socket channels in plan order.
+fn take_capabilities(bootstrap: Handle) {
     let (mut fs, mut mount, mut stdin, mut stdout) = (Handle(0), Handle(0), Handle(0), Handle(0));
     let mut pipes = [Handle(0); 64];
     let mut pipe_count = 0usize;
@@ -364,7 +525,6 @@ extern "C" fn persona_spawn_entry(bootstrap: u64) -> ! {
     }
     let _ = handle_close(bootstrap);
     files::adopt_spawn(fs, mount, stdin, stdout, &pipes[..pipe_count]);
-    crate::exec_staged()
 }
 
 // ---- wait4 -----------------------------------------------------------------------------------

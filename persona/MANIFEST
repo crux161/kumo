@@ -1,8 +1,8 @@
-#j918
 #j919
 #j920
 #j921
 #j924
+#j925
 # persona/ — Linux-side payloads for the persona shim (PLAN/022 SH7-c j888, SH7-d j889/j890).
 # Rebuild: scripts/persona-payloads.sh (needs docker + network). xtask refuses to pack a file
 # whose sha256 differs from this list (PERSONA_PAYLOADS in xtask/src/main.rs).
@@ -19,6 +19,7 @@
 # threadprobe  : gcc -O2 -o threadprobe threadprobe.c && strip threadprobe  (SH7-d3c-2, j916: musl pthreads — clone, futex, exit, timed waits)
 # sigprobe     : gcc -O2 -o sigprobe sigprobe.c && strip sigprobe  (SH7-e2, j919: signal delivery; passes on Linux too)
 # spawnprobe   : gcc -O2 -o spawnprobe spawnprobe.c && strip spawnprobe  (SH7-f, j924: posix_spawn, pipes, waitpid; passes on Linux too)
+# forkprobe   : gcc -O2 -o forkprobe forkprobe.c && strip forkprobe  (SH7-g, j925: fork, socketpair, execve in place; passes on Linux too)
 # objprobe     : gcc -O2 -o objprobe objprobe.c /usr/lib/libmd.a && strip objprobe (libmd-dev 1.1.0-r0; see libmd-COPYING)
 # pipeprobe    : scripts/persona-probes.sh (SH7-d3c-1; header-free, clang + pinned rust-lld)
 # musl/ld-musl-aarch64.so.1 : /lib/ld-musl-aarch64.so.1 from musl-1.2.5-r13 (musl's libc.so and dynamic loader)
@@ -37,5 +38,6 @@ bf6367753015b26b088eebc72ec6d6251555fa0870e4483e7fceeb97f372e46c  sigprobe
 42fb025bc758b76e60e7b3b0fcdcfab93b6ba1694b363244c2e8e6f51847e28c  musl/ld-musl-aarch64.so.1
 f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af  musl/COPYRIGHT
 efbb647e3b5dadf42f35c4a30e4b9401b9b533b2be1a11fec3814b7d75f8cae1  objprobe
+d68084c7545ac3869a85465b127d651bdb33512d387f1635af11c8a846ec5dea  forkprobe
 40b10c1cf4a0c2f056ad8fa092debea7133fd89ae93aed3cb953e09b8dc7ec8a  spawnprobe
 143d61c17c7f39521080e4c0c2e1285fb078884fb9148e47b70f6fb481381fbf  libmd-COPYING

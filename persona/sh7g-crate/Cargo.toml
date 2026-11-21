@@ -1,0 +1,10 @@
+[package]
+name = "sh7-hello"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+message = { path = "message" }
+
+[profile.release]
+panic = "abort"

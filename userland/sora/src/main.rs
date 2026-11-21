@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j913
 //j914
 //j917
 //j923
 //j924
+//j925
 
 extern crate alloc;
 
@@ -7482,69 +7482,7 @@ fn eval_command(
         }
         return true;
     } else if cmd.name == "linux" {
-        //j890
-        // SH7-d2 (PLAN/022, cut X1): run a Linux program. The persona shim is launched like any
-        // program, with argv `[persona-linux-shim, path, args...]` and a private filesystem
-        // session over the image; it then loads the program and its interpreter by path itself,
-        // as Linux `execve` does. Only this word grants the shim files. The verdict line is the
-        // shell's own, from the program's exit status. — TEAL
-        if cmd.args.is_empty() {
-            usage(b"usage: linux <path> [args...]\n");
-            return true;
-        }
-        let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
-        slots[0] = b"persona-linux-shim";
-        let mut count = 1;
-        for arg in cmd.args.iter().take(MAX_ARGV - 1) {
-            slots[count] = arg.as_bytes();
-            count += 1;
-        }
-        // SH7-d3b: a program under `/media/<vol>/` runs over a read-only session on that
-        // volume, and its path becomes volume-relative: the volume is the Linux program's
-        // whole filesystem, so its `/lib` and everything else it opens are the volume's.
-        let mut fs = FsGrant::ImageMount;
-        match sora::media_route(cmd.args[0].as_bytes()) {
-            sora::MediaRoute::Elsewhere => {}
-            sora::MediaRoute::Root => {
-                log(b"linux: /media: is a directory\n");
-                return true;
-            }
-            sora::MediaRoute::Volume { name, path } => {
-                // A synchronous autoexec runs before the serve loop reads the stick's offer:
-                // wait for it as the `media` word does (the read-only session below is all
-                // this launch takes).
-                if media().is_none() {
-                    let _ = ensure_media_writable(initrd);
-                }
-                if !media().is_some_and(|media| media.name.as_bytes() == name) {
-                    log(b"linux: /media/");
-                    log(name);
-                    log(b": no such volume\n");
-                    return true;
-                }
-                slots[1] = path;
-                fs = FsGrant::Media(BlockAccess::ReadOnly);
-            }
-        }
-        run_with_startup_input(
-            initrd,
-            kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
-            b"linux",
-            Some(&slots[..count]),
-            false,
-            fs,
-            false,
-            false,
-            StdinMode::None,
-            false,
-        );
-        log(b"linux: ");
-        log(cmd.args[0].as_bytes());
-        if LAST_STATUS.load(Ordering::Relaxed) == 0 {
-            log(b" exited 0\n");
-        } else {
-            log(b" failed\n");
-        }
+        run_linux(initrd, &cmd.args, &[], cwd);
         return true;
     } else if cmd.name == "kilo" {
         // The first third-party C program on KUMO, byte-identical to antirez's upstream
@@ -7709,7 +7647,7 @@ fn eval_command(
     } else if cmd.name == "env" {
         // env NAME=VALUE ... <program> [args...]: launch with exactly the granted
         // environment (SH2). No other launcher word mints one. — TIMBERDOODLE
-        run_env_command(initrd, cmd)
+        run_env_command(initrd, cmd, cwd)
     } else if cmd.name == "bg" {
         // bg <run|net|media> <program> [args...]: start one program without waiting for it;
         // `wait` later drains its output. One job at a time (J816, NET2b-2). `media` grants
@@ -8234,7 +8172,87 @@ static BG_PROCESS: AtomicU32 = AtomicU32::new(0);
 /// Start `argv` as the background job. It reuses the interactive launch, which returns as soon
 /// as the child parks or exits and hands back its ends without draining them; the job reads no
 /// input, so its stdin writer is closed at once. — TIMBERDOODLE
-fn run_env_command(initrd: Handle, cmd: &kumoza::Command) {
+/// The `linux` word, and `env NAME=VALUE ... linux ...` (j925).
+//j890
+// SH7-d2 (PLAN/022, cut X1): run a Linux program. The persona shim is launched like any
+// program, with argv `[persona-linux-shim, path, args...]` and a private filesystem
+// session over the image; it then loads the program and its interpreter by path itself,
+// as Linux `execve` does. Only this word grants the shim files. The verdict line is the
+// shell's own, from the program's exit status. — TEAL
+// j925 (SH7-g): the environment is exactly what `env` granted, plus `PWD`, the shell's working
+// directory, where the program starts (a Linux child inherits its cwd). Cargo needs both.
+fn run_linux(
+    initrd: Handle,
+    args: &[alloc::string::String],
+    granted: &[&[u8]],
+    cwd: &WorkingDirectory,
+) {
+    if args.is_empty() {
+        usage(b"usage: linux <path> [args...]\n");
+        return;
+    }
+    let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+    slots[0] = b"persona-linux-shim";
+    let mut count = 1;
+    for arg in args.iter().take(MAX_ARGV - 1) {
+        slots[count] = arg.as_bytes();
+        count += 1;
+    }
+    let pwd = alloc::format!("PWD={}", cwd.path());
+    let mut env: alloc::vec::Vec<&[u8]> = granted.to_vec();
+    if !env.iter().any(|pair| pair.starts_with(b"PWD=")) {
+        env.push(pwd.as_bytes());
+    }
+    // SH7-d3b: a program under `/media/<vol>/` runs over a read-only session on that
+    // volume, and its path becomes volume-relative: the volume is the Linux program's
+    // whole filesystem, so its `/lib` and everything else it opens are the volume's.
+    let mut fs = FsGrant::ImageMount;
+    match sora::media_route(args[0].as_bytes()) {
+        sora::MediaRoute::Elsewhere => {}
+        sora::MediaRoute::Root => {
+            log(b"linux: /media: is a directory\n");
+            return;
+        }
+        sora::MediaRoute::Volume { name, path } => {
+            // A synchronous autoexec runs before the serve loop reads the stick's offer:
+            // wait for it as the `media` word does (the read-only session below is all
+            // this launch takes).
+            if media().is_none() {
+                let _ = ensure_media_writable(initrd);
+            }
+            if !media().is_some_and(|media| media.name.as_bytes() == name) {
+                log(b"linux: /media/");
+                log(name);
+                log(b": no such volume\n");
+                return;
+            }
+            slots[1] = path;
+            fs = FsGrant::Media(BlockAccess::ReadOnly);
+        }
+    }
+    run_with_startup_input_with_env(
+        initrd,
+        kumo_abi::initrd::PERSONA_LINUX_SHIM_PATH.as_bytes(),
+        b"linux",
+        Some(&slots[..count]),
+        false,
+        fs,
+        false,
+        false,
+        StdinMode::None,
+        false,
+        Some(&env),
+    );
+    log(b"linux: ");
+    log(args[0].as_bytes());
+    if LAST_STATUS.load(Ordering::Relaxed) == 0 {
+        log(b" exited 0\n");
+    } else {
+        log(b" failed\n");
+    }
+}
+
+fn run_env_command(initrd: Handle, cmd: &kumoza::Command, cwd: &WorkingDirectory) {
     let mut env: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
     let mut index = 0;
     while index < cmd.args.len() {
@@ -8254,6 +8272,10 @@ fn run_env_command(initrd: Handle, cmd: &kumoza::Command) {
         return;
     }
     let program: alloc::vec::Vec<alloc::string::String> = cmd.args[index..].to_vec();
+    if program[0] == "linux" {
+        run_linux(initrd, &program[1..], &env, cwd);
+        return;
+    }
     run_program_granted_with_env(initrd, &program, false, Some(&env));
 }
 
@@ -13632,6 +13654,8 @@ fn log_dec(mut v: u64) {
 
 /// Maximum argv entries Sora forwards (program name + 15 args), bounding the heap-free slot array.
 const MAX_ARGV: usize = 16;
+/// The argv and env VMO size every launch sends (j925).
+const ARGV_VMO_BYTES: usize = 4096;
 
 /// Pack `slots` into a per-launch snapshot, then retain only read+transfer authority. A
 /// background child's first read may follow another launch; a shared writable scratch VMO
@@ -13681,9 +13705,11 @@ fn string_argv_slots<'a>(
 }
 
 fn write_argv(argv: &[&[u8]]) -> Option<Handle> {
-    let mut buf = [0u8; 256];
+    // j925: 4 KiB (Cargo's environment and command lines); a reader of the first 256 bytes
+    // still finds what it always did.
+    let mut buf = [0u8; ARGV_VMO_BYTES];
     let written = kumo_abi::pack_argv(argv, &mut buf)?;
-    let vmo = syscall_handle(vmo_create(256))?;
+    let vmo = syscall_handle(vmo_create(ARGV_VMO_BYTES as u64))?;
     if vmo_write(vmo, 0, buf.as_ptr(), written) != 0 {
         let _ = handle_close(vmo);
         return None;

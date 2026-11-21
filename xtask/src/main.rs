@@ -1,8 +1,8 @@
-//j918
 //j919
 //j920
 //j921
 //j924
+//j925
 
 use std::env;
 use std::fmt;
@@ -1249,6 +1249,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let persona_payloads = build_persona_payloads(&workspace_root()?)?;
             let persona_rustc = build_persona_rustc(&workspace_root()?)?;
             let persona_link = build_persona_link(&workspace_root()?)?;
+            let persona_cargo = build_persona_cargo(&workspace_root()?)?;
             let drv_i2c_hid = build_drv_i2c_hid_image(&workspace_root()?)?;
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
             let drv_nvme = build_drv_nvme_image(&workspace_root()?)?;
@@ -1313,6 +1314,10 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 ));
             }
             for (path, bytes) in &persona_link {
+                linux_files.push((path, bytes.as_slice()));
+            }
+            // j925 (SH7-g): the opt-in Cargo set and its workspace.
+            for (path, bytes) in &persona_cargo {
                 linux_files.push((path, bytes.as_slice()));
             }
             let fat32_img = build_fat32_image(std_smoke.as_slice(), &linux_files);
@@ -2141,7 +2146,7 @@ fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
 /// filesystem grant, as Linux `execve` and musl's loader expect. Each file is checked against the
 /// digest persona/MANIFEST records, so the image carries exactly the bytes that manifest and musl's
 /// COPYRIGHT describe. — TEAL
-const PERSONA_PAYLOADS: [(&str, &str, &str); 15] = [
+const PERSONA_PAYLOADS: [(&str, &str, &str); 16] = [
     (
         "persona/libmd-COPYING",
         "/usr/share/licenses/libmd/COPYING",
@@ -2161,6 +2166,11 @@ const PERSONA_PAYLOADS: [(&str, &str, &str); 15] = [
         "persona/spawnprobe",
         "/bin/spawnprobe",
         "40b10c1cf4a0c2f056ad8fa092debea7133fd89ae93aed3cb953e09b8dc7ec8a",
+    ),
+    (
+        "persona/forkprobe",
+        "/bin/forkprobe",
+        "d68084c7545ac3869a85465b127d651bdb33512d387f1635af11c8a846ec5dea",
     ),
     (
         "persona/writeprobe",
@@ -2314,6 +2324,67 @@ const PERSONA_LINK: [(&str, &str, &str); 7] = [
         "cefacb61bbb3b788f26bdd7745cca415618db5050361520f896054452cc80175",
     ),
 ];
+
+/// j925 (SH7-g): what Cargo needs on KUMO beyond the link set, packed when
+/// `KUMO_PERSONA_CARGO=1` (with `KUMO_PERSONA_RUSTC=1 KUMO_PERSONA_LINK=1`): the pinned nightly's
+/// `cargo` and the `aarch64-unknown-linux-musl` std files a host proc macro is built and linked
+/// from (persona/sh7g-tree.sha256 pins every one; scripts/persona-rustc.sh fetches them), musl's
+/// `libc.so` and `libgcc_s.so` where the host link looks (`-L/usr/lib`), and the oracle's
+/// two-crate workspace at /w (persona/sh7g-crate).
+fn build_persona_cargo(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    if env::var("KUMO_PERSONA_CARGO").as_deref() != Ok("1") {
+        return Ok(Vec::new());
+    }
+    let mut list: Vec<(&str, &'static str, &str)> = Vec::new();
+    for line in include_str!("../../persona/sh7g-tree.sha256").lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let (sha, rel) = line
+            .split_once("  ")
+            .ok_or_else(|| format!("persona/sh7g-tree.sha256: bad line {line:?}"))?;
+        let tree: &'static str =
+            Box::leak(format!("build/persona-rustc/tree/{rel}").into_boxed_str());
+        let linux: &'static str = Box::leak(format!("/{rel}").into_boxed_str());
+        list.push((tree, linux, sha));
+    }
+    // musl's libc.so is its dynamic loader; libgcc_s.so is the runtime rustc's driver uses too.
+    list.push((
+        "persona/musl/ld-musl-aarch64.so.1",
+        "/usr/lib/libc.so",
+        "42fb025bc758b76e60e7b3b0fcdcfab93b6ba1694b363244c2e8e6f51847e28c",
+    ));
+    list.push((
+        "build/persona-rustc/tree/lib/libgcc_s.so.1",
+        "/usr/lib/libgcc_s.so",
+        "2d945d6ce360769b41fbffc652c2440014bbd69416f13fe206fbac19d32c9431",
+    ));
+    let mut files = pinned_files(root, &list, "run scripts/persona-rustc.sh")?;
+    for (rel, linux) in [
+        ("persona/sh7g-crate/Cargo.toml", "/w/Cargo.toml"),
+        ("persona/sh7g-crate/Cargo.lock", "/w/Cargo.lock"),
+        (
+            "persona/sh7g-crate/.cargo/config.toml",
+            "/w/.cargo/config.toml",
+        ),
+        ("persona/sh7g-crate/src/main.rs", "/w/src/main.rs"),
+        ("persona/sh7g-crate/src/generated.rs", "/w/src/generated.rs"),
+        (
+            "persona/sh7g-crate/message/Cargo.toml",
+            "/w/message/Cargo.toml",
+        ),
+        (
+            "persona/sh7g-crate/message/src/lib.rs",
+            "/w/message/src/lib.rs",
+        ),
+    ] {
+        let bytes = fs::read(root.join(rel)).map_err(|err| format!("read {rel}: {err}"))?;
+        files.push((linux, bytes));
+    }
+    // Cargo's TMPDIR exists before it runs.
+    files.push(("/tmp/.keep", Vec::new()));
+    Ok(files)
+}
 
 /// Read and verify [`PERSONA_LINK`] when `KUMO_PERSONA_LINK=1`; empty otherwise.
 fn build_persona_link(root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {

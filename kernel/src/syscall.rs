@@ -1,8 +1,8 @@
-//j889
 //j912
 //j922
 //j923
 //j924
+//j925
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -4697,6 +4697,13 @@ impl SyscallEngine {
                                     let result = self.apply_to_live_tree(ttbr0, mapping, vmo_koid);
                                     unsafe { kumo_hal::active::set_user_aspace_root(saved) };
                                     if let Err(e) = result {
+                                        // j925: a refused map leaves nothing behind. The record
+                                        // stayed before, so every later map of the same range
+                                        // was refused as an overlap (fatfs's image window,
+                                        // seen as a stream of failed windows).
+                                        let _ = self.clear_mapping_leaves(process, mapping);
+                                        let _ =
+                                            process.remove_mapping_exact(mapping.virt, mapping.len);
                                         return KernelCallResult::Status(e.status());
                                     }
                                 }

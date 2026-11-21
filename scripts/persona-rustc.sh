@@ -2,6 +2,7 @@
 #j917
 #j920
 #j924
+#j925
 # SH7-d3d: fetch the Linux rustc tree the persona shim runs, pinned by sha256, into
 # build/persona-rustc/tree (never committed: the driver alone is 290 MiB). The SH7-d3 cut
 # (ratified 2026-11-14) chose upstream musl rustc via musl's own ld-musl: the pinned nightly's
@@ -40,8 +41,15 @@ f743f925e93779c189dc5574dc919002409fe5ce7c83836ed3f8bad6a26eed29  opt/rust/$TARG
 51696641966b07d28020dca5628f211b81221690b6c547687c09613845d3857d  opt/rust/$TARGET_LIB/libcore-bf137cc3142afd85.rmeta
 236909a842ad8970e3f7ab01a9077d254a003cfb047221e5219f211a18919520  $LLD"
 
+# j925 (SH7-g): cargo and the host musl std, pinned file by file in persona/sh7g-tree.sha256.
+CARGO_TARBALL=cargo-nightly-aarch64-unknown-linux-musl.tar.xz
+CARGO_SHA=bc37d9129e38213a269e8ff74fe9118fdbe7331e3ab6d0a0e94c604620bc5c7d
+HOST_STD_TARBALL=rust-std-nightly-aarch64-unknown-linux-musl.tar.xz
+HOST_STD_SHA=46a787136884d3ab6338301e5d083d0f92f2952ca6f8a6ec9f18a519ef5c2b5e
+CARGO_PINS=$(grep -v '^#' "$ROOT/persona/sh7g-tree.sha256")
+
 check() {
-    (cd "$TREE" && printf '%s\n' "$PINS" | shasum -a 256 -c -)
+    (cd "$TREE" && printf '%s\n%s\n' "$PINS" "$CARGO_PINS" | shasum -a 256 -c -)
 }
 
 if [ -d "$TREE" ] && check >/dev/null 2>&1; then
@@ -58,6 +66,8 @@ fetch() {
 }
 fetch "$TARBALL" "$TARBALL_SHA"
 fetch "$STD_TARBALL" "$STD_SHA"
+fetch "$CARGO_TARBALL" "$CARGO_SHA"
+fetch "$HOST_STD_TARBALL" "$HOST_STD_SHA"
 STAGE="$OUT/extract"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
@@ -73,6 +83,17 @@ STD_LIB="rust-std-nightly-$TARGET/rust-std-$TARGET/$TARGET_LIB"
 tar -xJf "$OUT/dl/$STD_TARBALL" -C "$STAGE" "$STD_LIB"
 mkdir -p "$TREE/opt/rust/$TARGET_LIB"
 cp "$STAGE/$STD_LIB/"*.rlib "$STAGE/$STD_LIB/"*.rmeta "$TREE/opt/rust/$TARGET_LIB/"
+HOST_LIB=lib/rustlib/aarch64-unknown-linux-musl/lib
+tar -xJf "$OUT/dl/$CARGO_TARBALL" -C "$STAGE" "cargo-nightly-aarch64-unknown-linux-musl/cargo/bin/cargo"
+cp "$STAGE/cargo-nightly-aarch64-unknown-linux-musl/cargo/bin/cargo" "$TREE/opt/rust/bin/cargo"
+HOST_STD="rust-std-nightly-aarch64-unknown-linux-musl/rust-std-aarch64-unknown-linux-musl/$HOST_LIB"
+tar -xJf "$OUT/dl/$HOST_STD_TARBALL" -C "$STAGE" "$HOST_STD"
+mkdir -p "$TREE/opt/rust/$HOST_LIB"
+printf '%s\n' "$CARGO_PINS" | while read -r _ path; do
+    case "$path" in
+        opt/rust/$HOST_LIB/*) cp "$STAGE/$HOST_STD/${path##*/}" "$TREE/$path" ;;
+    esac
+done
 rm -rf "$STAGE"
 
 NAME=kumo-persona-rustc-$$

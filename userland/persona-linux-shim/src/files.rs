@@ -1,8 +1,8 @@
-//j917
 //j918
 //j919
 //j921
 //j924
+//j925
 //! SH7-d2: the Linux file surface over the persona's `kumo-vfs` session.
 //!
 //! Sora launches the shim with a filesystem grant (`STARTUP_TAG_FS`): a private `fatfs` session
@@ -44,6 +44,7 @@ const DEV_NULL: &[u8] = b"/dev/null";
 const O_ACCMODE: u64 = 3;
 const O_RDONLY: u64 = 0;
 const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
 const O_CREAT: u64 = 0o100;
 const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
@@ -62,6 +63,7 @@ const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 const S_IFIFO: u32 = 0o010000;
+const S_IFSOCK: u32 = 0o140000;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 
@@ -74,6 +76,8 @@ enum Kind {
         channel: u32,
         readable: bool,
         inode: u64,
+        /// j925: a Unix socketpair end, readable and writable both (one channel per end).
+        duplex: bool,
     },
     /// An open vfs file: its server handle and size.
     File {
@@ -652,6 +656,7 @@ pub fn pipe2(pair: u64, flags: u64) -> i64 {
         channel: channel as u32,
         readable,
         inode,
+        duplex: false,
     };
     let reader = match new_fd(end(a, true), &[], flags) {
         Ok(fd) => fd,
@@ -1050,6 +1055,13 @@ pub fn fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
     const F_SETFD: u64 = 2;
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
+    const F_GETLK: u64 = 5;
+    const F_SETLK: u64 = 6;
+    const F_SETLKW: u64 = 7;
+    const F_OFD_GETLK: u64 = 36;
+    const F_OFD_SETLK: u64 = 37;
+    const F_OFD_SETLKW: u64 = 38;
+    const F_UNLCK: i16 = 2;
     let d = match descriptor(fd) {
         Ok(d) => d,
         Err(e) => return e,
@@ -1064,6 +1076,17 @@ pub fn fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
             });
             0
         }
+        // j925 (SH7-g): record locks (SQLite's, in Cargo's cache tracker) are granted, as
+        // `flock` is: nobody else holds the image. F_GETLK reports no conflict (F_UNLCK).
+        F_GETLK | F_OFD_GETLK => {
+            if arg == 0 {
+                return -errno::EFAULT;
+            }
+            // SAFETY: the program's `struct flock`, whose first field is the short l_type.
+            unsafe { core::ptr::write_unaligned(arg as *mut i16, F_UNLCK) };
+            0
+        }
+        F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => 0,
         F_GETFL => (session().files[d.file].flags & !(O_CREAT | O_EXCL | O_TRUNC)) as i64,
         F_SETFL => {
             let flags = &mut session().files[d.file].flags;
@@ -1148,6 +1171,11 @@ pub fn fstat(fd: i64, buf: u64) -> i64 {
     match entry.kind {
         Kind::File { size, .. } => put_stat(buf, 1, inode(entry.path()), S_IFREG | 0o755, size),
         Kind::Dir { .. } => put_stat(buf, 1, inode(entry.path()), S_IFDIR | 0o755, 0),
+        Kind::Pipe {
+            inode,
+            duplex: true,
+            ..
+        } => put_stat(buf, 3, inode, S_IFSOCK | 0o600, 0),
         Kind::Pipe { inode, .. } => put_stat(buf, 3, inode, S_IFIFO | 0o600, 0),
         _ => put_stat(buf, 2, fd as u64 + 1, S_IFCHR | 0o620, 0),
     }
@@ -1322,6 +1350,12 @@ fn poll_once(fds: u64, count: u64) -> i64 {
                         }
                         _ => 0,
                     };
+                    // j925: a socket end can always be written to as well.
+                    let now = if matches!(entry.kind, Kind::Pipe { duplex: true, .. }) {
+                        now | POLLOUT
+                    } else {
+                        now
+                    };
                     // POLLHUP is reported whether asked for or not, as on Linux.
                     now & (events | POLLHUP)
                 }
@@ -1422,9 +1456,10 @@ pub fn write_out(fd: i64, bytes: &[u8]) -> i64 {
         Ok(Kind::Stdout) => {}
         Ok(Kind::Pipe {
             channel,
-            readable: false,
+            readable,
+            duplex,
             ..
-        }) => {
+        }) if !readable || duplex => {
             let mut written = 0;
             for chunk in bytes.chunks(PIPE_CHUNK) {
                 let status = channel_write(Handle(channel), chunk.as_ptr(), chunk.len());
@@ -1806,6 +1841,7 @@ enum Carried {
     Pipe {
         readable: bool,
         inode: u64,
+        duplex: bool,
     },
     /// A file or directory, opened again by path on the new process's own session.
     Path {
@@ -1826,7 +1862,8 @@ struct CarriedFile {
 /// behind them. The parent fills it with the shim lock held, right before the snapshot that
 /// copies it into the child; the child reads its copy before anything else.
 struct SpawnPlan {
-    fds: [Option<u8>; MAX_FDS],
+    /// Each kept descriptor's plan entry and its close-on-exec flag.
+    fds: [Option<(u8, bool)>; MAX_FDS],
     files: [CarriedFile; MAX_FDS],
     count: usize,
     cwd: ([u8; PATH_MAX], usize),
@@ -1845,7 +1882,7 @@ static mut SPAWN_PLAN: SpawnPlan = SpawnPlan {
     cwd: ([0; PATH_MAX], 0),
 };
 
-fn plan() -> &'static mut SpawnPlan {
+fn spawn_plan() -> &'static mut SpawnPlan {
     // SAFETY: the parent writes it under the shim lock; the child reads its private copy
     // before it has a second thread.
     unsafe { &mut *core::ptr::addr_of_mut!(SPAWN_PLAN) }
@@ -1892,6 +1929,15 @@ fn transferable(handle: Handle) -> Option<Handle> {
 /// channel per carried pipe end (`'p'`). Shim lock held. ENOSYS without a mount to open
 /// sessions on (a `/media` launch); the caller logs it.
 pub fn plan_spawn(out: &mut SpawnHandles) -> Result<(), i64> {
+    plan(out, false)
+}
+
+/// j925: [`plan_spawn`] for `fork`: every descriptor goes, close-on-exec ones with their flag.
+pub fn plan_fork(out: &mut SpawnHandles) -> Result<(), i64> {
+    plan(out, true)
+}
+
+fn plan(out: &mut SpawnHandles, fork: bool) -> Result<(), i64> {
     let s = session();
     if s.fs_mount.0 == 0 {
         return Err(-errno::ENOSYS);
@@ -1904,7 +1950,7 @@ pub fn plan_spawn(out: &mut SpawnHandles) -> Result<(), i64> {
     };
     out.push(b'm', control);
     let table = *bindings();
-    let p = plan();
+    let p = spawn_plan();
     p.fds = [None; MAX_FDS];
     p.count = 0;
     p.cwd = table.cwd;
@@ -1915,7 +1961,7 @@ pub fn plan_spawn(out: &mut SpawnHandles) -> Result<(), i64> {
         let Some(descriptor) = entry else {
             continue;
         };
-        if descriptor.cloexec {
+        if descriptor.cloexec && !fork {
             continue;
         }
         if planned[descriptor.file] == u8::MAX {
@@ -1953,6 +1999,7 @@ pub fn plan_spawn(out: &mut SpawnHandles) -> Result<(), i64> {
                     channel,
                     readable,
                     inode,
+                    duplex,
                 } => {
                     match transferable(Handle(channel)) {
                         Some(handle) => out.push(b'p', handle),
@@ -1961,7 +2008,11 @@ pub fn plan_spawn(out: &mut SpawnHandles) -> Result<(), i64> {
                             return Err(-errno::EAGAIN);
                         }
                     }
-                    Carried::Pipe { readable, inode }
+                    Carried::Pipe {
+                        readable,
+                        inode,
+                        duplex,
+                    }
                 }
                 Kind::File { .. } => Carried::Path { directory: false },
                 Kind::Dir { .. } => Carried::Path { directory: true },
@@ -1977,7 +2028,7 @@ pub fn plan_spawn(out: &mut SpawnHandles) -> Result<(), i64> {
             planned[descriptor.file] = at as u8;
             p.count += 1;
         }
-        p.fds[fd] = Some(planned[descriptor.file]);
+        p.fds[fd] = Some((planned[descriptor.file], descriptor.cloexec && fork));
     }
     Ok(())
 }
@@ -2024,7 +2075,7 @@ pub fn adopt_spawn(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle, 
     }
     unsafe { *core::ptr::addr_of_mut!(BINDINGS) = [Bindings::EMPTY; MAX_BINDINGS] };
     set_active(0);
-    let p = plan();
+    let p = spawn_plan();
     bindings().cwd = p.cwd;
     let mut pipe_at = 0usize;
     // Plan entry -> open-file index here, or None when it could not be carried.
@@ -2035,7 +2086,11 @@ pub fn adopt_spawn(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle, 
             Carried::Stdin => Kind::Stdin,
             Carried::Stdout => Kind::Stdout,
             Carried::Null => Kind::Null,
-            Carried::Pipe { readable, inode } => {
+            Carried::Pipe {
+                readable,
+                inode,
+                duplex,
+            } => {
                 let Some(&channel) = pipes.get(pipe_at) else {
                     continue;
                 };
@@ -2044,6 +2099,7 @@ pub fn adopt_spawn(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle, 
                     channel: channel.0,
                     readable,
                     inode,
+                    duplex,
                 }
             }
             Carried::Path { directory: true } => Kind::Dir { next: 0 },
@@ -2076,21 +2132,136 @@ pub fn adopt_spawn(fs: Handle, fs_mount: Handle, stdin: Handle, stdout: Handle, 
         entry.path[..path.len()].copy_from_slice(path);
         entry.path_len = path.len();
         // Its descriptors' count now, so the next description takes another slot.
-        entry.refs = p.fds.iter().filter(|at| **at == Some(index as u8)).count();
+        entry.refs = p
+            .fds
+            .iter()
+            .filter(|at| at.is_some_and(|(file, _)| file == index as u8))
+            .count();
         placed[index] = Some(slot);
     }
-    for (fd, plan_index) in p.fds.iter().enumerate() {
-        let Some(slot) = plan_index.and_then(|at| placed[at as usize]) else {
+    for (fd, planned) in p.fds.iter().enumerate() {
+        let Some((at, cloexec)) = *planned else {
+            continue;
+        };
+        let Some(slot) = placed[at as usize] else {
             continue;
         };
         bindings().fds[fd] = Some(Descriptor {
             file: slot,
-            cloexec: false,
+            cloexec,
         });
+    }
+}
+
+/// j925: the first program's cwd, from the launcher's `PWD` (an absolute path; `/` otherwise).
+pub fn set_start_cwd(dir: &[u8]) {
+    if dir.first() == Some(&b'/') && dir.len() < PATH_MAX {
+        let cwd = &mut bindings().cwd;
+        cwd.0[..dir.len()].copy_from_slice(dir);
+        cwd.1 = dir.len();
     }
 }
 
 /// j924: a program-supplied path, resolved against the active table's cwd (execve's path).
 pub fn resolve_user(path_ptr: u64, out: &mut [u8; PATH_MAX]) -> Result<usize, i64> {
     user_resolved(AT_FDCWD, path_ptr, out)
+}
+
+/// j925: `execve` in this process closes every close-on-exec descriptor. Lock held.
+pub fn close_on_exec() {
+    for fd in 0..MAX_FDS {
+        if bindings().fds[fd].is_some_and(|d| d.cloexec) {
+            let _ = close(fd as i64);
+        }
+    }
+}
+
+/// j925: `execve` in this process unmapped the bounce VMO's mapping: forget it.
+pub fn forget_bounce() {
+    let s = session();
+    if s.bounce.0 != 0 {
+        let _ = handle_close(s.bounce);
+    }
+    s.bounce = Handle(0);
+    s.bounce_at = 0;
+}
+
+/// j925 (SH7-g): `socketpair(AF_UNIX, SOCK_STREAM | SOCK_SEQPACKET | SOCK_DGRAM, 0, sv)`: one
+/// channel pair, each end a descriptor that reads and writes (Rust's fork path reports an
+/// `execve` failure through one; Cargo's job server uses pipes). Message boundaries are the
+/// channel's, which is what SEQPACKET and DGRAM promise and STREAM does not mind.
+pub fn socketpair(domain: u64, kind: u64, protocol: u64, pair: u64) -> i64 {
+    const AF_UNIX: u64 = 1;
+    const SOCK_NONBLOCK: u64 = O_NONBLOCK;
+    const SOCK_CLOEXEC: u64 = O_CLOEXEC;
+    if domain != AF_UNIX {
+        return -errno::EAFNOSUPPORT;
+    }
+    if protocol != 0 || !matches!(kind & 0xf, 1 | 2 | 5) {
+        return -errno::EPROTONOSUPPORT;
+    }
+    if kind & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return -errno::EINVAL;
+    }
+    if pair == 0 {
+        return -errno::EFAULT;
+    }
+    let flags = O_RDWR | (kind & (SOCK_NONBLOCK | SOCK_CLOEXEC));
+    let (a, b) = channel_create_pair();
+    if a == u64::MAX || b == u64::MAX {
+        for raw in [a, b] {
+            if raw != u64::MAX {
+                let _ = handle_close(Handle(raw as u32));
+            }
+        }
+        return -errno::ENOMEM;
+    }
+    let inode = session().next_pipe;
+    session().next_pipe += 1;
+    let end = |channel: u64| Kind::Pipe {
+        channel: channel as u32,
+        readable: true,
+        inode,
+        duplex: true,
+    };
+    let first = match new_fd(end(a), &[], flags) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = handle_close(Handle(a as u32));
+            let _ = handle_close(Handle(b as u32));
+            return e;
+        }
+    };
+    let second = match new_fd(end(b), &[], flags) {
+        Ok(fd) => fd,
+        Err(e) => {
+            close(first as i64);
+            let _ = handle_close(Handle(b as u32));
+            return e;
+        }
+    };
+    unsafe {
+        (pair as *mut i32).write_unaligned(first as i32);
+        ((pair + 4) as *mut i32).write_unaligned(second as i32);
+    }
+    0
+}
+
+/// j925: `recvfrom(fd, buf, len, flags, addr, addrlen)` on a socket end: a read (MSG_DONTWAIT
+/// does not wait). A socketpair peer has no address to report.
+pub fn recvfrom(fd: i64, buf: u64, len: u64, flags: u64, addr_len: u64) -> i64 {
+    const MSG_DONTWAIT: u64 = 0x40;
+    if addr_len != 0 {
+        unsafe { (addr_len as *mut u32).write_unaligned(0) };
+    }
+    read_from(fd, buf, len, flags & MSG_DONTWAIT == 0)
+}
+
+/// j925: `flock(fd, operation)`: granted. One persona process tree uses the image at a time,
+/// and Cargo's package-cache and build-directory locks have nobody to wait for.
+pub fn flock(fd: i64) -> i64 {
+    match descriptor(fd) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
 }

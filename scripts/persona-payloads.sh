@@ -1,9 +1,9 @@
 #!/bin/sh
-#j916
 #j918
 #j919
 #j920
 #j924
+#j925
 # SH7-c: rebuild the Linux-side persona payloads in persona/ from a pinned Alpine image.
 # musl's dynamic loader (ld-musl-aarch64.so.1, which is musl's libc.so) and a dynamic musl
 # hello built against it. Needs docker (OrbStack) and network for the image and apk.
@@ -19,7 +19,7 @@ trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT INT TERM
 docker exec "$NAME" apk add --no-cache gcc=14.2.0-r6 musl=1.2.5-r13 musl-dev=1.2.5-r13 libmd-dev=1.1.0-r0 binutils >/dev/null
 docker exec "$NAME" mkdir -p /w
 # SH7-d3a (j891): bigread, the bulk-read probe. SH7-d3c-2 (j916): threadprobe, musl pthreads.
-for prog in hello-dyn vmprobe bigread threadprobe sigprobe spawnprobe; do
+for prog in hello-dyn vmprobe bigread threadprobe sigprobe spawnprobe forkprobe; do
     docker cp "$OUT/$prog.c" "$NAME:/w/$prog.c"
     docker exec "$NAME" sh -c "cd /w && gcc -O2 -o $prog $prog.c && strip $prog"
     docker cp "$NAME:/w/$prog" "$OUT/$prog"
@@ -42,4 +42,4 @@ done
 docker cp -L "$NAME:/lib/ld-musl-aarch64.so.1" "$OUT/musl/ld-musl-aarch64.so.1"
 docker exec "$NAME" wget -q -O /w/COPYRIGHT "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5"
 docker cp "$NAME:/w/COPYRIGHT" "$OUT/musl/COPYRIGHT"
-cd "$OUT" && shasum -a 256 hello-dyn vmprobe bigread threadprobe sigprobe spawnprobe objprobe greet libgreet.so fileprobe writeprobe musl/ld-musl-aarch64.so.1 musl/COPYRIGHT libmd-COPYING
+cd "$OUT" && shasum -a 256 hello-dyn vmprobe bigread threadprobe sigprobe spawnprobe forkprobe objprobe greet libgreet.so fileprobe writeprobe musl/ld-musl-aarch64.so.1 musl/COPYRIGHT libmd-COPYING

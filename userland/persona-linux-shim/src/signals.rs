@@ -1,5 +1,6 @@
 //j919
 //j924
+//j925
 //! SH7-e2 (PLAN/022, the SH7-e cut, S3): Linux signals, delivered.
 //!
 //! **Sending** (`tkill`, `tgkill`, `kill` of this process) sets a bit in the target thread's
@@ -117,6 +118,14 @@ pub fn prepare_exec(slot: usize) {
         } else {
             [SIG_DFL, 0, 0, 0]
         };
+    }
+}
+
+/// j925: in a fork child: the dispositions stay (they were copied); the registry starts empty
+/// and the child's one thread registers itself.
+pub fn adopt_fork() {
+    for slot in &THREADS {
+        slot.store(0, Ordering::Relaxed);
     }
 }
 

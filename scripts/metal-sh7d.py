@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j918
 #j919
 #j920
 #j922
 #j924
+#j925
 """SH7-d metal: the persona-linux programs on the Orange Pi 5 Plus, one PXE boot.
 
     linux /bin/m10-hello   static Linux ELF through the in-process shim (SH7-b)
@@ -60,6 +60,7 @@ BOOT = (
     b"linux /bin/pipeprobe\n"
     b"linux /bin/threadprobe\n"
     b"linux /bin/sigprobe\n"
+    b"linux /bin/forkprobe\n"
     b"linux /bin/spawnprobe\n"
     b"linux /bin/bigread\n"
     b"echo SH7D ends\n"
@@ -99,6 +100,8 @@ EXPECTED = (
     "sigprobe: futex-parked handler and interrupted sleep OK",
     "sigprobe: OK (0 failures)",
     "linux: /bin/sigprobe exited 0",
+    "forkprobe: OK (0 failures)",
+    "linux: /bin/forkprobe exited 0",
     "spawnprobe: OK (0 failures)",
     "linux: /bin/spawnprobe exited 0",
     "bigread: OK (0 failures)",
@@ -146,6 +149,12 @@ def main():
         help="compile and verify /w/add.o with the image's rustc (KUMO_PERSONA_RUSTC=1)",
     )
     parser.add_argument(
+        "--cargo-image",
+        action="store_true",
+        help="SH7-g: cargo builds the proc-macro workspace, hashes the binary and runs it "
+        "(KUMO_PERSONA_RUSTC=1 KUMO_PERSONA_LINK=1 KUMO_PERSONA_CARGO=1)",
+    )
+    parser.add_argument(
         "--link-image",
         action="store_true",
         help="SH7-f: rustc links /w/hello for KUMO through rust-lld, hashes it and runs it "
@@ -179,6 +188,8 @@ def main():
         boot = boot.replace(b"echo SH7D ends\n", persona_rustc_proof.BOOT + b"echo SH7D ends\n")
     if args.link_image:
         boot = boot.replace(b"echo SH7D ends\n", persona_rustc_proof.LINK_BOOT + b"echo SH7D ends\n")
+    if args.cargo_image:
+        boot = boot.replace(b"echo SH7D ends\n", persona_rustc_proof.CARGO_BOOT + b"echo SH7D ends\n")
 
     board = load_board()
     if shutil.which("tio") is None:
@@ -206,8 +217,9 @@ def main():
             board.send_raw(b"\r")
         else:
             board.wake_board(work / "boot.log")
-        long_run = args.rustc_image or args.link_image
-        timeout = args.timeout if args.timeout is not None else (1800 if args.link_image else 900 if long_run else 240)
+        long_run = args.rustc_image or args.link_image or args.cargo_image
+        slow = args.link_image or args.cargo_image
+        timeout = args.timeout if args.timeout is not None else (3600 if slow else 900 if long_run else 240)
         board.wait_for("SH7D ends", work / "boot.log", timeout)
         # The login prompt after autoexec must come AFTER the end marker (a stale pre-reset
         # prompt would otherwise pass); prompts lack newlines, so read the raw capture.
@@ -228,6 +240,8 @@ def main():
             persona_rustc_proof.validate(window)
         if args.link_image:
             persona_rustc_proof.validate_link(window)
+        if args.cargo_image:
+            persona_rustc_proof.validate_cargo(window)
         if args.stick and window.count("bigread: OK (0 failures)") != 2:
             raise RuntimeError("bigread did not pass both from the image and from the stick")
         if "TOWER" in window:

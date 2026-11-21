@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j866
 //j869
 //j891
 //j892
 //j924
+//j925
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -36,7 +36,7 @@ use kumo_vfs::{
 };
 
 /// Maximum number of open file handles in this first fixed table.
-pub const MAX_OPEN_FILES: usize = 8;
+pub const MAX_OPEN_FILES: usize = 32;
 
 /// Largest `Open` request frame accepted by `kumo-vfs`.
 pub const REQUEST_BUF_BYTES: usize = WRITE_HEADER_LEN + MAX_WRITE_DATA;
@@ -775,6 +775,17 @@ pub fn dispatch_bulk<R: SectorReader + SectorWriter, W: BulkWindow>(
     }
 }
 
+/// Whether `path`'s parent is an existing directory (the root always is).
+fn parent_is_dir<R: SectorReader>(volume: &FatVolume, reader: &mut R, path: &[u8]) -> bool {
+    let trimmed = path.strip_suffix(b"/").unwrap_or(path);
+    match trimmed.iter().rposition(|&b| b == b'/') {
+        None | Some(0) => true,
+        Some(at) => volume
+            .resolve_path(reader, &trimmed[..at])
+            .is_some_and(|entry| entry.is_dir()),
+    }
+}
+
 fn open<R: SectorReader + SectorWriter>(
     volume: &FatVolume,
     reader: &mut R,
@@ -785,6 +796,11 @@ fn open<R: SectorReader + SectorWriter>(
 ) -> usize {
     let entry = match volume.resolve_path(reader, path) {
         Some(entry) => entry,
+        // j925 (SH7-g): a create in a directory that is not there is NOT_FOUND (Linux
+        // ENOENT), which is what tells Cargo to make its home directory and try again.
+        None if options & OPEN_CREATE != 0 && !parent_is_dir(volume, reader, path) => {
+            return write_status(reply, VFS_NOT_FOUND);
+        }
         None if options & OPEN_CREATE != 0 => match volume.create_file(reader, path) {
             Ok(entry) => {
                 if let Err(error) = volume.flush(reader) {
@@ -1105,7 +1121,11 @@ fn rename<R: SectorReader + SectorWriter>(
 ) -> usize {
     match volume.resolve_path(io, from) {
         None => write_status(reply, VFS_NOT_FOUND),
-        Some(entry) if entry.is_dir() => write_status(reply, VFS_NOT_SUPPORTED),
+        // j925 (SH7-g): a directory renames to a free name (Cargo's atomic target directory);
+        // an existing target is EXISTS, as Linux says for a non-empty one.
+        Some(entry) if entry.is_dir() && volume.resolve_path(io, to).is_some() => {
+            write_status(reply, VFS_EXISTS)
+        }
         Some(_) => match volume.rename(io, from, to).and_then(|_| volume.flush(io)) {
             Ok(()) => write_status(reply, VFS_OK),
             Err(error) => write_status(reply, mutation_status(error)),
@@ -1629,6 +1649,24 @@ mod tests {
             assert_eq!(&reply[..n], &[VFS_IO_ERROR]);
         }
         assert_eq!(disk.1, 7);
+    }
+
+    /// j925 (SH7-g): creating in a missing directory is NOT_FOUND (ENOENT), not a bad request.
+    #[test]
+    fn a_create_in_a_missing_directory_is_not_found() {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let options = OPEN_READ | OPEN_WRITE | OPEN_CREATE;
+        let request = encode_request(Request::open_options(b"/NOHOME/.lock", options));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_NOT_FOUND]);
+        let request = encode_request(Request::open_options(b"/HOME.TXT/.lock", options));
+        let made = encode_request(Request::open_options(b"/HOME.TXT", options));
+        let _ = dispatch(&volume, &mut disk, &mut table, &made, &mut reply);
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_NOT_FOUND]);
     }
 
     #[test]
@@ -2348,9 +2386,16 @@ mod tests {
 
         let request = encode_request(Request::mkdir(b"/WORK"));
         let _ = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        // j925: a directory renames to a free name, and an existing target is EXISTS.
+        let request = encode_request(Request::rename(b"/WORK", b"/SAVE.TXT"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_EXISTS]);
         let request = encode_request(Request::rename(b"/WORK", b"/OTHER"));
         let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
-        assert_eq!(&reply[..n], &[VFS_NOT_SUPPORTED]);
+        assert_eq!(&reply[..n], &[VFS_OK]);
+        assert!(volume
+            .resolve_path(&mut disk, b"/OTHER")
+            .is_some_and(|e| e.is_dir()));
     }
 
     #[test]

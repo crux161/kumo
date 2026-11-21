@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j918
 #j919
 #j920
 #j922
 #j924
+#j925
 """SH7-b/c: one QEMU boot proving the in-process persona shim (PLAN.md §10 R1), with a static
 program (SH7-b) and a dynamically linked musl program run through musl's loader (SH7-c).
 
@@ -46,6 +46,11 @@ def main():
     parser.add_argument("--timeout", type=float, help="seconds per boot (default 90, or 900 with --rustc)")
     parser.add_argument("--rustc", action="store_true", help="compile and verify /w/add.o with the opt-in rustc image")
     parser.add_argument(
+        "--cargo",
+        action="store_true",
+        help="SH7-g: cargo builds a proc-macro workspace for aarch64-unknown-kumo, then it runs",
+    )
+    parser.add_argument(
         "--link",
         action="store_true",
         help="SH7-f: rustc links /w/hello for aarch64-unknown-kumo through rust-lld, then it runs",
@@ -77,6 +82,7 @@ def main():
         b"linux /bin/pipeprobe\n"
         b"linux /bin/threadprobe\n"
         b"linux /bin/sigprobe\n"
+        b"linux /bin/forkprobe\n"
         b"linux /bin/spawnprobe\n"
         b"linux /bin/bigread\n"
         b"echo AXH persona ends\n",
@@ -115,6 +121,8 @@ def main():
             "sigprobe: futex-parked handler and interrupted sleep OK",
             "sigprobe: OK (0 failures)",
             "linux: /bin/sigprobe exited 0",
+            "forkprobe: OK (0 failures)",
+            "linux: /bin/forkprobe exited 0",
             "spawnprobe: OK (0 failures)",
             "linux: /bin/spawnprobe exited 0",
             "bigread: OK (0 failures)",
@@ -143,6 +151,17 @@ def main():
         )
         proof_env.update(KUMO_PERSONA_RUSTC="1", KUMO_PERSONA_LINK="1", KUMO_INITRD_ZSTD="0")
         memory_mib = 5120
+    if args.cargo:
+        case = axh.Case(
+            "persona-cargo",
+            b"echo AXH persona-cargo begins\n" + persona_rustc_proof.CARGO_BOOT + b"echo AXH persona-cargo ends\n",
+            (persona_rustc_proof.CARGO_OBJECT, persona_rustc_proof.CARGO_HELLO, "linux: /bin/objprobe exited 0"),
+            ready=0,
+        )
+        proof_env.update(
+            KUMO_PERSONA_RUSTC="1", KUMO_PERSONA_LINK="1", KUMO_PERSONA_CARGO="1", KUMO_INITRD_ZSTD="0"
+        )
+        memory_mib = 6144
     default_env = {k: v for k, v in os.environ.items() if k not in axh.CONTROLS}
     manifest = {"head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
     try:
@@ -153,8 +172,10 @@ def main():
         shutil.rmtree(work / case.name, ignore_errors=True)
         manifest["case"] = axh.boot(
             ROOT, source, case, work / case.name, qemu, firmware,
-            args.timeout if args.timeout is not None else (900 if args.rustc or args.link else 90), memory_mib
+            args.timeout if args.timeout is not None else (2400 if args.cargo else 900 if args.rustc or args.link else 90), memory_mib
         )
+        if args.cargo:
+            persona_rustc_proof.validate_cargo((work / case.name / "serial.log").read_text(errors="replace"))
         if args.link:
             persona_rustc_proof.validate_link((work / case.name / "serial.log").read_text(errors="replace"))
         if args.rustc:

@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j917
 //j918
 //j919
 //j921
 //j924
+//j925
 
 //! `persona-linux-shim` — the in-process Linux personality runtime (SH7, PLAN.md §10 R1).
 //!
@@ -72,6 +72,24 @@ mod nr {
     pub const FSYNC: u64 = 82;
     pub const FDATASYNC: u64 = 83;
     pub const EXECVE: u64 = 221;
+    // j925 (SH7-g): what Cargo adds.
+    pub const FLOCK: u64 = 32;
+    pub const FCHOWNAT: u64 = 54;
+    pub const FCHOWN: u64 = 55;
+    pub const LINKAT: u64 = 37;
+    pub const UTIMENSAT: u64 = 88;
+    pub const RESTART_SYSCALL: u64 = 128;
+    pub const GETPGID: u64 = 155;
+    pub const GETSID: u64 = 156;
+    pub const GETPPID: u64 = 173;
+    pub const GETUID: u64 = 174;
+    pub const GETEUID: u64 = 175;
+    pub const GETGID: u64 = 176;
+    pub const GETEGID: u64 = 177;
+    pub const SOCKETPAIR: u64 = 199;
+    pub const SENDTO: u64 = 206;
+    pub const RECVFROM: u64 = 207;
+    pub const MREMAP: u64 = 216;
     pub const WAIT4: u64 = 260;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
@@ -134,6 +152,8 @@ pub(crate) mod errno {
     pub const ENOSYS: i64 = 38;
     pub const E2BIG: i64 = 7;
     pub const ECHILD: i64 = 10;
+    pub const EPROTONOSUPPORT: i64 = 93;
+    pub const EAFNOSUPPORT: i64 = 97;
     pub const ENOTEMPTY: i64 = 39;
     pub const ETIMEDOUT: i64 = 110;
 }
@@ -416,6 +436,15 @@ extern "C" fn persona_dispatch(frame: *mut TrapFrame, rec: *mut threads::ThreadR
         nr::GETRANDOM => threads::getrandom(a0, a1, a2),
         nr::MEMBARRIER => threads::membarrier(a0, a1),
         nr::SCHED_GETAFFINITY => sched_getaffinity(a1, a2),
+        // j925: one user, root, as the persona's Linux view has always been (files are 0755).
+        nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => 0,
+        // The launcher is no Linux process: the first program's parent is init's pid. Process
+        // groups and sessions are not modelled: each process leads its own.
+        nr::GETPPID => 1,
+        nr::GETPGID | nr::GETSID if a0 == 0 => threads::getpid(),
+        nr::GETPGID | nr::GETSID => a0 as i64,
+        // Nothing is restarted through it here: a call the shim interrupts restarts itself.
+        nr::RESTART_SYSCALL => -errno::EINTR,
         number => {
             threads::lock();
             // j924: a vfork child's calls use its own descriptor table.
@@ -460,6 +489,19 @@ fn serve_locked(number: u64, frame: &[u64; 31]) -> i64 {
         nr::DUP3 => files::dup3(a0 as i64, a1 as i64, a2),
         nr::FCNTL => files::fcntl(a0 as i64, a1, a2),
         nr::IOCTL => files::ioctl(a0 as i64, a1, a2),
+        // j925 (SH7-g): Cargo's calls.
+        nr::SOCKETPAIR => files::socketpair(a0, a1, a2, frame[3]),
+        nr::RECVFROM => files::recvfrom(a0 as i64, a1, a2, frame[3], frame[5]),
+        nr::SENDTO => write(a0, a1, a2),
+        nr::FLOCK => files::flock(a0 as i64),
+        // FAT keeps no times the persona reports; Cargo's fingerprints compare its own records.
+        nr::UTIMENSAT => 0,
+        // FAT has no owners; everything is root's already.
+        nr::FCHOWN | nr::FCHOWNAT => 0,
+        // FAT has no hard links: EPERM, as Linux's vfat says. std's callers copy instead.
+        nr::LINKAT => -errno::EPERM,
+        // musl's realloc copies when a mapping cannot move.
+        nr::MREMAP => -errno::ENOMEM,
         nr::RT_SIGACTION => signals::rt_sigaction(a0, a1, a2, frame[3]),
         nr::READLINKAT => files::readlinkat(a0 as i64, a1, a2, frame[3]),
         nr::PPOLL => files::ppoll(a0, a1, a2),
@@ -735,7 +777,7 @@ struct Loaded {
 }
 
 /// The argv wire VMOs the launcher sends hold at most this many bytes.
-const ARGV_BYTES: usize = 256;
+const ARGV_BYTES: usize = 4096;
 static mut ARGV_BUF: [u8; ARGV_BYTES] = [0; ARGV_BYTES];
 static mut ENV_BUF: [u8; ARGV_BYTES] = [0; ARGV_BYTES];
 
@@ -873,7 +915,7 @@ extern "C" fn main(
     // argv[0] is the shim itself; argv[1] is the program, which is also the program's argv[0].
     let args = exec_args();
     args.clear();
-    for arg in kumo_abi::unpack_argv(&argv_buf[..]).skip(1).take(16) {
+    for arg in kumo_abi::unpack_argv(&argv_buf[..]).skip(1).take(EXEC_ARGS) {
         if args.argc == 0 && !args.set_path(arg) {
             fail("program path too long");
         }
@@ -882,7 +924,11 @@ extern "C" fn main(
     if args.argc == 0 {
         fail("usage: linux <path> [args...]");
     }
-    for pair in kumo_abi::unpack_argv(&env_buf[..]).take(16) {
+    for pair in kumo_abi::unpack_argv(&env_buf[..]).take(EXEC_ENVS) {
+        // j925: a shell's PWD is where the program starts, as a Linux child inherits its cwd.
+        if let Some(dir) = pair.strip_prefix(b"PWD=") {
+            files::set_start_cwd(dir);
+        }
         args.push(pair, true);
     }
     exec_staged()

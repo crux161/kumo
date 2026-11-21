@@ -2,6 +2,7 @@
 //j917
 //j919
 //j924
+//j925
 //! SH7-d3c-2: the minimum Linux thread (the ratified SH7-d3 cut, T1).
 //!
 //! **Threads.** A Linux `clone` with musl's pthread flag set becomes a KUMO `ThreadSpawn` in
@@ -344,6 +345,10 @@ pub fn clone(
     if crate::processes::is_vfork(flags) {
         return crate::processes::vfork(parent, frame, stack);
     }
+    // j925: no shared memory, no new thread: `fork` (musl's is `clone(SIGCHLD, 0)`).
+    if flags & (CLONE_VM | CLONE_THREAD | CLONE_VFORK) == 0 && stack == 0 {
+        return crate::processes::fork(parent, frame);
+    }
     let Some(kind) = thread::thread_clone(flags) else {
         log(format_args!(
             "persona-linux: clone flags {:#x} are not a thread (-EINVAL)\n",
@@ -371,6 +376,64 @@ pub fn clone(
             .store(tid as u32, Ordering::Release);
     }
     tid as i64
+}
+
+const CLONE_VM: u64 = 0x100;
+const CLONE_VFORK: u64 = 0x4000;
+const CLONE_THREAD: u64 = 0x1_0000;
+
+/// j925: the record and trap stack a fork child's one thread starts on, filled here so the
+/// snapshot copies it: the parent's registers at the `clone` svc, its TLS, its open call's
+/// resume point and its mask. `(record address, region base, region length)`; the parent
+/// unmaps its own copy once the child is started.
+pub fn prepare_fork_thread(parent: &ThreadRec, frame: &[u64; 31]) -> Result<(u64, u64, u64), i64> {
+    let (status, pc, sp, x8) = persona_context(kumo_abi::sys::PERSONA_CONTEXT_GET, 0, 0, 0);
+    if status != 0 {
+        return Err(-errno::EINVAL);
+    }
+    let region_len = (TRAP_STACK_BYTES + core::mem::size_of::<ThreadRec>())
+        .next_multiple_of(crate::PAGE as usize) as u64;
+    let Some(region) = vmo(region_len) else {
+        return Err(-errno::EAGAIN);
+    };
+    let mapped = vmar_map_anywhere(region, region_len, crate::MAP_R | crate::MAP_W);
+    let _ = kumo_rt::handle_close(region);
+    let region_base = match mapped {
+        (0, at) if at != 0 => at,
+        _ => return Err(-errno::EAGAIN),
+    };
+    let rec_at = (region_base + region_len - core::mem::size_of::<ThreadRec>() as u64) & !15;
+    let rec = unsafe { &mut *(rec_at as *mut ThreadRec) };
+    *rec = ThreadRec::EMPTY;
+    rec.frame = *frame;
+    unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) rec.tls) };
+    rec.pc = pc;
+    rec.sp = sp;
+    rec.x8 = x8;
+    rec.region_base = region_base;
+    rec.region_len = region_len;
+    rec.sigmask = parent.sigmask;
+    rec.alt_sp = parent.alt_sp;
+    rec.alt_flags = parent.alt_flags;
+    rec.alt_size = parent.alt_size;
+    Ok((rec_at, region_base, region_len))
+}
+
+/// j925: in a fork child, before its thread starts: no lock holder, its own pid.
+pub fn reset_for_fork(pid: u32) {
+    LOCK.store(0, Ordering::Relaxed);
+    PID.store(pid, Ordering::Relaxed);
+}
+
+/// j925: `execve` in this process: the main record starts over (the pid stays).
+pub fn reset_for_exec() {
+    let rec = unsafe { &mut *core::ptr::addr_of_mut!(MAIN_TRAP.rec) };
+    *rec = ThreadRec::EMPTY;
+}
+
+/// The Linux tid (and pid) a koid names.
+pub fn tid_of(koid: u64) -> Option<u32> {
+    thread::tid_of_koid(koid).map(|tid| tid as u32)
 }
 
 /// How a new shim thread starts: what `clone` gives it beyond the parent's registers.

@@ -1,0 +1,48 @@
+# j925 (SH7-g): cargo and the aarch64-unknown-linux-musl std files the pinned rustc opens to
+# build and link a host proc macro, from the 2026-06-22 nightly (cargo 0.99.0 a595d0da2,
+# rust-std 1.98.0 91fe22da8). scripts/persona-rustc.sh fetches them into build/persona-rustc/tree;
+# xtask packs them (same path, rooted at /) when KUMO_PERSONA_CARGO=1 and checks every hash.
+6e4d6b11c34e967d9815b96e117523fe4bc4b4b285822a999155e60057685ad5  opt/rust/bin/cargo
+4c9f972f03c563d5b3625a7d0d430433f0e84d6f7c6f525128ad52330a2d837e  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libaddr2line-82634d604b2adfb1.rlib
+0a0aae5fd3b2b995aeb16886310333cc834359137b0c20701d41ba52c50002f1  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libaddr2line-82634d604b2adfb1.rmeta
+a7567e051fc895717de0d1dc8f5d7675dc6371658865e874daf2d535b3f02464  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libadler2-e5d189f7a3120761.rlib
+e9c127d04efb801576af85e62f6805afc2ab9f9f880ac691a9de0f4b69325dca  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libadler2-e5d189f7a3120761.rmeta
+323f73e9777a50588bc4417da49098de9f38b8007dfcb4838c815373ecbbac06  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/liballoc-b6176948db20e220.rlib
+1da5ba1910658b0b20f98a23b454dc2fbcbf25d80dc106631edc394a25c942d8  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/liballoc-b6176948db20e220.rmeta
+21fb6c15a2c841efdfe3dca77fe595fe47f87517ff30d42679e3fbcfa177087a  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libcfg_if-f45c06f95308d189.rlib
+a2b994b72e5807ab2bd1dabb236a3277ab6afa9b99f37410c2acc5f11367a487  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libcfg_if-f45c06f95308d189.rmeta
+918393f1cf3d54027c21c2c2eb66e387d53c3bb9ee42d3a668aec84082289682  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libcompiler_builtins-b8101d45f8d1e1d7.rlib
+81427c3a74dc7cbb9a3536271d8466a837babfb5cbc94b2ee7a10dc2011ca895  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libcompiler_builtins-b8101d45f8d1e1d7.rmeta
+b7275503195be336b3bee4cbc3dbaa972bddaddcece31dcc9db8eea0103722d4  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libcore-04feeb8c13cb4877.rlib
+5f36097304d53bce21db4c2a74e2d510283d8886ba40f5dc7fbeaeea9a42510a  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libcore-04feeb8c13cb4877.rmeta
+f8b32a37781afa547cf59a194465190ef760ca76c87407ee587f80658d7ff294  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libgimli-97ef39c081320dcb.rlib
+ff8baeabf9d83c44e14b41b522ca3d54746c474ada254cc852ea0541e4027e79  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libgimli-97ef39c081320dcb.rmeta
+fcee93e19d9361da137b6bd6a829889a30ddc31ffe54f04bf4bdd080689c09c6  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libhashbrown-5bc1415baa185ede.rlib
+b59014ca1982b08bb06b1c97b633dd8068a58a72c9e4b51af5bcc1111f44e79b  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libhashbrown-5bc1415baa185ede.rmeta
+3b5d7b4f9a1c16e172ba80e020d618681d3a1b298d8e1b43ef43a8d1a3851cc4  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/liblibc-80b0d3b685728832.rlib
+8eb66858ba4992315965162fc42840198bb97664b196ae8d0a7b7f6d67780067  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/liblibc-80b0d3b685728832.rmeta
+93bcc1145b8aa074b9c6d6422f7e8af3382117c8368f5206b83bf4ab25a50686  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libmemchr-db4d8bee9c217ce9.rlib
+c80ba870e0ee9f881e863d8211db65878c8f18dfadffd93570897ca4c15bf239  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libmemchr-db4d8bee9c217ce9.rmeta
+97fb091823a2ca2897f97dd549c931d53b29799e9f79f9331744959770705737  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libminiz_oxide-26ae36bfe02fd7c6.rlib
+9d4bb487e787e0206425446b7adf8e2e09b1e10daf0dbc2ccc303efad4cc40da  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libminiz_oxide-26ae36bfe02fd7c6.rmeta
+b3e9f3219e32fd91c776fa4154ad3662ff5e0431eaead2b80a889c41ce018477  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libobject-6668a14646e22d02.rlib
+68a7b568621bcd5fb9abce35d50de60a93b0f92b73952c3490173bd7d4215841  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libobject-6668a14646e22d02.rmeta
+8ebd359bcfe0154cdc3650df543cf253653df36c47eb702769ad1ecfa8e86901  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libpanic_unwind-b61c1777dec0e233.rlib
+1e6bc235a21e1fb8973077975d7cf3ec95bd2b630baa766ab42d1037f1493eca  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libpanic_unwind-b61c1777dec0e233.rmeta
+c4a079a8f0d7a3d3cab98949ff10e91ae38930803fb5e9beba3684a3b6085e65  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libproc_macro-3a70a9f7263869ed.rlib
+fd5f0053fb20b78415adc1f7f7f525e95b36257723bd04272a3b608f7523677b  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libproc_macro-3a70a9f7263869ed.rmeta
+055cbf8d7cdf2850cb73cc7a87ebb06599df721ed033267b24197d0b047a3e90  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/librustc_demangle-47533195ccbd9d1e.rlib
+407e606a3546ed888e70d4c8871972dab48d89b7c22db06b6978cf4e75048641  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/librustc_demangle-47533195ccbd9d1e.rmeta
+b13950e19a3906bd077d8a029328cdd0f49b7f2076f3cdf04b88e7becb8023c5  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/librustc_literal_escaper-3584ca4e30f0ce27.rlib
+862a2758088622b123cc38638912af6d779f318fb91d479d7d78727abd8f3fd3  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/librustc_literal_escaper-3584ca4e30f0ce27.rmeta
+412c9e6d4fca311ada6c3025a40b8769f581fce9bf559e2c1f93ab99de7b964a  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/librustc_std_workspace_alloc-de887bb4a13870ac.rlib
+fa8170dd7aaad0fad28d32826cfe8d5c5fe78885466229572b492c961244842f  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/librustc_std_workspace_alloc-de887bb4a13870ac.rmeta
+9569e5290b24e4a4b40ed6e49b05796397d64d30f4f35d1769b62d5d91c25910  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/librustc_std_workspace_core-21b4c21733a3200b.rlib
+c538c6ede82295ddb73aaad651c6e86e1f4be6d63d92517d779b2b15abe31d90  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/librustc_std_workspace_core-21b4c21733a3200b.rmeta
+3bf4a083e3871a93652a95f0c395c9c9786dc01d349990ce506152f12e2a5eb1  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libstd-4c2645ca1464cad6.rlib
+0ac6ec3d4e38450babe11a4b744cfc0f4b6d9081bc0c946d23859531d08a28ea  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libstd-4c2645ca1464cad6.rmeta
+31d9fcdf438208a724fd4b445de41adb61129b3dc135746e45eb7169c7169ae0  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libstd-4c2645ca1464cad6.so
+7e6f68dc9b4236f640e3880803a19751edbc7c6510922d5fc1d9a43acda42f5d  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libstd_detect-e9d5b433926c1051.rlib
+ad5d7551b9e066ce5904ea1f70143938d499c78bfa8d9f42f4ed7c88bb4ddf8d  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libstd_detect-e9d5b433926c1051.rmeta
+c075a4224efb27035f6b1d8c86523f1b6c9594b7ec4a5185676fa8d7247637d8  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libunwind-470d092195f5412b.rlib
+d099e764e1038d3973ec2a438ffca6106a2cc781bc7a9338a2040076bbc66658  opt/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/libunwind-470d092195f5412b.rmeta

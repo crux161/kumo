@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j548
 //j861
 //j891
 //j892
 //j918
+//j925
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -791,6 +791,10 @@ pub enum FatWriteError {
 /// a large FAT never has to be resident.
 pub struct FatVolume {
     bpb: Bpb,
+    /// j925: where the next free-cluster search starts (just past the last cluster handed
+    /// out, or the lowest one freed since). Only a starting point: a candidate is always
+    /// checked free in the FAT itself, so another writer of the same image cannot be misled.
+    next_free: core::cell::Cell<u32>,
 }
 
 impl FatVolume {
@@ -802,6 +806,7 @@ impl FatVolume {
         }
         Ok(FatVolume {
             bpb: Bpb::parse(&buf)?,
+            next_free: core::cell::Cell::new(2),
         })
     }
 
@@ -1312,12 +1317,29 @@ impl FatVolume {
         Ok(())
     }
 
+    /// j925 (SH7-g): from the hint to the end, then from cluster 2 to the hint, one FAT sector
+    /// read per 128 entries. The search used to start at cluster 2 and read a sector per entry
+    /// for every allocation: on the 900 MB toolchain image that was thousands of sector reads
+    /// per cluster rustc wrote under Cargo, and the server ran for minutes.
     fn find_free_cluster<R: SectorReader>(&self, reader: &mut R) -> Result<u32, FatWriteError> {
-        for cluster in 2..self.cluster_limit() {
-            match self.next_link(reader, cluster) {
-                Some(FatEntry::Free) => return Ok(cluster),
-                Some(_) => {}
-                None => return Err(FatWriteError::Io),
+        let limit = self.cluster_limit();
+        let start = self.next_free.get().clamp(2, limit.max(2));
+        let mut buf = [0u8; SECTOR_SIZE];
+        for (low, high) in [(start, limit), (2, start)] {
+            let mut cluster = low;
+            while cluster < high {
+                let sector = self.bpb.fat_start_sector() + cluster / FAT_ENTRIES_PER_SECTOR;
+                if !reader.read_sector(sector, &mut buf) {
+                    return Err(FatWriteError::Io);
+                }
+                let sector_end = (cluster / FAT_ENTRIES_PER_SECTOR + 1) * FAT_ENTRIES_PER_SECTOR;
+                for candidate in cluster..sector_end.min(high) {
+                    if fat_entry(&buf, candidate % FAT_ENTRIES_PER_SECTOR) == Some(FatEntry::Free) {
+                        self.next_free.set(candidate + 1);
+                        return Ok(candidate);
+                    }
+                }
+                cluster = sector_end;
             }
         }
         Err(FatWriteError::NoSpace)
@@ -1522,6 +1544,9 @@ impl FatVolume {
                 Some(FatEntry::Bad) | None => return Err(FatWriteError::Io),
             };
             self.write_fat_entry(io, cluster, 0)?;
+            if cluster < self.next_free.get() {
+                self.next_free.set(cluster);
+            }
             freed += 1;
             match next {
                 Some(next) => cluster = next,
@@ -1708,8 +1733,11 @@ impl FatVolume {
 
     /// Rename one file, replacing an existing target file (SH3; any names since SH7-e1). The
     /// new entry is written before the old one is retired, so a mid-way failure leaves a
-    /// duplicate rather than a lost file. Directory renames are refused; FAT would also require
-    /// rewriting the directory's `..` entry.
+    /// duplicate rather than a lost file.
+    ///
+    /// j925 (SH7-g): a directory renames too, to a name that does not exist (Cargo makes its
+    /// target directory by renaming a prepared temporary one into place). Moving it under
+    /// another parent rewrites its `..` first; moving it into itself is refused.
     pub fn rename<R: SectorReader + SectorWriter>(
         &self,
         io: &mut R,
@@ -1720,10 +1748,10 @@ impl FatVolume {
         let (source, source_slots) = self
             .find_with_slots(io, from_dir, from_name)
             .ok_or(FatWriteError::Invalid)?;
-        if source.is_dir() {
-            return Err(FatWriteError::Invalid);
-        }
         let (to_dir, to_name) = self.parent_dir(io, to)?;
+        if source.is_dir() {
+            return self.rename_dir(io, (from_dir, &source, &source_slots), to_dir, to_name);
+        }
         if let Some((target, target_slots)) = self.find_with_slots(io, to_dir, to_name) {
             if target.location != source.location {
                 if target.is_dir() {
@@ -1744,6 +1772,58 @@ impl FatVolume {
             source.size,
         )?;
         self.clear_with_slots(io, &source, &source_slots)
+    }
+
+    fn rename_dir<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        (from_dir, source, source_slots): (u32, &DirEntry, &names::SlotRun),
+        to_dir: u32,
+        to_name: &[u8],
+    ) -> Result<(), FatWriteError> {
+        if self.find_with_slots(io, to_dir, to_name).is_some() {
+            return Err(FatWriteError::Invalid);
+        }
+        // The new parent must not lie inside the directory being moved: walk up its `..`s.
+        let mut cursor = to_dir;
+        for _ in 0..256 {
+            if cursor == source.first_cluster {
+                return Err(FatWriteError::Invalid);
+            }
+            if cursor == self.bpb.root_cluster {
+                break;
+            }
+            let mut sector = [0u8; SECTOR_SIZE];
+            if !io.read_sector(self.bpb.cluster_to_sector(cursor), &mut sector) {
+                return Err(FatWriteError::Io);
+            }
+            let at = DIR_ENTRY_SIZE;
+            let high = u16::from_le_bytes([sector[at + 20], sector[at + 21]]) as u32;
+            let low = u16::from_le_bytes([sector[at + 26], sector[at + 27]]) as u32;
+            cursor = match high << 16 | low {
+                0 => self.bpb.root_cluster,
+                up => up,
+            };
+        }
+        if to_dir != from_dir {
+            let parent_cluster = if to_dir == self.bpb.root_cluster {
+                0
+            } else {
+                to_dir
+            };
+            let first = self.bpb.cluster_to_sector(source.first_cluster);
+            let mut sector = [0u8; SECTOR_SIZE];
+            if !io.read_sector(first, &mut sector) {
+                return Err(FatWriteError::Io);
+            }
+            let dotdot = short_entry_bytes(b"..         ", attr::DIRECTORY, parent_cluster, 0);
+            sector[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot);
+            if !io.write_sector(first, &sector) {
+                return Err(FatWriteError::Io);
+            }
+        }
+        self.write_named(io, to_dir, to_name, source.attr, source.first_cluster, 0)?;
+        self.clear_with_slots(io, source, source_slots)
     }
 
     pub fn flush<R: SectorWriter>(&self, writer: &mut R) -> Result<(), FatWriteError> {
@@ -3359,15 +3439,21 @@ mod tests {
         assert_eq!(&out[..n], b"moved");
     }
 
+    /// j925: a directory renames to a free name (SH3 refused it), never onto an existing one.
     #[test]
-    fn rename_refuses_a_directory() {
+    fn rename_moves_a_directory_only_to_a_free_name() {
         let mut disk = WritableDisk::fixture();
         let vol = FatVolume::mount(&mut disk).unwrap();
         vol.create_dir(&mut disk, b"/WORK").unwrap();
+        vol.create_file(&mut disk, b"/TAKEN.TXT").unwrap();
         assert_eq!(
-            vol.rename(&mut disk, b"/WORK", b"/OTHER"),
+            vol.rename(&mut disk, b"/WORK", b"/TAKEN.TXT"),
             Err(FatWriteError::Invalid)
         );
+        assert_eq!(vol.rename(&mut disk, b"/WORK", b"/OTHER"), Ok(()));
+        assert!(vol
+            .resolve_path(&mut disk, b"/OTHER")
+            .is_some_and(|e| e.is_dir()));
     }
 
     //j918
@@ -3513,5 +3599,93 @@ mod tests {
         let names = listed(&vol, &mut disk, dir.first_cluster);
         assert_eq!(names.len(), 10);
         assert_eq!(names[9], "codegen-unit-07.rcgu.o");
+    }
+
+    /// j925 (SH7-g): Cargo's lock and fingerprint files start with a dot (`.package-cache`,
+    /// `.fingerprint`, `.cargo-lock`). Windows gives them `PACKAG~1` style aliases. — TEAL
+    #[test]
+    fn a_name_with_a_leading_dot_gets_an_alias() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        vol.create_dir(&mut disk, b"/home").unwrap();
+        let file = vol
+            .create_file(&mut disk, b"/home/.package-cache")
+            .expect("create a dot file");
+        let dir = vol
+            .create_dir(&mut disk, b"/home/.fingerprint")
+            .expect("create a dot directory");
+        assert!(dir.is_dir());
+        assert_ne!(file.name, dir.name);
+        let home = vol.resolve_path(&mut disk, b"/home").unwrap();
+        let names = listed(&vol, &mut disk, home.first_cluster);
+        assert!(names.iter().any(|n| n == ".package-cache"), "{names:?}");
+        assert!(names.iter().any(|n| n == ".fingerprint"), "{names:?}");
+        assert!(vol
+            .resolve_path(&mut disk, b"/home/.package-cache")
+            .is_some());
+    }
+
+    /// j925 (SH7-g): a directory renames in place and across parents; its contents and `..`
+    /// follow; it cannot move into itself or onto an existing name. — TEAL
+    #[test]
+    fn a_directory_renames_and_moves() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        vol.create_dir(&mut disk, b"/out").unwrap();
+        vol.create_dir(&mut disk, b"/out/.tmpAbC123").unwrap();
+        vol.create_file(&mut disk, b"/out/.tmpAbC123/CACHEDIR.TAG")
+            .unwrap();
+        vol.rename(&mut disk, b"/out/.tmpAbC123", b"/out/target")
+            .expect("rename in place");
+        assert!(vol.resolve_path(&mut disk, b"/out/.tmpAbC123").is_none());
+        assert!(vol
+            .resolve_path(&mut disk, b"/out/target/CACHEDIR.TAG")
+            .is_some());
+        vol.create_dir(&mut disk, b"/other").unwrap();
+        vol.rename(&mut disk, b"/out/target", b"/other/moved")
+            .expect("move across parents");
+        let moved = vol.resolve_path(&mut disk, b"/other/moved").unwrap();
+        let other = vol.resolve_path(&mut disk, b"/other").unwrap();
+        let mut sector = [0u8; SECTOR_SIZE];
+        assert!(disk.read_sector(vol.bpb.cluster_to_sector(moved.first_cluster), &mut sector));
+        let at = DIR_ENTRY_SIZE;
+        let up = (u16::from_le_bytes([sector[at + 20], sector[at + 21]]) as u32) << 16
+            | u16::from_le_bytes([sector[at + 26], sector[at + 27]]) as u32;
+        assert_eq!(up, other.first_cluster, "`..` names the new parent");
+        assert!(vol
+            .resolve_path(&mut disk, b"/other/moved/CACHEDIR.TAG")
+            .is_some());
+        assert!(vol
+            .rename(&mut disk, b"/other", b"/other/moved/inside")
+            .is_err());
+        assert!(vol.rename(&mut disk, b"/other/moved", b"/out").is_err());
+    }
+
+    /// j925 (SH7-g): Cargo's own sequence: a renamed target directory, then a deep fingerprint
+    /// directory and a long-named file in it.
+    #[test]
+    fn cargo_builds_a_fingerprint_tree_under_a_renamed_directory() {
+        let mut disk = WritableDisk::fixture();
+        let vol = FatVolume::mount(&mut disk).unwrap();
+        vol.create_dir(&mut disk, b"/out").unwrap();
+        vol.create_dir(&mut disk, b"/out/.tmpAbC123").unwrap();
+        vol.create_file(&mut disk, b"/out/.tmpAbC123/CACHEDIR.TAG")
+            .unwrap();
+        vol.create_file(&mut disk, b"/out/.tmpAbC123/.gitignore")
+            .unwrap();
+        vol.rename(&mut disk, b"/out/.tmpAbC123", b"/out/target")
+            .unwrap();
+        for dir in [
+            &b"/out/target/release"[..],
+            b"/out/target/release/.fingerprint",
+            b"/out/target/release/.fingerprint/message-d6b32edc9b72d2ca",
+        ] {
+            vol.create_dir(&mut disk, dir).expect("mkdir");
+        }
+        vol.create_file(
+            &mut disk,
+            b"/out/target/release/.fingerprint/message-d6b32edc9b72d2ca/invoked.timestamp",
+        )
+        .expect("create the timestamp");
     }
 }

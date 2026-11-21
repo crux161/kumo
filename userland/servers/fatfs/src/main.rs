@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j891
 //j892
 //j913
 //j917
 //j924
+//j925
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -29,7 +29,7 @@ use kumo_fatfs::{FatVolume, SectorReader, SectorWriter, SECTOR_SIZE};
 use kumo_rt::{
     channel_read, channel_read_with_handle, channel_write, channel_write_with_handle, handle_close,
     handle_duplicate, handle_koid, port_bind, port_create, port_unbind, port_wait, vmar_map,
-    vmar_map_anywhere_at, vmar_unmap,
+    vmar_unmap,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
@@ -45,6 +45,10 @@ kumo_rt::entry!(main);
 /// window over it, so the server's address space stays small and its `ReadVmo` client windows
 /// keep their room. Matches `drv-blk`'s old single-map ceiling.
 const WINDOW_LEN: u64 = 16 * 1024 * 1024;
+/// j925: where a `ReadVmo` client window is mapped, past the image window's whole range.
+const CLIENT_VA: u64 = VMO_VA + WINDOW_LEN;
+/// One request's window: `READ_VMO_MAX` plus the page its offset may start inside.
+const CLIENT_WINDOW_LEN: u64 = kumo_vfs::READ_VMO_MAX as u64 + 0x1000;
 /// j924: the image bootstrap's length flag for a mount-scoped (multi-session) server.
 const IMAGE_MOUNT: u64 = kumo_vfs::IMAGE_MOUNT_FLAG;
 
@@ -53,6 +57,15 @@ const IMAGE_MOUNT: u64 = kumo_vfs::IMAGE_MOUNT_FLAG;
 /// so a multi-MiB map at 0x1000_0000 would remap the stack read-only.
 /// j913: offset into this architecture's user window (x86 programs live at 0x80_0000_0000).
 const VMO_VA: u64 = kumo_rt::USER_WINDOW_BASE + 0x0000_0000_1100_0000;
+
+/// Write `value`'s low hex digits into `out`, most significant first.
+fn put_hex(out: &mut [u8], value: u64) {
+    let len = out.len();
+    for (i, digit) in out.iter_mut().enumerate() {
+        let shift = (len - 1 - i) * 4;
+        *digit = b"0123456789abcdef"[((value >> shift) & 0xf) as usize];
+    }
+}
 
 fn fail(message: &[u8]) -> ! {
     log_info(message);
@@ -82,16 +95,21 @@ impl MappedSectors {
                 self.window_at = u64::MAX;
             }
             let map_len = WINDOW_LEN.min(self.len - start);
-            if vmar_map(
+            let status = vmar_map(
                 Handle(0),
                 self.vmo,
                 start,
                 VMO_VA,
                 map_len,
                 (VmarFlags::READ | VmarFlags::WRITE).0,
-            ) != 0
-            {
-                log_info(b"fatfs: image window map failed\n");
+            );
+            if status != 0 {
+                // j925: say why, with the window asked for.
+                let mut line =
+                    *b"fatfs: image window map failed status=0x00000000 at=0x0000000000000000\n";
+                put_hex(&mut line[40..48], status as u64);
+                put_hex(&mut line[54..70], start);
+                log_info(&line);
                 return None;
             }
             self.window_at = start;
@@ -161,13 +179,23 @@ impl BulkWindow for VmoWindow {
         let page = vmo_offset & !0xFFF;
         let delta = vmo_offset - page;
         let map_len = (delta + len as u64).checked_add(0xFFF)? & !0xFFF;
-        let (status, view) = vmar_map_anywhere_at(
+        if map_len > CLIENT_WINDOW_LEN {
+            return None;
+        }
+        // j925: at its own fixed address, never wherever the kernel finds room. Placed first-fit,
+        // it could land in the hole a short tail image window leaves inside the image window's
+        // range, and the next full-size image window then overlapped it (InvalidArgs, and the
+        // read failed: rustc's metadata, under Cargo).
+        let view = CLIENT_VA;
+        let status = vmar_map(
+            Handle(0),
             Handle(vmo),
             page,
+            view,
             map_len,
             (VmarFlags::READ | VmarFlags::WRITE).0,
         );
-        if status != 0 || view == 0 {
+        if status != 0 {
             log_info(b"fatfs: ReadVmo window could not be mapped\n");
             return None;
         }
@@ -261,7 +289,10 @@ fn serve_mount<D: SectorReader + SectorWriter>(control: Handle, mut disk: D) -> 
         fail(b"fatfs: mount-scoped control bind failed\n");
     }
     log_info(b"fatfs: serving a mount\n");
-    let mut server = SharedServer::new();
+    // j925: sixteen sessions of 32 open files is ~28 KB: static, not on the service stack.
+    static mut SHARED: SharedServer = SharedServer::new();
+    // SAFETY: the single-threaded serve loop is the only user, and it never returns.
+    let server = unsafe { &mut *core::ptr::addr_of_mut!(SHARED) };
     let mut sessions: [Option<(Handle, u64)>; MAX_SESSIONS] = [None; MAX_SESSIONS];
     let mut request_buf = [0u8; REQUEST_BUF_BYTES];
     let mut reply_buf = [0u8; REPLY_BUF_BYTES];
@@ -328,7 +359,7 @@ fn serve_mount<D: SectorReader + SectorWriter>(control: Handle, mut disk: D) -> 
                 let reply_len = dispatch_shared_bulk(
                     &volume,
                     &mut disk,
-                    &mut server,
+                    server,
                     index,
                     &request_buf[..n as usize],
                     vmo,
