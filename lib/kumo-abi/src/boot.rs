@@ -4,6 +4,7 @@ use core::marker::PhantomData;
 //j467
 //j480
 //j622
+//j932
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,10 +261,108 @@ impl BootInfo {
     }
 }
 
+/// j932 (SH8-f): the most boot command-line bytes the kernel copies into Sora's one-page
+/// BootInfo snapshot. The loader's bytes live in its own allocation; the snapshot cannot point
+/// there, so the kernel copies them to [`SNAPSHOT_CMDLINE_OFFSET`] and the snapshot's
+/// `cmdline` carries that page offset and the length instead of a pointer. — TEAL
+pub const CMDLINE_MAX: usize = 256;
+/// j932: where in the snapshot page the copied command line starts.
+pub const SNAPSHOT_CMDLINE_OFFSET: usize = 2048;
+const _: () = assert!(core::mem::size_of::<BootInfo>() <= SNAPSHOT_CMDLINE_OFFSET);
+const _: () = assert!(SNAPSHOT_CMDLINE_OFFSET + CMDLINE_MAX <= 4096);
+
+/// j932 (SH8-f, D2): the root filesystem the boot command line names, `root=uuid:<hex>`: one
+/// space-separated word, 32 hex digits (hyphens ignored, as in a printed UUID). Any other
+/// spelling names no root; a second `root=` word makes the line ambiguous and names none.
+pub fn root_uuid(cmdline: &[u8]) -> Option<[u8; 16]> {
+    let mut found = None;
+    for word in cmdline.split(|b| b.is_ascii_whitespace()) {
+        let Some(value) = word.strip_prefix(b"root=") else {
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some(parse_uuid(value.strip_prefix(b"uuid:")?)?);
+    }
+    found
+}
+
+/// 32 hex digits, hyphens anywhere ignored, to 16 bytes.
+pub fn parse_uuid(text: &[u8]) -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
+    let mut digits = 0usize;
+    for &c in text {
+        let nibble = match c {
+            b'-' => continue,
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => return None,
+        };
+        if digits == 32 {
+            return None;
+        }
+        out[digits / 2] |= if digits % 2 == 0 { nibble << 4 } else { nibble };
+        digits += 1;
+    }
+    (digits == 32).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ABI_VERSION;
+
+    #[test]
+    fn root_uuid_reads_one_root_word() {
+        let hex = b"00112233445566778899aabbccddeeff";
+        let mut line = b"loglevel=6 root=uuid:".to_vec();
+        line.extend_from_slice(hex);
+        line.extend_from_slice(b" quiet");
+        let want = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        assert_eq!(root_uuid(&line), Some(want));
+        assert_eq!(
+            root_uuid(b"root=uuid:00112233-4455-6677-8899-AABBCCDDEEFF"),
+            Some(want),
+            "hyphens and upper case are a printed UUID"
+        );
+    }
+
+    #[test]
+    fn root_uuid_names_nothing_when_unclear() {
+        assert_eq!(root_uuid(b""), None);
+        assert_eq!(root_uuid(b"quiet"), None);
+        assert_eq!(
+            root_uuid(b"root=/dev/disk5s1"),
+            None,
+            "positional names are refused"
+        );
+        assert_eq!(root_uuid(b"root=uuid:0011"), None, "too short");
+        assert_eq!(
+            root_uuid(b"root=uuid:00112233445566778899aabbccddeeff00"),
+            None,
+            "too long"
+        );
+        assert_eq!(
+            root_uuid(b"root=uuid:00112233445566778899aabbccddeefg"),
+            None
+        );
+        assert_eq!(
+            root_uuid(b"root=uuid:00112233445566778899aabbccddeeff root=uuid:ffeeddccbbaa99887766554433221100"),
+            None,
+            "two roots are ambiguous"
+        );
+    }
+
+    #[test]
+    fn snapshot_cmdline_fits_after_the_struct() {
+        assert!(core::mem::size_of::<BootInfo>() <= SNAPSHOT_CMDLINE_OFFSET);
+        assert!(SNAPSHOT_CMDLINE_OFFSET + CMDLINE_MAX <= 4096);
+    }
 
     #[test]
     fn empty_boot_info_is_unambiguous() {

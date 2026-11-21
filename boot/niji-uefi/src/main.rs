@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j805
 //j810
 //j904
 //j905
 //j906
+//j932
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -1454,6 +1454,25 @@ unsafe fn stamp_boot_config(
         },
         None => kprint!(con_out, "console UART : BSP default\r\n"),
     }
+
+    // j932 (SH8-f, D2): `root = uuid:<hex>` becomes the command line `root=uuid:<hex>`, written
+    // after the struct in BootInfo's own allocation (see `alloc_bootinfo`). The kernel copies
+    // it into Sora's BootInfo snapshot; Sora mounts the RedoxFS volume with that UUID at `/`.
+    match config.map(|cfg| (cfg.root, cfg.root_cmdline())) {
+        Some((Some(_), Some((line, len)))) if len <= kumo_abi::boot::CMDLINE_MAX => {
+            let dst = unsafe { (boot_ptr as *mut u8).add(size_of::<BootInfo>()) };
+            unsafe { core::ptr::copy_nonoverlapping(line.as_ptr(), dst, len) };
+            unsafe { (*boot_ptr).cmdline = RawSlice::from_raw_parts(dst as u64, len as u64) };
+            let text = core::str::from_utf8(&line[..len]).unwrap_or("");
+            kprint!(con_out, "root         : {}\r\n", text);
+        }
+        Some((Some(value), _)) => kprint!(
+            con_out,
+            "root         : rejected '{}' (want uuid:<32 hex digits>; staying on initrd)\r\n",
+            value
+        ),
+        _ => {}
+    }
     unsafe { ((*boot_services).free_pool)(buffer) };
 }
 
@@ -2299,7 +2318,9 @@ unsafe fn alloc_bootinfo(boot_services: *mut EfiBootServices) -> Option<*mut Boo
     let status = unsafe {
         ((*boot_services).allocate_pool)(
             efi_memory_type::LOADER_DATA,
-            size_of::<BootInfo>(),
+            // j932 (SH8-f): the boot command line lives right after the struct, in the same
+            // LoaderData allocation, so it lasts exactly as long as BootInfo does.
+            size_of::<BootInfo>() + kumo_abi::boot::CMDLINE_MAX,
             &mut ptr,
         )
     };

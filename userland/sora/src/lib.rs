@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j774
 //j803
 //j820
 //j928
 //j930
+//j932
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -849,6 +849,71 @@ pub fn scratch_path(path: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// j932 (SH8-f): whether `/` is a RedoxFS root this boot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootState {
+    /// No root was named or found: `/` is the read-only initrd, `/tmp` the RAM FAT image.
+    Initrd,
+    /// The named RedoxFS volume is mounted at `/`.
+    Mounted,
+    /// It was mounted and its server was given up (D5): `/` is the initrd again, and nothing
+    /// falls back to the FAT image, whose writes would land somewhere the user does not expect.
+    Lost,
+}
+
+/// j932: where a canonical absolute shell path lands, given the root's state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellRoute<'a> {
+    /// The read-only initrd, as before SH8-f.
+    Initrd,
+    /// The RAM FAT scratch image at `/tmp` (no root), at this path from its root.
+    Scratch(&'a [u8]),
+    /// `/media` itself.
+    MediaRoot,
+    /// A volume under `/media`.
+    Media { name: &'a [u8], path: &'a [u8] },
+    /// The RedoxFS root, at this (unchanged, absolute) path.
+    Root(&'a [u8]),
+    /// `/tmp` after the root was lost: refused rather than silently FAT.
+    RootLost,
+}
+
+/// Route `path`. `/media` stays Sora's own namespace in every state; with a root mounted every
+/// other path, `/tmp` included, is the root's.
+pub fn shell_route(path: &[u8], root: RootState) -> ShellRoute<'_> {
+    match media_route(path) {
+        MediaRoute::Root => return ShellRoute::MediaRoot,
+        MediaRoute::Volume { name, path } => return ShellRoute::Media { name, path },
+        MediaRoute::Elsewhere => {}
+    }
+    match (root, scratch_path(path)) {
+        (RootState::Mounted, _) => ShellRoute::Root(path),
+        (RootState::Initrd, Some(scratch)) => ShellRoute::Scratch(scratch),
+        (RootState::Lost, Some(_)) => ShellRoute::RootLost,
+        (_, None) => ShellRoute::Initrd,
+    }
+}
+
+/// j932: a RedoxFS header's UUID, from the volume's first block (`Filesystem::detect` said
+/// RedoxFS): bytes 16..32, after the signature and the version.
+pub fn redoxfs_uuid(sector0: &[u8]) -> Option<[u8; 16]> {
+    if sector0.get(..8) != Some(b"RedoxFS\0") {
+        return None;
+    }
+    sector0.get(16..32)?.try_into().ok()
+}
+
+/// j932: 32 lowercase hex digits, as `xtask redoxfs-image` prints a UUID.
+pub fn uuid_hex(uuid: &[u8; 16]) -> [u8; 32] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 32];
+    for (i, byte) in uuid.iter().enumerate() {
+        out[2 * i] = HEX[usize::from(byte >> 4)];
+        out[2 * i + 1] = HEX[usize::from(byte & 0xf)];
+    }
+    out
+}
+
 /// Close every present handle, continuing after an error so one failed close
 /// cannot strand the remaining authority. Returns whether every close succeeded.
 ///
@@ -995,6 +1060,50 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    #[test]
+    fn shell_routes_follow_the_root() {
+        use ShellRoute::*;
+        let none = RootState::Initrd;
+        assert_eq!(shell_route(b"/", none), Initrd);
+        assert_eq!(shell_route(b"/etc/passwd", none), Initrd);
+        assert_eq!(shell_route(b"/tmp", none), Scratch(b"/"));
+        assert_eq!(shell_route(b"/tmp/a", none), Scratch(b"/a"));
+        assert_eq!(shell_route(b"/tmpfoo", none), Initrd);
+        let root = RootState::Mounted;
+        assert_eq!(shell_route(b"/", root), Root(b"/"));
+        assert_eq!(shell_route(b"/tmp/a", root), Root(b"/tmp/a"));
+        assert_eq!(shell_route(b"/home/crux", root), Root(b"/home/crux"));
+        assert_eq!(shell_route(b"/mediafoo", root), Root(b"/mediafoo"));
+        for state in [none, root, RootState::Lost] {
+            assert_eq!(shell_route(b"/media", state), MediaRoot);
+            assert_eq!(
+                shell_route(b"/media/KUMO/x", state),
+                Media {
+                    name: b"KUMO",
+                    path: b"/x"
+                }
+            );
+        }
+        let lost = RootState::Lost;
+        assert_eq!(shell_route(b"/", lost), Initrd);
+        assert_eq!(
+            shell_route(b"/tmp/a", lost),
+            RootLost,
+            "no silent FAT after a loss"
+        );
+    }
+
+    #[test]
+    fn redoxfs_uuid_is_read_from_the_header() {
+        let mut sector = [0u8; 4096];
+        assert_eq!(redoxfs_uuid(&sector), None);
+        sector[..8].copy_from_slice(b"RedoxFS\0");
+        sector[16..32].copy_from_slice(b"0123456789abcdef");
+        assert_eq!(redoxfs_uuid(&sector), Some(*b"0123456789abcdef"));
+        assert_eq!(redoxfs_uuid(&sector[..20]), None);
+        assert_eq!(&uuid_hex(&[0xab; 16])[..4], b"abab");
+    }
     use alloc::vec::Vec;
     use drv_fb::{Console, BG, GLYPH_H, GLYPH_W};
     use kumo_i2c_hid::{BootMouseReport, MouseButtons};

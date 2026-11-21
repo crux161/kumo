@@ -3,6 +3,7 @@
 #j929
 #j930
 #j931
+#j932
 """SH8-b: one QEMU boot proving RedoxFS through the VFS (PLAN/008 S5, PLAN/022 SH8).
 
 The autoexec makes the RAM work volume (`workvol`), which Sora mounts at /media/WORK with
@@ -170,12 +171,16 @@ def zero_header_ring(image):
     image.write_bytes(bytes(data))
 
 
-def boot_with_disk(axh, case, work, qemu, firmware, timeout, disk, memory_mib=2048):
-    """axh.boot with a modern virtio-mmio block device on `disk`."""
+def boot_with_disk(axh, case, work, qemu, firmware, timeout, disk, memory_mib=2048, manifest_extra=None):
+    """axh.boot with a modern virtio-mmio block device on `disk`. `manifest_extra` (j932, SH8-f)
+    is appended to this boot's copy of the ESP manifest, e.g. `root = uuid:<hex>`."""
     import time
     source = ROOT / "build/images/qemu-virt-aarch64"
     work.mkdir()
     shutil.copytree(source, work / "esp")
+    if manifest_extra:
+        conf = work / "esp/EFI/KUMO/nijigumo.conf"
+        conf.write_text(conf.read_text() + manifest_extra)
     initrd_hash = axh.stage(work / "esp/EFI/KUMO/initrd.img", case)
     axh.raw_initrd_only(work / "esp/EFI/KUMO")
     (work / "autoexec.txt").write_bytes(case.script)

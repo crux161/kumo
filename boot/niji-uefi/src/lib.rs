@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j800
 //j804
 //j810
 //j905
 //j910
+//j932
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
@@ -441,6 +441,10 @@ pub struct BootConfig<'a> {
     pub initrd_zstd_path: Option<&'a str>,
     pub initrd_zstd_sha256: Option<[u8; 32]>,
     pub initrd_size: Option<u64>,
+    /// j932 (SH8-f, D2): the root filesystem, `root = uuid:<hex>`, as source text. The loader
+    /// checks it with [`kumo_abi::boot::parse_uuid`] and forwards it in `BootInfo.cmdline` as
+    /// `root=uuid:<hex>`; Sora mounts the RedoxFS volume whose header carries that UUID.
+    pub root: Option<&'a str>,
 }
 
 /// The compressed-initrd triple from a manifest: path, compressed-stream SHA-256, decoded size.
@@ -491,6 +495,7 @@ impl<'a> BootConfig<'a> {
         let mut initrd_zstd_path: Option<&'a str> = None;
         let mut initrd_zstd_sha256: Option<[u8; 32]> = None;
         let mut initrd_size: Option<u64> = None;
+        let mut root: Option<&'a str> = None;
         let mut dtb = DtbSource::Firmware;
         for raw in text.lines() {
             let line = match raw.split_once('#') {
@@ -513,6 +518,7 @@ impl<'a> BootConfig<'a> {
                 "initrd_zstd" => initrd_zstd_path = Some(value),
                 "initrd_zstd_sha256" => initrd_zstd_sha256 = parse_sha256_hex(value),
                 "initrd_size" => initrd_size = value.parse().ok(),
+                "root" => root = Some(value),
                 "dtb" => {
                     dtb = if value.eq_ignore_ascii_case("firmware") {
                         DtbSource::Firmware
@@ -534,13 +540,52 @@ impl<'a> BootConfig<'a> {
             initrd_zstd_path,
             initrd_zstd_sha256,
             initrd_size,
+            root,
         })
+    }
+
+    /// j932: the boot command line the `root` key asks for, `root=uuid:<32 hex digits>`, or
+    /// `None` when the key is absent or does not hold exactly one UUID.
+    pub fn root_cmdline(&self) -> Option<([u8; 42], usize)> {
+        let value = self.root?;
+        let hex = value.strip_prefix("uuid:")?.trim();
+        let uuid = kumo_abi::boot::parse_uuid(hex.as_bytes())?;
+        let mut line = [0u8; 42];
+        line[..10].copy_from_slice(b"root=uuid:");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for (i, byte) in uuid.iter().enumerate() {
+            line[10 + 2 * i] = HEX[usize::from(byte >> 4)];
+            line[11 + 2 * i] = HEX[usize::from(byte & 0xf)];
+        }
+        Some((line, 42))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_key_becomes_one_canonical_cmdline_word() {
+        let cfg =
+            BootConfig::parse("kernel = k\nroot = uuid:00112233-4455-6677-8899-AABBCCDDEEFF\n")
+                .unwrap();
+        let (line, len) = cfg.root_cmdline().expect("a valid root");
+        assert_eq!(&line[..len], b"root=uuid:00112233445566778899aabbccddeeff");
+        assert_eq!(
+            kumo_abi::boot::root_uuid(&line[..len]).map(|u| u[15]),
+            Some(0xff),
+            "Sora's parser reads what the loader writes"
+        );
+        for bad in [
+            "kernel = k\nroot = /dev/disk5s1\n",
+            "kernel = k\nroot = uuid:0011\n",
+            "kernel = k\n",
+        ] {
+            let cfg = BootConfig::parse(bad).unwrap();
+            assert_eq!(cfg.root_cmdline(), None, "{bad}");
+        }
+    }
 
     #[test]
     fn the_compressed_initrd_needs_path_digest_and_size_together() {

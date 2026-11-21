@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j925
 //j928
 //j929
 //j930
 //j931
+//j932
 
 extern crate alloc;
 
@@ -2705,7 +2705,7 @@ fn set_device(index: usize, device: Option<Device>) {
 /// Mount the offered volume of controller `index` as `/media/<name>`, and say so. The
 /// volume is served by ONE mount-scoped `fatfs` (SH3-c2), not a per-launch instance: every
 /// client gets a session on it, which is what makes advisory locks and renames shared.
-fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaName) {
+fn mount_device(initrd: Handle, slot: Slot, index: usize, device: Device, name: sora::MediaName) {
     // j930 (SH8-d, D5): a volume's filesystem is what its first sector says; only the blank RAM
     // work volume, which Sora made itself, is RedoxFS by fiat (and may be formatted).
     let transport = sora::StorageTransport::of(index);
@@ -2732,28 +2732,36 @@ fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaN
     };
     let process_koid = handle_koid(process);
     if server_end.0 != 0 {
-        let mut supervisor = MEDIA_SUPERVISOR.get();
+        let mut supervisors = MEDIA_SUPERVISOR.get();
+        let supervisor = &mut supervisors[slot as usize];
         supervisor.initrd = initrd;
         supervisor.intensity = sora::RestartIntensity::new(10_000_000_000);
         supervisor.backoff = sora::RestartBackoff::new(50_000_000, 400_000_000);
         supervisor.instance = 1;
-        MEDIA_SUPERVISOR.set(supervisor);
+        MEDIA_SUPERVISOR.set(supervisors);
         media_watch(process);
         let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
         if port.0 != 0 {
             let _ = port_bind(port, process);
         }
     }
-    set_media(Some(Media {
-        name,
-        ready: device.ready,
-        control,
-        device: index,
-        process,
-        process_koid,
-        server_end,
-        filesystem,
-    }));
+    set_mounted(
+        slot,
+        Some(Media {
+            name,
+            ready: device.ready,
+            control,
+            device: index,
+            process,
+            process_koid,
+            server_end,
+            filesystem,
+        }),
+    );
+    if slot == Slot::Root {
+        // The root's own line and probe are `mount_root`'s (it names the UUID).
+        return;
+    }
     notice(&[
         b"media: ",
         &sora::disk_path(index),
@@ -2775,22 +2783,65 @@ fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaN
     }
 }
 
-struct MediaCell(core::cell::UnsafeCell<Option<Media>>);
+/// j932 (SH8-f): Sora's mount slots. `Media` is the one `/media/<name>` volume (J766); `Root`
+/// is the RedoxFS volume the boot command line named, mounted at `/` (DESIGN/010 §7). Each has
+/// its own supervisor; a device is in at most one slot. — TEAL
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Slot {
+    Media = 0,
+    Root = 1,
+}
 
-// SAFETY: Sora is single-threaded, and `media`/`set_media` copy in and out without keeping a
-// reference.
+const SLOTS: [Slot; 2] = [Slot::Media, Slot::Root];
+
+struct MediaCell(core::cell::UnsafeCell<[Option<Media>; 2]>);
+
+// SAFETY: Sora is single-threaded, and `mounted`/`set_mounted` copy in and out without keeping
+// a reference.
 unsafe impl Sync for MediaCell {}
 
-static MEDIA: MediaCell = MediaCell(core::cell::UnsafeCell::new(None));
+static MEDIA: MediaCell = MediaCell(core::cell::UnsafeCell::new([None, None]));
+
+fn mounted(slot: Slot) -> Option<Media> {
+    // SAFETY: see `MediaCell`.
+    unsafe { (*MEDIA.0.get())[slot as usize] }
+}
+
+fn set_mounted(slot: Slot, media: Option<Media>) {
+    // SAFETY: see `MediaCell`.
+    unsafe { (*MEDIA.0.get())[slot as usize] = media }
+}
 
 fn media() -> Option<Media> {
-    // SAFETY: see `MediaCell`.
-    unsafe { *MEDIA.0.get() }
+    mounted(Slot::Media)
 }
 
 fn set_media(media: Option<Media>) {
-    // SAFETY: see `MediaCell`.
-    unsafe { *MEDIA.0.get() = media }
+    set_mounted(Slot::Media, media)
+}
+
+/// j932: the root's UUID from the boot command line (D2), read once before autoexec.
+static ROOT_WANTED: Shared<Option<[u8; 16]>> = Shared(core::cell::UnsafeCell::new(None));
+/// j932 (D5): the root was mounted and its server given up; `/` is the initrd until reboot.
+static ROOT_LOST: AtomicBool = AtomicBool::new(false);
+
+fn root_state() -> sora::RootState {
+    if mounted(Slot::Root).is_some() {
+        sora::RootState::Mounted
+    } else if ROOT_LOST.load(Ordering::Relaxed) {
+        sora::RootState::Lost
+    } else {
+        sora::RootState::Initrd
+    }
+}
+
+/// Whether storage slot `index` serves the root (and so never mounts at `/media`).
+fn is_root_device(index: usize) -> bool {
+    mounted_root_on(index).is_some()
+}
+
+fn mounted_root_on(index: usize) -> Option<Media> {
+    mounted(Slot::Root).filter(|root| root.device == index)
 }
 
 //j893
@@ -6255,6 +6306,8 @@ extern "C" fn sora_main(
     // autoexec so its `media` launches can mount it. Its control channel joins the storage
     // controls the pump and the serve loop bind.
     spawn_virtio_disk(initrd);
+    // j932 (SH8-f): the named RedoxFS root mounts at `/` before the first shell command.
+    resolve_root(initrd);
 
     // Autoexec (input-less): run the boot script shipped at `etc/autoexec` in the initrd —
     // one shell command per line, `#` comments and blanks skipped (`kumoza::autoexec_lines`).
@@ -7311,15 +7364,17 @@ fn eval_command(
     }
     #[cfg(feature = "fsd-crash-proof")]
     if cmd.name == "fsd-crash-proof" {
+        // j932 (SH8-f): `fsd-crash-proof root [...]` aims at the root's redoxfsd.
+        let (slot, args) = match cmd.args.split_first() {
+            Some((first, rest)) if first == "root" => (Slot::Root, rest),
+            _ => (Slot::Media, cmd.args.as_slice()),
+        };
         fsd_crash_proof(
-            cmd.args
-                .first()
+            slot,
+            args.first()
                 .map_or(b"/sh8c/armed".as_slice(), |s| s.as_bytes()),
-            cmd.args
-                .get(1)
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0),
-            cmd.args.get(2).map(|s| s.as_bytes()),
+            args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+            args.get(2).map(|s| s.as_bytes()),
         );
         return true;
     }
@@ -7731,12 +7786,15 @@ fn eval_command(
                 run_program_background(initrd, program, true)
             }
             Some((launcher, program)) if !program.is_empty() && launcher == "media" => {
-                run_program_media_background(initrd, program)
+                run_program_media_background(initrd, Slot::Media, program)
+            }
+            Some((launcher, program)) if !program.is_empty() && launcher == "root" => {
+                run_program_media_background(initrd, Slot::Root, program)
             }
             Some((launcher, program)) if !program.is_empty() && launcher == "linux" => {
                 run_linux(initrd, program, &[], cwd, true)
             }
-            _ => usage(b"usage: bg run|net|media|linux <program> [args...]\n"),
+            _ => usage(b"usage: bg run|net|media|root|linux <program> [args...]\n"),
         }
     } else if cmd.name == "media" {
         // media <program> [args...]: `run`, plus a read-write session on the mounted volume
@@ -7745,7 +7803,15 @@ fn eval_command(
         if cmd.args.is_empty() {
             usage(b"usage: media <program> [args...]\n");
         } else {
-            run_program_media(initrd, &cmd.args);
+            run_program_media(initrd, Slot::Media, &cmd.args);
+        }
+    } else if cmd.name == "root" {
+        // j932 (SH8-f): root <program> [args...]: `run`, plus a read-write session on the
+        // RedoxFS root and its control endpoint (the `media` grant, aimed at `/`). — TEAL
+        if cmd.args.is_empty() {
+            usage(b"usage: root <program> [args...]\n");
+        } else {
+            run_program_media(initrd, Slot::Root, &cmd.args);
         }
     } else if cmd.name == "wait" {
         if !cmd.args.is_empty() {
@@ -7919,7 +7985,17 @@ fn run_with_startup(
 /// open-file table remains disposable soft state. The bootstrap message rides the same channel
 /// that afterwards carries vfs frames — the shape `drv-blk` established — so the child needs
 /// exactly one handle.
+/// j932 (SH8-f, item 3): say once per boot that the RAM FAT scratch image is serving a launch.
+/// Under a RedoxFS root it never is, and the root proof checks that this line is absent.
+fn announce_fat_scratch() {
+    static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+    if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+        notice(&[b"fatfs: scratch image server started (RAM FAT /tmp)\n"]);
+    }
+}
+
 fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
+    announce_fat_scratch();
     let (client_raw, server_raw) = channel_create_pair();
     if client_raw == u64::MAX || server_raw == u64::MAX {
         log(b"fatfs: channel unavailable\n");
@@ -7971,6 +8047,7 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
 /// the persona shim keeps so every process it starts opens its own session on the same volume.
 /// The server ends when the control channel and every session are closed.
 fn spawn_fatfs_mount(initrd: Handle) -> Option<(Handle, Handle)> {
+    announce_fat_scratch();
     let (control_raw, server_raw) = channel_create_pair();
     let (session_raw, session_server_raw) = channel_create_pair();
     let raws = [control_raw, server_raw, session_raw, session_server_raw];
@@ -8071,8 +8148,11 @@ fn media_offered(
         if index == sora::NVME_STORAGE {
             nvme_unavailable();
         }
-        if let Some(gone) = media().filter(|media| media.control == control) {
-            set_media(None);
+        for slot in SLOTS {
+            let Some(gone) = mounted(slot).filter(|media| media.control == control) else {
+                continue;
+            };
+            set_mounted(slot, None);
             if gone.server_end.0 != 0 {
                 let _ = handle_close(gone.server_end);
             }
@@ -8080,7 +8160,12 @@ fn media_offered(
                 let _ = process_kill(gone.process);
                 let _ = handle_close(gone.process);
             }
-            log(b"media: driver gone; volume removed\n");
+            if slot == Slot::Root {
+                ROOT_LOST.store(true, Ordering::Relaxed);
+                notice(&[b"root: driver gone; / is the initrd until reboot\n"]);
+            } else {
+                log(b"media: driver gone; volume removed\n");
+            }
         }
         return false;
     }
@@ -8111,6 +8196,35 @@ fn media_ready(initrd: Handle, index: usize, control: Handle, ready: drv_blk::Me
     let name = sora::MediaName::new(ready.label, ready.serial);
     let device = Device { ready, control };
     set_device(index, Some(device));
+    // j932 (SH8-f, D2): while a named root is still unmounted, every offer is checked against
+    // it first. The match mounts at `/`; another RedoxFS volume waits for an explicit `mount`.
+    if let Some(want) = ROOT_WANTED
+        .get()
+        .filter(|_| root_state() == sora::RootState::Initrd)
+    {
+        if let Some(sector) = read_first_block(device) {
+            match sora::redoxfs_uuid(&sector) {
+                Some(uuid) if uuid == want => {
+                    mount_root(initrd, index, device, uuid);
+                    return mounted(Slot::Root).is_some();
+                }
+                Some(uuid) => {
+                    NOT_ROOT[index].store(true, Ordering::Relaxed);
+                    notice(&[
+                        b"media: ",
+                        &sora::disk_path(index),
+                        b" redoxfs uuid:",
+                        &sora::uuid_hex(&uuid),
+                        b" is not the named root; `mount ",
+                        &sora::disk_path(index),
+                        b"` to use\n",
+                    ]);
+                    return false;
+                }
+                None => {}
+            }
+        }
+    }
     if !transport.auto_mounts() {
         notice(&[
             b"media: ",
@@ -8132,6 +8246,9 @@ fn media_ready(initrd: Handle, index: usize, control: Handle, ready: drv_blk::Me
     }
     // J766: a volume mounts by itself only when `/media` is free or already holds it; a second
     // stick waits for `mount`.
+    if is_root_device(index) {
+        return false;
+    }
     if media().is_some_and(|media| media.device != index) {
         notice(&[
             b"media: ",
@@ -8155,7 +8272,7 @@ fn media_ready(initrd: Handle, index: usize, control: Handle, ready: drv_blk::Me
     } else {
         b"\n"
     });
-    mount_device(initrd, index, device, name);
+    mount_device(initrd, Slot::Media, index, device, name);
     true
 }
 
@@ -8168,13 +8285,30 @@ fn run_on_filesystem(
     flags: &[&[u8]],
     path: &[u8],
 ) -> bool {
-    if let Some(path) = sora::scratch_path(path) {
-        run_on_volume(initrd, program, image, flags, path, FsGrant::Image);
-        return true;
-    }
-    let (name, path) = match sora::media_route(path) {
-        sora::MediaRoute::Elsewhere => return false,
-        sora::MediaRoute::Root => {
+    // j932 (SH8-f): with a RedoxFS root, every path outside `/media` is the root's.
+    let (name, path) = match sora::shell_route(path, root_state()) {
+        sora::ShellRoute::Initrd => return false,
+        sora::ShellRoute::Scratch(path) => {
+            run_on_volume(initrd, program, image, flags, path, FsGrant::Image);
+            return true;
+        }
+        sora::ShellRoute::Root(path) => {
+            run_on_volume(
+                initrd,
+                program,
+                image,
+                flags,
+                path,
+                FsGrant::Root(BlockAccess::ReadOnly),
+            );
+            return true;
+        }
+        sora::ShellRoute::RootLost => {
+            log(program);
+            log(b": /tmp: unavailable; the root was lost\n");
+            return true;
+        }
+        sora::ShellRoute::MediaRoot => {
             // `/media` is Sora's own namespace: the volumes it has mounted.
             match (program, media()) {
                 (b"ls", Some(media)) => {
@@ -8189,7 +8323,7 @@ fn run_on_filesystem(
             }
             return true;
         }
-        sora::MediaRoute::Volume { name, path } => (name, path),
+        sora::ShellRoute::Media { name, path } => (name, path),
     };
     if !media().is_some_and(|media| media.name.as_bytes() == name) {
         log(program);
@@ -8423,11 +8557,14 @@ fn ensure_media_writable(initrd: Handle) -> bool {
 fn mount_writable_media(initrd: Handle) -> Option<bool> {
     for (index, slot) in DEVICES.get().iter().enumerate() {
         let Some(device) = slot else { continue };
-        if device.ready.read_only || MEDIA_GIVEN_UP[index].load(Ordering::Relaxed) {
+        if device.ready.read_only
+            || MEDIA_GIVEN_UP[index].load(Ordering::Relaxed)
+            || is_root_device(index)
+        {
             continue;
         }
         let name = sora::MediaName::new(device.ready.label, device.ready.serial);
-        mount_device(initrd, index, *device, name);
+        mount_device(initrd, Slot::Media, index, *device, name);
         return Some(media().is_some_and(|volume| !volume.ready.read_only));
     }
     None
@@ -8503,20 +8640,26 @@ fn mount_removable_media(initrd: Handle) -> Option<bool> {
         if device.ready.read_only
             || !sora::StorageTransport::of(index).auto_mounts()
             || MEDIA_GIVEN_UP[index].load(Ordering::Relaxed)
+            || is_root_device(index)
+            || not_the_named_root(index)
         {
             continue;
         }
         let name = sora::MediaName::new(device.ready.label, device.ready.serial);
-        mount_device(initrd, index, *device, name);
+        mount_device(initrd, Slot::Media, index, *device, name);
         return Some(media().is_some_and(|volume| !volume.ready.read_only));
     }
     None
 }
 
 /// `media <program> [args...]`: foreground launch with a read-write volume session.
-fn run_program_media(initrd: Handle, argv: &[alloc::string::String]) {
-    if !ensure_media_writable(initrd) {
-        log(b"media: no writable volume mounted\n");
+fn run_program_media(initrd: Handle, slot: Slot, argv: &[alloc::string::String]) {
+    if !slot_writable(initrd, slot) {
+        log(if slot == Slot::Root {
+            b"root: no RedoxFS root mounted\n" as &[u8]
+        } else {
+            b"media: no writable volume mounted\n"
+        });
         fail_status(1);
         return;
     }
@@ -8536,7 +8679,7 @@ fn run_program_media(initrd: Handle, argv: &[alloc::string::String]) {
         full,
         Some(&slots[..count]),
         false,
-        FsGrant::Media(BlockAccess::ReadWrite),
+        slot_grant(slot),
         false,
         false,
         StdinMode::Finite(b"\n"),
@@ -8544,15 +8687,31 @@ fn run_program_media(initrd: Handle, argv: &[alloc::string::String]) {
     );
 }
 
+/// j932: the read-write grant of a slot's mount.
+fn slot_grant(slot: Slot) -> FsGrant {
+    match slot {
+        Slot::Media => FsGrant::Media(BlockAccess::ReadWrite),
+        Slot::Root => FsGrant::Root(BlockAccess::ReadWrite),
+    }
+}
+
+/// j932: whether `slot` has a writable mount, mounting the removable volume as `media` does.
+fn slot_writable(initrd: Handle, slot: Slot) -> bool {
+    match slot {
+        Slot::Media => ensure_media_writable(initrd),
+        Slot::Root => mounted(Slot::Root).is_some_and(|root| !root.ready.read_only),
+    }
+}
+
 /// `bg media <program> [args...]`: the background twin, same grant.
-fn run_program_media_background(initrd: Handle, argv: &[alloc::string::String]) {
+fn run_program_media_background(initrd: Handle, slot: Slot, argv: &[alloc::string::String]) {
     if BG_STDOUT.load(Ordering::Relaxed) != 0 {
         log(b"bg: a background job is still running; `wait` for it first\n");
         fail_status(1);
         return;
     }
-    if !ensure_media_writable(initrd) {
-        log(b"bg: media: no writable volume mounted\n");
+    if !slot_writable(initrd, slot) {
+        log(b"bg: no writable volume mounted for that launcher\n");
         fail_status(1);
         return;
     }
@@ -8572,7 +8731,7 @@ fn run_program_media_background(initrd: Handle, argv: &[alloc::string::String]) 
         full,
         Some(&slots[..count]),
         false,
-        FsGrant::Media(BlockAccess::ReadWrite),
+        slot_grant(slot),
         false,
         false,
         StdinMode::Interactive,
@@ -8863,8 +9022,15 @@ fn payload_status() {
 fn find_program(initrd: Handle, path: &[u8]) -> Option<(Handle, u64, u64)> {
     match sora::media_route(path) {
         sora::MediaRoute::Root => return None,
-        sora::MediaRoute::Volume { name, path } => return volume_program(name, path),
+        sora::MediaRoute::Volume { name, path } => {
+            media().filter(|m| m.name.as_bytes() == name)?;
+            return volume_program(Slot::Media, path);
+        }
         sora::MediaRoute::Elsewhere => {}
+    }
+    // j932: an absolute path names a program on the RedoxFS root when there is one.
+    if path.first() == Some(&b'/') && root_state() == sora::RootState::Mounted {
+        return volume_program(Slot::Root, path);
     }
     if path.first() == Some(&b'/') {
         return fat_program(initrd, path);
@@ -8934,9 +9100,8 @@ fn fat_program(initrd: Handle, path: &[u8]) -> Option<(Handle, u64, u64)> {
 /// Snapshot a native executable from the named mount through a read-only VFS session.
 /// The child receives its executable bytes, with no filesystem capability from `run`.
 /// The 64 MiB limit bounds the loader's temporary copy. — KESTREL
-fn volume_program(name: &[u8], path: &[u8]) -> Option<(Handle, u64, u64)> {
-    media().filter(|m| m.name.as_bytes() == name)?;
-    let fs = media_session(BlockAccess::ReadOnly)?;
+fn volume_program(slot: Slot, path: &[u8]) -> Option<(Handle, u64, u64)> {
+    let fs = mount_session(slot, BlockAccess::ReadOnly)?;
     let copied = (|| {
         let mut frame = [0; kumo_vfs::MAX_PATH + 8];
         let mut reply = [0; 257];
@@ -12643,6 +12808,13 @@ fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory, initrd: Handle) 
         for (index, device) in DEVICES.get().iter().enumerate() {
             let Some(device) = device else { continue };
             let path = sora::disk_path(index);
+            if let Some(root) = mounted_root_on(index) {
+                log_line(
+                    &[&path, b" on / type ", root.filesystem.name(), b" (rw)\n"],
+                    0,
+                );
+                continue;
+            }
             match mounted.filter(|media| media.device == index) {
                 Some(media) => log_line(
                     &[
@@ -12682,6 +12854,10 @@ fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory, initrd: Handle) 
         log_line(&[b"mount: ", operand, b": no such device\n"], 32);
         return;
     };
+    if is_root_device(index) {
+        log_line(&[b"mount: ", operand, b": already mounted on /\n"], 32);
+        return;
+    }
     let name = match cmd.args.get(1) {
         None => sora::MediaName::new(device.ready.label, device.ready.serial),
         Some(point) => {
@@ -12725,7 +12901,7 @@ fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory, initrd: Handle) 
         None => {
             // An explicit mount is the operator's call, even for a slot the supervisor gave up.
             MEDIA_GIVEN_UP[index].store(false, Ordering::Relaxed);
-            mount_device(initrd, index, device, name)
+            mount_device(initrd, Slot::Media, index, device, name)
         }
     }
 }
@@ -12738,6 +12914,20 @@ fn umount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
         usage(b"usage: umount /media/NAME | /dev/diskNs1\n");
         return;
     };
+    // j932 (SH8-f): the root stays mounted while KUMO runs.
+    let is_root =
+        operand == "/" || sora::parse_disk(operand.as_bytes()).is_some_and(is_root_device);
+    if is_root && root_state() == sora::RootState::Mounted {
+        log_line(
+            &[
+                b"umount: ",
+                operand.as_bytes(),
+                b": the root is not unmounted while KUMO runs\n",
+            ],
+            32,
+        );
+        return;
+    }
     let Some(media) = media() else {
         log_line(&[b"umount: ", operand.as_bytes(), b": not mounted\n"], 32);
         return;
@@ -13061,18 +13251,22 @@ fn log_directory_error(command: &[u8], error: DirectoryError) {
 /// leaves the shell's directory untouched, and closing its channel disposes the server.
 /// No directory state or pathname authority moves into the kernel. — KESTREL
 fn check_directory(initrd: Handle, path: &str) -> Result<(), DirectoryError> {
-    if let Some(path) = sora::scratch_path(path.as_bytes()) {
-        return check_volume_directory(spawn_fatfs(initrd), path);
-    }
-    match sora::media_route(path.as_bytes()) {
-        sora::MediaRoute::Root => return Ok(()),
-        sora::MediaRoute::Volume { name, path } => {
+    match sora::shell_route(path.as_bytes(), root_state()) {
+        sora::ShellRoute::Scratch(path) => {
+            return check_volume_directory(spawn_fatfs(initrd), path)
+        }
+        sora::ShellRoute::Root(path) => {
+            return check_volume_directory(mount_session(Slot::Root, BlockAccess::ReadOnly), path)
+        }
+        sora::ShellRoute::RootLost => return Err(DirectoryError::Unavailable),
+        sora::ShellRoute::MediaRoot => return Ok(()),
+        sora::ShellRoute::Media { name, path } => {
             if !media().is_some_and(|volume| volume.name.as_bytes() == name) {
                 return Err(DirectoryError::NotFound);
             }
             return check_volume_directory(media_session(BlockAccess::ReadOnly), path);
         }
-        sora::MediaRoute::Elsewhere => {}
+        sora::ShellRoute::Initrd => {}
     }
     let mut table = [0u8; kumo_abi::INITRD_TABLE_MAX];
     if vmo_read(initrd, 0, table.as_mut_ptr(), kumo_abi::INITRD_HEADER_LEN) != 0 {
@@ -13233,16 +13427,147 @@ fn connect_block_client(device: Device) -> Option<Handle> {
 /// j930 (SH8-d): read a volume's first sector through a short-lived read-only client and say
 /// which filesystem it carries.
 fn detect_filesystem(device: Device) -> Option<sora::Filesystem> {
+    read_first_block(device).and_then(|block| sora::Filesystem::detect(&block))
+}
+
+/// j932: the volume's first block, read through a short-lived read-only block client.
+fn read_first_block(device: Device) -> Option<[u8; drv_blk::BLOCK_SIZE as usize]> {
     let client = connect_block_client_with(device, BlockAccess::ReadOnly)?;
     let request = drv_blk::Request::read(0, 1).encode();
     let mut reply = [0u8; 1 + drv_blk::BLOCK_SIZE as usize];
-    let detected = (channel_write(client, request.as_ptr(), request.len()) == 0
+    let block = (channel_write(client, request.as_ptr(), request.len()) == 0
         && wait_readable(client, 5_000_000_000))
     .then(|| channel_read(client, reply.as_mut_ptr(), reply.len()))
     .and_then(|n| drv_blk::read_payload(&reply[..(n as usize).min(reply.len())]).ok())
-    .and_then(sora::Filesystem::detect);
+    .and_then(|payload| payload.try_into().ok());
     let _ = handle_close(client);
-    detected
+    block
+}
+
+/// j932: storage slots whose RedoxFS volume is not the named root. They never mount by
+/// themselves (a disk that is not the root is not touched); `mount` still can.
+static NOT_ROOT: [AtomicBool; sora::STORAGE_DEVICES] =
+    [const { AtomicBool::new(false) }; sora::STORAGE_DEVICES];
+
+fn not_the_named_root(index: usize) -> bool {
+    NOT_ROOT[index].load(Ordering::Relaxed)
+}
+
+/// j932 (SH8-f, D2): the root the boot command line names, from Sora's BootInfo snapshot: the
+/// kernel copied the line into the page at `SNAPSHOT_CMDLINE_OFFSET`, and `cmdline` holds that
+/// offset and its length.
+fn boot_root_uuid() -> Option<[u8; 16]> {
+    let bootinfo = Handle(BOOTINFO_VMO_HANDLE.load(Ordering::Relaxed) as u32);
+    if bootinfo.0 == 0 {
+        return None;
+    }
+    let mut raw = [0u8; core::mem::size_of::<kumo_abi::BootInfo>()];
+    if vmo_read(bootinfo, 0, raw.as_mut_ptr(), raw.len()) != 0 {
+        return None;
+    }
+    // SAFETY: BootInfo is plain `repr(C)` data and `raw` holds exactly one.
+    let boot: kumo_abi::BootInfo = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
+    let len = boot.cmdline.len as usize;
+    if boot.cmdline.ptr != kumo_abi::boot::SNAPSHOT_CMDLINE_OFFSET as u64
+        || len == 0
+        || len > kumo_abi::boot::CMDLINE_MAX
+    {
+        return None;
+    }
+    let mut line = [0u8; kumo_abi::boot::CMDLINE_MAX];
+    if vmo_read(bootinfo, boot.cmdline.ptr, line.as_mut_ptr(), len) != 0 {
+        return None;
+    }
+    kumo_abi::boot::root_uuid(&line[..len])
+}
+
+/// j932: mount the named root found in slot `index` at `/`, and say so.
+fn mount_root(initrd: Handle, index: usize, device: Device, uuid: [u8; 16]) {
+    if device.ready.read_only {
+        notice(&[
+            b"root: ",
+            &sora::disk_path(index),
+            b" is read-only; staying on initrd\n",
+        ]);
+        return;
+    }
+    let name = sora::MediaName::chosen(b"ROOT").expect("a plain name");
+    mount_device(initrd, Slot::Root, index, device, name);
+    let Some(root) = mounted(Slot::Root) else {
+        return;
+    };
+    // A first instance that dies while it mounts (a refused volume) goes through the same
+    // supervision as a crash before `/` is announced: replaced within the budget, or given up
+    // (D5) with the initrd still the root.
+    if media_process_exited(root.process, STARTUP_WINDOW_NS)
+        && !media_respawn_after_exit(Slot::Root)
+    {
+        return;
+    }
+    notice(&[
+        b"root: redoxfs uuid:",
+        &sora::uuid_hex(&uuid),
+        b" mounted at /\n",
+    ]);
+    if let Some(client) = mount_session(Slot::Root, BlockAccess::ReadOnly) {
+        let _ = check_volume_directory(Some(client), b"/");
+    }
+}
+
+/// j932 (SH8-f): before autoexec, wait a bounded time for the named root's storage offer and
+/// mount it (`media_ready` does, on the matching offer). Without a `root=` word this does
+/// nothing and `/` is the initrd, exactly as before.
+fn resolve_root(initrd: Handle) {
+    const ROOT_WAIT_NS: u64 = 10_000_000_000;
+    let Some(want) = boot_root_uuid() else {
+        return;
+    };
+    ROOT_WANTED.set(Some(want));
+    let Some(port) = syscall_handle(port_create()) else {
+        return;
+    };
+    let mut watches: [Option<Handle>; sora::STORAGE_DEVICES] = [None; sora::STORAGE_DEVICES];
+    for (index, slot) in watches.iter_mut().enumerate() {
+        let control = Handle(STORAGE_CONTROLS[index].load(Ordering::Relaxed));
+        let raw_koid = handle_koid(control);
+        if control.0 != 0 && raw_koid != u64::MAX && port_bind(port, control) == 0 {
+            *slot = Some(Handle(raw_koid as u32));
+        }
+    }
+    let deadline = syscall_handle(timer_create(ROOT_WAIT_NS));
+    let deadline_koid = deadline.map_or(u64::MAX, handle_koid);
+    if deadline.is_some_and(|timer| port_bind(port, timer) == 0) {
+        while root_state() == sora::RootState::Initrd {
+            let source = port_wait(port);
+            if source == deadline_koid || source == u64::MAX {
+                break;
+            }
+            if let Some(index) = watches
+                .iter()
+                .position(|slot| slot.is_some_and(|handle| u64::from(handle.0) == source))
+            {
+                let _ = media_offered(initrd, port, index, &mut watches);
+            }
+        }
+    }
+    for (index, slot) in watches.iter().enumerate() {
+        if slot.is_some() {
+            let control = Handle(STORAGE_CONTROLS[index].load(Ordering::Relaxed));
+            let _ = port_unbind(port, control);
+        }
+    }
+    if let Some(timer) = deadline {
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+    }
+    let _ = handle_close(port);
+    if root_state() == sora::RootState::Initrd {
+        notice(&[
+            b"root: uuid:",
+            &sora::uuid_hex(&want),
+            b" not found, staying on initrd\n",
+        ]);
+    }
 }
 
 fn connect_block_client_with(device: Device, access: BlockAccess) -> Option<Handle> {
@@ -13337,14 +13662,19 @@ fn start_redoxfsd(
 /// has created `/sh8c/armed`, kill the mount's redoxfsd while the probe holds open handles, and
 /// let the supervisor bring a replacement up on the same control endpoint. — TEAL
 #[cfg(feature = "fsd-crash-proof")]
-fn fsd_crash_proof(armed_path: &[u8], minimum_size: u64, must_be_absent: Option<&[u8]>) {
+fn fsd_crash_proof(
+    slot: Slot,
+    armed_path: &[u8],
+    minimum_size: u64,
+    must_be_absent: Option<&[u8]>,
+) {
     let attempts = if minimum_size == 0 && must_be_absent.is_none() {
         400
     } else {
         12000
     };
     let armed = (|| {
-        let session = media_session(BlockAccess::ReadOnly)?;
+        let session = mount_session(slot, BlockAccess::ReadOnly)?;
         let mut frame = [0u8; kumo_vfs::MAX_PATH + 8];
         let n = kumo_vfs::Request::Stat { path: armed_path }.encode_into(&mut frame)?;
         let mut found = false;
@@ -13396,7 +13726,7 @@ fn fsd_crash_proof(armed_path: &[u8], minimum_size: u64, must_be_absent: Option<
     log(b"fsd-crash-proof: observed ");
     log(armed_path);
     log(b"\n");
-    let Some(media) = media() else {
+    let Some(media) = mounted(slot) else {
         log_line(&[b"fsd-crash-proof: FAIL nothing mounted\n"], 1);
         return;
     };
@@ -13410,7 +13740,7 @@ fn fsd_crash_proof(armed_path: &[u8], minimum_size: u64, must_be_absent: Option<
         return;
     }
     // The supervisor's own check would consume the queued termination again: say it died.
-    if !media_respawn_after_exit() {
+    if !media_respawn_after_exit(slot) {
         log_line(&[b"fsd-crash-proof: FAIL no replacement\n"], 1);
         return;
     }
@@ -13427,13 +13757,16 @@ struct MediaSupervisor {
     instance: u32,
 }
 
-static MEDIA_SUPERVISOR: Shared<MediaSupervisor> =
-    Shared(core::cell::UnsafeCell::new(MediaSupervisor {
-        initrd: Handle(0),
-        intensity: sora::RestartIntensity::new(10_000_000_000),
-        backoff: sora::RestartBackoff::new(50_000_000, 400_000_000),
-        instance: 0,
-    }));
+const IDLE_SUPERVISOR: MediaSupervisor = MediaSupervisor {
+    initrd: Handle(0),
+    intensity: sora::RestartIntensity::new(10_000_000_000),
+    backoff: sora::RestartBackoff::new(50_000_000, 400_000_000),
+    instance: 0,
+};
+
+/// One supervisor per [`Slot`] (j932).
+static MEDIA_SUPERVISOR: Shared<[MediaSupervisor; 2]> =
+    Shared(core::cell::UnsafeCell::new([IDLE_SUPERVISOR; 2]));
 
 /// The mount server's watch port. Each instance is bound to it when it starts, because a
 /// port bound only after a kill can miss TERMINATED once the kernel clears the dead slot.
@@ -13505,12 +13838,12 @@ fn media_process_exited(process: Handle, ns: u64) -> bool {
 
 /// The serve loop's hook: the supervised mount server died.
 fn media_event(source: u64) -> bool {
-    let Some(media) = media() else {
+    let Some(slot) = SLOTS.into_iter().find(|slot| {
+        mounted(*slot).is_some_and(|media| media.server_end.0 != 0 && media.process_koid == source)
+    }) else {
         return false;
     };
-    if media.server_end.0 == 0 || media.process_koid != source {
-        return false;
-    }
+    let media = mounted(slot).expect("found above");
     for port in [
         Handle(SERVE_PORT.load(Ordering::Relaxed) as u32),
         Handle(REPLY_PORT.load(Ordering::Relaxed)),
@@ -13519,34 +13852,35 @@ fn media_event(source: u64) -> bool {
             let _ = port_unbind(port, media.process);
         }
     }
-    media_supervise();
+    media_supervise(slot);
     true
 }
 
 /// Restart the mount's redoxfsd if it has died (a crash, never an `umount`, which clears
 /// `media` first). Called from the serve loop's watch and lazily before every new session,
 /// because autoexec runs outside the serve loop. Returns whether a live server is mounted.
-fn media_supervise() -> bool {
-    let Some(media) = media() else {
+fn media_supervise(slot: Slot) -> bool {
+    let Some(media) = mounted(slot) else {
         return false;
     };
     if media.server_end.0 == 0 || !media_process_exited(media.process, 1_000) {
         return true;
     }
-    media_respawn_after_exit()
+    media_respawn_after_exit(slot)
 }
 
 /// How long a replacement redoxfsd is watched for an exit while it mounts.
 const STARTUP_WINDOW_NS: u64 = 500_000_000;
 
 /// The mount's server is known dead: restart it within the budget, or give the mount up.
-fn media_respawn_after_exit() -> bool {
-    let Some(mut media) = media() else {
+fn media_respawn_after_exit(slot: Slot) -> bool {
+    let Some(mut media) = mounted(slot) else {
         return false;
     };
     let _ = handle_close(media.process);
     log(b"redoxfsd: terminated; sessions invalidated, the control endpoint kept\n");
-    let mut supervisor = MEDIA_SUPERVISOR.get();
+    let mut supervisors = MEDIA_SUPERVISOR.get();
+    let mut supervisor = supervisors[slot as usize];
     let device = DEVICES.get()[media.device];
     // j930 (SH8-d): a replacement that dies while it mounts (a refused or poisoned volume) is
     // another exit against the same budget, so a disk that never mounts reaches the give-up
@@ -13572,11 +13906,19 @@ fn media_respawn_after_exit() -> bool {
         log(b"redoxfsd: the replacement exited while mounting\n");
     };
     let Some(process) = replacement else {
-        MEDIA_SUPERVISOR.set(supervisor);
-        set_media(None);
+        supervisors[slot as usize] = supervisor;
+        MEDIA_SUPERVISOR.set(supervisors);
+        set_mounted(slot, None);
         MEDIA_GIVEN_UP[media.device].store(true, Ordering::Relaxed);
         let _ = handle_close(media.server_end);
         let _ = handle_close(media.control);
+        if slot == Slot::Root {
+            // j932 (D5): loud and lossless. Launches that would have written the root get no
+            // filesystem; nothing falls back to the RAM FAT image.
+            ROOT_LOST.store(true, Ordering::Relaxed);
+            notice(&[b"root: redoxfsd gave up; / is the initrd until reboot\n"]);
+            return false;
+        }
         notice(&[
             b"redoxfsd: giving up (restart intensity or resources exhausted); /media/",
             media.name.as_bytes(),
@@ -13585,14 +13927,15 @@ fn media_respawn_after_exit() -> bool {
         return false;
     };
     supervisor.instance += 1;
-    MEDIA_SUPERVISOR.set(supervisor);
+    supervisors[slot as usize] = supervisor;
+    MEDIA_SUPERVISOR.set(supervisors);
     media.process = process;
     media.process_koid = handle_koid(process);
     let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
     if port.0 != 0 {
         let _ = port_bind(port, process);
     }
-    set_media(Some(media));
+    set_mounted(slot, Some(media));
     log(b"redoxfsd: supervised instance ");
     log_dec(u64::from(supervisor.instance));
     log(b" ready\n");
@@ -13602,11 +13945,16 @@ fn media_respawn_after_exit() -> bool {
 /// Mint one client session on the mount-scoped server (SH3-c2): `[b'S'][access]` carries
 /// the server end over the control channel; the client end becomes the program's fs grant.
 fn media_session(access: BlockAccess) -> Option<Handle> {
+    mount_session(Slot::Media, access)
+}
+
+/// j932: [`media_session`] on either slot.
+fn mount_session(slot: Slot, access: BlockAccess) -> Option<Handle> {
     // j929: a crashed redoxfsd is restarted before anyone is handed a session on it.
-    if !media_supervise() {
+    if !media_supervise(slot) {
         return None;
     }
-    let media = media()?;
+    let media = mounted(slot)?;
     let (client_raw, server_raw) = channel_create_pair();
     if client_raw == u64::MAX || server_raw == u64::MAX {
         for end in [client_raw, server_raw] {
@@ -13798,6 +14146,22 @@ enum FsGrant {
     /// also gets the server's session-control channel (`STARTUP_TAG_FS_MOUNT`), so the processes
     /// it starts (a Linux `execve` after `vfork`) each open a session on the same volume.
     ImageMount,
+    /// j932 (SH8-f): a session on the RedoxFS root's redoxfsd; a read-write one also carries
+    /// its control endpoint, like `Media`, so the client reconnects after a restart.
+    Root(BlockAccess),
+}
+
+/// j932 (SH8-f, D3/D5): with a RedoxFS root mounted, a launch granted the RAM FAT image gets the
+/// root instead, so the same binaries (kilo, the relibc and std smokes, `linux`) read and write
+/// `/` unmodified. After the root was lost they get no filesystem, never the FAT image.
+fn effective_grant(fs: FsGrant) -> FsGrant {
+    match (fs, root_state()) {
+        (FsGrant::Image | FsGrant::ImageMount, sora::RootState::Mounted) => {
+            FsGrant::Root(BlockAccess::ReadWrite)
+        }
+        (FsGrant::Image | FsGrant::ImageMount, sora::RootState::Lost) => FsGrant::None,
+        (fs, _) => fs,
+    }
 }
 
 /// How a spawned child gets its standard input.
@@ -13861,6 +14225,7 @@ fn run_with_startup_input_with_env(
     grant_net: bool,
     env: Option<&[&[u8]]>,
 ) -> Option<InteractiveChild> {
+    let fs = effective_grant(fs);
     let refused = |reason: &[u8]| {
         fail_status(1);
         log(name);
@@ -13968,6 +14333,13 @@ fn run_with_startup_input_with_env(
         FsGrant::ImageMount => spawn_fatfs_mount(initrd).map(|(session, control)| {
             fs_control = Some(control);
             session
+        }),
+        FsGrant::Root(access) => mount_session(Slot::Root, access).inspect(|_| {
+            if access == BlockAccess::ReadWrite {
+                fs_control = mounted(Slot::Root)
+                    .filter(|m| m.server_end.0 != 0)
+                    .and_then(|m| syscall_handle(handle_duplicate(m.control, CONTROL_RIGHTS)));
+            }
         }),
     };
     let tty_child = if grant_tty {
@@ -14412,7 +14784,12 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
     let count = command_argv_slots(cmd, &mut slots);
     let mut fs = FsGrant::Image;
     if let Some(path) = cmd.args.first() {
-        if let Some(path) = sora::scratch_path(path.as_bytes()) {
+        let scratch = sora::scratch_path(path.as_bytes());
+        if scratch.is_some() && root_state() == sora::RootState::Lost {
+            log(b"kilo: /tmp: unavailable; the root was lost\n");
+            return true;
+        }
+        if let Some(path) = scratch.filter(|_| root_state() == sora::RootState::Initrd) {
             if path == b"/" {
                 log(b"kilo: is a directory\n");
                 return true;
@@ -14420,6 +14797,10 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
             slots[1] = path;
         } else {
             match sora::media_route(path.as_bytes()) {
+                // j932: on a RedoxFS root, kilo edits the root's file at its own path.
+                sora::MediaRoute::Elsewhere if root_state() == sora::RootState::Mounted => {
+                    fs = FsGrant::Root(BlockAccess::ReadWrite);
+                }
                 sora::MediaRoute::Elsewhere => {
                     log(b"kilo: root filesystem is read-only; use /tmp or /media/<volume>\n");
                     return true;

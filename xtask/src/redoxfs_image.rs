@@ -1,6 +1,7 @@
 //j930
 //j931
-//! `cargo xtask redoxfs-image <path> --size <MiB> [--uuid <text>] [--force] [--persona-cargo] [--sdk-source <path>]` (SH8-d, D-c/D4).
+//j932
+//! `cargo xtask redoxfs-image <path> --size <MiB> [--uuid <text>] [--force] [--persona-cargo] [--sdk-source <path>] [--root]` (SH8-d, D-c/D4).
 //!
 //! Writes a fresh RedoxFS disk image with the SAME pinned, vendored RedoxFS and
 //! `kumo-redoxfs::BlockDisk` KUMO mounts with, through the drv-blk volume protocol, so the format
@@ -33,13 +34,14 @@ const MAX_MIB: u64 = 64 * 1024;
 
 pub fn run(args: &[String]) -> Result<(), String> {
     const USAGE: &str =
-        "usage: cargo xtask redoxfs-image <path> --size <MiB> [--uuid <text>] [--force] [--persona-cargo] [--sdk-source <path>]";
+        "usage: cargo xtask redoxfs-image <path> --size <MiB> [--uuid <text>] [--force] [--persona-cargo] [--sdk-source <path>] [--root]";
     let mut path = None;
     let mut size = None;
     let mut uuid_text = None;
     let mut force = false;
     let mut cargo_tree = false;
     let mut sdk_source: Option<PathBuf> = None;
+    let mut root_tree = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -48,6 +50,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--force" => force = true,
             "--persona-cargo" => cargo_tree = true,
             "--sdk-source" => sdk_source = it.next().map(PathBuf::from),
+            "--root" => root_tree = true,
             other if path.is_none() && !other.starts_with("--") => {
                 path = Some(PathBuf::from(other))
             }
@@ -69,7 +72,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let seed = uuid_text.unwrap_or_else(|| path.display().to_string());
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&kumo_sha256::digest(seed.as_bytes())[..16]);
-    let files = if cargo_tree {
+    if cargo_tree && root_tree {
+        return Err("--root and --persona-cargo are separate disks".into());
+    }
+    let files = if root_tree {
+        // j932 (SH8-f): a root disk carries the pinned Linux probes at their FHS paths; the
+        // skeleton directories come from ROOT_SKELETON.
+        let root = super::workspace_root()?;
+        super::pinned_files(&root, &super::PERSONA_PAYLOADS, "persona payloads")?
+    } else if cargo_tree {
         let root = super::workspace_root()?;
         let mut files = super::pinned_files(&root, &super::PERSONA_PAYLOADS, "persona payloads")?;
         files.extend(super::pinned_files(
@@ -106,7 +117,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     } else {
         Vec::new()
     };
-    let image = populated(mib, uuid, &files)?;
+    let dirs: &[&str] = if root_tree { &ROOT_SKELETON } else { &[] };
+    let image = populated_tree(mib, uuid, dirs, &files)?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
@@ -116,8 +128,34 @@ pub fn run(args: &[String]) -> Result<(), String> {
         path.display(),
         uuid.iter().map(|b| format!("{b:02x}")).collect::<String>()
     );
+    if root_tree {
+        // The line a boot manifest needs to make this disk the root (DESIGN/010 §7, D2).
+        println!(
+            "redoxfs-image: root = uuid:{}",
+            uuid.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    }
     Ok(())
 }
+
+/// j932 (SH8-f): the FHS 3.0 merged-`/usr` skeleton of a root disk (DESIGN/012 §2), minus the
+/// trees that are synthetic (`dev`, `proc`, `sys`) or the ESP (`boot`). `bin`, `sbin` and `lib`
+/// are real directories until RedoxFS links are part of the record. — TEAL
+const ROOT_SKELETON: [&str; 13] = [
+    "/etc",
+    "/home",
+    "/root",
+    "/tmp",
+    "/var/log",
+    "/var/run",
+    "/var/lib",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/libexec/kumo",
+    "/opt",
+    "/media",
+    "/mnt",
+];
 
 /// A formatted image of `mib` MiB, verified by mounting it again.
 #[cfg(test)]
@@ -125,14 +163,28 @@ pub fn format(mib: u64, uuid: [u8; 16]) -> Result<Vec<u8>, String> {
     populated(mib, uuid, &[])
 }
 
+#[cfg(test)]
 fn populated(mib: u64, uuid: [u8; 16], files: &[(&str, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    populated_tree(mib, uuid, &[], files)
+}
+
+/// `populated`, plus empty directories `dirs` (each created with its parents) before the files.
+fn populated_tree(
+    mib: u64,
+    uuid: [u8; 16],
+    dirs: &[&str],
+    files: &[(&str, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
     let sectors = mib * 2048;
     let disk = BlockDisk::new(Ram(vec![0; (sectors * 512) as usize]), sectors)
         .map_err(|e| format!("volume: {e:?}"))?;
     let mut fs =
         FileSystem::create_unencrypted(disk, uuid, 0, 0).map_err(|e| format!("format: {e:?}"))?;
     let mut directories = BTreeMap::from([(String::new(), TreePtr::root())]);
-    for (path, data) in files {
+    let as_dirs: Vec<(&str, Option<&Vec<u8>>)> = dirs.iter().map(|d| (*d, None)).collect();
+    let as_files: Vec<(&str, Option<&Vec<u8>>)> =
+        files.iter().map(|(p, d)| (*p, Some(d))).collect();
+    for (path, data) in as_dirs.into_iter().chain(as_files) {
         let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
         if !path.starts_with('/')
             || parts
@@ -143,7 +195,13 @@ fn populated(mib: u64, uuid: [u8; 16], files: &[(&str, Vec<u8>)]) -> Result<Vec<
         }
         let mut parent = TreePtr::root();
         let mut directory = String::new();
-        for part in &parts[..parts.len() - 1] {
+        // A directory entry creates every component; a file every component but its name.
+        let parents = if data.is_none() {
+            parts.len()
+        } else {
+            parts.len() - 1
+        };
+        for part in &parts[..parents] {
             directory.push('/');
             directory.push_str(part);
             parent = if let Some(ptr) = directories.get(&directory) {
@@ -157,6 +215,9 @@ fn populated(mib: u64, uuid: [u8; 16], files: &[(&str, Vec<u8>)]) -> Result<Vec<
                 node
             };
         }
+        let Some(data) = data else {
+            continue;
+        };
         let name = parts[parts.len() - 1];
         let node = fs
             .tx(|tx| tx.create_node(parent, name, Node::MODE_FILE | 0o755, 0, 0))
@@ -209,6 +270,20 @@ fn populated(mib: u64, uuid: [u8; 16], files: &[(&str, Vec<u8>)]) -> Result<Vec<
             }
         }
     }
+    for path in dirs {
+        let node = fs
+            .tx(|tx| {
+                let mut node = tx.read_tree(TreePtr::root())?;
+                for part in path.trim_start_matches('/').split('/') {
+                    node = tx.find_node(node.ptr(), part)?;
+                }
+                Ok(node)
+            })
+            .map_err(|e| format!("lookup after remount {path}: {e:?}"))?;
+        if !node.data().is_dir() {
+            return Err(format!("not a directory after remount: {path}"));
+        }
+    }
     if !files.is_empty() {
         println!(
             "redoxfs-image: verified {} files after remount",
@@ -221,6 +296,24 @@ fn populated(mib: u64, uuid: [u8; 16], files: &[(&str, Vec<u8>)]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_disk_carries_the_whole_skeleton_beside_its_files() {
+        let image = populated_tree(
+            8,
+            *b"KUMO-SH8-f-root!",
+            &ROOT_SKELETON,
+            &[("/bin/probe", b"elf".to_vec())],
+        )
+        .unwrap();
+        assert_eq!(&image[..8], b"RedoxFS\0");
+        assert_eq!(
+            &image[16..32],
+            b"KUMO-SH8-f-root!",
+            "Sora reads the UUID here"
+        );
+        assert!(populated_tree(8, *b"KUMO-SH8-f-root!", &["/a/../b"], &[]).is_err());
+    }
 
     #[test]
     fn nested_seed_files_cross_records_and_transactions_and_remount_by_name() {

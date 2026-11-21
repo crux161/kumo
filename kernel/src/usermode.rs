@@ -1,4 +1,5 @@
 //j922
+//j932
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -3463,7 +3464,33 @@ fn attempt_sora(
         let bootinfo_frame = unsafe { crate::mm::alloc_zeroed_frame(boot) }
             .ok_or(UsermodeError::BootInfoFrameAllocation)?;
         // Write BootInfo into the identity-mapped frame (J153: identity, not physmap).
-        unsafe { (bootinfo_frame as *mut BootInfo).write(*boot) };
+        // j932 (SH8-f): the loader's command line is copied into the same page, because Sora
+        // cannot reach the loader's allocation; the snapshot's `cmdline` is then that page
+        // offset and length, never a pointer. Only a current-ABI loader's bounded line is
+        // taken (Nijigumo's own LoaderData, kept by the frame allocator). — TEAL
+        let mut snapshot = *boot;
+        snapshot.cmdline = kumo_abi::RawSlice::empty();
+        let cmdline_len = boot.cmdline.len as usize;
+        if boot.version == kumo_abi::ABI_VERSION
+            && boot.cmdline.ptr != 0
+            && (1..=kumo_abi::boot::CMDLINE_MAX).contains(&cmdline_len)
+        {
+            // SAFETY: the loader wrote `cmdline_len` bytes there in its LoaderData allocation,
+            // which stays mapped and is never handed out by the frame allocator; the
+            // destination is inside the fresh frame, after the struct (asserted in kumo-abi).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    boot.cmdline.ptr as *const u8,
+                    (bootinfo_frame as *mut u8).add(kumo_abi::boot::SNAPSHOT_CMDLINE_OFFSET),
+                    cmdline_len,
+                );
+            }
+            snapshot.cmdline = kumo_abi::RawSlice::from_raw_parts(
+                kumo_abi::boot::SNAPSHOT_CMDLINE_OFFSET as u64,
+                cmdline_len as u64,
+            );
+        }
+        unsafe { (bootinfo_frame as *mut BootInfo).write(snapshot) };
         // The struct was written through this CPU's cacheable mapping; clean the page to
         // the point of coherency before wrapping it in a VMO for Sora. Without this, Sora's
         // mapping of the same physical frame can read stale RAM on real hardware (X13s —
