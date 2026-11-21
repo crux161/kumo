@@ -1,8 +1,8 @@
-//j857
 //j888
 //j889
 //j890
 //j893
+//j928
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -37,6 +37,10 @@ pub const DRV_THERMAL_PATH: &str = "bin/drv-thermal";
 /// byte offset of a FAT image inside it, then answers `kumo-vfs` Open/Read frames
 /// on the same channel — the storage domain's first live server.
 pub const FATFS_PATH: &str = "bin/fatfs";
+/// SH8-b (j928): the RedoxFS mount-scoped server, started for the RAM work volume.
+pub const REDOXFSD_PATH: &str = "bin/redoxfsd";
+/// SH8-b (j928): the RedoxFS VFS probe, carried only by the opt-in proof image.
+pub const REDOXPROBE_PATH: &str = "bin/redoxprobe";
 pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
 /// The identity service (PLAN/012): handed `/etc/passwd`, `/etc/group` and `/etc/shadow` as one
 /// read-only bundle, it answers `verify` and `lookup` and is the only process that checks a

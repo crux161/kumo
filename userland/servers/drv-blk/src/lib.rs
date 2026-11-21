@@ -1,9 +1,9 @@
 #![no_std]
-//j545
 //j550
 //j803
 //j864
 //j892
+//j928
 
 //! `drv-blk` — a minimal ramdisk block device over a VMO.
 //!
@@ -434,6 +434,40 @@ pub fn encode_mount_bootstrap(block_count: u64) -> [u8; CLIENT_BOOTSTRAP_LEN] {
     buf
 }
 
+/// SH8-b: a mount flag. The launcher created this volume blank, so the server may put a new
+/// filesystem on it. A server never formats without it, and with it still mounts a volume that
+/// already carries its filesystem (a respawn must not erase the tree). — TEAL
+pub const MOUNT_FORMAT: u8 = 1 << 0;
+/// Wire length of a mount bootstrap with flags: `[CLIENT_MOUNT_TAG][block_count][flags]`.
+pub const MOUNT_FLAGS_BOOTSTRAP_LEN: usize = CLIENT_BOOTSTRAP_LEN + 1;
+
+/// [`encode_mount_bootstrap`] plus a flags byte, for the servers that read one (redoxfsd).
+pub fn encode_mount_bootstrap_flags(
+    block_count: u64,
+    flags: u8,
+) -> [u8; MOUNT_FLAGS_BOOTSTRAP_LEN] {
+    let mut buf = [0u8; MOUNT_FLAGS_BOOTSTRAP_LEN];
+    buf[..CLIENT_BOOTSTRAP_LEN].copy_from_slice(&encode_mount_bootstrap(block_count));
+    buf[CLIENT_BOOTSTRAP_LEN] = flags;
+    buf
+}
+
+/// A mount bootstrap's block count and flags (0 for the flagless form); `None` for any other
+/// message or an unknown flag.
+pub fn decode_mount_bootstrap_flags(raw: &[u8]) -> Option<(u64, u8)> {
+    match raw.len() {
+        CLIENT_BOOTSTRAP_LEN => Some((decode_mount_bootstrap(raw)?, 0)),
+        MOUNT_FLAGS_BOOTSTRAP_LEN => {
+            let flags = raw[CLIENT_BOOTSTRAP_LEN];
+            if flags & !MOUNT_FORMAT != 0 {
+                return None;
+            }
+            Some((decode_mount_bootstrap(&raw[..CLIENT_BOOTSTRAP_LEN])?, flags))
+        }
+        _ => None,
+    }
+}
+
 /// The volume's block count from a mount bootstrap; `None` for any other message.
 pub fn decode_mount_bootstrap(raw: &[u8]) -> Option<u64> {
     if raw.len() != CLIENT_BOOTSTRAP_LEN || raw[0] != CLIENT_MOUNT_TAG {
@@ -451,9 +485,140 @@ pub fn decode_client_bootstrap(raw: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(raw[1..].try_into().ok()?))
 }
 
+// --- Device mode (SH8-b) ---
+//
+// The launcher hands drv-blk a VMO that IS a volume: no private copy, so the bytes outlive any
+// filesystem server (and this driver) that serves them. drv-blk then behaves like a removable
+// media driver: it announces the volume on its bootstrap channel ([`MediaReady`]) and serves
+// every client Sora connects, each with the access Sora fixed. — TEAL
+
+/// First byte of a device-mode bootstrap: `[DEVICE_BOOTSTRAP_TAG][block_count: u64 LE]`,
+/// carrying the volume VMO, readable and writable.
+pub const DEVICE_BOOTSTRAP_TAG: u8 = b'W';
+/// Wire length of a device-mode bootstrap.
+pub const DEVICE_BOOTSTRAP_LEN: usize = 9;
+/// The label a device-mode volume is announced with: Sora mounts it at `/media/WORK`.
+pub const WORK_LABEL: [u8; 11] = *b"WORK       ";
+/// The serial a device-mode volume is announced with ("KUMO"), for a name of last resort.
+pub const WORK_SERIAL: u32 = u32::from_le_bytes(*b"KUMO");
+
+pub fn encode_device_bootstrap(block_count: u64) -> [u8; DEVICE_BOOTSTRAP_LEN] {
+    let mut buf = [0u8; DEVICE_BOOTSTRAP_LEN];
+    buf[0] = DEVICE_BOOTSTRAP_TAG;
+    buf[1..].copy_from_slice(&block_count.to_le_bytes());
+    buf
+}
+
+/// The volume's block count from a device-mode bootstrap; `None` for any other message,
+/// including the legacy 8-byte ramdisk size.
+pub fn decode_device_bootstrap(raw: &[u8]) -> Option<u64> {
+    if raw.len() != DEVICE_BOOTSTRAP_LEN || raw[0] != DEVICE_BOOTSTRAP_TAG {
+        return None;
+    }
+    let blocks = u64::from_le_bytes(raw[1..].try_into().ok()?);
+    (blocks != 0).then_some(blocks)
+}
+
+/// Serve one volume frame against `store` (the whole mapped volume) and write the reply.
+/// Every frame is validated by [`volume_request`] before a byte moves; the client's access
+/// is enforced here. `CMD_READ_VMO` answers [`STATUS_UNSUPPORTED`], so clients read by block.
+pub fn serve_device_frame(
+    store: &mut [u8],
+    frame: &[u8],
+    read_only: bool,
+    reply: &mut [u8],
+) -> usize {
+    let block = BLOCK_SIZE as usize;
+    let blocks = (store.len() / block) as u64;
+    let status = match volume_request(frame, 0, blocks, read_only) {
+        Ok(VolumeRequest::Read(lba)) => {
+            let at = lba as usize * block;
+            let Some(out) = reply.get_mut(..1 + block) else {
+                return 0;
+            };
+            out[1..].copy_from_slice(&store[at..at + block]);
+            out[0] = STATUS_OK;
+            return 1 + block;
+        }
+        Ok(VolumeRequest::Write(lba, data)) => {
+            let at = lba as usize * block;
+            store[at..at + block].copy_from_slice(data);
+            STATUS_OK
+        }
+        // RAM: every write is already where every later read looks.
+        Ok(VolumeRequest::Flush) => STATUS_OK,
+        Ok(VolumeRequest::ReadVmo { .. }) => STATUS_UNSUPPORTED,
+        Err(status) => status,
+    };
+    match reply.first_mut() {
+        Some(first) => {
+            *first = status;
+            1
+        }
+        None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_volume_serves_reads_writes_and_access_from_its_own_bytes() {
+        let mut store = [0u8; 4 * BLOCK_SIZE as usize];
+        let mut reply = [0u8; 1 + BLOCK_SIZE as usize];
+        let mut frame = [0u8; REQUEST_LEN + BLOCK_SIZE as usize];
+        frame[..REQUEST_LEN].copy_from_slice(&Request::write(3, 1).encode());
+        frame[REQUEST_LEN..].fill(0x5A);
+        assert_eq!(serve_device_frame(&mut store, &frame, false, &mut reply), 1);
+        assert_eq!(reply[0], STATUS_OK);
+        assert!(store[3 * 512..].iter().all(|b| *b == 0x5A));
+        assert!(store[..3 * 512].iter().all(|b| *b == 0));
+        let read = Request::read(3, 1).encode();
+        assert_eq!(serve_device_frame(&mut store, &read, true, &mut reply), 513);
+        assert_eq!((reply[0], reply[1], reply[512]), (STATUS_OK, 0x5A, 0x5A));
+        // Read-only clients, out-of-range LBAs and malformed frames move no byte.
+        frame[REQUEST_LEN..].fill(0x11);
+        assert_eq!(serve_device_frame(&mut store, &frame, true, &mut reply), 1);
+        assert_eq!(reply[0], STATUS_READ_ONLY);
+        frame[..REQUEST_LEN].copy_from_slice(&Request::write(4, 1).encode());
+        serve_device_frame(&mut store, &frame, false, &mut reply);
+        assert_eq!(reply[0], STATUS_BAD_LBA);
+        serve_device_frame(&mut store, &frame[..20], false, &mut reply);
+        assert_eq!(reply[0], STATUS_BAD_LEN);
+        assert!(store[3 * 512..].iter().all(|b| *b == 0x5A));
+        serve_device_frame(&mut store, &Request::flush().encode(), true, &mut reply);
+        assert_eq!(reply[0], STATUS_OK);
+        serve_device_frame(&mut store, &encode_read_vmo(0, 1, 0), false, &mut reply);
+        assert_eq!(reply[0], STATUS_UNSUPPORTED);
+        assert_eq!(
+            decode_device_bootstrap(&encode_device_bootstrap(8192)),
+            Some(8192)
+        );
+        assert_eq!(decode_device_bootstrap(&encode_device_bootstrap(0)), None);
+        assert_eq!(decode_device_bootstrap(&8192u64.to_le_bytes()), None);
+    }
+
+    #[test]
+    fn a_mount_bootstrap_carries_only_known_flags() {
+        let plain = encode_mount_bootstrap(4096);
+        assert_eq!(decode_mount_bootstrap_flags(&plain), Some((4096, 0)));
+        let format = encode_mount_bootstrap_flags(4096, MOUNT_FORMAT);
+        assert_eq!(
+            decode_mount_bootstrap_flags(&format),
+            Some((4096, MOUNT_FORMAT))
+        );
+        // The flagless decoder (fatfs) never mistakes a flagged bootstrap for its own.
+        assert_eq!(decode_mount_bootstrap(&format), None);
+        assert_eq!(
+            decode_mount_bootstrap_flags(&encode_mount_bootstrap_flags(1, 0x80)),
+            None
+        );
+        assert_eq!(
+            decode_mount_bootstrap_flags(&encode_client_bootstrap(4096)),
+            None
+        );
+    }
 
     #[test]
     fn a_connect_grants_only_its_explicit_access() {

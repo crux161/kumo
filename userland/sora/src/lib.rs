@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j766
 //j720
 //j774
 //j803
 //j820
+//j928
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -414,9 +414,12 @@ pub fn mount_point(path: &[u8]) -> Option<MediaName> {
 /// Slots 0–2 stay the xHCI controllers usb0, usb1 and host2, so every existing USB name keeps
 /// its meaning; slot 3 is the NVMe namespace. A new transport gets a new slot, never a borrowed
 /// one: SD (PLAN/018) appends rather than reusing an xHCI index.
-pub const STORAGE_DEVICES: usize = 4;
+pub const STORAGE_DEVICES: usize = 5;
 /// The NVMe namespace's slot: `/dev/disk3s1`.
 pub const NVME_STORAGE: usize = 3;
+/// SH8-b (j928): the RAM work volume's slot, `/dev/disk4s1`, served by drv-blk's device mode
+/// and mounted with RedoxFS. It exists only after the shell's `workvol` creates it. — TEAL
+pub const WORK_STORAGE: usize = 4;
 
 /// What carries a storage slot's volume.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -425,15 +428,17 @@ pub enum StorageTransport {
     Usb(u8),
     /// The PCIe NVMe namespace, internal and fixed.
     Nvme,
+    /// A RAM volume Sora made itself (SH8-b): it outlives its filesystem server, not a reboot.
+    Ram,
 }
 
 impl StorageTransport {
     pub const fn of(index: usize) -> StorageTransport {
         assert!(index < STORAGE_DEVICES);
-        if index == NVME_STORAGE {
-            StorageTransport::Nvme
-        } else {
-            StorageTransport::Usb(index as u8)
+        match index {
+            NVME_STORAGE => StorageTransport::Nvme,
+            WORK_STORAGE => StorageTransport::Ram,
+            usb => StorageTransport::Usb(usb as u8),
         }
     }
 
@@ -442,14 +447,42 @@ impl StorageTransport {
         match self {
             StorageTransport::Usb(_) => b"usb",
             StorageTransport::Nvme => b"nvme",
+            StorageTransport::Ram => b"ram",
         }
     }
 
     /// Whether an offered volume mounts by itself when `/media` is free. Removable USB sticks
-    /// do (J545/J766). The internal NVMe disk waits for an explicit `mount`, so it never takes
-    /// `/media` ahead of the stick a user plugged in.
+    /// do (J545/J766), and so does the work volume, which is only ever offered because the
+    /// shell asked for it. The internal NVMe disk waits for an explicit `mount`, so it never
+    /// takes `/media` ahead of the stick a user plugged in.
     pub const fn auto_mounts(self) -> bool {
-        matches!(self, StorageTransport::Usb(_))
+        matches!(self, StorageTransport::Usb(_) | StorageTransport::Ram)
+    }
+
+    /// The filesystem a volume on this transport carries: FAT32 everywhere but the work
+    /// volume, which is RedoxFS (DESIGN/010's record store).
+    pub const fn filesystem(self) -> Filesystem {
+        match self {
+            StorageTransport::Ram => Filesystem::RedoxFs,
+            _ => Filesystem::Fat32,
+        }
+    }
+}
+
+/// The filesystems Sora mounts, and so the server it starts for one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Filesystem {
+    Fat32,
+    RedoxFs,
+}
+
+impl Filesystem {
+    /// The name `mount` prints, as Linux's `type` column.
+    pub const fn name(self) -> &'static [u8] {
+        match self {
+            Filesystem::Fat32 => b"fat32",
+            Filesystem::RedoxFs => b"redoxfs",
+        }
     }
 }
 
@@ -1350,16 +1383,26 @@ mod tests {
             StorageTransport::Usb(1),
             StorageTransport::Usb(2),
             StorageTransport::Nvme,
+            StorageTransport::Ram,
         ]
         .into_iter()
         .enumerate()
         {
             assert_eq!(StorageTransport::of(index), transport);
             assert_eq!(transport.auto_mounts(), index != NVME_STORAGE);
+            assert_eq!(
+                transport.filesystem(),
+                if index == WORK_STORAGE {
+                    Filesystem::RedoxFs
+                } else {
+                    Filesystem::Fat32
+                }
+            );
         }
         assert_eq!(StorageTransport::Nvme.name(), b"nvme");
+        assert_eq!(&disk_path(WORK_STORAGE), b"/dev/disk4s1");
         for refused in [
-            b"/dev/disk4s1".as_slice(),
+            b"/dev/disk5s1".as_slice(),
             b"/dev/disk0s2",
             b"/dev/disk0",
             b"disk0s1",

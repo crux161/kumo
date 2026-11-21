@@ -1,4 +1,5 @@
 //j926
+//j928
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //! RedoxFS over an explicitly granted `drv-blk` volume (SH8-a).
@@ -36,6 +37,11 @@ impl<T: BlockTransport> BlockDisk<T> {
 
     pub fn into_transport(self) -> T {
         self.transport
+    }
+
+    /// The transport, for a serve loop's diagnostics and for tests that inject faults. — TEAL
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
     }
 
     fn span(&self, block: u64, len: usize) -> Result<u64> {

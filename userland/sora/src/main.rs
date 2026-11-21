@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j914
 //j917
 //j923
 //j924
 //j925
+//j928
 
 extern crate alloc;
 
@@ -15,7 +15,7 @@ use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
     GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GPU_LANE_PATH, GROUP_PATH,
-    HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, NETSTACK_PATH, PASSWD_PATH,
+    HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, NETSTACK_PATH, PASSWD_PATH, REDOXFSD_PATH,
     RELIBC_SMOKE_PATH, SHADOW_PATH, STD_SMOKE_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
@@ -2699,7 +2699,8 @@ fn set_device(index: usize, device: Option<Device>) {
 /// volume is served by ONE mount-scoped `fatfs` (SH3-c2), not a per-launch instance: every
 /// client gets a session on it, which is what makes advisory locks and renames shared.
 fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaName) {
-    let Some((control, process)) = spawn_mount_fatfs(initrd, device) else {
+    let filesystem = sora::StorageTransport::of(index).filesystem();
+    let Some((control, process)) = spawn_mount_server(initrd, device, filesystem) else {
         log(b"media: mount-scoped server unavailable\n");
         return;
     };
@@ -2715,10 +2716,12 @@ fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaN
         &sora::disk_path(index),
         b" mounted on /media/",
         name.as_bytes(),
+        b" (",
+        filesystem.name(),
         if device.ready.read_only {
-            b" (fat32, read-only)\n" as &[u8]
+            b", read-only)\n" as &[u8]
         } else {
-            b" (fat32)\n"
+            b")\n"
         },
     ]);
     // Health probe through one short-lived session (the J545 check, now against the
@@ -7404,6 +7407,10 @@ fn eval_command(
         umount_command(cmd, cwd);
         return true;
     }
+    if cmd.name == "workvol" {
+        workvol_command(cmd, initrd);
+        return true;
+    }
     if cmd.name == "cd" {
         if cmd.args.len() > 1 {
             usage(b"usage: cd [path]\n");
@@ -8070,7 +8077,9 @@ fn media_ready(initrd: Handle, index: usize, control: Handle, ready: drv_blk::Me
     diag(name.as_bytes());
     diag(b" ");
     diag(transport.name());
-    diag(b" fat32 blocks=");
+    diag(b" ");
+    diag(transport.filesystem().name());
+    diag(b" blocks=");
     diag_hex(ready.block_count);
     diag(b" serial=");
     diag(sora::MediaName::new(None, ready.serial).as_bytes());
@@ -12461,13 +12470,23 @@ fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory, initrd: Handle) 
                         &path,
                         b" on /media/",
                         media.name.as_bytes(),
-                        b" type fat32 (",
+                        b" type ",
+                        sora::StorageTransport::of(index).filesystem().name(),
+                        b" (",
                         if device.ready.read_only { b"ro" } else { b"rw" },
                         b")\n",
                     ],
                     0,
                 ),
-                None => log_line(&[&path, b" type fat32 (not mounted)\n"], 0),
+                None => log_line(
+                    &[
+                        &path,
+                        b" type ",
+                        sora::StorageTransport::of(index).filesystem().name(),
+                        b" (not mounted)\n",
+                    ],
+                    0,
+                ),
             }
         }
         return;
@@ -12588,6 +12607,156 @@ fn umount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
     ]);
 }
 
+/// The work volume's VMO (SH8-b). Sora keeps its own handle, so the volume's bytes outlive the
+/// driver and every filesystem server that serves them; 0 until `workvol` runs.
+static WORK_VOLUME: AtomicU32 = AtomicU32::new(0);
+/// The work volume's drv-blk process (SH8-b); 0 until `workvol` runs.
+static WORK_DRIVER: AtomicU32 = AtomicU32::new(0);
+
+/// `workvol [MiB]` (SH8-b, j928): make the RAM work volume, `/dev/disk4s1`, and mount it with
+/// RedoxFS at `/media/WORK` when `/media` is free. drv-blk serves the VMO in place (device
+/// mode), and redoxfsd formats it on first mount only. Later `umount`/`mount` replace the
+/// server while the bytes stay. Default 64 MiB, at most 192. Failures exit 1. — TEAL
+fn workvol_command(cmd: &kumoza::Command, initrd: Handle) {
+    const DEFAULT_MIB: u64 = 64;
+    const MAX_MIB: u64 = 192;
+    let mib = match cmd.args.as_slice() {
+        [] => DEFAULT_MIB,
+        [size] => match size.parse::<u64>() {
+            Ok(mib @ 1..=MAX_MIB) => mib,
+            _ => {
+                usage(b"usage: workvol [MiB], 1 to 192\n");
+                return;
+            }
+        },
+        _ => {
+            usage(b"usage: workvol [MiB], 1 to 192\n");
+            return;
+        }
+    };
+    if WORK_VOLUME.load(Ordering::Relaxed) != 0 {
+        log_line(
+            &[
+                b"workvol: ",
+                &sora::disk_path(sora::WORK_STORAGE),
+                b" exists; `mount` it\n",
+            ],
+            1,
+        );
+        return;
+    }
+    let bytes = mib << 20;
+    let Some(volume) = syscall_handle(vmo_create(bytes)) else {
+        log_line(&[b"workvol: no memory for the volume\n"], 1);
+        return;
+    };
+    let Some(lent) = syscall_handle(handle_duplicate(
+        volume,
+        Rights::READ | Rights::WRITE | Rights::TRANSFER,
+    )) else {
+        let _ = handle_close(volume);
+        log_line(&[b"workvol: volume handle unavailable\n"], 1);
+        return;
+    };
+    let (control_raw, driver_raw) = channel_create_pair();
+    if control_raw == u64::MAX || driver_raw == u64::MAX {
+        for end in [control_raw, driver_raw] {
+            if end != u64::MAX {
+                let _ = handle_close(Handle(end as u32));
+            }
+        }
+        let _ = handle_close(lent);
+        let _ = handle_close(volume);
+        log_line(&[b"workvol: control channel unavailable\n"], 1);
+        return;
+    }
+    let control = Handle(control_raw as u32);
+    let bootstrap = drv_blk::encode_device_bootstrap(bytes / drv_blk::BLOCK_SIZE);
+    if channel_write_with_handle(control, bootstrap.as_ptr(), bootstrap.len(), lent)
+        != Errno::Ok.status()
+    {
+        let _ = handle_close(lent);
+        let _ = handle_close(control);
+        let _ = handle_close(Handle(driver_raw as u32));
+        let _ = handle_close(volume);
+        log_line(&[b"workvol: driver bootstrap failed\n"], 1);
+        return;
+    }
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    let mut kept = None;
+    if !run_elf_threads(
+        initrd,
+        kumo_abi::DRV_BLK_PATH.as_bytes(),
+        0,
+        driver_raw,
+        flags,
+        b"drv-blk",
+        0,
+        Some(&mut kept),
+    ) {
+        let _ = handle_close(control);
+        let _ = handle_close(volume);
+        log_line(&[b"workvol: drv-blk did not start\n"], 1);
+        return;
+    }
+    // Sora keeps the driver's process handle for the volume's life, as it keeps a mount server's.
+    if let Some(process) = kept {
+        WORK_DRIVER.store(process.0, Ordering::Relaxed);
+    }
+    // The driver announces the volume as soon as it has mapped it. A channel read here does
+    // not block, so wait for the offer on a private port, bounded by a deadline.
+    const OFFER_WAIT_NS: u64 = 5_000_000_000;
+    if !wait_readable(control, OFFER_WAIT_NS) {
+        let _ = handle_close(control);
+        let _ = handle_close(volume);
+        log_line(&[b"workvol: drv-blk offered no volume in time\n"], 1);
+        return;
+    }
+    let mut offer = [0u8; drv_blk::MEDIA_READY_LEN];
+    let n = channel_read(control, offer.as_mut_ptr(), offer.len());
+    let Some(ready) = (n as usize == drv_blk::MEDIA_READY_LEN)
+        .then(|| drv_blk::MediaReady::decode(&offer))
+        .flatten()
+    else {
+        let _ = handle_close(control);
+        let _ = handle_close(volume);
+        log_line(&[b"workvol: drv-blk offered no volume\n"], 1);
+        return;
+    };
+    WORK_VOLUME.store(volume.0, Ordering::Relaxed);
+    STORAGE_CONTROLS[sora::WORK_STORAGE].store(control.0, Ordering::Relaxed);
+    notice(&[
+        b"media: ",
+        &sora::disk_path(sora::WORK_STORAGE),
+        b" ram work volume ready\n",
+    ]);
+    let _ = media_ready(initrd, sora::WORK_STORAGE, control, ready);
+}
+
+/// Wait until `channel` has a message (or its peer closed), at most `ns`. False on the deadline
+/// or when no private port/timer could be made. Sora's own serve port is not involved. — TEAL
+fn wait_readable(channel: Handle, ns: u64) -> bool {
+    let Some(port) = syscall_handle(port_create()) else {
+        return false;
+    };
+    let Some(timer) = syscall_handle(timer_create(ns)) else {
+        let _ = handle_close(port);
+        return false;
+    };
+    let channel_koid = handle_koid(channel);
+    let timer_koid = handle_koid(timer);
+    let bound = channel_koid != u64::MAX
+        && timer_koid != u64::MAX
+        && port_bind(port, channel) == 0
+        && port_bind(port, timer) == 0;
+    let ready = bound && port_wait(port) == channel_koid;
+    let _ = port_unbind(port, channel);
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    let _ = handle_close(port);
+    ready
+}
+
 fn log_directory_error(command: &[u8], error: DirectoryError) {
     fail_status(1);
     log(command);
@@ -12678,7 +12847,15 @@ fn check_volume_directory(fs: Option<Handle>, path: &[u8]) -> Result<(), Directo
 /// when the instance exits, the driver sees that channel close and frees the client slot.
 /// Spawn the mount-scoped `fatfs` for one offered volume (SH3-c2): a kept process handle,
 /// a mount-mode bootstrap, and the control channel sessions are granted over.
-fn spawn_mount_fatfs(initrd: Handle, device: Device) -> Option<(Handle, Handle)> {
+/// j928 (SH8-b): the server is the filesystem's: fatfs for FAT32, redoxfsd for RedoxFS. Both take
+/// the same mount bootstrap and session grants. Only the work volume, which Sora made blank
+/// itself, is handed over with permission to format; redoxfsd still mounts a RedoxFS it finds
+/// there, so a respawn never erases the tree. — TEAL
+fn spawn_mount_server(
+    initrd: Handle,
+    device: Device,
+    filesystem: sora::Filesystem,
+) -> Option<(Handle, Handle)> {
     let (control_raw, server_raw) = channel_create_pair();
     if control_raw == u64::MAX || server_raw == u64::MAX {
         for end in [control_raw, server_raw] {
@@ -12721,7 +12898,13 @@ fn spawn_mount_fatfs(initrd: Handle, device: Device) -> Option<(Handle, Handle)>
         log(b"media: driver connect failed\n");
         return None;
     }
-    let bootstrap = drv_blk::encode_mount_bootstrap(device.ready.block_count);
+    let flagged =
+        drv_blk::encode_mount_bootstrap_flags(device.ready.block_count, drv_blk::MOUNT_FORMAT);
+    let plain = drv_blk::encode_mount_bootstrap(device.ready.block_count);
+    let (bootstrap, image, name): (&[u8], &str, &[u8]) = match filesystem {
+        sora::Filesystem::Fat32 => (&plain, FATFS_PATH, b"fatfs"),
+        sora::Filesystem::RedoxFs => (&flagged, REDOXFSD_PATH, b"redoxfsd"),
+    };
     if channel_write_with_handle(control, bootstrap.as_ptr(), bootstrap.len(), block_client)
         != Errno::Ok.status()
     {
@@ -12735,11 +12918,11 @@ fn spawn_mount_fatfs(initrd: Handle, device: Device) -> Option<(Handle, Handle)>
     let mut kept = None;
     if !run_elf_threads(
         initrd,
-        FATFS_PATH.as_bytes(),
+        image.as_bytes(),
         0,
         server_raw,
         flags,
-        b"fatfs",
+        name,
         0,
         Some(&mut kept),
     ) {

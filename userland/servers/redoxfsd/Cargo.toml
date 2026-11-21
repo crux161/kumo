@@ -1,0 +1,30 @@
+#j928
+
+[package]
+name = "redoxfsd"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+drv-blk = { path = "../drv-blk" }
+kumo-redoxfs = { path = "../../../lib/kumo-redoxfs" }
+kumo-vfs = { path = "../../../lib/kumo-vfs" }
+syscall = { package = "redox_syscall", version = "=0.9.0", default-features = false }
+
+[lib]
+test = true
+
+# The resident binary, gated like fatfs's so `cargo test -p redoxfsd` exercises the
+# handler on the host without the runtime.
+[[bin]]
+name = "redoxfsd"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+[target.'cfg(any(target_arch = "aarch64", target_os = "none"))'.dependencies]
+kumo-rt = { path = "../../kumo-rt" }
+kumo-abi = { path = "../../../lib/kumo-abi" }

@@ -1,0 +1,29 @@
+#j928
+
+[package]
+name = "redoxprobe"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-vfs = { path = "../../lib/kumo-vfs" }
+
+[dev-dependencies]
+redoxfsd = { path = "../servers/redoxfsd" }
+drv-blk = { path = "../servers/drv-blk" }
+
+[lib]
+test = true
+
+[[bin]]
+name = "redoxprobe"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+[target.'cfg(any(target_arch = "aarch64", target_os = "none"))'.dependencies]
+kumo-rt = { path = "../kumo-rt" }
+kumo-abi.workspace = true

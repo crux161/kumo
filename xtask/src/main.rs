@@ -1,8 +1,8 @@
-//j919
 //j920
 //j921
 //j924
 //j925
+//j928
 
 use std::env;
 use std::fmt;
@@ -1255,6 +1255,9 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let drv_nvme = build_drv_nvme_image(&workspace_root()?)?;
             let drv_blk = build_drv_blk_image(&workspace_root()?)?;
             let fatfs = build_fatfs_image(&workspace_root()?)?;
+            // j928 (SH8-b): the RedoxFS server; `workvol` starts it for the RAM work volume.
+            let redoxfsd = build_native_bin(&workspace_root()?, "redoxfsd")?;
+            let redoxprobe = build_redoxprobe(&workspace_root()?)?;
             let identityd = build_identityd_image(&workspace_root()?)?;
             let netstack = build_native_bin(&workspace_root()?, "netstack")?;
             let netprobe = build_native_bin(&workspace_root()?, "netprobe")?;
@@ -1323,7 +1326,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let fat32_img = build_fat32_image(std_smoke.as_slice(), &linux_files);
             let payloadd = build_native_bin(&workspace_root()?, "payloadd")?;
             let drv_thermal = build_native_bin(&workspace_root()?, "drv-thermal")?;
-            let files: Vec<(&str, &[u8])> = vec![
+            let mut files: Vec<(&str, &[u8])> = vec![
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
                 (TTYD_PATH, ttyd.as_slice()),
@@ -1337,6 +1340,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (DRV_BLK_PATH, drv_blk.as_slice()),
                 (kumo_abi::DRV_THERMAL_PATH, drv_thermal.as_slice()),
                 (FATFS_PATH, fatfs.as_slice()),
+                (kumo_abi::REDOXFSD_PATH, redoxfsd.as_slice()),
                 (IDENTITYD_PATH, identityd.as_slice()),
                 (kumo_abi::initrd::NETSTACK_PATH, netstack.as_slice()),
                 (kumo_abi::initrd::NETPROBE_PATH, netprobe.as_slice()),
@@ -1378,6 +1382,9 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (SHADOW_PATH, shadow.as_bytes()),
                 (kumo_abi::PAYLOADD_PATH, payloadd.as_slice()),
             ];
+            if let Some(probe) = &redoxprobe {
+                files.push((kumo_abi::REDOXPROBE_PATH, probe.as_slice()));
+            }
             split_payload(out_dir, plan, files)?
         }
         ImageArch::X86_64 => build_x86_initrd(&workspace_root()?)?,
@@ -2605,6 +2612,16 @@ fn build_fatfs_image(root: &Path) -> Result<Vec<u8>, String> {
 }
 
 /// Build one aarch64 native bin whose package and bin share `name` (J815: netstack, netprobe).
+/// j928 (SH8-b): the RedoxFS VFS probe, packed only when `KUMO_REDOXPROBE=1` (the proof image
+/// `scripts/redoxfs-smoke.py` builds); default images stay one entry lighter.
+fn build_redoxprobe(root: &Path) -> Result<Option<Vec<u8>>, String> {
+    match env::var("KUMO_REDOXPROBE").as_deref() {
+        Ok("1") => build_native_bin(root, "redoxprobe").map(Some),
+        Ok("0") | Err(_) => Ok(None),
+        Ok(_) => Err("KUMO_REDOXPROBE must be 0 or 1".into()),
+    }
+}
+
 fn build_native_bin(root: &Path, name: &str) -> Result<Vec<u8>, String> {
     run_cargo(
         root,

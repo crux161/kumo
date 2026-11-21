@@ -1,8 +1,8 @@
-#j825
 #j826
 #j893
 #j905
 #j926
+#j928
 [workspace]
 members = [
     "boot/niji-loader",
@@ -54,6 +54,7 @@ members = [
     "userland/ls",
     "userland/netprobe",
     "userland/payloadd",
+    "userland/redoxprobe",
     "userland/lua-repl",
     "userland/threads",
     "userland/kumo-dispatch",
@@ -70,6 +71,7 @@ members = [
     "userland/servers/drv-serial",
     "userland/servers/drv-thermal",
     "userland/servers/fatfs",
+    "userland/servers/redoxfsd",
     "userland/servers/identityd",
     "userland/servers/netstack",
     "userland/servers/svc-health",

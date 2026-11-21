@@ -1,19 +1,21 @@
 #![no_std]
 #![no_main]
 
-//j413
-//j414
 //j559
 //j892
 //j913
 //j690
+//j928
 
 use drv_blk::{
     split_write_frame, BlockDevice, Request, CMD_FLUSH, CMD_READ, CMD_READ_VMO, CMD_WRITE,
     STATUS_BAD_LBA, STATUS_OK, STATUS_UNSUPPORTED,
 };
 use kumo_abi::{Handle, VmarFlags};
-use kumo_rt::{channel_read_with_handle, channel_write, vmar_map, vmo_create};
+use kumo_rt::{
+    channel_read_with_handle, channel_write, handle_close, handle_koid, port_bind, port_create,
+    port_unbind, port_wait, vmar_map, vmo_create,
+};
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
 /// allows. Failures are ERR, so a default boot still shows them.
@@ -49,16 +51,20 @@ extern "C" fn main(
 
     let ch = Handle(bootstrap_channel as u32);
 
-    // Read the initrd VMO handle + 8-byte size from the bootstrap channel.
-    let mut size_buf = [0u8; 8];
-    let (n, vmo_raw) = channel_read_with_handle(ch, size_buf.as_mut_ptr(), size_buf.len());
+    // Read the initrd VMO handle + 8-byte size from the bootstrap channel. SH8-b: or a
+    // device-mode bootstrap, whose VMO is the volume itself.
+    let mut boot = [0u8; 16];
+    let (n, vmo_raw) = channel_read_with_handle(ch, boot.as_mut_ptr(), boot.len());
     let vmo = Handle(vmo_raw as u32);
-    if vmo_raw == 0 {
+    if vmo_raw == 0 || vmo_raw == u64::MAX {
         log_err(b"drv-blk: missing vmo\n");
         kumo_rt::process_exit(1);
     }
-    let vmo_len = if n >= 8 {
-        u64::from_le_bytes(size_buf)
+    if let Some(blocks) = drv_blk::decode_device_bootstrap(&boot[..n.min(boot.len())]) {
+        serve_device(ch, vmo, blocks);
+    }
+    let vmo_len = if n == 8 {
+        u64::from_le_bytes(boot[..8].try_into().unwrap())
     } else {
         MAX_VMO_MAP // fallback: map up to 16 MiB
     };
@@ -178,6 +184,120 @@ extern "C" fn main(
             _ => {
                 buf[0] = STATUS_BAD_LBA;
                 channel_write(ch, buf.as_ptr(), 1);
+            }
+        }
+    }
+}
+
+/// The largest volume device mode maps: it must fit below the child-VMAR boundary at
+/// 0x2000_0000 above the 0x1100_0000 base.
+const MAX_DEVICE_BYTES: u64 = 192 * 1024 * 1024;
+/// Clients one device serves at once (a mount-scoped filesystem server holds one).
+const MAX_DEVICE_CLIENTS: usize = 4;
+
+/// SH8-b device mode: serve the VMO in place as an offered volume. The bootstrap channel is the
+/// control channel: drv-blk announces the volume there and Sora connects clients through it.
+/// The VMO is the volume, so the bytes outlive every client and this driver. — TEAL
+fn serve_device(control: Handle, volume: Handle, blocks: u64) -> ! {
+    let Some(bytes) = blocks
+        .checked_mul(drv_blk::BLOCK_SIZE)
+        .filter(|b| *b <= MAX_DEVICE_BYTES && b % 0x1000 == 0)
+    else {
+        log_err(b"drv-blk: device volume size refused\n");
+        kumo_rt::process_exit(1);
+    };
+    let va = kumo_rt::USER_WINDOW_BASE + 0x0000_0000_1100_0000;
+    if vmar_map(
+        Handle(0),
+        volume,
+        0,
+        va,
+        bytes,
+        (VmarFlags::READ | VmarFlags::WRITE).0,
+    ) != 0
+    {
+        log_err(b"drv-blk: device volume map failed\n");
+        kumo_rt::process_exit(1);
+    }
+    // SAFETY: the kernel mapped `bytes` writable bytes at `va` for this process alone.
+    let store = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, bytes as usize) };
+    let port = port_create();
+    let control_koid = handle_koid(control);
+    if port == 0 || port == u64::MAX || control_koid == u64::MAX {
+        log_err(b"drv-blk: device port failed\n");
+        kumo_rt::process_exit(1);
+    }
+    let port = Handle(port as u32);
+    if port_bind(port, control) != 0 {
+        log_err(b"drv-blk: device control bind failed\n");
+        kumo_rt::process_exit(1);
+    }
+    let ready = drv_blk::MediaReady {
+        block_count: blocks,
+        serial: drv_blk::WORK_SERIAL,
+        label: Some(drv_blk::WORK_LABEL),
+        read_only: false,
+    }
+    .encode();
+    if channel_write(control, ready.as_ptr(), ready.len()) != 0 {
+        log_err(b"drv-blk: device announce failed\n");
+        kumo_rt::process_exit(1);
+    }
+    log_info(b"drv-blk: device volume offered\n");
+    // (channel, koid, read_only)
+    let mut clients: [Option<(Handle, u64, bool)>; MAX_DEVICE_CLIENTS] = [None; MAX_DEVICE_CLIENTS];
+    let mut frame = [0u8; drv_blk::REQUEST_LEN + drv_blk::BLOCK_SIZE as usize + 16];
+    let mut reply = [0u8; 1 + drv_blk::BLOCK_SIZE as usize];
+    loop {
+        let source = port_wait(port);
+        if source == control_koid {
+            let mut msg = [0u8; drv_blk::CONTROL_CONNECT_LEN];
+            let (n, raw) = channel_read_with_handle(control, msg.as_mut_ptr(), msg.len());
+            let carried = (raw != 0 && raw != u64::MAX).then_some(Handle(raw as u32));
+            if n == 0 {
+                // Sora is gone. The clients keep their channels until they close them.
+                let _ = port_unbind(port, control);
+                continue;
+            }
+            let (Some(access), Some(channel)) =
+                (drv_blk::decode_connect(&msg[..n.min(msg.len())]), carried)
+            else {
+                if let Some(extra) = carried {
+                    let _ = handle_close(extra);
+                }
+                continue;
+            };
+            let koid = handle_koid(channel);
+            let slot = clients.iter().position(Option::is_none);
+            match slot {
+                Some(slot) if koid != u64::MAX && port_bind(port, channel) == 0 => {
+                    clients[slot] = Some((channel, koid, access == drv_blk::BlockAccess::ReadOnly));
+                }
+                _ => {
+                    log_err(b"drv-blk: device client refused\n");
+                    let _ = handle_close(channel);
+                }
+            }
+        } else if let Some(slot) = clients
+            .iter()
+            .position(|c| c.is_some_and(|(_, koid, _)| koid == source))
+        {
+            let Some((channel, _, read_only)) = clients[slot] else {
+                continue;
+            };
+            let (n, raw) = channel_read_with_handle(channel, frame.as_mut_ptr(), frame.len());
+            if raw != 0 && raw != u64::MAX {
+                let _ = handle_close(Handle(raw as u32));
+            }
+            if n == 0 || n > frame.len() {
+                let _ = port_unbind(port, channel);
+                let _ = handle_close(channel);
+                clients[slot] = None;
+                continue;
+            }
+            let len = drv_blk::serve_device_frame(store, &frame[..n], read_only, &mut reply);
+            if len != 0 {
+                let _ = channel_write(channel, reply.as_ptr(), len);
             }
         }
     }
