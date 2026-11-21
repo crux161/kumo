@@ -1,5 +1,6 @@
 # RedoxFS on KUMO
 <!-- j926 -->
+<!-- j930 -->
 
 SH8-a / PLAN/008 S5-a. The upstream source is RedoxFS **0.9.1**, tag `0.9.1`,
 commit `473b4baeb041ebe14504f30693393b1cae52558c` from
@@ -35,6 +36,18 @@ Local source changes:
   compatibility with its memory adapters; durable KUMO mounts use `BlockDisk`.
 - Refuse a checksummed header whose generation would underflow the ring origin.
 - Silence the unused decompression error when upstream logging is disabled.
+- **j930 (TEAL, SH8-d), mount and replay hardened against forged disks** (found by the
+  hash-consistent forger in `lib/kumo-redoxfs/src/fuzz.rs`; each class has a pinned
+  regression test there):
+  - `FileSystem::open` refuses a header whose byte size is not whole blocks, exceeds the disk
+    past the ring origin or leaves no room for the header ring, and ignores headers at or past
+    `GENERATION_LIMIT` (2^62), which would overflow the next commit.
+  - `reset_allocator` treats the alloc log as input: every entry must name blocks inside the
+    volume, its count may not be `i64::MIN`, a block may not be allocated twice (was an
+    `assert_eq!`), and the replay touches at most `ALLOC_REPLAY_FACTOR` (64) blocks per volume
+    block. Each is now EIO, not a panic, an overflow, or a 2^63-step loop.
+  - `read_tree_and_addr` answers EIO for a node id whose index names a slot past a TreeList's
+    254 entries (was an out-of-bounds panic, reachable from a forged release list).
 
 `kumo-redoxfs::BlockDisk` owns a volume transport and the granted 512-byte sector
 count. The driver owns partition offsets and access policy. RedoxFS's 4096-byte
@@ -63,3 +76,6 @@ Before holding real data: bound and fuzz hostile mount/replay inputs, implement 
 boot `fsd` through the existing VFS protocol, prove Sora kill/restart recovery on a
 persistent backend, then repeat SH7's Cargo workspace from that volume. An ordinary
 image boot still uses the existing FAT mechanics. — KESTREL 2026-11-20
+
+j930: the patch was regenerated against the same pinned archive and still reproduces every
+upstream file byte for byte; the forger's long run is recorded in JOURNAL/930. — TEAL

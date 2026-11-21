@@ -8,11 +8,10 @@
 -description = "The Redox Filesystem"
 -repository = "https://gitlab.redox-os.org/redox-os/redoxfs"
  version = "0.9.1"
-+edition = "2021"
- license-file = "LICENSE"
+-license-file = "LICENSE"
 -readme = "README.md"
 -authors = ["Jeremy Soller <jackpot51@gmail.com>"]
--edition = "2021"
+ edition = "2021"
 -
 -[lib]
 -name = "redoxfs"
@@ -47,6 +46,7 @@
 -path = "src/bin/resize.rs"
 -doc = false
 -required-features = ["std"]
++license-file = "LICENSE"
 +publish = false
 +autobins = false
 +autotests = false
@@ -114,7 +114,7 @@
 -assert_cmd = "2.0.17"
 --- a/src/disk/mod.rs
 +++ b/src/disk/mod.rs
-@@ -36,6 +36,13 @@
+@@ -36,6 +36,13 @@ pub trait Disk {
      /// Unsafe to discourage use, use filesystem wrappers instead
      unsafe fn write_at(&mut self, block: u64, buffer: &[u8]) -> Result<usize>;
  
@@ -130,7 +130,7 @@
  }
 --- a/src/filesystem.rs
 +++ b/src/filesystem.rs
-@@ -2,16 +2,18 @@
+@@ -2,16 +2,18 @@ use aes::Aes128;
  use alloc::{
      collections::{BTreeMap, VecDeque},
      vec,
@@ -151,7 +151,21 @@
  
  fn compress_cache() -> Vec<u8> {
      vec![0; lz4_flex::block::get_maximum_output_size(RECORD_SIZE as usize)]
-@@ -48,7 +50,10 @@
+@@ -31,6 +33,13 @@ pub struct FileSystem<D: Disk> {
+     pub node_usages: BTreeMap<u32, u64>,
+ }
+ 
++/// j930 (TEAL): a header generation at or past this is refused at mount (a real volume would
++/// need 2^62 commits; a forged one would overflow the next).
++pub const GENERATION_LIMIT: u64 = 1 << 62;
++/// j930 (TEAL): the alloc-log replay at mount touches at most this many blocks per volume
++/// block (the log is squashed at every cleanup, so a real one is far shorter).
++pub const ALLOC_REPLAY_FACTOR: u64 = 64;
++
+ impl<D: Disk> FileSystem<D> {
+     /// Open a file system on a disk
+     pub fn open(
+@@ -48,7 +57,10 @@ impl<D: Disk> FileSystem<D> {
                  continue;
              }
  
@@ -163,7 +177,38 @@
              for i in 0..HEADER_RING {
                  let mut other_header = Header::default();
                  unsafe { disk.read_at(block + i, &mut other_header)? };
-@@ -125,9 +130,38 @@
+@@ -58,12 +70,28 @@ impl<D: Disk> FileSystem<D> {
+                     continue;
+                 }
+ 
+-                // If this is a newer header, use it
+-                if other_header.generation() > header.generation() {
++                // If this is a newer header, use it. A generation past the limit could only
++                // be forged; it would also overflow the next commit. — TEAL (j930)
++                if other_header.generation() > header.generation()
++                    && other_header.generation() < GENERATION_LIMIT
++                {
+                     header = other_header;
+                 }
+             }
+ 
++            // A hostile header must not size the volume past the disk, nor leave no room for
++            // the header ring, nor carry a generation the next commit would overflow. The
++            // header's size is in bytes, from the volume's first block. — TEAL (j930)
++            let disk_blocks = disk.size()? / BLOCK_SIZE;
++            let blocks = header.size() / BLOCK_SIZE;
++            if header.generation() >= GENERATION_LIMIT
++                || header.size() % BLOCK_SIZE != 0
++                || blocks > disk_blocks.saturating_sub(block)
++                || blocks <= HEADER_RING
++            {
++                return Err(Error::new(syscall::error::EIO));
++            }
++
+             let cipher_opt = match password_opt {
+                 Some(password) => {
+                     if !header.encrypted() {
+@@ -125,9 +153,38 @@ impl<D: Disk> FileSystem<D> {
      /// We need to pass ctime and ctime_nsec in order to initialize the unix timestamps
      #[cfg(feature = "std")]
      pub fn create_reserved(
@@ -202,7 +247,7 @@
          ctime: u64,
          ctime_nsec: u32,
      ) -> Result<Self> {
-@@ -154,9 +188,13 @@
+@@ -154,9 +211,13 @@ impl<D: Disk> FileSystem<D> {
              }
          }
  
@@ -217,9 +262,52 @@
              Some(password) => {
                  //TODO: handle errors
                  header.key_slots[0] = KeySlot::new(
+@@ -261,6 +322,11 @@ impl<D: Disk> FileSystem<D> {
+     /// Unsafe, it must only be called when opening the filesystem
+     unsafe fn reset_allocator(&mut self) -> Result<()> {
+         self.allocator = Allocator::default();
++        // j930 (TEAL): the alloc log is disk input. Every entry must name blocks inside the
++        // volume, the same block may not be allocated twice, and the whole replay is bounded,
++        // so a forged log is an EIO, never a panic, an overflow or a 2^63-step loop.
++        let volume = self.header.size() / BLOCK_SIZE;
++        let mut budget = volume.saturating_mul(ALLOC_REPLAY_FACTOR);
+ 
+         // To avoid having to update all prior alloc blocks, there is only a previous pointer
+         // This means we need to roll back all allocations. Currently we do this by reading the
+@@ -280,15 +346,21 @@ impl<D: Disk> FileSystem<D> {
+             for entry in alloc.data().entries.iter() {
+                 let index = entry.index();
+                 let count = entry.count();
+-                if count < 0 {
+-                    for i in 0..-count {
+-                        //TODO: replace assert with error?
+-                        let addr = BlockAddr::new(index + i as u64, BlockMeta::default());
+-                        assert_eq!(self.allocator.allocate_exact(addr), Some(addr));
+-                    }
+-                } else {
+-                    for i in 0..count {
+-                        let addr = BlockAddr::new(index + i as u64, BlockMeta::default());
++                let blocks = count.unsigned_abs();
++                let inside = index
++                    .checked_add(blocks)
++                    .is_some_and(|end| end <= volume);
++                if !inside || blocks > budget {
++                    return Err(Error::new(syscall::error::EIO));
++                }
++                budget -= blocks;
++                for i in 0..blocks {
++                    let addr = BlockAddr::new(index + i, BlockMeta::default());
++                    if count < 0 {
++                        if self.allocator.allocate_exact(addr) != Some(addr) {
++                            return Err(Error::new(syscall::error::EIO));
++                        }
++                    } else {
+                         self.allocator.deallocate(addr);
+                     }
+                 }
 --- a/src/header.rs
 +++ b/src/header.rs
-@@ -42,11 +42,15 @@
+@@ -42,11 +42,15 @@ pub struct Header {
  impl Header {
      #[cfg(feature = "std")]
      pub fn new(size: u64) -> Header {
@@ -247,7 +335,20 @@
  use crate::{BlockLevel, BlockTrait, RECORD_LEVEL};
 --- a/src/transaction.rs
 +++ b/src/transaction.rs
-@@ -294,6 +294,9 @@
+@@ -75,6 +75,12 @@ pub struct Transaction<'a, D: Disk> {
+     pub(crate) write_cache: BTreeMap<BlockAddr, Vec<u8>>,
+ }
+ 
++/// j930 (TEAL): the `i`th pointer of a TreeList level, or EIO when a disk-supplied id names a
++/// slot past its entries.
++fn tree_slot<T>(ptrs: &[BlockPtr<T>], i: usize) -> Result<BlockPtr<T>> {
++    ptrs.get(i).copied().ok_or(Error::new(EIO))
++}
++
+ impl<'a, D: Disk> Transaction<'a, D> {
+     pub(crate) fn new(fs: &'a mut FileSystem<D>) -> Self {
+         let header = fs.header;
+@@ -294,6 +300,9 @@ impl<'a, D: Disk> Transaction<'a, D> {
              return Ok(false);
          }
  
@@ -257,7 +358,7 @@
          // Update header to next generation
          let gen = self.header.update(self.fs.cipher_opt.as_ref());
          let gen_block = gen % HEADER_RING;
-@@ -311,6 +314,7 @@
+@@ -311,6 +320,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
              return Err(Error::new(EIO));
          }
  
@@ -265,7 +366,7 @@
          self.header_changed = false;
          Ok(true)
      }
-@@ -420,6 +424,7 @@
+@@ -420,6 +430,7 @@ impl<'a, D: Disk> Transaction<'a, D> {
              if let Err(err) = lz4_flex::decompress_into(&record.data()[2..total_len], &mut decomp) {
                  #[cfg(feature = "log")]
                  log::error!("READ_RECORD: FAILED TO DECOMPRESS: {:?}", err);
@@ -273,3 +374,22 @@
                  return Err(Error::new(EIO));
              }
              record = BlockData::new(BlockAddr::null(BlockMeta::new(decomp_level)), decomp);
+@@ -506,12 +517,14 @@ impl<'a, D: Disk> Transaction<'a, D> {
+             return Err(Error::new(ENOENT));
+         }
+ 
++        // j930 (TEAL): an id is disk input (a release-list entry, a directory entry); each of
++        // its indexes can name a slot past a TreeList's entries. That is EIO, never a panic.
+         let (i3, i2, i1, i0) = ptr.indexes();
+         let l3 = self.read_block(self.header.tree)?;
+-        let l2 = self.read_block(l3.data().ptrs[i3])?;
+-        let l1 = self.read_block(l2.data().ptrs[i2])?;
+-        let l0 = self.read_block(l1.data().ptrs[i1])?;
+-        let raw = self.read_block(l0.data().ptrs[i0])?;
++        let l2 = self.read_block(tree_slot(&l3.data().ptrs, i3)?)?;
++        let l1 = self.read_block(tree_slot(&l2.data().ptrs, i2)?)?;
++        let l0 = self.read_block(tree_slot(&l1.data().ptrs, i1)?)?;
++        let raw = self.read_block(tree_slot(&l0.data().ptrs, i0)?)?;
+ 
+         //TODO: transmute instead of copy?
+         let mut data = match T::empty(BlockLevel::default()) {

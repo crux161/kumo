@@ -1,4 +1,5 @@
 //j926
+//j930
 use super::*;
 use drv_blk::{BlockDevice, CMD_FLUSH, CMD_READ, CMD_WRITE};
 use redoxfs::{FileSystem, Node, TreePtr, BLOCK_SIZE, HEADER_RING};
@@ -319,5 +320,153 @@ fn replay_refuses_corrupt_allocator_and_misplaced_header_generation() {
     assert_eq!(
         FileSystem::open(memory.power_loss(), None, Some(0), false).err(),
         Some(Error::new(EIO))
+    );
+}
+
+// --- j930 (SH8-d): the bulk path ---
+
+/// [`Memory`] with a bulk path, as drv-virtio-blk serves one: `CMD_READ_VMO`/`CMD_WRITE_VMO`
+/// through the caller's buffer, writes into the volatile cache, refused when `supported` is off.
+#[derive(Clone)]
+struct BulkMemory {
+    inner: Memory,
+    supported: bool,
+    bulk_requests: usize,
+    fail_bulk_write: bool,
+}
+
+impl BlockTransport for BulkMemory {
+    fn exchange(&mut self, request: &[u8], reply: &mut [u8]) -> Option<usize> {
+        self.inner.exchange(request, reply)
+    }
+
+    fn exchange_bulk(
+        &mut self,
+        request: &[u8],
+        payload: Bulk<'_>,
+        reply: &mut [u8],
+    ) -> Option<usize> {
+        if !self.supported {
+            reply[0] = drv_blk::STATUS_UNSUPPORTED;
+            return Some(1);
+        }
+        self.bulk_requests += 1;
+        let device = BlockDevice::new(SECTORS * SECTOR_SIZE);
+        reply[0] = match (drv_blk::volume_request(request, 0, SECTORS, false), payload) {
+            (Ok(drv_blk::VolumeRequest::ReadVmo { lba, count, .. }), Bulk::Read(out)) => {
+                match device.read_blocks(&self.inner.cache, lba, count) {
+                    Ok(data) if data.len() == out.len() => {
+                        out.copy_from_slice(data);
+                        STATUS_OK
+                    }
+                    _ => drv_blk::STATUS_BAD_LBA,
+                }
+            }
+            (Ok(drv_blk::VolumeRequest::WriteVmo { lba, count, .. }), Bulk::Write(data)) => {
+                if self.fail_bulk_write {
+                    drv_blk::STATUS_IO_ERROR
+                } else {
+                    device.write_blocks(&mut self.inner.cache, lba, count, data)
+                }
+            }
+            (Err(status), _) => status,
+            _ => drv_blk::STATUS_BAD_LEN,
+        };
+        Some(1)
+    }
+}
+
+type BulkFs = FileSystem<BlockDisk<BulkMemory>>;
+
+fn bulk_format(supported: bool) -> BulkFs {
+    let memory = BulkMemory {
+        inner: Memory::new(),
+        supported,
+        bulk_requests: 0,
+        fail_bulk_write: false,
+    };
+    FileSystem::create_unencrypted(BlockDisk::new(memory, SECTORS).unwrap(), UUID, 1, 0).unwrap()
+}
+
+fn big_file(fs: &mut BulkFs, data: &[u8]) {
+    fs.tx(|tx| {
+        let f = tx.create_node(TreePtr::root(), "big", Node::MODE_FILE | 0o644, 1, 0)?;
+        tx.write_node(f.ptr(), 0, data, 1, 0).map(|_| ())
+    })
+    .unwrap();
+}
+
+fn read_big(fs: &mut BulkFs) -> Vec<u8> {
+    fs.tx(|tx| {
+        let node = tx.find_node(TreePtr::root(), "big")?;
+        let mut out = vec![0; node.data().size() as usize];
+        tx.read_node(node.ptr(), 0, &mut out, 0, 0)?;
+        Ok(out)
+    })
+    .unwrap()
+}
+
+#[test]
+fn the_bulk_path_moves_records_in_a_fraction_of_the_requests_and_survives_power_loss() {
+    let data: Vec<u8> = (0..400_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    let mut fast = bulk_format(true);
+    let before = fast.disk.requests;
+    big_file(&mut fast, &data);
+    let fast_requests = fast.disk.requests - before;
+    let mut slow = bulk_format(false);
+    let before = slow.disk.requests;
+    big_file(&mut slow, &data);
+    let slow_requests = slow.disk.requests - before;
+    assert!(
+        fast_requests * 6 < slow_requests,
+        "bulk {fast_requests} requests vs sector-by-sector {slow_requests}"
+    );
+    assert!(fast.disk.into_transport().bulk_requests > 0);
+    // Power loss keeps exactly the committed tree, read back over the bulk path.
+    let mut fast = bulk_format(true);
+    big_file(&mut fast, &data);
+    let mut memory = fast.disk.into_transport();
+    memory.inner = memory.inner.power_loss().into_transport();
+    let mut fs: BulkFs = FileSystem::open(
+        BlockDisk::new(memory, SECTORS).unwrap(),
+        None,
+        Some(0),
+        false,
+    )
+    .unwrap();
+    assert_eq!(read_big(&mut fs), data);
+}
+
+#[test]
+fn an_unsupported_bulk_path_falls_back_once_and_a_failed_bulk_write_never_commits() {
+    let mut fs = bulk_format(false);
+    big_file(&mut fs, &[7u8; 50_000]);
+    let memory = fs.disk.into_transport();
+    assert_eq!(memory.bulk_requests, 0, "refused once, never asked again");
+
+    let mut fs = bulk_format(true);
+    big_file(&mut fs, b"committed");
+    fs.disk.transport_mut().fail_bulk_write = true;
+    let failed = fs.tx(|tx| {
+        let f = tx.create_node(TreePtr::root(), "doomed", Node::MODE_FILE | 0o644, 2, 0)?;
+        tx.write_node(f.ptr(), 0, &[1u8; 30_000], 2, 0).map(|_| ())
+    });
+    assert_eq!(failed, Err(Error::new(EIO)));
+    let mut memory = fs.disk.into_transport();
+    memory.fail_bulk_write = false;
+    memory.inner = memory.inner.power_loss().into_transport();
+    let mut fs: BulkFs = FileSystem::open(
+        BlockDisk::new(memory, SECTORS).unwrap(),
+        None,
+        Some(0),
+        false,
+    )
+    .unwrap();
+    assert_eq!(read_big(&mut fs), b"committed");
+    assert_eq!(
+        fs.tx(|tx| tx.find_node(TreePtr::root(), "doomed")).err(),
+        Some(Error::new(ENOENT))
     );
 }

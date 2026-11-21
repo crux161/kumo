@@ -75,6 +75,12 @@ pub struct Transaction<'a, D: Disk> {
     pub(crate) write_cache: BTreeMap<BlockAddr, Vec<u8>>,
 }
 
+/// j930 (TEAL): the `i`th pointer of a TreeList level, or EIO when a disk-supplied id names a
+/// slot past its entries.
+fn tree_slot<T>(ptrs: &[BlockPtr<T>], i: usize) -> Result<BlockPtr<T>> {
+    ptrs.get(i).copied().ok_or(Error::new(EIO))
+}
+
 impl<'a, D: Disk> Transaction<'a, D> {
     pub(crate) fn new(fs: &'a mut FileSystem<D>) -> Self {
         let header = fs.header;
@@ -511,12 +517,14 @@ impl<'a, D: Disk> Transaction<'a, D> {
             return Err(Error::new(ENOENT));
         }
 
+        // j930 (TEAL): an id is disk input (a release-list entry, a directory entry); each of
+        // its indexes can name a slot past a TreeList's entries. That is EIO, never a panic.
         let (i3, i2, i1, i0) = ptr.indexes();
         let l3 = self.read_block(self.header.tree)?;
-        let l2 = self.read_block(l3.data().ptrs[i3])?;
-        let l1 = self.read_block(l2.data().ptrs[i2])?;
-        let l0 = self.read_block(l1.data().ptrs[i1])?;
-        let raw = self.read_block(l0.data().ptrs[i0])?;
+        let l2 = self.read_block(tree_slot(&l3.data().ptrs, i3)?)?;
+        let l1 = self.read_block(tree_slot(&l2.data().ptrs, i2)?)?;
+        let l0 = self.read_block(tree_slot(&l1.data().ptrs, i1)?)?;
+        let raw = self.read_block(tree_slot(&l0.data().ptrs, i0)?)?;
 
         //TODO: transmute instead of copy?
         let mut data = match T::empty(BlockLevel::default()) {

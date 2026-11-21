@@ -2,6 +2,7 @@
 //j434
 //j468
 //j473
+//j930
 
 //! `kumo-bsp` — the Board Support Package: the **runtime** board-specific parameters the
 //! generic arm64 kernel and HAL must not hardcode.
@@ -124,6 +125,20 @@ pub struct BoardSpec {
     /// boot path guarantees one. A present DTB is richer and stays authoritative
     /// (DESIGN/017 §5); this is only the board-scoped escape hatch when the handoff omits it.
     pub gic_fallback: Option<GicFallback>,
+    /// SH8-d (j930): a virtio-mmio transport window the board always has at fixed addresses
+    /// (QEMU `virt`'s, which no DTB describes under UEFI). `None` elsewhere: Sora probes only
+    /// what the board names.
+    pub virtio_mmio: Option<VirtioMmioWindow>,
+}
+
+/// Fixed virtio-mmio transports: `slots` register windows of `stride` bytes from `base`, slot
+/// `n` interrupting on GIC INTID `first_intid + n`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtioMmioWindow {
+    pub base: u64,
+    pub slots: u32,
+    pub stride: u64,
+    pub first_intid: u32,
 }
 
 impl Board {
@@ -146,6 +161,13 @@ impl Board {
                     redistributor_base: Some(0x080a_0000),
                     cpu_base: Some(0x0801_0000),
                 }),
+                // QEMU virt's VIRT_MMIO: 32 transports, 0x200 apart, SPIs 16-47 (INTIDs 48-79).
+                virtio_mmio: Some(VirtioMmioWindow {
+                    base: 0x0a00_0000,
+                    slots: 32,
+                    stride: 0x200,
+                    first_intid: 48,
+                }),
             },
             Board::ThinkPadX13sGen1 => BoardSpec {
                 id: "thinkpad-x13s-gen1",
@@ -155,6 +177,7 @@ impl Board {
                 gic: GicVersion::V3,
                 // Nijigumo stages the X13s DTB on the ESP, so a device tree is always present.
                 gic_fallback: None,
+                virtio_mmio: None,
             },
             Board::RaspberryPi5 => BoardSpec {
                 id: "raspberry-pi-5",
@@ -190,6 +213,7 @@ impl Board {
                     redistributor_base: None,
                     cpu_base: Some(0x10_7fff_a000),
                 }),
+                virtio_mmio: None,
             },
             Board::OrangePi5Plus => BoardSpec {
                 id: "orange-pi-5-plus",
@@ -215,6 +239,7 @@ impl Board {
                     redistributor_base: Some(0xfe68_0000),
                     cpu_base: None,
                 }),
+                virtio_mmio: None,
             },
         }
     }
@@ -240,6 +265,23 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_qemu_virt_names_a_virtio_window() {
+        let window = Board::QemuVirtAarch64.spec().virtio_mmio.unwrap();
+        assert_eq!(
+            (window.base, window.slots, window.stride),
+            (0x0a00_0000, 32, 0x200)
+        );
+        assert_eq!(window.first_intid, 48);
+        for board in [
+            Board::ThinkPadX13sGen1,
+            Board::RaspberryPi5,
+            Board::OrangePi5Plus,
+        ] {
+            assert_eq!(board.spec().virtio_mmio, None);
+        }
+    }
 
     #[test]
     fn qemu_virt_boots_on_pl011_at_the_historical_base() {

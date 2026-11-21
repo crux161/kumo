@@ -1,8 +1,8 @@
-#j798
 #j805
 #j820
 #j893
 #j929
+#j930
 
 [package]
 name = "sora"
@@ -16,6 +16,8 @@ bmp-view = { path = "../bmp-view" }
 drv-fb = { path = "../servers/drv-fb" }
 drv-gpu = { path = "../servers/drv-gpu" }
 drv-blk = { path = "../servers/drv-blk" }
+kumo-bsp = { path = "../../lib/kumo-bsp" }
+kumo-virtio = { path = "../../lib/kumo-virtio" }
 drv-i2c-hid = { path = "../servers/drv-i2c-hid" }
 drv-nvme = { path = "../servers/drv-nvme" }
 drv-thermal = { path = "../servers/drv-thermal" }

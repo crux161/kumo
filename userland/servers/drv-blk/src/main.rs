@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j559
 //j892
 //j913
 //j690
 //j928
+//j930
 
 use drv_blk::{
     split_write_frame, BlockDevice, Request, CMD_FLUSH, CMD_READ, CMD_READ_VMO, CMD_WRITE,
@@ -172,7 +172,8 @@ extern "C" fn main(
                 buf[0] = status;
                 channel_write(ch, buf.as_ptr(), 1);
             }
-            CMD_READ_VMO => {
+            // j930: neither bulk command on the legacy ramdisk; clients fall back to blocks.
+            CMD_READ_VMO | drv_blk::CMD_WRITE_VMO => {
                 buf[0] = STATUS_UNSUPPORTED;
                 channel_write(ch, buf.as_ptr(), 1);
             }

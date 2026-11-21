@@ -33,6 +33,13 @@ pub struct FileSystem<D: Disk> {
     pub node_usages: BTreeMap<u32, u64>,
 }
 
+/// j930 (TEAL): a header generation at or past this is refused at mount (a real volume would
+/// need 2^62 commits; a forged one would overflow the next).
+pub const GENERATION_LIMIT: u64 = 1 << 62;
+/// j930 (TEAL): the alloc-log replay at mount touches at most this many blocks per volume
+/// block (the log is squashed at every cleanup, so a real one is far shorter).
+pub const ALLOC_REPLAY_FACTOR: u64 = 64;
+
 impl<D: Disk> FileSystem<D> {
     /// Open a file system on a disk
     pub fn open(
@@ -63,10 +70,26 @@ impl<D: Disk> FileSystem<D> {
                     continue;
                 }
 
-                // If this is a newer header, use it
-                if other_header.generation() > header.generation() {
+                // If this is a newer header, use it. A generation past the limit could only
+                // be forged; it would also overflow the next commit. — TEAL (j930)
+                if other_header.generation() > header.generation()
+                    && other_header.generation() < GENERATION_LIMIT
+                {
                     header = other_header;
                 }
+            }
+
+            // A hostile header must not size the volume past the disk, nor leave no room for
+            // the header ring, nor carry a generation the next commit would overflow. The
+            // header's size is in bytes, from the volume's first block. — TEAL (j930)
+            let disk_blocks = disk.size()? / BLOCK_SIZE;
+            let blocks = header.size() / BLOCK_SIZE;
+            if header.generation() >= GENERATION_LIMIT
+                || header.size() % BLOCK_SIZE != 0
+                || blocks > disk_blocks.saturating_sub(block)
+                || blocks <= HEADER_RING
+            {
+                return Err(Error::new(syscall::error::EIO));
             }
 
             let cipher_opt = match password_opt {
@@ -299,6 +322,11 @@ impl<D: Disk> FileSystem<D> {
     /// Unsafe, it must only be called when opening the filesystem
     unsafe fn reset_allocator(&mut self) -> Result<()> {
         self.allocator = Allocator::default();
+        // j930 (TEAL): the alloc log is disk input. Every entry must name blocks inside the
+        // volume, the same block may not be allocated twice, and the whole replay is bounded,
+        // so a forged log is an EIO, never a panic, an overflow or a 2^63-step loop.
+        let volume = self.header.size() / BLOCK_SIZE;
+        let mut budget = volume.saturating_mul(ALLOC_REPLAY_FACTOR);
 
         // To avoid having to update all prior alloc blocks, there is only a previous pointer
         // This means we need to roll back all allocations. Currently we do this by reading the
@@ -318,15 +346,21 @@ impl<D: Disk> FileSystem<D> {
             for entry in alloc.data().entries.iter() {
                 let index = entry.index();
                 let count = entry.count();
-                if count < 0 {
-                    for i in 0..-count {
-                        //TODO: replace assert with error?
-                        let addr = BlockAddr::new(index + i as u64, BlockMeta::default());
-                        assert_eq!(self.allocator.allocate_exact(addr), Some(addr));
-                    }
-                } else {
-                    for i in 0..count {
-                        let addr = BlockAddr::new(index + i as u64, BlockMeta::default());
+                let blocks = count.unsigned_abs();
+                let inside = index
+                    .checked_add(blocks)
+                    .is_some_and(|end| end <= volume);
+                if !inside || blocks > budget {
+                    return Err(Error::new(syscall::error::EIO));
+                }
+                budget -= blocks;
+                for i in 0..blocks {
+                    let addr = BlockAddr::new(index + i, BlockMeta::default());
+                    if count < 0 {
+                        if self.allocator.allocate_exact(addr) != Some(addr) {
+                            return Err(Error::new(syscall::error::EIO));
+                        }
+                    } else {
                         self.allocator.deallocate(addr);
                     }
                 }

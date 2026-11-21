@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j720
 //j774
 //j803
 //j820
 //j928
+//j930
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -414,12 +414,14 @@ pub fn mount_point(path: &[u8]) -> Option<MediaName> {
 /// Slots 0–2 stay the xHCI controllers usb0, usb1 and host2, so every existing USB name keeps
 /// its meaning; slot 3 is the NVMe namespace. A new transport gets a new slot, never a borrowed
 /// one: SD (PLAN/018) appends rather than reusing an xHCI index.
-pub const STORAGE_DEVICES: usize = 5;
+pub const STORAGE_DEVICES: usize = 6;
 /// The NVMe namespace's slot: `/dev/disk3s1`.
 pub const NVME_STORAGE: usize = 3;
 /// SH8-b (j928): the RAM work volume's slot, `/dev/disk4s1`, served by drv-blk's device mode
 /// and mounted with RedoxFS. It exists only after the shell's `workvol` creates it. — TEAL
 pub const WORK_STORAGE: usize = 4;
+/// SH8-d (j930): a virtio-blk disk's slot, `/dev/disk5s1` (QEMU's persistent disk). — TEAL
+pub const VIRTIO_STORAGE: usize = 5;
 
 /// What carries a storage slot's volume.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,6 +432,8 @@ pub enum StorageTransport {
     Nvme,
     /// A RAM volume Sora made itself (SH8-b): it outlives its filesystem server, not a reboot.
     Ram,
+    /// A virtio-blk disk (SH8-d): persistent, and its filesystem is read off the disk.
+    Virtio,
 }
 
 impl StorageTransport {
@@ -438,6 +442,7 @@ impl StorageTransport {
         match index {
             NVME_STORAGE => StorageTransport::Nvme,
             WORK_STORAGE => StorageTransport::Ram,
+            VIRTIO_STORAGE => StorageTransport::Virtio,
             usb => StorageTransport::Usb(usb as u8),
         }
     }
@@ -448,6 +453,7 @@ impl StorageTransport {
             StorageTransport::Usb(_) => b"usb",
             StorageTransport::Nvme => b"nvme",
             StorageTransport::Ram => b"ram",
+            StorageTransport::Virtio => b"virtio",
         }
     }
 
@@ -456,11 +462,15 @@ impl StorageTransport {
     /// shell asked for it. The internal NVMe disk waits for an explicit `mount`, so it never
     /// takes `/media` ahead of the stick a user plugged in.
     pub const fn auto_mounts(self) -> bool {
-        matches!(self, StorageTransport::Usb(_) | StorageTransport::Ram)
+        matches!(
+            self,
+            StorageTransport::Usb(_) | StorageTransport::Ram | StorageTransport::Virtio
+        )
     }
 
-    /// The filesystem a volume on this transport carries: FAT32 everywhere but the work
-    /// volume, which is RedoxFS (DESIGN/010's record store).
+    /// The filesystem a volume on this transport is assumed to carry: FAT32 everywhere but the
+    /// work volume, which is RedoxFS (DESIGN/010's record store). j930: Sora now reads it off
+    /// every other volume ([`Filesystem::detect`]); this answers only for the blank RAM volume.
     pub const fn filesystem(self) -> Filesystem {
         match self {
             StorageTransport::Ram => Filesystem::RedoxFs,
@@ -477,6 +487,18 @@ pub enum Filesystem {
 }
 
 impl Filesystem {
+    /// SH8-d (j930, D5): what a volume's first sector says it is. RedoxFS's header signature,
+    /// or a FAT boot sector (0x55AA and a `FAT` type string); `None` for anything else, which
+    /// Sora leaves unmounted.
+    pub fn detect(sector0: &[u8]) -> Option<Filesystem> {
+        if sector0.get(..8) == Some(b"RedoxFS\0") {
+            return Some(Filesystem::RedoxFs);
+        }
+        let boot = sector0.get(..512)?;
+        let fat_type = &boot[82..85] == b"FAT" || &boot[54..57] == b"FAT";
+        (boot[510] == 0x55 && boot[511] == 0xAA && fat_type).then_some(Filesystem::Fat32)
+    }
+
     /// The name `mount` prints, as Linux's `type` column.
     pub const fn name(self) -> &'static [u8] {
         match self {
@@ -1370,6 +1392,26 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_is_recognized_by_its_first_sector() {
+        let mut sector = [0u8; 512];
+        assert_eq!(Filesystem::detect(&sector), None, "blank");
+        sector[..8].copy_from_slice(b"RedoxFS\0");
+        assert_eq!(Filesystem::detect(&sector), Some(Filesystem::RedoxFs));
+        let mut fat32 = [0u8; 512];
+        fat32[82..87].copy_from_slice(b"FAT32");
+        fat32[510] = 0x55;
+        fat32[511] = 0xAA;
+        assert_eq!(Filesystem::detect(&fat32), Some(Filesystem::Fat32));
+        let mut fat16 = [0u8; 512];
+        fat16[54..59].copy_from_slice(b"FAT16");
+        fat16[510..512].copy_from_slice(&[0x55, 0xAA]);
+        assert_eq!(Filesystem::detect(&fat16), Some(Filesystem::Fat32));
+        fat16[511] = 0;
+        assert_eq!(Filesystem::detect(&fat16), None, "no boot signature");
+        assert_eq!(Filesystem::detect(&[0u8; 100]), None, "short");
+    }
+
+    #[test]
     fn disks_are_named_by_their_storage_slot() {
         assert_eq!(&disk_path(0), b"/dev/disk0s1");
         assert_eq!(&disk_path(2), b"/dev/disk2s1");
@@ -1384,6 +1426,7 @@ mod tests {
             StorageTransport::Usb(2),
             StorageTransport::Nvme,
             StorageTransport::Ram,
+            StorageTransport::Virtio,
         ]
         .into_iter()
         .enumerate()
@@ -1401,8 +1444,9 @@ mod tests {
         }
         assert_eq!(StorageTransport::Nvme.name(), b"nvme");
         assert_eq!(&disk_path(WORK_STORAGE), b"/dev/disk4s1");
+        assert_eq!(&disk_path(VIRTIO_STORAGE), b"/dev/disk5s1");
         for refused in [
-            b"/dev/disk5s1".as_slice(),
+            b"/dev/disk6s1".as_slice(),
             b"/dev/disk0s2",
             b"/dev/disk0",
             b"disk0s1",

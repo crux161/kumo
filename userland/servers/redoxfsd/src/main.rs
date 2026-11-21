@@ -2,6 +2,7 @@
 #![no_main]
 //j928
 //j929
+//j930
 //! The resident `redoxfsd`: the tested handler in this crate's library over a `drv-blk`
 //! volume channel, serving `kumo-vfs` sessions exactly as fatfs's mount-scoped server does
 //! (SH8-b).
@@ -15,7 +16,7 @@ extern crate alloc;
 
 use kumo_abi::{Handle, VmarFlags};
 use kumo_redoxfs::redoxfs::FileSystem;
-use kumo_redoxfs::{BlockDisk, BlockTransport};
+use kumo_redoxfs::{BlockDisk, BlockTransport, Bulk};
 use kumo_rt::{
     channel_read, channel_read_with_handle, channel_write, handle_close, handle_koid, port_bind,
     port_create, port_unbind, port_wait, vmar_map, vmar_unmap,
@@ -62,6 +63,57 @@ fn valid(raw: u64) -> Option<Handle> {
 /// The volume channel's syscall boundary; framing lives in `kumo-redoxfs`.
 struct ChannelBlocks {
     channel: Handle,
+    /// j930: the bulk VMO (`BULK_BYTES`, mapped at [`BULK_VA`]); 0 when it could not be made,
+    /// and then every transfer goes sector by sector.
+    bulk: Handle,
+}
+
+/// Where the bulk VMO lives in this process, past the `ReadVmo` client window.
+const BULK_VA: u64 = CLIENT_VA + CLIENT_WINDOW_LEN.next_multiple_of(0x10_0000);
+
+impl ChannelBlocks {
+    /// A block channel with the process's bulk VMO, made and mapped once (a format after a
+    /// refused open builds a second transport over the same mapping).
+    fn new(channel: Handle) -> Self {
+        static BULK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+        let made = BULK.load(core::sync::atomic::Ordering::Relaxed);
+        if made != u32::MAX {
+            return Self {
+                channel,
+                bulk: Handle(made),
+            };
+        }
+        let raw = kumo_rt::vmo_create(kumo_redoxfs::BULK_BYTES as u64);
+        let bulk = match valid(raw) {
+            Some(vmo)
+                if vmar_map(
+                    Handle(0),
+                    vmo,
+                    0,
+                    BULK_VA,
+                    kumo_redoxfs::BULK_BYTES as u64,
+                    (VmarFlags::READ | VmarFlags::WRITE).0,
+                ) == 0 =>
+            {
+                vmo
+            }
+            other => {
+                if let Some(vmo) = other {
+                    let _ = handle_close(vmo);
+                }
+                log_info(b"redoxfsd: no bulk VMO; transfers go sector by sector\n");
+                Handle(0)
+            }
+        };
+        BULK.store(bulk.0, core::sync::atomic::Ordering::Relaxed);
+        Self { channel, bulk }
+    }
+
+    fn window(&mut self, len: usize) -> &'static mut [u8] {
+        // SAFETY: BULK_VA maps BULK_BYTES of this process's private bulk VMO; `len` is bounded
+        // by BlockDisk (one bulk request); only one exchange is ever in flight.
+        unsafe { core::slice::from_raw_parts_mut(BULK_VA as *mut u8, len) }
+    }
 }
 
 impl BlockTransport for ChannelBlocks {
@@ -71,6 +123,49 @@ impl BlockTransport for ChannelBlocks {
         }
         let n = channel_read(self.channel, reply.as_mut_ptr(), reply.len());
         (n != 0 && n != u64::MAX && n <= reply.len() as u64).then_some(n as usize)
+    }
+
+    /// j930 (SH8-d): up to 64 KiB per request through the bulk VMO. The driver gets a copy of
+    /// it for this request (closed by the driver), never this process's mapping.
+    fn exchange_bulk(
+        &mut self,
+        request: &[u8],
+        payload: Bulk<'_>,
+        reply: &mut [u8],
+    ) -> Option<usize> {
+        if self.bulk.0 == 0 {
+            return None;
+        }
+        let len = match &payload {
+            Bulk::Read(out) => out.len(),
+            Bulk::Write(data) => data.len(),
+        };
+        if len > kumo_redoxfs::BULK_BYTES {
+            return None;
+        }
+        if let Bulk::Write(data) = &payload {
+            self.window(len).copy_from_slice(data);
+        }
+        let copy = valid(kumo_rt::handle_duplicate(
+            self.bulk,
+            kumo_abi::Rights(
+                kumo_abi::Rights::READ.0 | kumo_abi::Rights::WRITE.0 | kumo_abi::Rights::TRANSFER.0,
+            ),
+        ))?;
+        if kumo_rt::channel_write_with_handle(self.channel, request.as_ptr(), request.len(), copy)
+            != 0
+        {
+            let _ = handle_close(copy);
+            return None;
+        }
+        let n = channel_read(self.channel, reply.as_mut_ptr(), reply.len());
+        if n == 0 || n == u64::MAX || n > reply.len() as u64 {
+            return None;
+        }
+        if let (Bulk::Read(out), Some(&drv_blk::STATUS_OK)) = (payload, reply.first()) {
+            out.copy_from_slice(self.window(len));
+        }
+        Some(n as usize)
     }
 }
 
@@ -118,8 +213,18 @@ type Disk = CachedDisk<BlockDisk<ChannelBlocks>>;
 
 /// Mount the volume, or (only when the launcher says it made it blank, and only when it holds
 /// no RedoxFS yet) put a new filesystem on it.
+/// j930 (SH8-d): the volume would not mount: no RedoxFS, a corrupt or forged header, or an
+/// alloc log that fails replay (vendored RedoxFS refuses those with EIO). That is the disk's
+/// problem, not a crash: say so and exit 0, without a TOWER. Sora's supervisor restarts the
+/// server inside its intensity window like any exit, and then gives the mount up with a notice,
+/// so a poisoned disk cannot crash-loop it. Never formatted. — TEAL
+fn refuse() -> ! {
+    log_notice(b"redoxfsd: volume refused (not a RedoxFS this server will mount)\n");
+    kumo_rt::process_exit(0)
+}
+
 fn mount(blocks: Handle, block_count: u64, flags: u8) -> FileSystem<Disk> {
-    let Ok(volume) = BlockDisk::new(ChannelBlocks { channel: blocks }, block_count) else {
+    let Ok(volume) = BlockDisk::new(ChannelBlocks::new(blocks), block_count) else {
         fail(b"redoxfsd: volume size is not whole RedoxFS blocks\n");
     };
     let disk = CachedDisk::new(volume, CACHE_BLOCKS);
@@ -129,11 +234,9 @@ fn mount(blocks: Handle, block_count: u64, flags: u8) -> FileSystem<Disk> {
             log_notice(b"redoxfsd: mounted an existing RedoxFS volume\n");
             return fs;
         }
-        Err(_) if flags & drv_blk::MOUNT_FORMAT == 0 => {
-            fail(b"redoxfsd: no RedoxFS on the volume; refusing to format it\n");
-        }
+        Err(_) if flags & drv_blk::MOUNT_FORMAT == 0 => refuse(),
         // `open` consumed the disk; build it again over the same channel.
-        Err(_) => match BlockDisk::new(ChannelBlocks { channel: blocks }, block_count) {
+        Err(_) => match BlockDisk::new(ChannelBlocks::new(blocks), block_count) {
             Ok(volume) => CachedDisk::new(volume, CACHE_BLOCKS),
             Err(_) => fail(b"redoxfsd: volume size is not whole RedoxFS blocks\n"),
         },

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j843
 //j881
 //j886
 //j892
 //j896
+//j930
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -2818,6 +2818,8 @@ fn serve_block_client(
                 }
             }
         },
+        // j930 (SH8-d): bulk writes are virtio-blk's for now; clients fall back to blocks.
+        Ok(StorageRequest::WriteVmo { .. }) => drv_blk::STATUS_UNSUPPORTED,
         Ok(StorageRequest::Flush) => {
             if service.with_disk(io, layout, image, evt, |disk| disk.flush()) {
                 service.clients[index].flushes += 1;

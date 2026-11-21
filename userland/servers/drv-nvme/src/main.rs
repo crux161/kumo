@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j805
 //j806
 //j807
 //j892
 //j895
+//j930
 //! One owner per process: polled Identify, then a read-only I/O pair whose completions
 //! arrive by INTx (NV6). A proof owner runs the NV6 sequence and exits; a serve owner
 //! (NV7) offers the namespace's FAT32 volume to Sora and serves it read-only until Sora
@@ -942,7 +942,7 @@ fn serve(
                 );
                 STATUS_OK
             }
-            Ok(VolumeRequest::ReadVmo { .. }) => {
+            Ok(VolumeRequest::ReadVmo { .. } | VolumeRequest::WriteVmo { .. }) => {
                 clients[i].refused += 1;
                 STATUS_UNSUPPORTED
             }

@@ -1,0 +1,24 @@
+#j930
+[package]
+name = "drv-virtio-blk"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# SH8-d (j930): the persistent QEMU disk. All request logic lives (and is host-tested) in
+# kumo-virtio::blk; this binary is the syscall boundary.
+[[bin]]
+name = "drv-virtio-blk"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+[dependencies]
+drv-blk = { path = "../drv-blk" }
+kumo-virtio = { path = "../../../lib/kumo-virtio" }
+
+[target.'cfg(any(target_arch = "aarch64", target_os = "none"))'.dependencies]
+kumo-rt = { path = "../../kumo-rt" }
+kumo-abi = { path = "../../../lib/kumo-abi" }

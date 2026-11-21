@@ -1,4 +1,5 @@
 #j562
+#j930
 [package]
 name = "xtask"
 authors.workspace = true
@@ -14,6 +15,9 @@ kumo-abi.workspace = true
 kumo-identity = { path = "../lib/kumo-identity" }
 # SHA-256 for the persona payload pins (SH7-c) and the staged initrd.img.zst (PROPOSAL/025 Z1).
 kumo-sha256.workspace = true
+# j930 (SH8-d): `cargo xtask redoxfs-image` formats with the exact RedoxFS KUMO mounts with.
+kumo-redoxfs = { path = "../lib/kumo-redoxfs" }
+drv-blk = { path = "../userland/servers/drv-blk" }
 # Echo off at /dev/tty while a password is typed.
 libc = "0.2"
 

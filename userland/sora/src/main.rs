@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j923
 //j924
 //j925
 //j928
 //j929
+//j930
 
 extern crate alloc;
 
@@ -2681,6 +2681,8 @@ struct Media {
     /// j929 (SH8-c): Sora's duplicate of the control channel's server end, which keeps the
     /// endpoint alive across a redoxfsd crash; 0 for an unsupervised fatfs mount.
     server_end: Handle,
+    /// j930: what the volume turned out to carry.
+    filesystem: sora::Filesystem,
 }
 
 /// J766: the volume each storage controller's driver offers, mounted or not. `mount` mounts one
@@ -2704,8 +2706,26 @@ fn set_device(index: usize, device: Option<Device>) {
 /// volume is served by ONE mount-scoped `fatfs` (SH3-c2), not a per-launch instance: every
 /// client gets a session on it, which is what makes advisory locks and renames shared.
 fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaName) {
-    let filesystem = sora::StorageTransport::of(index).filesystem();
-    let Some((control, process, server_end)) = spawn_mount_server(initrd, device, filesystem)
+    // j930 (SH8-d, D5): a volume's filesystem is what its first sector says; only the blank RAM
+    // work volume, which Sora made itself, is RedoxFS by fiat (and may be formatted).
+    let transport = sora::StorageTransport::of(index);
+    let (filesystem, format) = if transport == sora::StorageTransport::Ram {
+        (sora::Filesystem::RedoxFs, true)
+    } else {
+        match detect_filesystem(device) {
+            Some(filesystem) => (filesystem, false),
+            None => {
+                notice(&[
+                    b"media: ",
+                    &sora::disk_path(index),
+                    b" unrecognized volume; not mounted\n",
+                ]);
+                return;
+            }
+        }
+    };
+    let Some((control, process, server_end)) =
+        spawn_mount_server(initrd, device, filesystem, format)
     else {
         log(b"media: mount-scoped server unavailable\n");
         return;
@@ -2732,6 +2752,7 @@ fn mount_device(initrd: Handle, index: usize, device: Device, name: sora::MediaN
         process,
         process_koid,
         server_end,
+        filesystem,
     }));
     notice(&[
         b"media: ",
@@ -6230,6 +6251,11 @@ extern "C" fn sora_main(
 
     let mut cwd = WorkingDirectory::default();
 
+    // j930 (SH8-d): a virtio-blk disk, on a board whose BSP names a virtio-mmio window, before
+    // autoexec so its `media` launches can mount it. Its control channel joins the storage
+    // controls the pump and the serve loop bind.
+    spawn_virtio_disk(initrd);
+
     // Autoexec (input-less): run the boot script shipped at `etc/autoexec` in the initrd —
     // one shell command per line, `#` comments and blanks skipped (`kumoza::autoexec_lines`).
     // Each line is parsed and dispatched through the SAME `eval_command` as interactive input,
@@ -8108,8 +8134,6 @@ fn media_ready(initrd: Handle, index: usize, control: Handle, ready: drv_blk::Me
     diag(name.as_bytes());
     diag(b" ");
     diag(transport.name());
-    diag(b" ");
-    diag(transport.filesystem().name());
     diag(b" blocks=");
     diag_hex(ready.block_count);
     diag(b" serial=");
@@ -8348,7 +8372,7 @@ fn ensure_media_writable(initrd: Handle) -> bool {
 fn mount_writable_media(initrd: Handle) -> Option<bool> {
     for (index, slot) in DEVICES.get().iter().enumerate() {
         let Some(device) = slot else { continue };
-        if device.ready.read_only {
+        if device.ready.read_only || MEDIA_GIVEN_UP[index].load(Ordering::Relaxed) {
             continue;
         }
         let name = sora::MediaName::new(device.ready.label, device.ready.serial);
@@ -8425,7 +8449,10 @@ fn pump_removable_media(initrd: Handle) -> bool {
 fn mount_removable_media(initrd: Handle) -> Option<bool> {
     for (index, slot) in DEVICES.get().iter().enumerate() {
         let Some(device) = slot else { continue };
-        if device.ready.read_only || !sora::StorageTransport::of(index).auto_mounts() {
+        if device.ready.read_only
+            || !sora::StorageTransport::of(index).auto_mounts()
+            || MEDIA_GIVEN_UP[index].load(Ordering::Relaxed)
+        {
             continue;
         }
         let name = sora::MediaName::new(device.ready.label, device.ready.serial);
@@ -9160,6 +9187,10 @@ fn netstack_schedule_restart() {
 /// otherwise depend on the very keyboard whose driver is waiting for ACK.
 /// Per-wake one message; no draining ChannelRead on an empty peer. — TIMBERDOODLE
 fn dispatch_service_event(source: u64) -> bool {
+    // j930: the supervised mount server died while Sora waits elsewhere.
+    if source != 0 && media_event(source) {
+        return true;
+    }
     if source != 0 {
         if let Some(index) = USB_CONTROL_KOIDS
             .iter()
@@ -12502,22 +12533,14 @@ fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory, initrd: Handle) 
                         b" on /media/",
                         media.name.as_bytes(),
                         b" type ",
-                        sora::StorageTransport::of(index).filesystem().name(),
+                        media.filesystem.name(),
                         b" (",
                         if device.ready.read_only { b"ro" } else { b"rw" },
                         b")\n",
                     ],
                     0,
                 ),
-                None => log_line(
-                    &[
-                        &path,
-                        b" type ",
-                        sora::StorageTransport::of(index).filesystem().name(),
-                        b" (not mounted)\n",
-                    ],
-                    0,
-                ),
+                None => log_line(&[&path, b" (not mounted)\n"], 0),
             }
         }
         return;
@@ -12582,7 +12605,11 @@ fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory, initrd: Handle) 
             ],
             32,
         ),
-        None => mount_device(initrd, index, device, name),
+        None => {
+            // An explicit mount is the operator's call, even for a slot the supervisor gave up.
+            MEDIA_GIVEN_UP[index].store(false, Ordering::Relaxed);
+            mount_device(initrd, index, device, name)
+        }
     }
 }
 
@@ -12644,6 +12671,112 @@ fn umount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
         media.name.as_bytes(),
         b"\n",
     ]);
+}
+
+/// The board this boot runs on, from BootInfo (j930). Mapped briefly; `None` without BootInfo.
+fn board() -> Option<kumo_bsp::Board> {
+    const PEEK_VA: u64 = kumo_rt::USER_WINDOW_BASE + 0x3f10_0000;
+    let vmo = Handle(BOOTINFO_VMO_HANDLE.load(Ordering::Relaxed) as u32);
+    if vmo.0 == 0 || vmar_map(Handle(0), vmo, 0, PEEK_VA, 4096, VmarFlags::READ.0) != 0 {
+        return None;
+    }
+    // SAFETY: the kernel populated this BootInfo page, mapped read-only just above.
+    let board = kumo_bsp::Board::from_id(unsafe { &*(PEEK_VA as *const BootInfo) }.board_id());
+    let _ = kumo_rt::vmar_unmap(PEEK_VA, 4096);
+    board
+}
+
+/// j930 (SH8-d, D2): probe the board's virtio-mmio window (read-only) and start
+/// `drv-virtio-blk` on the first modern block transport, as storage slot 5. The driver gets a
+/// child Resource bounded to the transport's MMIO page and its one interrupt line, and nothing
+/// else. — TEAL
+fn spawn_virtio_disk(initrd: Handle) {
+    use kumo_virtio::{ids, mmio};
+    const PROBE_VA: u64 = kumo_rt::USER_WINDOW_BASE + 0x3f00_0000;
+    let Some(window) = board().and_then(|board| board.spec().virtio_mmio) else {
+        return;
+    };
+    let root = Handle(ROOT_RESOURCE.load(Ordering::Relaxed) as u32);
+    let len = (u64::from(window.slots) * window.stride).next_multiple_of(0x1000);
+    let Some(view) = syscall_handle(resource_mint_mmio(root, window.base, len)) else {
+        log(b"virtio: window mint failed\n");
+        return;
+    };
+    let mapped = vmar_map(
+        Handle(0),
+        view,
+        0,
+        PROBE_VA,
+        len,
+        (VmarFlags::READ | VmarFlags::DEVICE).0,
+    );
+    let _ = handle_close(view);
+    if mapped != 0 {
+        log(b"virtio: window map failed\n");
+        return;
+    }
+    let read = |slot: u32, offset: u32| -> u32 {
+        let at = PROBE_VA + u64::from(slot) * window.stride + u64::from(offset);
+        // SAFETY: inside the read-only Device mapping made above.
+        unsafe { (at as *const u32).read_volatile() }
+    };
+    let found = (0..window.slots).find(|&slot| {
+        read(slot, mmio::MAGIC_VALUE) == mmio::MAGIC
+            && read(slot, mmio::VERSION) == mmio::VERSION_MODERN
+            && read(slot, mmio::DEVICE_ID) == ids::BLOCK
+    });
+    let _ = kumo_rt::vmar_unmap(PROBE_VA, len);
+    let Some(slot) = found else {
+        diag(b"virtio: no modern block transport\n");
+        return;
+    };
+    let address = window.base + u64::from(slot) * window.stride;
+    let page = address & !0xFFF;
+    let irq = window.first_intid + slot;
+    // The driver's whole authority: this transport's MMIO page and its one interrupt line.
+    let Some(resource) = syscall_handle(kumo_rt::resource_create_child(root, page, 0x1000, irq, 1))
+    else {
+        log(b"virtio: transport resource failed\n");
+        return;
+    };
+    let (control_raw, driver_raw) = channel_create_pair();
+    if control_raw == u64::MAX || driver_raw == u64::MAX {
+        let _ = handle_close(resource);
+        log(b"virtio: control channel unavailable\n");
+        return;
+    }
+    let control = Handle(control_raw as u32);
+    let mut bootstrap = [0u8; 17];
+    bootstrap[0] = b'R';
+    bootstrap[1..9].copy_from_slice(&page.to_le_bytes());
+    bootstrap[9..13].copy_from_slice(&((address - page) as u32).to_le_bytes());
+    bootstrap[13..17].copy_from_slice(&irq.to_le_bytes());
+    if channel_write_with_handle(control, bootstrap.as_ptr(), bootstrap.len(), resource)
+        != Errno::Ok.status()
+    {
+        let _ = handle_close(resource);
+        log(b"virtio: driver bootstrap failed\n");
+        return;
+    }
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    let mut kept = None;
+    if !run_elf_threads(
+        initrd,
+        kumo_abi::DRV_VIRTIO_BLK_PATH.as_bytes(),
+        0,
+        driver_raw,
+        flags,
+        b"drv-virtio-blk",
+        0,
+        Some(&mut kept),
+    ) {
+        let _ = handle_close(control);
+        return;
+    }
+    STORAGE_CONTROLS[sora::VIRTIO_STORAGE].store(control.0, Ordering::Relaxed);
+    log(b"virtio: block transport in slot ");
+    log_dec(u64::from(slot));
+    log(b"; drv-virtio-blk serves /dev/disk5s1\n");
 }
 
 /// The work volume's VMO (SH8-b). Sora keeps its own handle, so the volume's bytes outlive the
@@ -12897,6 +13030,7 @@ fn spawn_mount_server(
     initrd: Handle,
     device: Device,
     filesystem: sora::Filesystem,
+    format: bool,
 ) -> Option<(Handle, Handle, Handle)> {
     let (control_raw, server_raw) = channel_create_pair();
     if control_raw == u64::MAX || server_raw == u64::MAX {
@@ -12917,7 +13051,8 @@ fn spawn_mount_server(
             log(b"media: control endpoint could not be kept\n");
             return None;
         };
-        let Some(process) = start_redoxfsd(initrd, device, server, drv_blk::MOUNT_FORMAT) else {
+        let flags = if format { drv_blk::MOUNT_FORMAT } else { 0 };
+        let Some(process) = start_redoxfsd(initrd, device, server, flags) else {
             let _ = handle_close(control);
             let _ = handle_close(keep);
             return None;
@@ -12970,6 +13105,30 @@ const CONTROL_RIGHTS: Rights = Rights(
 
 /// A new client channel on the device's driver, with the access the device allows.
 fn connect_block_client(device: Device) -> Option<Handle> {
+    let access = if device.ready.read_only {
+        BlockAccess::ReadOnly
+    } else {
+        BlockAccess::ReadWrite
+    };
+    connect_block_client_with(device, access)
+}
+
+/// j930 (SH8-d): read a volume's first sector through a short-lived read-only client and say
+/// which filesystem it carries.
+fn detect_filesystem(device: Device) -> Option<sora::Filesystem> {
+    let client = connect_block_client_with(device, BlockAccess::ReadOnly)?;
+    let request = drv_blk::Request::read(0, 1).encode();
+    let mut reply = [0u8; 1 + drv_blk::BLOCK_SIZE as usize];
+    let detected = (channel_write(client, request.as_ptr(), request.len()) == 0
+        && wait_readable(client, 5_000_000_000))
+    .then(|| channel_read(client, reply.as_mut_ptr(), reply.len()))
+    .and_then(|n| drv_blk::read_payload(&reply[..(n as usize).min(reply.len())]).ok())
+    .and_then(sora::Filesystem::detect);
+    let _ = handle_close(client);
+    detected
+}
+
+fn connect_block_client_with(device: Device, access: BlockAccess) -> Option<Handle> {
     let (client_raw, server_raw) = channel_create_pair();
     if client_raw == u64::MAX || server_raw == u64::MAX {
         for end in [client_raw, server_raw] {
@@ -12980,11 +13139,6 @@ fn connect_block_client(device: Device) -> Option<Handle> {
         log(b"media: block channel unavailable\n");
         return None;
     }
-    let access = if device.ready.read_only {
-        BlockAccess::ReadOnly
-    } else {
-        BlockAccess::ReadWrite
-    };
     let connect = drv_blk::encode_connect(access);
     if channel_write_with_handle(
         device.control,
@@ -13149,12 +13303,24 @@ fn media_port() -> Option<Handle> {
     Some(port)
 }
 
-/// Watch a new mount server instance for its termination.
+/// Watch a new mount server instance for its termination: on the supervisor's own port and,
+/// j930, on Sora's reply port, whose waits (`read_channel_ready`, foreground children) dispatch
+/// service events. Sora then restarts a dead server even while it is itself waiting on a
+/// client of that server; otherwise the client's grant sits in the kept control endpoint and
+/// both wait forever.
 fn media_watch(process: Handle) {
     if let Some(port) = media_port() {
         let _ = port_bind(port, process);
     }
+    if let Some(port) = reply_port() {
+        let _ = port_bind(port, process);
+    }
 }
+
+/// j930: slots whose mount the supervisor gave up. They no longer mount by themselves (a
+/// poisoned disk is not retried on every launch); an explicit `mount` clears the mark.
+static MEDIA_GIVEN_UP: [AtomicBool; sora::STORAGE_DEVICES] =
+    [const { AtomicBool::new(false) }; sora::STORAGE_DEVICES];
 
 /// Wait up to `ns` for `process` (watched since it started) to terminate. A deadline of a
 /// microsecond is a non-blocking check: a termination already queued wakes the port first.
@@ -13200,9 +13366,13 @@ fn media_event(source: u64) -> bool {
     if media.server_end.0 == 0 || media.process_koid != source {
         return false;
     }
-    let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
-    if port.0 != 0 {
-        let _ = port_unbind(port, media.process);
+    for port in [
+        Handle(SERVE_PORT.load(Ordering::Relaxed) as u32),
+        Handle(REPLY_PORT.load(Ordering::Relaxed)),
+    ] {
+        if port.0 != 0 {
+            let _ = port_unbind(port, media.process);
+        }
     }
     media_supervise();
     true
@@ -13221,6 +13391,9 @@ fn media_supervise() -> bool {
     media_respawn_after_exit()
 }
 
+/// How long a replacement redoxfsd is watched for an exit while it mounts.
+const STARTUP_WINDOW_NS: u64 = 500_000_000;
+
 /// The mount's server is known dead: restart it within the budget, or give the mount up.
 fn media_respawn_after_exit() -> bool {
     let Some(mut media) = media() else {
@@ -13230,18 +13403,33 @@ fn media_respawn_after_exit() -> bool {
     log(b"redoxfsd: terminated; sessions invalidated, the control endpoint kept\n");
     let mut supervisor = MEDIA_SUPERVISOR.get();
     let device = DEVICES.get()[media.device];
-    let budget = supervisor.intensity.try_consume(kumo_rt::clock_get());
-    let replacement = match (budget, device) {
-        (true, Some(device)) => {
-            let _ = kumo_rt::sleep_ns(supervisor.backoff.next_delay_ns());
-            syscall_handle(handle_duplicate(media.server_end, CONTROL_RIGHTS))
-                .and_then(|server| start_redoxfsd(supervisor.initrd, device, server, 0))
+    // j930 (SH8-d): a replacement that dies while it mounts (a refused or poisoned volume) is
+    // another exit against the same budget, so a disk that never mounts reaches the give-up
+    // here, in one pass, instead of one restart per session request.
+    let replacement = loop {
+        let budget = supervisor.intensity.try_consume(kumo_rt::clock_get());
+        let started = match (budget, device) {
+            (true, Some(device)) => {
+                let _ = kumo_rt::sleep_ns(supervisor.backoff.next_delay_ns());
+                syscall_handle(handle_duplicate(media.server_end, CONTROL_RIGHTS))
+                    .and_then(|server| start_redoxfsd(supervisor.initrd, device, server, 0))
+            }
+            _ => None,
+        };
+        let Some(process) = started else {
+            break None;
+        };
+        media_watch(process);
+        if !media_process_exited(process, STARTUP_WINDOW_NS) {
+            break Some(process);
         }
-        _ => None,
+        let _ = handle_close(process);
+        log(b"redoxfsd: the replacement exited while mounting\n");
     };
     let Some(process) = replacement else {
         MEDIA_SUPERVISOR.set(supervisor);
         set_media(None);
+        MEDIA_GIVEN_UP[media.device].store(true, Ordering::Relaxed);
         let _ = handle_close(media.server_end);
         let _ = handle_close(media.control);
         notice(&[
@@ -13253,7 +13441,6 @@ fn media_respawn_after_exit() -> bool {
     };
     supervisor.instance += 1;
     MEDIA_SUPERVISOR.set(supervisor);
-    media_watch(process);
     media.process = process;
     media.process_koid = handle_koid(process);
     let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);

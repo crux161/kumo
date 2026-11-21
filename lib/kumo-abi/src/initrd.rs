@@ -1,8 +1,8 @@
-//j888
 //j889
 //j890
 //j893
 //j928
+//j930
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -41,6 +41,8 @@ pub const FATFS_PATH: &str = "bin/fatfs";
 pub const REDOXFSD_PATH: &str = "bin/redoxfsd";
 /// SH8-b (j928): the RedoxFS VFS probe, carried only by the opt-in proof image.
 pub const REDOXPROBE_PATH: &str = "bin/redoxprobe";
+/// SH8-d (j930): the virtio-blk disk driver Sora starts on boards with a virtio-mmio window.
+pub const DRV_VIRTIO_BLK_PATH: &str = "bin/drv-virtio-blk";
 pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
 /// The identity service (PLAN/012): handed `/etc/passwd`, `/etc/group` and `/etc/shadow` as one
 /// read-only bundle, it answers `verify` and `lookup` and is the only process that checks a

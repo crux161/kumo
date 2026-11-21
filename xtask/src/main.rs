@@ -1,8 +1,8 @@
-//j921
 //j924
 //j925
 //j928
 //j929
+//j930
 
 use std::env;
 use std::fmt;
@@ -29,6 +29,7 @@ use kumo_abi::initrd::{
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
 mod identity;
+mod redoxfs_image;
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
 
@@ -108,6 +109,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
+    // j930 (SH8-d): a host-side RedoxFS image, before the image flags too.
+    if env::args().nth(1).as_deref() == Some("redoxfs-image") {
+        let rest: Vec<String> = env::args().skip(2).collect();
+        return redoxfs_image::run(&rest);
+    }
     // `passwd` takes a user, not the image flags, so it is dispatched before them.
     if env::args().nth(1).as_deref() == Some("passwd") {
         let users: Vec<String> = env::args().skip(2).collect();
@@ -1257,6 +1263,8 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let fatfs = build_fatfs_image(&workspace_root()?)?;
             // j928 (SH8-b): the RedoxFS server; `workvol` starts it for the RAM work volume.
             let redoxfsd = build_native_bin(&workspace_root()?, "redoxfsd")?;
+            // j930 (SH8-d): the virtio-blk disk driver (QEMU's persistent disk).
+            let drv_virtio_blk = build_native_bin(&workspace_root()?, "drv-virtio-blk")?;
             let redoxprobe = build_redoxprobe(&workspace_root()?)?;
             let identityd = build_identityd_image(&workspace_root()?)?;
             let netstack = build_native_bin(&workspace_root()?, "netstack")?;
@@ -1341,6 +1349,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (kumo_abi::DRV_THERMAL_PATH, drv_thermal.as_slice()),
                 (FATFS_PATH, fatfs.as_slice()),
                 (kumo_abi::REDOXFSD_PATH, redoxfsd.as_slice()),
+                (kumo_abi::DRV_VIRTIO_BLK_PATH, drv_virtio_blk.as_slice()),
                 (IDENTITYD_PATH, identityd.as_slice()),
                 (kumo_abi::initrd::NETSTACK_PATH, netstack.as_slice()),
                 (kumo_abi::initrd::NETPROBE_PATH, netprobe.as_slice()),

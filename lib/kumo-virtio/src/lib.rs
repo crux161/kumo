@@ -3,7 +3,11 @@
 //j416
 //j515
 //j516
+//j930
 //! Pure virtio constants and helpers shared by future transport drivers.
+//! SH8-d (j930): [`blk`] adds the request engine `drv-virtio-blk` drives.
+
+pub mod blk;
 
 pub mod mmio {
     pub const MAGIC: u32 = 0x7472_6976;
