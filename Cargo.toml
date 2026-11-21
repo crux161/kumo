@@ -1,8 +1,8 @@
-#j824
 #j825
 #j826
 #j893
 #j905
+#j926
 [workspace]
 members = [
     "boot/niji-loader",
@@ -29,6 +29,7 @@ members = [
     "lib/kumo-mali",
     "lib/kumo-pdc",
     "lib/kumo-pcie",
+    "lib/kumo-redoxfs",
     "lib/kumo-sha256",
     "lib/kumo-usb-storage",
     "lib/kumo-virtio",
@@ -79,6 +80,7 @@ members = [
 ]
 resolver = "2"
 exclude = [
+    "vendor/redoxfs",
     "vendor/tinybmp",
     "vendor/cargo/gc-arena-0.5.3",
     "vendor/cargo/libm-0.2.16",

@@ -1,0 +1,26 @@
+#j926
+# KUMO no_std-only packaging of RedoxFS 0.9.1; see KUMO.md and KUMO.patch.
+[package]
+name = "redoxfs"
+version = "0.9.1"
+edition = "2021"
+license-file = "LICENSE"
+publish = false
+autobins = false
+autotests = false
+
+[dependencies]
+aes = { version = "=0.8.4", default-features = false }
+argon2 = { version = "=0.4.1", default-features = false, features = ["alloc"] }
+bitflags = "=2.13.0"
+endian-num = "=0.1.2"
+lz4_flex = { version = "=0.11.6", default-features = false, features = ["checked-decode"] }
+redox_syscall = { version = "=0.9.0", default-features = false }
+seahash = { version = "=4.1.0", default-features = false }
+xts-mode = { version = "=0.5.1", default-features = false }
+
+[features]
+default = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

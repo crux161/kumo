@@ -1,0 +1,275 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,96 +1,26 @@
++#j926
++# KUMO no_std-only packaging of RedoxFS 0.9.1; see KUMO.md and KUMO.patch.
+ [package]
+ name = "redoxfs"
+-description = "The Redox Filesystem"
+-repository = "https://gitlab.redox-os.org/redox-os/redoxfs"
+ version = "0.9.1"
++edition = "2021"
+ license-file = "LICENSE"
+-readme = "README.md"
+-authors = ["Jeremy Soller <jackpot51@gmail.com>"]
+-edition = "2021"
+-
+-[lib]
+-name = "redoxfs"
+-path = "src/lib.rs"
+-
+-[[bin]]
+-name = "redoxfs"
+-path = "src/bin/mount.rs"
+-doc = false
+-required-features = ["std"]
+-
+-[[bin]]
+-name = "redoxfs-ar"
+-path = "src/bin/ar.rs"
+-doc = false
+-required-features = ["std"]
+-
+-[[bin]]
+-name = "redoxfs-clone"
+-path = "src/bin/clone.rs"
+-doc = false
+-required-features = ["std"]
+-
+-[[bin]]
+-name = "redoxfs-mkfs"
+-path = "src/bin/mkfs.rs"
+-doc = false
+-required-features = ["std"]
+-
+-[[bin]]
+-name = "redoxfs-resize"
+-path = "src/bin/resize.rs"
+-doc = false
+-required-features = ["std"]
++publish = false
++autobins = false
++autotests = false
+ 
+ [dependencies]
+-aes = { version = "0.8", default-features = false }
+-argon2 = { version = "0.4", default-features = false, features = ["alloc"] }
+-base64ct = { version = "1", default-features = false }
+-bitflags = "2"
+-endian-num = "0.1"
+-env_logger = { version = "0.11", optional = true }
+-getrandom = { version = "0.2.5", optional = true }
+-humansize = { version = "2", optional = true }
+-libc = "0.2"
+-log = { version = "0.4.14", default-features = false, optional = true }
+-lz4_flex = { version = "0.11", default-features = false, features = ["checked-decode"] }
+-parse-size = { version = "1", optional = true }
+-range-tree = { version = "0.1", optional = true }
+-redox_syscall = "0.9.0"
+-seahash = { version = "4.1.0", default-features = false }
+-termion = { version = "4", optional = true }
+-uuid = { version = "1.4", default-features = false }
+-xts-mode = { version = "0.5", default-features = false }
++aes = { version = "=0.8.4", default-features = false }
++argon2 = { version = "=0.4.1", default-features = false, features = ["alloc"] }
++bitflags = "=2.13.0"
++endian-num = "=0.1.2"
++lz4_flex = { version = "=0.11.6", default-features = false, features = ["checked-decode"] }
++redox_syscall = { version = "=0.9.0", default-features = false }
++seahash = { version = "=4.1.0", default-features = false }
++xts-mode = { version = "=0.5.1", default-features = false }
+ 
+ [features]
+-default = ["std", "log", "fuse"]
+-fuse = [
+-    "fuser",
+-    "std",
+-]
+-std = [
+-    "env_logger",
+-    "getrandom",
+-    "humansize",
+-    "libredox",
+-    "parse-size",
+-    "range-tree",
+-    "termion",
+-    "uuid/v4",
+-    "redox_syscall/std",
+-    "redox-scheme",
+-]
+-
+-[target.'cfg(not(target_os = "redox"))'.dependencies]
+-fuser = { version = "0.16", optional = true }
+-
+-[target.'cfg(target_os = "redox")'.dependencies]
+-libredox = { version = "0.1.18", optional = true }
+-redox-path = "0.3.0"
+-redox-scheme = { version = "0.11.2", optional = true }
++default = []
+ 
+ [lints.rust]
+ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+-
+-[dev-dependencies]
+-assert_cmd = "2.0.17"
+--- a/src/disk/mod.rs
++++ b/src/disk/mod.rs
+@@ -36,6 +36,13 @@
+     /// Unsafe to discourage use, use filesystem wrappers instead
+     unsafe fn write_at(&mut self, block: u64, buffer: &[u8]) -> Result<usize>;
+ 
++    /// Order prior writes on stable storage before publishing a CoW header. The KUMO
++    /// adapter must propagate a real block flush; the default retains upstream RAM-disk
++    /// behavior for other adapters. — KESTREL
++    fn sync(&mut self) -> Result<()> {
++        Ok(())
++    }
++
+     /// Get size of disk in bytes
+     fn size(&mut self) -> Result<u64>;
+ }
+--- a/src/filesystem.rs
++++ b/src/filesystem.rs
+@@ -2,16 +2,18 @@
+ use alloc::{
+     collections::{BTreeMap, VecDeque},
+     vec,
++    vec::Vec,
+ };
+ use syscall::error::{Error, Result, EKEYREJECTED, ENOENT, ENOKEY};
+ use xts_mode::{get_tweak_default, Xts128};
+ 
+-#[cfg(feature = "std")]
+-use crate::{AllocEntry, AllocList, BlockData, BlockTrait, Key, KeySlot, Node, Salt, TreeList};
++use crate::{AllocEntry, AllocList, BlockData, BlockTrait, Node, TreeList};
+ use crate::{
+     Allocator, BlockAddr, BlockLevel, BlockMeta, Disk, Header, Transaction, BLOCK_SIZE,
+     HEADER_RING, RECORD_SIZE,
+ };
++#[cfg(feature = "std")]
++use crate::{Key, KeySlot, Salt};
+ 
+ fn compress_cache() -> Vec<u8> {
+     vec![0; lz4_flex::block::get_maximum_output_size(RECORD_SIZE as usize)]
+@@ -48,7 +50,10 @@
+                 continue;
+             }
+ 
+-            let block = ring_block - (header.generation() % HEADER_RING);
++            // A checksummed but misplaced generation is still invalid input. — KESTREL
++            let block = ring_block
++                .checked_sub(header.generation() % HEADER_RING)
++                .ok_or(Error::new(syscall::error::EIO))?;
+             for i in 0..HEADER_RING {
+                 let mut other_header = Header::default();
+                 unsafe { disk.read_at(block + i, &mut other_header)? };
+@@ -125,9 +130,38 @@
+     /// We need to pass ctime and ctime_nsec in order to initialize the unix timestamps
+     #[cfg(feature = "std")]
+     pub fn create_reserved(
++        disk: D,
++        password_opt: Option<&[u8]>,
++        reserved: &[u8],
++        ctime: u64,
++        ctime_nsec: u32,
++    ) -> Result<Self> {
++        Self::create_reserved_with_uuid(
++            disk,
++            password_opt,
++            reserved,
++            *uuid::Uuid::new_v4().as_bytes(),
++            ctime,
++            ctime_nsec,
++        )
++    }
++
++    /// Create an unencrypted filesystem without an ambient clock or random source.
++    /// The caller supplies the volume UUID and timestamp. KUMO SH8-a. — KESTREL
++    pub fn create_unencrypted(
++        disk: D,
++        uuid: [u8; 16],
++        ctime: u64,
++        ctime_nsec: u32,
++    ) -> Result<Self> {
++        Self::create_reserved_with_uuid(disk, None, &[], uuid, ctime, ctime_nsec)
++    }
++
++    fn create_reserved_with_uuid(
+         mut disk: D,
+         password_opt: Option<&[u8]>,
+         reserved: &[u8],
++        uuid: [u8; 16],
+         ctime: u64,
+         ctime_nsec: u32,
+     ) -> Result<Self> {
+@@ -154,9 +188,13 @@
+             }
+         }
+ 
+-        let mut header = Header::new(fs_blocks * BLOCK_SIZE);
++        #[allow(unused_mut)]
++        let mut header = Header::with_uuid(fs_blocks * BLOCK_SIZE, uuid);
+ 
+         let cipher_opt = match password_opt {
++            #[cfg(not(feature = "std"))]
++            Some(_) => return Err(syscall::error::Error::new(syscall::error::EOPNOTSUPP)),
++            #[cfg(feature = "std")]
+             Some(password) => {
+                 //TODO: handle errors
+                 header.key_slots[0] = KeySlot::new(
+--- a/src/header.rs
++++ b/src/header.rs
+@@ -42,11 +42,15 @@
+ impl Header {
+     #[cfg(feature = "std")]
+     pub fn new(size: u64) -> Header {
+-        let uuid = uuid::Uuid::new_v4();
++        Self::with_uuid(size, *uuid::Uuid::new_v4().as_bytes())
++    }
++
++    /// Construct a header using entropy supplied by the launcher. — KESTREL
++    pub fn with_uuid(size: u64, uuid: [u8; 16]) -> Header {
+         let mut header = Header {
+             signature: *SIGNATURE,
+             version: VERSION.into(),
+-            uuid: *uuid.as_bytes(),
++            uuid,
+             size: size.into(),
+             ..Default::default()
+         };
+--- a/src/record.rs
++++ b/src/record.rs
+@@ -1,4 +1,4 @@
+-use alloc::vec;
++use alloc::{vec, vec::Vec};
+ use core::ops;
+ 
+ use crate::{BlockLevel, BlockTrait, RECORD_LEVEL};
+--- a/src/transaction.rs
++++ b/src/transaction.rs
+@@ -294,6 +294,9 @@
+             return Ok(false);
+         }
+ 
++        // Persist CoW data before the root, and the root before reporting a commit. — KESTREL
++        self.fs.disk.sync()?;
++
+         // Update header to next generation
+         let gen = self.header.update(self.fs.cipher_opt.as_ref());
+         let gen_block = gen % HEADER_RING;
+@@ -311,6 +314,7 @@
+             return Err(Error::new(EIO));
+         }
+ 
++        self.fs.disk.sync()?;
+         self.header_changed = false;
+         Ok(true)
+     }
+@@ -420,6 +424,7 @@
+             if let Err(err) = lz4_flex::decompress_into(&record.data()[2..total_len], &mut decomp) {
+                 #[cfg(feature = "log")]
+                 log::error!("READ_RECORD: FAILED TO DECOMPRESS: {:?}", err);
++                let _ = err;
+                 return Err(Error::new(EIO));
+             }
+             record = BlockData::new(BlockAddr::null(BlockMeta::new(decomp_level)), decomp);

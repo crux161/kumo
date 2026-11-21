@@ -1,0 +1,40 @@
+[package]
+name = "xts-mode"
+version = "0.5.1"
+authors = ["Aphek <bilkow@tutanota.com>"]
+edition = "2021"
+license = "MIT"
+
+readme = "README.md"
+description = "XTS block mode implementation in rust"
+repository = "https://github.com/pheki/xts-mode"
+documentation = "https://docs.rs/xts-mode"
+keywords = ["encryption", "xts"]
+exclude = ["test_files"]
+categories = ["cryptography", "no-std", "block-cipher"]
+rust-version = "1.57"
+
+[features]
+default = ["std"]
+std = []
+openssl_tests = ["openssl"]
+
+[dependencies]
+cipher = "0.4"
+byteorder = { version = "1", default-features = false }
+# Is actually a dev-dependency enabled only for/by openssl_tests, but dev-dependencies can't be
+# optional
+openssl = { version = "0.10", optional = true }
+
+[dev-dependencies]
+# For tests
+hex-literal = "0.3"
+aes = "0.8"
+
+# For benchmarks
+criterion = "0.4"
+rand = "0.8"
+
+[[bench]]
+name = "encryption"
+harness = false

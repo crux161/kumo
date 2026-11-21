@@ -1,0 +1,40 @@
+[package]
+name = "argon2"
+version = "0.4.1"
+description = """
+Pure Rust implementation of the Argon2 password hashing function with support
+for the Argon2d, Argon2i, and Argon2id algorithmic variants
+"""
+authors = ["RustCrypto Developers"]
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/argon2"
+repository = "https://github.com/RustCrypto/password-hashes/tree/master/argon2"
+keywords = ["crypto", "password", "hashing"]
+categories = ["cryptography", "no-std"]
+readme = "README.md"
+edition = "2021"
+rust-version = "1.57"
+
+[dependencies]
+base64ct = "1"
+blake2 = { version = "0.10.4", default-features = false }
+
+# optional dependencies
+password-hash = { version = "0.4", optional = true }
+rayon = { version = "1.5", optional = true }
+zeroize = { version = "1", optional = true }
+
+[dev-dependencies]
+hex-literal = "0.3"
+password-hash = { version = "0.4", features = ["rand_core"] }
+
+[features]
+default = ["alloc", "password-hash", "rand"]
+alloc = []
+parallel = ["rayon", "std"]
+rand = ["password-hash/rand_core"]
+std = ["alloc", "password-hash/std"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

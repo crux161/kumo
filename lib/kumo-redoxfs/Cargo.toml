@@ -1,0 +1,12 @@
+#j926
+[package]
+name = "kumo-redoxfs"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+drv-blk = { path = "../../userland/servers/drv-blk" }
+redoxfs = { path = "../../vendor/redoxfs", default-features = false }
+syscall = { package = "redox_syscall", version = "=0.9.0", default-features = false }
