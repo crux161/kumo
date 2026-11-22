@@ -2,10 +2,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 //j907
-//j912
 //j913
 //j914
 //j887
+//j933
 
 extern crate alloc;
 
@@ -362,6 +362,17 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         memory_regions.as_ptr() as usize,
         core::mem::size_of_val(memory_regions),
     );
+
+    // j933 (SH8-g): the same hazard for the boot command line, which Nijigumo writes after the
+    // BootInfo struct in the same LoaderData pool. Unclean, its dirty lines were bypassed after
+    // the switch and Sora's snapshot saw no `root=` on the Orange Pi 5 Plus (QEMU, with no cache
+    // model, hid it). Bounded and only for a current-ABI loader, as the later copy is. — TEAL
+    if boot.version == ABI_VERSION
+        && boot.cmdline.ptr != 0
+        && (1..=kumo_abi::boot::CMDLINE_MAX as u64).contains(&boot.cmdline.len)
+    {
+        kumo_hal::active::clean_dcache_to_poc(boot.cmdline.ptr as usize, boot.cmdline.len as usize);
+    }
 
     if report.has_initrd {
         // Flush the UEFI-loaded initrd to PoC before `enable_paging` replaces firmware's

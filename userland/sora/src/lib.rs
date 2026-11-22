@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j803
 //j820
 //j928
 //j930
 //j932
+//j933
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -414,7 +414,7 @@ pub fn mount_point(path: &[u8]) -> Option<MediaName> {
 /// Slots 0–2 stay the xHCI controllers usb0, usb1 and host2, so every existing USB name keeps
 /// its meaning; slot 3 is the NVMe namespace. A new transport gets a new slot, never a borrowed
 /// one: SD (PLAN/018) appends rather than reusing an xHCI index.
-pub const STORAGE_DEVICES: usize = 6;
+pub const STORAGE_DEVICES: usize = 7;
 /// The NVMe namespace's slot: `/dev/disk3s1`.
 pub const NVME_STORAGE: usize = 3;
 /// SH8-b (j928): the RAM work volume's slot, `/dev/disk4s1`, served by drv-blk's device mode
@@ -422,6 +422,9 @@ pub const NVME_STORAGE: usize = 3;
 pub const WORK_STORAGE: usize = 4;
 /// SH8-d (j930): a virtio-blk disk's slot, `/dev/disk5s1` (QEMU's persistent disk). — TEAL
 pub const VIRTIO_STORAGE: usize = 5;
+/// SH8-g (j933, D4): the NVMe namespace's second partition, the RedoxFS root, `/dev/disk3s2`.
+/// Same controller and driver as slot 3; its offers arrive on slot 3's control channel. — TEAL
+pub const NVME_ROOT_STORAGE: usize = 6;
 
 /// What carries a storage slot's volume.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -440,7 +443,7 @@ impl StorageTransport {
     pub const fn of(index: usize) -> StorageTransport {
         assert!(index < STORAGE_DEVICES);
         match index {
-            NVME_STORAGE => StorageTransport::Nvme,
+            NVME_STORAGE | NVME_ROOT_STORAGE => StorageTransport::Nvme,
             WORK_STORAGE => StorageTransport::Ram,
             VIRTIO_STORAGE => StorageTransport::Virtio,
             usb => StorageTransport::Usb(usb as u8),
@@ -509,19 +512,27 @@ impl Filesystem {
 }
 
 /// The shell's name for the volume the driver in storage slot `index` offers (J766):
-/// `/dev/disk<index>s1`. Each driver serves the one FAT32 volume it found, so the slice is
-/// always 1. KUMO has no `/dev` tree; the name exists for `mount` and `umount`.
+/// `/dev/disk<index>s1`. Each driver serves the one volume it found, so the slice is 1, except
+/// j933's NVMe root partition, which is the NVMe disk's second slice, `/dev/disk3s2` (D4).
+/// KUMO has no `/dev` tree; the name exists for `mount` and `umount`.
 pub fn disk_path(index: usize) -> [u8; 12] {
     assert!(index < STORAGE_DEVICES);
+    if index == NVME_ROOT_STORAGE {
+        return *b"/dev/disk3s2";
+    }
     let mut path = *b"/dev/disk0s1";
     path[9] = b'0' + index as u8;
     path
 }
 
-/// The controller index a `/dev/disk<N>s1` name refers to.
+/// The storage slot a `/dev/disk<N>s<P>` name refers to.
 pub fn parse_disk(path: &[u8]) -> Option<usize> {
     match path.strip_prefix(b"/dev/disk")? {
-        [digit @ b'0'..=b'9', b's', b'1'] if usize::from(digit - b'0') < STORAGE_DEVICES => {
+        b"3s2" => Some(NVME_ROOT_STORAGE),
+        [digit @ b'0'..=b'9', b's', b'1']
+            if usize::from(digit - b'0') < STORAGE_DEVICES
+                && usize::from(digit - b'0') != NVME_ROOT_STORAGE =>
+        {
             Some(usize::from(digit - b'0'))
         }
         _ => None,
@@ -1528,6 +1539,14 @@ mod tests {
         for index in 0..STORAGE_DEVICES {
             assert_eq!(parse_disk(&disk_path(index)), Some(index));
         }
+        // j933: the NVMe root is the NVMe disk's second slice, never a positional sixth disk.
+        assert_eq!(&disk_path(NVME_ROOT_STORAGE), b"/dev/disk3s2");
+        assert_eq!(parse_disk(b"/dev/disk6s1"), None);
+        assert_eq!(
+            StorageTransport::of(NVME_ROOT_STORAGE),
+            StorageTransport::Nvme
+        );
+        assert!(!StorageTransport::of(NVME_ROOT_STORAGE).auto_mounts());
         // USB slots keep their controller numbers; NVMe is its own slot and never auto-mounts.
         for (index, transport) in [
             StorageTransport::Usb(0),

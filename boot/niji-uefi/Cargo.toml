@@ -1,8 +1,8 @@
-#j800
 #j801
 #j804
 #j805
 #j810
+#j933
 [package]
 name = "niji-uefi"
 authors.workspace = true
@@ -16,6 +16,8 @@ niji-loader = { path = "../niji-loader" }
 kumo-sha256.workspace = true
 # zstd decoder for the compressed netboot initrd (PROPOSAL/025 Z1); MIT, no dependencies.
 ruzstd = { version = "=0.8.3", default-features = false }
+# j933: the SH8-g layout constants (optional; only nvme-prepare-root links it).
+kumo-gpt = { path = "../../lib/kumo-gpt", optional = true }
 
 [lib]
 path = "src/lib.rs"
@@ -28,6 +30,10 @@ path = "src/main.rs"
 ax88-oracle = []
 nvme-oracle = []
 nvme-prepare = ["nvme-oracle"]
+# j933 (SH8-g): add the RedoxFS root partition to the J804-prepared SSD.
+nvme-prepare-root = ["nvme-prepare", "dep:kumo-gpt"]
+# j933: re-image the SH8-g root partition (contents lost); its own token, never default.
+nvme-prepare-root-reimage = ["nvme-prepare-root"]
 nvme-write-reference = ["nvme-oracle"]
 
 [dev-dependencies]

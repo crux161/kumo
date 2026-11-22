@@ -3,6 +3,7 @@
 //j542
 //j543
 //j767
+//j933
 
 //! Allocation-free validation and discovery for GUID Partition Tables.
 //!
@@ -35,6 +36,47 @@ pub const EFI_SYSTEM_PARTITION_TYPE_GUID: Guid = Guid([
 pub const MICROSOFT_BASIC_DATA_TYPE_GUID: Guid = Guid([
     0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
 ]);
+
+/// j933 (SH8-g, D3): the KUMO RedoxFS partition type, 66B0A6B1-E42F-4F82-9CFC-B14CB508B888, in
+/// GPT entry byte order. KUMO-defined (the first 16 bytes of SHA-256 of
+/// `KUMO RedoxFS partition type (DESIGN/010, SH8-g)`, with RFC 4122 version 4 and variant bits)
+/// so it can never be mistaken for another system's filesystem type. — TEAL
+pub const KUMO_REDOXFS_TYPE_GUID: Guid = Guid([
+    0xb1, 0xa6, 0xb0, 0x66, 0x2f, 0xe4, 0x82, 0x4f, 0x9c, 0xfc, 0xb1, 0x4c, 0xb5, 0x08, 0xb8, 0x88,
+]);
+
+/// j933 (SH8-g): the opi5's disposable SSD as KUMO lays it out (J804 + SH8-g). Pure constants,
+/// shared by the firmware-side preparation (niji-uefi), drv-nvme's write admission and the
+/// image builder, so the three can never disagree. Partition 1 is J804's FAT32 `KUMONVME`;
+/// partition 2 is the RedoxFS root. Partition 2 starts at 1 GiB, past J805's reserved NV8 test
+/// extent (LBA 1 048 576..1 048 591), which stays in unallocated space.
+pub mod sh8g {
+    use super::Guid;
+
+    /// The namespace's size in 512-byte blocks (Samsung 970 EVO Plus 500GB).
+    pub const NAMESPACE_BLOCKS: u64 = 976_773_168;
+    /// J804's FAT32 partition: first LBA and length.
+    pub const FAT_FIRST: u64 = 2048;
+    pub const FAT_BLOCKS: u64 = 524_288;
+    /// SH8-g's RedoxFS root partition: 64 GiB at 1 GiB (D2).
+    pub const ROOT_FIRST: u64 = 2_097_152;
+    pub const ROOT_BLOCKS: u64 = 134_217_728;
+    /// Partition 2's unique GUID, 92964074-8A4E-460C-A7B2-EF20DA774D29 (SHA-256 of
+    /// `KUMO SH8-g opi5 NVMe root partition (j933)`, version 4 / variant bits).
+    pub const ROOT_PART_GUID: Guid = Guid([
+        0x74, 0x40, 0x96, 0x92, 0x4e, 0x8a, 0x0c, 0x46, 0xa7, 0xb2, 0xef, 0x20, 0xda, 0x77, 0x4d,
+        0x29,
+    ]);
+    /// The UTF-16 partition name.
+    pub const ROOT_NAME: &str = "KUMO root (RedoxFS)";
+    /// The seed `xtask redoxfs-image --uuid` turns into the root's RedoxFS UUID.
+    pub const ROOT_UUID_SEED: &str = "SH8-g opi5 NVMe root";
+
+    const _: () = assert!(FAT_FIRST + FAT_BLOCKS <= 1_048_576);
+    const _: () = assert!(ROOT_FIRST > 1_048_576 + 16);
+    const _: () = assert!(ROOT_FIRST % 2048 == 0);
+    const _: () = assert!(ROOT_FIRST + ROOT_BLOCKS <= NAMESPACE_BLOCKS - 34);
+}
 
 /// A GUID in the mixed-endian byte order used directly by GPT structures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

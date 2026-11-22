@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_code)]
-//j803
 //j805
 //j806
 //j807
 //j895
+//j933
 //! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a), one I/O pair (NV5), its
 //! INTx-driven completions (NV6) and the resident read-only volume service (NV7).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
@@ -13,8 +13,16 @@
 use core::fmt;
 
 pub const PAGE: u64 = 4096;
-/// Admin SQ, admin CQ, data page, I/O SQ, I/O CQ.
-pub const DMA_BYTES: u64 = 5 * PAGE;
+/// Admin SQ, admin CQ, data page, I/O SQ, I/O CQ; j933 (SH8-g G-c): then the bulk data
+/// pages and their PRP list. One contiguous region, so Sora's DMA custody (D5) covers all of it.
+pub const DMA_BYTES: u64 = (5 + BULK_PAGES + 1) * PAGE;
+/// j933: the bulk data pages' offset in the DMA region, and how many there are (64 KiB, drv-blk's
+/// `READ_VMO_MAX_BLOCKS` × 512).
+pub const BULK: u64 = 5 * PAGE;
+pub const BULK_PAGES: u64 = 16;
+/// j933: the PRP list page, after the bulk pages.
+pub const PRP_LIST: u64 = BULK + BULK_PAGES * PAGE;
+const _: () = assert!(BULK_PAGES * PAGE == 128 * 512);
 pub const MMIO_BYTES: u64 = 2 * PAGE;
 pub mod admin;
 pub mod intx;
@@ -23,6 +31,44 @@ pub mod shutdown;
 pub mod smart;
 pub mod volume;
 pub mod write;
+/// j933 (SH8-g G-b): the root volume's offer, after the FAT volume's plain `MediaReady` on the
+/// same control channel: this tag, then the `MediaReady`. Sora files it under `/dev/disk3s2`.
+pub const ROOT_OFFER_TAG: &[u8; 4] = b"NVR2";
+pub const ROOT_OFFER_LEN: usize = 4 + drv_blk::MEDIA_READY_LEN;
+/// j933: the byte a connect appends to ask for the root volume (volume 2); a plain drv-blk
+/// connect is the FAT volume, as before.
+pub const ROOT_VOLUME: u8 = 2;
+
+pub fn encode_root_offer(ready: &drv_blk::MediaReady) -> [u8; ROOT_OFFER_LEN] {
+    let mut b = [0; ROOT_OFFER_LEN];
+    b[..4].copy_from_slice(ROOT_OFFER_TAG);
+    b[4..].copy_from_slice(&ready.encode());
+    b
+}
+
+pub fn decode_root_offer(b: &[u8]) -> Option<drv_blk::MediaReady> {
+    if b.len() != ROOT_OFFER_LEN || &b[..4] != ROOT_OFFER_TAG {
+        return None;
+    }
+    drv_blk::MediaReady::decode(&b[4..])
+}
+
+/// A client's connect: its access and volume (1 = FAT, `ROOT_VOLUME` = root).
+pub fn decode_volume_connect(raw: &[u8]) -> Option<(drv_blk::BlockAccess, u8)> {
+    match raw.split_last() {
+        Some((&ROOT_VOLUME, connect)) if connect.len() == drv_blk::CONTROL_CONNECT_LEN => {
+            Some((drv_blk::decode_connect(connect)?, ROOT_VOLUME))
+        }
+        _ => Some((drv_blk::decode_connect(raw)?, 1)),
+    }
+}
+
+pub fn encode_root_connect(access: drv_blk::BlockAccess) -> [u8; drv_blk::CONTROL_CONNECT_LEN + 1] {
+    let mut b = [ROOT_VOLUME; drv_blk::CONTROL_CONNECT_LEN + 1];
+    b[..drv_blk::CONTROL_CONNECT_LEN].copy_from_slice(&drv_blk::encode_connect(access));
+    b
+}
+
 pub const DEPTH: u16 = 32;
 pub const BOOT_LEN: usize = 64;
 pub const MEMORY_LEN: usize = 32;
@@ -485,6 +531,41 @@ mod tests {
     use super::*;
     use std::vec::Vec;
     #[test]
+    fn the_root_offer_and_connect_are_distinct_from_the_fat_volume_s() {
+        use drv_blk::{BlockAccess, MediaReady};
+        let ready = MediaReady {
+            block_count: kumo_gpt::sh8g::ROOT_BLOCKS,
+            serial: 0x0f8d_3310,
+            label: None,
+            read_only: false,
+        };
+        let offer = encode_root_offer(&ready);
+        assert_eq!(decode_root_offer(&offer), Some(ready));
+        assert_eq!(
+            decode_root_offer(&ready.encode()),
+            None,
+            "a FAT offer is not a root offer"
+        );
+        assert!(
+            MediaReady::decode(&offer).is_none(),
+            "and Sora's FAT decoder refuses it"
+        );
+        let rw = drv_blk::encode_connect(BlockAccess::ReadWrite);
+        assert_eq!(
+            decode_volume_connect(&rw),
+            Some((BlockAccess::ReadWrite, 1))
+        );
+        let root = encode_root_connect(BlockAccess::ReadOnly);
+        assert_eq!(
+            decode_volume_connect(&root),
+            Some((BlockAccess::ReadOnly, ROOT_VOLUME))
+        );
+        assert_eq!(
+            decode_volume_connect(&[drv_blk::CONTROL_CONNECT, 1, 7]),
+            None
+        );
+    }
+    #[test]
     fn ready_operation_runs_before_stop_and_failure_retains_active_queues() {
         let mut io = Fake::new();
         let p = exercise_with(&mut io, startup(), memory(), |io| {
@@ -781,13 +862,15 @@ mod tests {
         assert!(!Proof { flags: 3, ..p }.complete());
         assert!(!Proof { final_csts: 1, ..p }.complete());
         assert!(!Proof { status: 9, ..p }.complete());
+        // The whole region must end at or below 4 GiB (j933: the region is DMA_BYTES long).
+        let last_ok = (1u64 << 32) - DMA_BYTES;
         assert!(Memory {
-            physical: 0xffff_b000,
+            physical: last_ok,
             ..memory()
         }
         .valid());
         assert!(!Memory {
-            physical: 0xffff_c000,
+            physical: last_ok + PAGE,
             ..memory()
         }
         .valid());

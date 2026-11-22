@@ -1,4 +1,5 @@
 //j804
+//j933
 //! One-purpose disposable NV7 media preparation, absent from default images.
 //! This is a quick format, not secure erase or an NVMe driver write path. Only
 //! the identified, explicitly disposable Samsung namespace is eligible. A prior
@@ -12,13 +13,13 @@ pub const LENGTH: u64 = 524_288;
 pub const DATA: u64 = 8224;
 pub const HELLO: &[u8] = b"KUMO NV7 NVMe FAT32 proof.\r\n";
 pub const LABEL: &[u8; 11] = b"KUMONVME   ";
-const DISK_GUID: [u8; 16] = [
+pub(crate) const DISK_GUID: [u8; 16] = [
     0xc8, 0xe4, 0xc0, 0x50, 0xc9, 0xba, 0x41, 0x43, 0x91, 0x4b, 0x03, 0x37, 0x94, 0x86, 0x08, 0x04,
 ];
-const PART_GUID: [u8; 16] = [
+pub(crate) const PART_GUID: [u8; 16] = [
     0xd3, 0x6f, 0x1b, 0x42, 0x42, 0xed, 0x0b, 0x44, 0xa6, 0x19, 0xb8, 0x39, 0x49, 0xb6, 0x08, 0x04,
 ];
-const BASIC: [u8; 16] = [
+pub(crate) const BASIC: [u8; 16] = [
     0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
 ];
 // Volume contents first; publish primary VBR last. Every phase is flushed and
@@ -137,16 +138,16 @@ pub fn apply<D: Disk>(
     }
     Ok(count)
 }
-fn u16_at(b: &mut [u8], at: usize, x: u16) {
+pub(crate) fn u16_at(b: &mut [u8], at: usize, x: u16) {
     b[at..at + 2].copy_from_slice(&x.to_le_bytes());
 }
-fn u32_at(b: &mut [u8], at: usize, x: u32) {
+pub(crate) fn u32_at(b: &mut [u8], at: usize, x: u32) {
     b[at..at + 4].copy_from_slice(&x.to_le_bytes());
 }
-fn u64_at(b: &mut [u8], at: usize, x: u64) {
+pub(crate) fn u64_at(b: &mut [u8], at: usize, x: u64) {
     b[at..at + 8].copy_from_slice(&x.to_le_bytes());
 }
-fn crc(bytes: impl Iterator<Item = u8>) -> u32 {
+pub(crate) fn crc(bytes: impl Iterator<Item = u8>) -> u32 {
     let mut c = !0u32;
     for b in bytes {
         c ^= u32::from(b);
@@ -156,7 +157,7 @@ fn crc(bytes: impl Iterator<Item = u8>) -> u32 {
     }
     !c
 }
-fn table(lba: u64) -> [u8; 512] {
+pub(crate) fn table(lba: u64) -> [u8; 512] {
     let mut b = [0; 512];
     if lba != 0 {
         return b;
@@ -261,6 +262,30 @@ pub fn sector(lba: u64) -> Option<[u8; 512]> {
         _ => return None,
     }
     Some(b)
+}
+
+/// j933: the SSD's identity for the SH8-g step's host tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+    /// The last LBA of J805's reserved NV8 extent (drv-nvme `write::RESERVED_START` + 16 - 1).
+    pub const NV8_RESERVED_END: u64 = 1_048_591;
+    pub fn target_pair() -> (Controller, Namespace) {
+        let mut b = [0; 4096];
+        b[..2].copy_from_slice(&0x144du16.to_le_bytes());
+        b[2..4].copy_from_slice(&0x144du16.to_le_bytes());
+        b[4..72].fill(b' ');
+        b[4..19].copy_from_slice(b"S58SNM0R302625Z");
+        b[24..54].copy_from_slice(b"Samsung SSD 970 EVO Plus 500GB");
+        b[64..72].copy_from_slice(b"2B2QEXM7");
+        b[516] = 1;
+        let c = Controller::parse(&b).unwrap();
+        b.fill(0);
+        u64_at(&mut b, 0, BLOCKS);
+        u64_at(&mut b, 8, BLOCKS);
+        b[130] = 9;
+        (c, Namespace::parse(1, &b).unwrap())
+    }
 }
 
 #[cfg(test)]

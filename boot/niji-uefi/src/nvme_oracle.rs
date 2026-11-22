@@ -2,6 +2,7 @@
 //j801
 //j804
 //j805
+//j933
 //! Default-off pre-EBS Identify reference through firmware's NVMe queues, then
 //! (NV5) LBA 0, LBA 1 and the last LBA through firmware's whole-namespace Block I/O.
 //! No drv-nvme dependency or direct controller write. Media preparation is a
@@ -282,9 +283,14 @@ pub(super) unsafe fn run(
         con,
         format_args!("NV4 UEFI reference complete; LoaderData page retained\r\n"),
     );
-    #[cfg(feature = "nvme-prepare")]
+    #[cfg(all(feature = "nvme-prepare", not(feature = "nvme-prepare-root")))]
     unsafe {
         prepare_media(bs, con, _st, &controller, &ns, buffer)
+    };
+    // j933 (SH8-g): the root image builds on J804's prepared disk instead of preparing it.
+    #[cfg(feature = "nvme-prepare-root")]
+    unsafe {
+        prepare_root(bs, con, _st, &controller, &ns, buffer)
     };
     unsafe { media_reference(bs, con, &ns, buffer) };
     #[cfg(feature = "nvme-write-reference")]
@@ -293,7 +299,262 @@ pub(super) unsafe fn run(
     true
 }
 
+/// The whole namespace through firmware Block I/O, re-checking the media on every access
+/// (J804; shared with the SH8-g root step since j933).
 #[cfg(feature = "nvme-prepare")]
+struct FirmwareDisk {
+    bio: *mut BlockIo,
+    buffer: *mut u8,
+    media_id: u32,
+}
+#[cfg(feature = "nvme-prepare")]
+impl FirmwareDisk {
+    fn check(&self) -> Result<(), niji_uefi::nvme_prepare::Error> {
+        let m = unsafe { &*(*self.bio).media };
+        if m.media_id != self.media_id
+            || m.present != 1
+            || m.read_only != 0
+            || m.logical_partition != 0
+            || m.block_size != 512
+            || m.last_block != niji_uefi::nvme_prepare::BLOCKS - 1
+        {
+            return Err(niji_uefi::nvme_prepare::Error::Io);
+        }
+        Ok(())
+    }
+}
+#[cfg(feature = "nvme-prepare")]
+impl niji_uefi::nvme_prepare::Disk for FirmwareDisk {
+    fn read(&mut self, lba: u64, b: &mut [u8; 512]) -> Result<(), niji_uefi::nvme_prepare::Error> {
+        self.check()?;
+        unsafe { nvme::read_block(self.bio, lba, self.buffer) }
+            .map_err(|_| niji_uefi::nvme_prepare::Error::Io)?;
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = unsafe { ptr::read_volatile(self.buffer.add(i)) };
+        }
+        Ok(())
+    }
+    fn write(&mut self, lba: u64, b: &[u8; 512]) -> Result<(), niji_uefi::nvme_prepare::Error> {
+        self.check()?;
+        if lba >= niji_uefi::nvme_prepare::BLOCKS {
+            return Err(niji_uefi::nvme_prepare::Error::Io);
+        }
+        for (i, x) in b.iter().enumerate() {
+            unsafe { ptr::write_volatile(self.buffer.add(i), *x) };
+        }
+        let call = unsafe { (*self.bio).write_blocks }.ok_or(niji_uefi::nvme_prepare::Error::Io)?;
+        let status = unsafe { call(self.bio, self.media_id, lba, 512, self.buffer.cast()) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(niji_uefi::nvme_prepare::Error::Io)
+        }
+    }
+    fn flush(&mut self) -> Result<(), niji_uefi::nvme_prepare::Error> {
+        self.check()?;
+        let call = unsafe { (*self.bio).flush_blocks }.ok_or(niji_uefi::nvme_prepare::Error::Io)?;
+        if unsafe { call(self.bio) } == 0 {
+            Ok(())
+        } else {
+            Err(niji_uefi::nvme_prepare::Error::Io)
+        }
+    }
+}
+
+/// j933 (SH8-g): the extent file `main` read from the ESP (or TFTP) before the oracle ran.
+#[cfg(feature = "nvme-prepare-root")]
+static ROOT_EXTENTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "nvme-prepare-root")]
+static ROOT_EXTENTS_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Hand the oracle the extent file (`None`: not found; the step then refuses).
+#[cfg(feature = "nvme-prepare-root")]
+pub fn set_root_extents(file: Option<(*mut c_void, usize)>) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (ptr, len) = file.map_or((0, 0), |(p, l)| (p as usize, l));
+    ROOT_EXTENTS.store(ptr, Relaxed);
+    ROOT_EXTENTS_LEN.store(len, Relaxed);
+}
+
+/// j933 (SH8-g, G-a): add the RedoxFS root partition. The whole-namespace Block I/O and media
+/// contract are J804's; only `nvme_prepare_root::inspect` can authorize a write. Before any
+/// write the GPT sectors are dumped to the serial host, and the step waits for the host's
+/// receipt token, which TEAL types only after CRUX's go for this boot (D8). — TEAL
+#[cfg(feature = "nvme-prepare-root")]
+unsafe fn prepare_root(
+    bs: *mut EfiBootServices,
+    con: *mut EfiSimpleTextOutputProtocol,
+    st: *mut crate::EfiSystemTable,
+    controller: &Controller,
+    ns: &Namespace,
+    buffer: *mut u8,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use niji_uefi::nvme_prepare::{self as prep, Disk};
+    use niji_uefi::nvme_prepare_root::{self as root, Extents, Inspection};
+    let (ptr, len) = (ROOT_EXTENTS.load(Relaxed), ROOT_EXTENTS_LEN.load(Relaxed));
+    if ptr == 0 || len == 0 {
+        print_line(
+            con,
+            format_args!("SH8G PREP refused: no extent file; zero writes\r\n"),
+        );
+        return;
+    }
+    let file = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let ext = match Extents::parse(file) {
+        Ok(ext) => ext,
+        Err(e) => {
+            print_line(
+                con,
+                format_args!("SH8G PREP refused: extent file {e:?}; zero writes\r\n"),
+            );
+            return;
+        }
+    };
+    print_line(
+        con,
+        format_args!(
+            "SH8G EXT uuid={:032x} records={} bytes={} sha={}\r\n",
+            u128::from_be_bytes(ext.uuid),
+            ext.count(),
+            len,
+            Hex(digest(file))
+        ),
+    );
+    let bio = match unsafe { whole_namespace_block_io(bs, ns.id) } {
+        Ok(bio) if !unsafe { (*bio).media }.is_null() => bio,
+        _ => {
+            print_line(
+                con,
+                format_args!("SH8G PREP refused: no unique whole namespace\r\n"),
+            );
+            return;
+        }
+    };
+    let m = unsafe { &*(*bio).media };
+    if !nvme::media_matches(m, ns)
+        || m.read_only != 0
+        || unsafe { (*bio).write_blocks }.is_none()
+        || unsafe { (*bio).flush_blocks }.is_none()
+    {
+        print_line(con, format_args!("SH8G PREP refused: media contract\r\n"));
+        return;
+    }
+    let mut disk = FirmwareDisk {
+        bio,
+        buffer,
+        media_id: m.media_id,
+    };
+    let original = match root::inspect(&mut disk, controller, ns) {
+        Ok(Inspection::Prepared) => {
+            print_line(
+                con,
+                format_args!("SH8G PREP already prepared; zero writes\r\n"),
+            );
+            return;
+        }
+        Ok(Inspection::Original(token)) => (token, false),
+        Ok(Inspection::Reimage(token)) => {
+            print_line(
+                con,
+                format_args!("SH8G PREP re-image build: partition 2 will be rewritten\r\n"),
+            );
+            (token, true)
+        }
+        Err(prep::Error::Io) => halt(con, nvme::Error::Data),
+        Err(e) => {
+            print_line(
+                con,
+                format_args!("SH8G PREP refused: {e:?}; zero writes\r\n"),
+            );
+            return;
+        }
+    };
+    let (original, reimage) = original;
+    // The GPT as it is now, to the serial host, before anything changes (the rollback record:
+    // restoring these 67 sectors and zeroing partition 2's header ring undoes this step).
+    let mut sha = kumo_sha256::Sha256::new();
+    let mut b = [0; 512];
+    for (first, last) in [(0, 33), (prep::BLOCKS - 33, prep::BLOCKS - 1)] {
+        for lba in first..=last {
+            if disk.read(lba, &mut b).is_err() {
+                halt(con, nvme::Error::Data);
+            }
+            sha.update(&lba.to_le_bytes());
+            sha.update(&b);
+            for (offset, chunk) in b.chunks_exact(32).enumerate() {
+                print_line(con, format_args!("SH8G BAK {lba} {} ", offset * 32));
+                for byte in chunk {
+                    print_line(con, format_args!("{byte:02x}"));
+                }
+                print_line(con, format_args!("\r\n"));
+            }
+        }
+    }
+    print_line(con, format_args!("SH8G BAKSHA {}\r\n", Hex(sha.finish())));
+    print_line(con, format_args!("SH8G PREP waiting for host receipt\r\n"));
+    let input = unsafe { (*st).con_in };
+    if input.is_null() {
+        return;
+    }
+    // A re-image takes its own token: the host must mean this one.
+    let token: &[u8] = if reimage {
+        b"K933-REIMAGE\r"
+    } else {
+        b"K933-ROOT\r"
+    };
+    let mut matched = 0;
+    let mut received = false;
+    for _ in 0..12_000 {
+        let mut key = crate::EfiInputKey {
+            scan_code: 0,
+            unicode_char: 0,
+        };
+        if unsafe { ((*input).read_key_stroke)(input, &mut key) } == 0 {
+            if key.unicode_char == u16::from(token[matched]) {
+                matched += 1;
+            } else {
+                matched = 0;
+            }
+            if matched == token.len() {
+                received = true;
+                break;
+            }
+        }
+        unsafe { ((*bs).stall)(10_000) };
+    }
+    if !received {
+        print_line(
+            con,
+            format_args!("SH8G PREP receipt timeout; zero writes\r\n"),
+        );
+        return;
+    }
+    print_line(
+        con,
+        format_args!(
+            "SH8G PREP begin: partition 2, {} extents, then GPT v2\r\n",
+            ext.count()
+        ),
+    );
+    match root::apply(&mut disk, original, &ext, |phase| {
+        print_line(
+            con,
+            format_args!("SH8G PREP phase {phase}/4 flushed and verified\r\n"),
+        )
+    }) {
+        Ok(count) => print_line(
+            con,
+            format_args!("SH8G PREP complete: {count} sectors written/flushed/readback\r\n"),
+        ),
+        Err(e) => {
+            print_line(con, format_args!("SH8G PREP failed {e:?}\r\n"));
+            halt(con, nvme::Error::Data);
+        }
+    }
+}
+
+#[cfg(all(feature = "nvme-prepare", not(feature = "nvme-prepare-root")))]
 unsafe fn prepare_media(
     bs: *mut EfiBootServices,
     con: *mut EfiSimpleTextOutputProtocol,
@@ -303,61 +564,6 @@ unsafe fn prepare_media(
     buffer: *mut u8,
 ) {
     use niji_uefi::nvme_prepare::{self as prep, Disk, Inspection};
-    struct FirmwareDisk {
-        bio: *mut BlockIo,
-        buffer: *mut u8,
-        media_id: u32,
-    }
-    impl FirmwareDisk {
-        fn check(&self) -> Result<(), prep::Error> {
-            let m = unsafe { &*(*self.bio).media };
-            if m.media_id != self.media_id
-                || m.present != 1
-                || m.read_only != 0
-                || m.logical_partition != 0
-                || m.block_size != 512
-                || m.last_block != prep::BLOCKS - 1
-            {
-                return Err(prep::Error::Io);
-            }
-            Ok(())
-        }
-    }
-    impl Disk for FirmwareDisk {
-        fn read(&mut self, lba: u64, b: &mut [u8; 512]) -> Result<(), prep::Error> {
-            self.check()?;
-            unsafe { nvme::read_block(self.bio, lba, self.buffer) }.map_err(|_| prep::Error::Io)?;
-            for (i, x) in b.iter_mut().enumerate() {
-                *x = unsafe { ptr::read_volatile(self.buffer.add(i)) };
-            }
-            Ok(())
-        }
-        fn write(&mut self, lba: u64, b: &[u8; 512]) -> Result<(), prep::Error> {
-            self.check()?;
-            if lba >= prep::BLOCKS {
-                return Err(prep::Error::Io);
-            }
-            for (i, x) in b.iter().enumerate() {
-                unsafe { ptr::write_volatile(self.buffer.add(i), *x) };
-            }
-            let call = unsafe { (*self.bio).write_blocks }.ok_or(prep::Error::Io)?;
-            let status = unsafe { call(self.bio, self.media_id, lba, 512, self.buffer.cast()) };
-            if status == 0 {
-                Ok(())
-            } else {
-                Err(prep::Error::Io)
-            }
-        }
-        fn flush(&mut self) -> Result<(), prep::Error> {
-            self.check()?;
-            let call = unsafe { (*self.bio).flush_blocks }.ok_or(prep::Error::Io)?;
-            if unsafe { call(self.bio) } == 0 {
-                Ok(())
-            } else {
-                Err(prep::Error::Io)
-            }
-        }
-    }
     let bio = match unsafe { whole_namespace_block_io(bs, ns.id) } {
         Ok(bio) if !unsafe { (*bio).media }.is_null() => bio,
         _ => {

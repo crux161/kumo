@@ -12,6 +12,8 @@ version.workspace = true
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
 imager = { path = "../imager" }
 kumo-abi.workspace = true
+# j933: the SH8-g partition constants (kumo_gpt::sh8g).
+kumo-gpt = { path = "../lib/kumo-gpt" }
 kumo-identity = { path = "../lib/kumo-identity" }
 # SHA-256 for the persona payload pins (SH7-c) and the staged initrd.img.zst (PROPOSAL/025 Z1).
 kumo-sha256.workspace = true

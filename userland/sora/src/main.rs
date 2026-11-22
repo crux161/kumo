@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j928
 //j929
 //j930
 //j931
 //j932
+//j933
 
 extern crate alloc;
 
@@ -2691,6 +2691,9 @@ struct Media {
 struct Device {
     ready: drv_blk::MediaReady,
     control: Handle,
+    /// j933 (SH8-g): which of its driver's volumes this is: 1, or `drv_nvme::ROOT_VOLUME` for
+    /// the NVMe root partition (slot 6, offered on slot 3's control channel).
+    volume: u8,
 }
 
 static DEVICES: Shared<[Option<Device>; sora::STORAGE_DEVICES]> =
@@ -4352,6 +4355,7 @@ fn nvme_stop_owner() -> bool {
     NVME_UNPROVEN.store(true, Ordering::Relaxed);
     set_nvme_owner(Some(owner));
     set_device(sora::NVME_STORAGE, None);
+    set_device(sora::NVME_ROOT_STORAGE, None);
     NVME_CONTROL_KOID.store(0, Ordering::Relaxed);
     let watch = NVME_WATCH_PORT.load(Ordering::Relaxed);
     if watch != 0 {
@@ -4424,7 +4428,20 @@ fn nvme_shutdown_owner() -> bool {
     owner.stopping = true;
     set_nvme_owner(Some(owner));
     NVME_UNPROVEN.store(true, Ordering::Relaxed);
+    // j933 (SH8-g): an NVMe root's server stops before the controller does. Every write it
+    // acknowledged is already flushed (commit-before-ack, j929), and RedoxFS's header ring keeps
+    // an unfinished transaction invisible; the slot is cleared first, so nothing respawns it.
+    if let Some(root) = mounted(Slot::Root).filter(|r| r.device == sora::NVME_ROOT_STORAGE) {
+        set_mounted(Slot::Root, None);
+        let _ = process_kill(root.process);
+        let _ = handle_close(root.process);
+        if root.server_end.0 != 0 {
+            let _ = handle_close(root.server_end);
+        }
+        notice(&[b"root: redoxfsd stopped for the NVMe shutdown\n"]);
+    }
     set_device(sora::NVME_STORAGE, None);
+    set_device(sora::NVME_ROOT_STORAGE, None);
     if media().is_some_and(|m| m.device == sora::NVME_STORAGE) {
         set_media(None);
     }
@@ -5179,6 +5196,10 @@ extern "C" fn sora_main(
     // into `BOOTINFO_VMO_HANDLE` at entry — reading x8 here would race the compiler's reuse of
     // it (see the static's doc-comment).
     let bootinfo_vmo: u64 = BOOTINFO_VMO_HANDLE.load(Ordering::Relaxed);
+    // j933 (SH8-g): read the named root now. On a board with a framebuffer the BootInfo VMO is
+    // handed to drv-fb below, after which Sora can no longer read it (found on the opi5; QEMU,
+    // headless, never transfers it).
+    ROOT_WANTED.set(boot_root_uuid());
     let dtb_vmo: u64 = DTB_VMO_HANDLE.load(Ordering::Relaxed);
 
     // Greeting.
@@ -7363,6 +7384,49 @@ fn eval_command(
         return true;
     }
     #[cfg(feature = "fsd-crash-proof")]
+    if cmd.name == "fsd-header-proof" {
+        let result = (|| {
+            let path = cmd.args.first()?.as_bytes();
+            let index = sora::parse_disk(path)?;
+            let device = DEVICES.get()[index]?;
+            let client = connect_block_client_with(device, BlockAccess::ReadOnly)?;
+            let mut hash = kumo_sha256::Sha256::new();
+            let result = (|| {
+                let mut reply = [0; 513];
+                for lba in 0..2048 {
+                    let request = drv_blk::Request::read(lba, 1).encode();
+                    if channel_write(client, request.as_ptr(), request.len()) != 0 {
+                        return None;
+                    }
+                    let n = read_channel_ready(client, &mut reply)?;
+                    let bytes = drv_blk::read_payload(&reply[..n]).ok()?;
+                    if bytes.len() != 512 {
+                        return None;
+                    }
+                    hash.update(bytes);
+                }
+                Some(hash.finish())
+            })();
+            let _ = handle_close(client);
+            let digest = result?;
+            // One log record keeps unrelated driver output outside the receipt. — KESTREL
+            let mut line =
+                alloc::format!("SH8G HEADER {} sha256 ", core::str::from_utf8(path).ok()?);
+            for byte in digest {
+                let digits = b"0123456789abcdef";
+                line.push(digits[(byte >> 4) as usize] as char);
+                line.push(digits[(byte & 15) as usize] as char);
+            }
+            line.push('\n');
+            log(line.as_bytes());
+            Some(())
+        })();
+        if result.is_none() {
+            log_line(&[b"fsd-header-proof: FAIL receipt unavailable\n"], 1);
+        }
+        return true;
+    }
+    #[cfg(feature = "fsd-crash-proof")]
     if cmd.name == "fsd-crash-proof" {
         // j932 (SH8-f): `fsd-crash-proof root [...]` aims at the root's redoxfsd.
         let (slot, args) = match cmd.args.split_first() {
@@ -8116,6 +8180,7 @@ fn nvme_unavailable() {
     NVME_UNPROVEN.store(true, Ordering::Relaxed);
     NVME_CONTROL_KOID.store(0, Ordering::Relaxed);
     set_device(sora::NVME_STORAGE, None);
+    set_device(sora::NVME_ROOT_STORAGE, None);
     if media().is_some_and(|m| m.device == sora::NVME_STORAGE) {
         set_media(None);
     }
@@ -8146,6 +8211,7 @@ fn media_offered(
         koids[index] = None;
         set_device(index, None);
         if index == sora::NVME_STORAGE {
+            set_device(sora::NVME_ROOT_STORAGE, None);
             nvme_unavailable();
         }
         for slot in SLOTS {
@@ -8173,6 +8239,12 @@ fn media_offered(
         accept_usb_custody(index, &frame[..n], raw, control);
         return false;
     }
+    // j933 (SH8-g G-b): drv-nvme's second offer, the RedoxFS root partition (`/dev/disk3s2`).
+    if index == sora::NVME_STORAGE && raw == 0 {
+        if let Some(ready) = drv_nvme::decode_root_offer(&frame[..n as usize]) {
+            return media_ready(initrd, sora::NVME_ROOT_STORAGE, control, ready);
+        }
+    }
     if raw != 0 || n != drv_blk::MEDIA_READY_LEN {
         close_unheld_usb_handle(raw);
         log(b"media: malformed offer; no DMA publication ACK\n");
@@ -8194,7 +8266,16 @@ fn media_offered(
 fn media_ready(initrd: Handle, index: usize, control: Handle, ready: drv_blk::MediaReady) -> bool {
     let transport = sora::StorageTransport::of(index);
     let name = sora::MediaName::new(ready.label, ready.serial);
-    let device = Device { ready, control };
+    let volume = if index == sora::NVME_ROOT_STORAGE {
+        drv_nvme::ROOT_VOLUME
+    } else {
+        1
+    };
+    let device = Device {
+        ready,
+        control,
+        volume,
+    };
     set_device(index, Some(device));
     // j932 (SH8-f, D2): while a named root is still unmounted, every offer is checked against
     // it first. The match mounts at `/`; another RedoxFS volume waits for an explicit `mount`.
@@ -13468,6 +13549,14 @@ fn boot_root_uuid() -> Option<[u8; 16]> {
     // SAFETY: BootInfo is plain `repr(C)` data and `raw` holds exactly one.
     let boot: kumo_abi::BootInfo = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
     let len = boot.cmdline.len as usize;
+    if len != 0 {
+        notice(&[alloc::format!(
+            "root: boot command line at {:#x}, {} bytes\n",
+            boot.cmdline.ptr,
+            len
+        )
+        .as_bytes()]);
+    }
     if boot.cmdline.ptr != kumo_abi::boot::SNAPSHOT_CMDLINE_OFFSET as u64
         || len == 0
         || len > kumo_abi::boot::CMDLINE_MAX
@@ -13519,10 +13608,9 @@ fn mount_root(initrd: Handle, index: usize, device: Device, uuid: [u8; 16]) {
 /// nothing and `/` is the initrd, exactly as before.
 fn resolve_root(initrd: Handle) {
     const ROOT_WAIT_NS: u64 = 10_000_000_000;
-    let Some(want) = boot_root_uuid() else {
+    let Some(want) = ROOT_WANTED.get() else {
         return;
     };
-    ROOT_WANTED.set(Some(want));
     let Some(port) = syscall_handle(port_create()) else {
         return;
     };
@@ -13581,7 +13669,14 @@ fn connect_block_client_with(device: Device, access: BlockAccess) -> Option<Hand
         log(b"media: block channel unavailable\n");
         return None;
     }
-    let connect = drv_blk::encode_connect(access);
+    // j933: the NVMe root partition is named by one extra byte on the shared control channel.
+    let plain = drv_blk::encode_connect(access);
+    let root = drv_nvme::encode_root_connect(access);
+    let connect: &[u8] = if device.volume == drv_nvme::ROOT_VOLUME {
+        &root
+    } else {
+        &plain
+    };
     if channel_write_with_handle(
         device.control,
         connect.as_ptr(),

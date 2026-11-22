@@ -1,4 +1,5 @@
 //j803
+//j933
 //! NV7: find the one FAT32 volume a read-only NVMe service offers. The protective MBR
 //! (LBA 0) and the primary GPT (header at LBA 1, CRC-checked entry array) are validated
 //! through `kumo-gpt` against the namespace size from Identify. Candidates are Microsoft
@@ -11,7 +12,7 @@ use crate::Error;
 use kumo_fatfs::{Bpb, SECTOR_SIZE};
 use kumo_gpt::{
     validate_protective_mbr, GptError, GptHeader, Guid, Partition, EFI_SYSTEM_PARTITION_TYPE_GUID,
-    MICROSOFT_BASIC_DATA_TYPE_GUID,
+    KUMO_REDOXFS_TYPE_GUID, MICROSOFT_BASIC_DATA_TYPE_GUID,
 };
 
 /// Largest GPT entry array the service reads (the usual array is 16 KiB).
@@ -34,6 +35,8 @@ pub enum Verdict {
     Chosen,
     /// A later candidate, not probed because one was already chosen.
     Unprobed,
+    /// j933 (SH8-g): the KUMO RedoxFS partition, its first sector signed `RedoxFS`.
+    RedoxFs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +55,10 @@ pub struct Discovery {
     pub entries: usize,
     pub reported: [Option<Entry>; MAX_REPORTED],
     pub chosen: Option<(Partition, Bpb)>,
+    /// j933 (SH8-g): the first KUMO RedoxFS-typed partition whose first sector carries the
+    /// RedoxFS signature, with its header's UUID (bytes 16..32). Offered as a second volume
+    /// only if write admission also proves the exact layout; otherwise read-only.
+    pub root: Option<(Partition, [u8; 16])>,
 }
 
 fn gpt(error: GptError) -> Error {
@@ -96,6 +103,7 @@ pub fn discover(
         entries: 0,
         reported: [None; MAX_REPORTED],
         chosen: None,
+        root: None,
     };
     for partition in table.partitions() {
         if found.entries < MAX_REPORTED {
@@ -134,6 +142,21 @@ pub fn discover(
                 if entry.partition.index == partition.index {
                     entry.verdict = verdict;
                     entry.oem = Some(oem);
+                }
+            }
+        }
+    }
+    if let Some(partition) = table
+        .partitions()
+        .find(|p| p.type_guid == KUMO_REDOXFS_TYPE_GUID && p.block_count() > 0)
+    {
+        blocks.read(partition.first_lba, &mut block)?;
+        if &block[..8] == b"RedoxFS\0" {
+            let uuid: [u8; 16] = block[16..32].try_into().unwrap();
+            found.root = Some((partition, uuid));
+            for entry in found.reported.iter_mut().flatten() {
+                if entry.partition.index == partition.index {
+                    entry.verdict = Verdict::RedoxFs;
                 }
             }
         }
@@ -252,6 +275,35 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_signed_kumo_redoxfs_partition_is_found_beside_the_fat_volume() {
+        let parts = [
+            (MICROSOFT_BASIC_DATA_TYPE_GUID.0, 2048, 4095, true),
+            (KUMO_REDOXFS_TYPE_GUID.0, 4096, 9999, false),
+        ];
+        let mut d = Disk::new(10240, &parts);
+        d.blocks[4096][..8].copy_from_slice(b"RedoxFS\0");
+        d.blocks[4096][16..32].copy_from_slice(b"0123456789abcdef");
+        let mut entries = std::vec![0u8; MAX_ENTRY_BYTES];
+        let found = discover(&mut d, 10240, &mut entries).unwrap();
+        assert_eq!(
+            found.chosen.unwrap().0.first_lba,
+            2048,
+            "FAT stays the first volume"
+        );
+        let (root, uuid) = found.root.unwrap();
+        assert_eq!(
+            (root.first_lba, root.block_count(), &uuid),
+            (4096, 5904, b"0123456789abcdef")
+        );
+        let verdicts: Vec<_> = found.reported.iter().flatten().map(|e| e.verdict).collect();
+        assert_eq!(verdicts, [Verdict::Chosen, Verdict::RedoxFs]);
+        // The type alone is not enough: an unsigned partition is not a root.
+        let mut d = Disk::new(10240, &parts);
+        let found = discover(&mut d, 10240, &mut entries).unwrap();
+        assert!(found.root.is_none());
     }
 
     #[test]

@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j804
 //j810
 //j905
 //j910
 //j932
+//j933
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
@@ -16,6 +16,9 @@ pub mod ax88;
 pub mod nvme;
 #[cfg(feature = "nvme-prepare")]
 pub mod nvme_prepare;
+/// j933 (SH8-g): the RedoxFS root partition on the disposable SSD.
+#[cfg(feature = "nvme-prepare-root")]
+pub mod nvme_prepare_root;
 
 pub const BOOTLOADER_NAME: &str = "Nijigumo";
 

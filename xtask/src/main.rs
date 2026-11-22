@@ -1,8 +1,8 @@
-//j925
 //j928
 //j929
 //j930
 //j931
+//j933
 
 use std::env;
 use std::fmt;
@@ -499,7 +499,55 @@ fn stage_uefi_bootloader(
     if prepare && write {
         return Err("NVMe preparation and write proof must be separate images".into());
     }
-    if prepare {
+    // j933 (SH8-g): KUMO_NVME_PREPARE_ROOT=1 adds the RedoxFS root partition to the J804 SSD.
+    let prepare_root_env = env::var("KUMO_NVME_PREPARE_ROOT")
+        .map(Some)
+        .or_else(|e| match e {
+            env::VarError::NotPresent => Ok(None),
+            _ => Err("KUMO_NVME_PREPARE_ROOT must be UTF-8 0 or 1".to_string()),
+        })?;
+    // `reimage` (j933): rewrite an already prepared root partition; contents are lost.
+    let reimage = prepare_root_env.as_deref() == Some("reimage");
+    let prepare_root = nvme_oracle_enabled(
+        if reimage {
+            Some("1")
+        } else {
+            prepare_root_env.as_deref()
+        },
+        plan.hardware.board().map(|b| b.id()).unwrap_or(""),
+    )
+    .map_err(|e| {
+        e.replace("oracle", "root preparation")
+            .replace("KUMO_NVME_ORACLE", "KUMO_NVME_PREPARE_ROOT")
+    })?;
+    if prepare_root && (prepare || write) {
+        return Err("NVMe root preparation must be its own image".into());
+    }
+    let extent_path = out_dir
+        .join(plan.hardware.to_string())
+        .join(redoxfs_image::ROOT_EXTENT_ESP_PATH);
+    if prepare_root {
+        let (extents, uuid) = redoxfs_image::nvme_root_extents(root)?;
+        if let Some(parent) = extent_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("create {}: {err}", parent.display()))?;
+        }
+        fs::write(&extent_path, &extents)
+            .map_err(|err| format!("write {}: {err}", extent_path.display()))?;
+        println!(
+            "xtask: SH8-g root extents staged ({} bytes, root = uuid:{})",
+            extents.len(),
+            uuid.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    } else {
+        // Only the root-preparation image carries the extent file.
+        let _ = fs::remove_file(&extent_path);
+    }
+    if prepare_root && reimage {
+        args.extend(["--features", "nvme-prepare-root-reimage"]);
+    } else if prepare_root {
+        args.extend(["--features", "nvme-prepare-root"]);
+    } else if prepare {
         args.extend(["--features", "nvme-prepare"]);
     } else if write {
         args.extend(["--features", "nvme-write-reference"]);
@@ -674,11 +722,19 @@ fn stage_boot_manifest(
     if let Some(parent) = staged_path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
-    fs::write(
-        &staged_path,
-        render_boot_manifest(plan, pl011_console_base, initrd_zstd),
-    )
-    .map_err(|err| format!("write {}: {err}", staged_path.display()))?;
+    let mut manifest = render_boot_manifest(plan, pl011_console_base, initrd_zstd);
+    // j933 (SH8-g, D6): a proof image names its root explicitly; default images never do.
+    match env::var("KUMO_ROOT_UUID") {
+        Ok(hex) if kumo_abi::boot::parse_uuid(hex.as_bytes()).is_some() => {
+            manifest.push_str(&format!("root = uuid:{hex}\n"))
+        }
+        Ok(hex) if hex.is_empty() => {}
+        Ok(_) => return Err("KUMO_ROOT_UUID must be 32 hex digits".into()),
+        Err(env::VarError::NotPresent) => {}
+        Err(_) => return Err("KUMO_ROOT_UUID must be UTF-8".into()),
+    }
+    fs::write(&staged_path, manifest)
+        .map_err(|err| format!("write {}: {err}", staged_path.display()))?;
     Ok(staged_path)
 }
 
@@ -2505,19 +2561,22 @@ fn build_drv_gpu_image(root: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn build_drv_nvme_image(root: &Path) -> Result<Vec<u8>, String> {
-    run_cargo(
-        root,
-        &[
-            "build",
-            "-p",
-            "drv-nvme",
-            "--bin",
-            "drv-nvme",
-            "--target",
-            "aarch64-unknown-none",
-            "--release",
-        ],
-    )?;
+    let mut args = vec![
+        "build",
+        "-p",
+        "drv-nvme",
+        "--bin",
+        "drv-nvme",
+        "--target",
+        "aarch64-unknown-none",
+        "--release",
+    ];
+    match env::var("KUMO_NVME_SECTOR_PROOF").as_deref() {
+        Ok("1") => args.extend(["--features", "sector-proof"]),
+        Ok("0") | Err(_) => {}
+        _ => return Err("KUMO_NVME_SECTOR_PROOF must be 0 or 1".into()),
+    }
+    run_cargo(root, &args)?;
     let path = root.join("target/aarch64-unknown-none/release/drv-nvme");
     let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     validate_aarch64_kernel_elf(&bytes).map_err(|e| format!("validate {}: {e}", path.display()))?;

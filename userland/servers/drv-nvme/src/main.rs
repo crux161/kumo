@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j806
 //j807
 //j892
 //j895
 //j930
+//j933
 //! One owner per process: polled Identify, then a read-only I/O pair whose completions
 //! arrive by INTx (NV6). A proof owner runs the NV6 sequence and exits; a serve owner
 //! (NV7) offers the namespace's FAT32 volume to Sora and serves it read-only until Sora
@@ -18,9 +18,10 @@
 
 extern crate alloc;
 use drv_blk::{
-    decode_connect, volume_request, BlockAccess, MediaReady, VolumeRequest, CONTROL_CONNECT_LEN,
-    REQUEST_LEN, STATUS_IO_ERROR, STATUS_OK, STATUS_READ_ONLY, STATUS_UNSUPPORTED,
+    volume_request, BlockAccess, MediaReady, VolumeRequest, CONTROL_CONNECT_LEN, REQUEST_LEN,
+    STATUS_BAD_LEN, STATUS_IO_ERROR, STATUS_OK, STATUS_READ_ONLY,
 };
+use drv_nvme::admin::AdminIo as _;
 use drv_nvme::{
     exercise_with, Error, Memory, Proof, RegisterIo, Startup, ACK, DMA_BYTES, MMIO_BYTES,
     MODE_SERVE, MODE_SERVE_WRITABLE, MODE_WRITE_PROOF, PAGE, PROOF_LEN,
@@ -37,6 +38,43 @@ use kumo_rt::{
 kumo_rt::entry!(main);
 const MMIO: u64 = 0x1100_0000;
 const DMA: u64 = 0x1200_0000;
+/// j933: where a bulk request's client VMO is mapped to copy (at most 64 KiB plus a page).
+const CLIENT_VA: u64 = 0x1300_0000;
+
+/// j933 (SH8-g G-c): map `len` bytes of a client's VMO at `offset` for `f`, then unmap (the
+/// drv-virtio-blk j930 pattern). `None`: the window cannot be mapped or is too large.
+fn with_window<R>(
+    vmo: Handle,
+    offset: u64,
+    len: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> Option<R> {
+    let page = offset & !(drv_nvme::PAGE - 1);
+    let delta = (offset - page) as usize;
+    let map_len = ((delta + len) as u64).next_multiple_of(drv_nvme::PAGE);
+    if len == 0 || map_len > drv_nvme::BULK_PAGES * drv_nvme::PAGE + drv_nvme::PAGE {
+        return None;
+    }
+    if vmar_map(
+        Handle(0),
+        vmo,
+        page,
+        CLIENT_VA,
+        map_len,
+        (VmarFlags::READ | VmarFlags::WRITE).0,
+    ) != 0
+    {
+        return None;
+    }
+    // SAFETY: the kernel just mapped `map_len >= delta + len` bytes at CLIENT_VA for us alone,
+    // and nothing else maps that window while `f` runs.
+    #[allow(unsafe_code)]
+    let window =
+        unsafe { core::slice::from_raw_parts_mut((CLIENT_VA as usize + delta) as *mut u8, len) };
+    let result = f(window);
+    let _ = vmar_unmap(CLIENT_VA, map_len);
+    Some(result)
+}
 
 fn log(level: u8, s: &str) {
     let _ = kumo_rt::log_write(level, s.as_bytes());
@@ -610,13 +648,22 @@ fn guid_text(g: kumo_gpt::Guid) -> alloc::string::String {
 struct Client {
     handle: u32,
     koid: u64,
+    /// j933: 1 = the FAT volume, `drv_nvme::ROOT_VOLUME` = the RedoxFS root.
+    volume: u8,
     served: u32,
     refused: u32,
     read_only: bool,
     writes: u32,
     flushes: u32,
+    /// j933: bytes moved by bulk requests.
+    bulk_bytes: u64,
 }
 const MAX_CLIENTS: usize = 4;
+
+/// j933: a bulk request's bytes, for the client's close line.
+fn stats_bulk(client: &mut Client, bytes: usize) {
+    client.bulk_bytes = client.bulk_bytes.saturating_add(bytes as u64);
+}
 
 /// NV7: bring the pair up as NV6 does, choose the FAT32 volume, offer it to Sora on the
 /// bootstrap channel and serve clients under volume/per-client access policy. Returns Ok when Sora closes the
@@ -688,6 +735,7 @@ fn serve(
                     Verdict::NotFat32 => "not-fat32",
                     Verdict::Chosen => "chosen",
                     Verdict::Unprobed => "unprobed",
+                    Verdict::RedoxFs => "redoxfs",
                 },
                 match entry.oem {
                     Some(oem) => oem
@@ -718,15 +766,21 @@ fn serve(
     // Writes are admitted only for CRUX's exact disposable SSD and J804 volume.
     // Every request is separately bounded to this partition and its client access.
     // Other drives/layouts continue read-only. — TIMBERDOODLE
+    // j933 (SH8-g): J804 + the RedoxFS root, exactly, admits both volumes for writing.
+    let root_layout = found.root.and_then(|(root, _)| {
+        drv_nvme::write::RootLayout::new(&controller, &ns, found.entries, &part, &root).ok()
+    });
     let writable = s.mode == MODE_SERVE_WRITABLE
-        && drv_nvme::write::TestExtent::new(
+        && (drv_nvme::write::TestExtent::new(
             &controller,
             &ns,
             found.entries,
             part.first_lba,
             part.block_count(),
         )
-        .is_ok();
+        .is_ok()
+            || root_layout.is_some());
+    let root_writable = s.mode == MODE_SERVE_WRITABLE && root_layout.is_some();
     let ready = MediaReady {
         block_count: part.block_count(),
         serial: bpb.volume_serial,
@@ -754,13 +808,50 @@ fn serve(
     if channel_write(control, offer.as_ptr(), offer.len()) != 0 {
         return Err(Error::Bootstrap);
     }
+    // j933 (SH8-g G-b): the RedoxFS root partition, offered second on the same channel.
+    if let Some((root, uuid)) = found.root {
+        let ready = MediaReady {
+            block_count: root.block_count(),
+            serial: u32::from_be_bytes(uuid[..4].try_into().unwrap()),
+            label: None,
+            read_only: !root_writable,
+        };
+        log(
+            kumo_abi::sys::log_level::NOTICE,
+            &alloc::format!(
+                "SH8G VOLUME session={} index={} first-lba={} blocks={} redoxfs uuid={:032x} {}; offered as volume 2\n",
+                s.session,
+                root.index,
+                root.first_lba,
+                root.block_count(),
+                u128::from_be_bytes(uuid),
+                if root_writable { "read-write" } else { "read-only" }
+            ),
+        );
+        let offer = drv_nvme::encode_root_offer(&ready);
+        if channel_write(control, offer.as_ptr(), offer.len()) != 0 {
+            return Err(Error::Bootstrap);
+        }
+    }
+    let volume_bounds = |volume: u8| match (volume, found.root) {
+        (drv_nvme::ROOT_VOLUME, Some((root, _))) => (root.first_lba, root.block_count()),
+        _ => (part.first_lba, part.block_count()),
+    };
     let control_koid = handle_koid(control);
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        if cfg!(feature = "sector-proof") {
+            "SH8G NVMe mode sector (bulk disabled for comparison)\n"
+        } else {
+            "SH8G NVMe mode bulk (up to 64 KiB)\n"
+        },
+    );
     let mut clients = [Client::default(); MAX_CLIENTS];
     let mut shutdown = false;
     loop {
         let source = port_wait(port);
         if source == control_koid {
-            let mut tag = [0u8; CONTROL_CONNECT_LEN + 1];
+            let mut tag = [0u8; CONTROL_CONNECT_LEN + 2];
             let (len, raw) = channel_read_with_handle(control, tag.as_mut_ptr(), tag.len());
             if len == 0 {
                 log(
@@ -827,15 +918,23 @@ fn serve(
             let Some(client) = syscall_handle(raw) else {
                 continue;
             };
-            let access = decode_connect(&tag[..len]);
+            // j933: a connect may name the root volume (`drv_nvme::ROOT_VOLUME`).
+            let access = drv_nvme::decode_volume_connect(&tag[..len])
+                .filter(|(_, volume)| *volume != drv_nvme::ROOT_VOLUME || found.root.is_some());
             let slot = clients.iter().position(|c| c.handle == 0);
             let koid = handle_koid(client);
             match (access, slot) {
-                (Some(access), Some(slot)) if port_bind(port, client) == 0 => {
+                (Some((access, volume)), Some(slot)) if port_bind(port, client) == 0 => {
+                    let volume_writable = if volume == drv_nvme::ROOT_VOLUME {
+                        root_writable
+                    } else {
+                        writable
+                    };
                     clients[slot] = Client {
                         handle: client.0,
                         koid,
-                        read_only: !writable || access == BlockAccess::ReadOnly,
+                        volume,
+                        read_only: !volume_writable || access == BlockAccess::ReadOnly,
                         ..Client::default()
                     };
                     log(
@@ -873,24 +972,27 @@ fn serve(
         let mut frame = [0u8; REQUEST_LEN + SECTOR_SIZE + 1];
         let (n, carried) = channel_read_with_handle(client, frame.as_mut_ptr(), frame.len());
         let n = n as u64;
-        // SH7-d3b: CMD_READ_VMO carries a VMO this driver does not use (it answers
-        // STATUS_UNSUPPORTED); never keep it.
-        if carried != 0 && carried != u64::MAX {
-            let _ = handle_close(Handle(carried as u32));
-        }
+        // j933 (SH8-g G-c): a bulk request carries the client's VMO; it is used for that request
+        // only and closed after the reply (SH7-d3b closed it at once, unsupported).
+        let carried = (carried != 0 && carried != u64::MAX).then_some(Handle(carried as u32));
         if n == 0 || n > frame.len() as u64 {
+            if let Some(vmo) = carried {
+                let _ = handle_close(vmo);
+            }
             let _ = port_unbind(port, client);
             let _ = handle_close(client);
             log(
                 kumo_abi::sys::log_level::INFO,
                 &alloc::format!(
-                    "NV7 CLIENT session={} slot={} closed served={} refused={} writes={} flushes={}\n",
+                    "NV7 CLIENT session={} slot={} volume={} closed served={} refused={} writes={} flushes={} bulk_bytes={}\n",
                     s.session,
                     i,
+                    clients[i].volume,
                     clients[i].served,
                     clients[i].refused,
                     clients[i].writes,
-                    clients[i].flushes
+                    clients[i].flushes,
+                    clients[i].bulk_bytes
                 ),
             );
             clients[i] = Client::default();
@@ -899,10 +1001,11 @@ fn serve(
         let rung = io.doorbells;
         let mut reply = [0u8; 1 + SECTOR_SIZE];
         let mut reply_len = 1;
+        let (first_lba, block_count) = volume_bounds(clients[i].volume);
         reply[0] = match volume_request(
             &frame[..n as usize],
-            part.first_lba,
-            part.block_count(),
+            first_lba,
+            block_count,
             clients[i].read_only,
         ) {
             Ok(VolumeRequest::Read(lba)) => {
@@ -942,9 +1045,104 @@ fn serve(
                 );
                 STATUS_OK
             }
-            Ok(VolumeRequest::ReadVmo { .. } | VolumeRequest::WriteVmo { .. }) => {
-                clients[i].refused += 1;
-                STATUS_UNSUPPORTED
+            Ok(VolumeRequest::ReadVmo { .. } | VolumeRequest::WriteVmo { .. })
+                if cfg!(feature = "sector-proof") =>
+            {
+                drv_blk::STATUS_UNSUPPORTED
+            }
+            Ok(request @ (VolumeRequest::ReadVmo { .. } | VolumeRequest::WriteVmo { .. })) => {
+                // j933 (SH8-g G-c): one NVMe command per bulk request, through the driver's own
+                // bulk pages; the client's VMO is only mapped to copy, never handed to the device.
+                let (write, lba, count, vmo_offset) = match request {
+                    VolumeRequest::WriteVmo {
+                        lba,
+                        count,
+                        vmo_offset,
+                    } => (true, lba, count, vmo_offset),
+                    VolumeRequest::ReadVmo {
+                        lba,
+                        count,
+                        vmo_offset,
+                    } => (false, lba, count, vmo_offset),
+                    _ => unreachable!(),
+                };
+                let len = usize::from(count) * SECTOR_SIZE;
+                let staged = match (carried, write) {
+                    (None, _) => None,
+                    (Some(vmo), true) => with_window(vmo, vmo_offset, len, |w| {
+                        for (k, word) in w.chunks_exact(4).enumerate() {
+                            io.dma_write32(
+                                drv_nvme::BULK + k as u64 * 4,
+                                u32::from_le_bytes(word.try_into().unwrap()),
+                            );
+                        }
+                    }),
+                    (Some(_), false) => Some(()),
+                };
+                match staged {
+                    None => {
+                        clients[i].refused += 1;
+                        log(
+                            kumo_abi::sys::log_level::NOTICE,
+                            &alloc::format!(
+                                "SH8G BULK session={} slot={} refused before I/O: write={} lba={} count={} offset={:#x} vmo={}\n",
+                                s.session, i, write, lba, count, vmo_offset, carried.is_some()
+                            ),
+                        );
+                        STATUS_BAD_LEN
+                    }
+                    Some(()) => {
+                        if let Err(e) = pair.bulk_irq(
+                            io,
+                            &mut line,
+                            s,
+                            memory,
+                            write,
+                            lba,
+                            count,
+                            controller.mdts,
+                            &mut stats,
+                        ) {
+                            let failed = [STATUS_IO_ERROR];
+                            let _ = channel_write(client, failed.as_ptr(), 1);
+                            if let Some(vmo) = carried {
+                                let _ = handle_close(vmo);
+                            }
+                            return Err(e);
+                        }
+                        let copied = write
+                            || carried
+                                .and_then(|vmo| {
+                                    with_window(vmo, vmo_offset, len, |w| {
+                                        for (k, word) in w.chunks_exact_mut(4).enumerate() {
+                                            word.copy_from_slice(
+                                                &io.dma_read32(drv_nvme::BULK + k as u64 * 4)
+                                                    .to_le_bytes(),
+                                            );
+                                        }
+                                    })
+                                })
+                                .is_some();
+                        if write {
+                            clients[i].writes += 1;
+                        } else {
+                            clients[i].served += 1;
+                        }
+                        stats_bulk(&mut clients[i], len);
+                        if copied {
+                            STATUS_OK
+                        } else {
+                            log(
+                                kumo_abi::sys::log_level::NOTICE,
+                                &alloc::format!(
+                                    "SH8G BULK session={} slot={} read lba={} count={} offset={:#x}: client window unmappable\n",
+                                    s.session, i, lba, count, vmo_offset
+                                ),
+                            );
+                            STATUS_BAD_LEN
+                        }
+                    }
+                }
             }
             Ok(VolumeRequest::Write(lba, data)) => {
                 if let Err(e) = pair.write_irq(io, &mut line, s, memory, lba, data, &mut stats) {
@@ -985,12 +1183,15 @@ fn serve(
             );
         }
         let _ = channel_write(client, reply.as_ptr(), reply_len);
+        if let Some(vmo) = carried {
+            let _ = handle_close(vmo);
+        }
     }
     for c in clients.iter().filter(|c| c.handle != 0) {
         let _ = port_unbind(port, Handle(c.handle));
         let _ = handle_close(Handle(c.handle));
     }
-    if shutdown || writable {
+    if shutdown || writable || root_writable {
         let elapsed = pair.flush_irq(io, &mut line, s, memory, &mut stats)?;
         log(
             kumo_abi::sys::log_level::NOTICE,

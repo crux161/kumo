@@ -1,6 +1,7 @@
 //j802
 //j803
 //j805
+//j933
 //! NV6: INTx-driven completions for the I/O pair (I/O CQ 1 created with IEN=1, IV=0).
 //! KUMO's DESIGN/016 contract holds unchanged: the kernel masks the level SPI when it
 //! fires and unmasks it only on InterruptComplete. A delivery is serviced by reaping
@@ -360,6 +361,41 @@ impl IoPair {
         }
         self.command_irq(io, line, s, memory, w, stats)
     }
+    /// j933 (SH8-g G-c): one bulk Read or Write of `blocks` sectors through the bulk pages
+    /// (`crate::BULK`), PRP list at `crate::PRP_LIST`. A Write's bytes must already be in the
+    /// bulk pages; a Read's are there after an Ok. Every bound is `bulk_command`'s, checked
+    /// before the list, the SQ slot or a doorbell is touched. The caller authorizes the range
+    /// (a volume's partition, its client's access) first. — TEAL
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_irq(
+        &mut self,
+        io: &mut impl AdminIo,
+        line: &mut impl Line,
+        s: Startup,
+        memory: Memory,
+        write: bool,
+        lba: u64,
+        blocks: u16,
+        mdts: u8,
+        stats: &mut Stats,
+    ) -> Result<u64, Error> {
+        s.validate()?;
+        if !memory.valid() || memory.session != s.session {
+            return Err(Error::Memory);
+        }
+        if self.queue.poisoned() || self.queue.outstanding() != 0 {
+            return Err(Error::State);
+        }
+        let (words, list, entries) =
+            crate::io::bulk_command(&self.ns, write, lba, blocks, memory.physical, mdts)?;
+        for (i, entry) in list[..entries].iter().enumerate() {
+            let at = crate::PRP_LIST + i as u64 * 8;
+            io.dma_write32(at, *entry as u32);
+            io.dma_write32(at + 4, (*entry >> 32) as u32);
+        }
+        self.command_irq(io, line, s, memory, words, stats)
+    }
+
     pub fn flush_irq(
         &mut self,
         io: &mut impl AdminIo,
@@ -557,7 +593,8 @@ mod tests {
         phase: u32,
         masked: bool,
         /// Commands rung but not yet posted (cid, lba, slice).
-        queued: Vec<(u32, u64, u64, u32)>,
+        /// (cid, first LBA, the DMA byte offset of each 512-byte sector, opcode).
+        queued: Vec<(u32, u64, Vec<u64>, u32)>,
         volatile: std::collections::BTreeMap<u64, [u8; 512]>,
         stable: std::collections::BTreeMap<u64, [u8; 512]>,
         command_error: bool,
@@ -606,24 +643,30 @@ mod tests {
             if self.queued.is_empty() {
                 return false;
             }
-            let (cid, lba, slice, opcode) = self.queued.remove(0);
+            let (cid, first, slices, opcode) = self.queued.remove(0);
             match opcode {
                 0 => self.stable = self.volatile.clone(),
                 1 => {
-                    let mut b = [0; 512];
-                    for (i, x) in b.iter_mut().enumerate() {
-                        *x = (self.dma[(slice as usize + i) / 4] >> ((i % 4) * 8)) as u8;
+                    for (k, slice) in slices.iter().enumerate() {
+                        let mut b = [0; 512];
+                        for (i, x) in b.iter_mut().enumerate() {
+                            *x = (self.dma[(*slice as usize + i) / 4] >> ((i % 4) * 8)) as u8;
+                        }
+                        self.volatile.insert(first + k as u64, b);
                     }
-                    self.volatile.insert(lba, b);
                 }
                 2 => {
-                    for i in 0..512 {
-                        let value = self
-                            .volatile
-                            .get(&lba)
-                            .map_or_else(|| block(lba, i), |b| b[i]);
-                        let word = &mut self.dma[(slice as usize + i) / 4];
-                        *word |= u32::from(value) << ((i % 4) * 8);
+                    for (k, slice) in slices.iter().enumerate() {
+                        let lba = first + k as u64;
+                        for i in 0..512 {
+                            let value = self
+                                .volatile
+                                .get(&lba)
+                                .map_or_else(|| block(lba, i), |b| b[i]);
+                            let word = &mut self.dma[(*slice as usize + i) / 4];
+                            *word &= !(0xff << ((i % 4) * 8));
+                            *word |= u32::from(value) << ((i % 4) * 8);
+                        }
                     }
                 }
                 _ => panic!("unplanned opcode"),
@@ -686,9 +729,43 @@ mod tests {
                         assert!(opcode <= 2);
                         assert_eq!(w[1], 1);
                         let lba = u64::from(w[10]) | (u64::from(w[11]) << 32);
-                        let slice = if opcode == 0 {
+                        let bulk = opcode != 0 && (w[12] != 0 || w[8] != 0);
+                        let slices = if opcode == 0 {
                             assert!(w[2..].iter().all(|&x| x == 0));
-                            0
+                            Vec::new()
+                        } else if bulk {
+                            // j933: a bulk transfer, resolved through PRP1, PRP2 and the list.
+                            assert!(w[2..6].iter().all(|&x| x == 0));
+                            assert_eq!((w[7], w[9]), (0, 0));
+                            assert!(w[13..].iter().all(|&x| x == 0));
+                            let sectors = w[12] as u64 + 1;
+                            let pages = (sectors * 512).div_ceil(crate::PAGE);
+                            let phys = memory().physical;
+                            let mut page_offsets = std::vec![u64::from(w[6]) - phys];
+                            match pages {
+                                1 => assert_eq!(w[8], 0),
+                                2 => page_offsets.push(u64::from(w[8]) - phys),
+                                n => {
+                                    let list = u64::from(w[8]) - phys;
+                                    assert_eq!(list, crate::PRP_LIST);
+                                    for i in 0..n - 1 {
+                                        let at = (list + i * 8) as usize / 4;
+                                        let entry =
+                                            u64::from(d.dma[at]) | (u64::from(d.dma[at + 1]) << 32);
+                                        page_offsets.push(entry - phys);
+                                    }
+                                }
+                            }
+                            for p in &page_offsets {
+                                assert!((crate::BULK..crate::PRP_LIST).contains(p));
+                                assert_eq!(p % crate::PAGE, 0);
+                            }
+                            (0..sectors)
+                                .map(|k| {
+                                    page_offsets[(k * 512 / crate::PAGE) as usize]
+                                        + k * 512 % crate::PAGE
+                                })
+                                .collect()
                         } else {
                             assert_eq!(w[12], 0);
                             assert!(w[2..6].iter().all(|&x| x == 0));
@@ -699,9 +776,9 @@ mod tests {
                             if opcode == 2 {
                                 assert!(d.dma[slice as usize / 4..][..128].iter().all(|&x| x == 0));
                             }
-                            slice
+                            std::vec![slice]
                         };
-                        d.queued.push((w[0] >> 16, lba, slice, opcode));
+                        d.queued.push((w[0] >> 16, lba, slices, opcode));
                         t = (t + 1) % crate::DEPTH;
                     }
                     d.tail = v as u16;
@@ -741,7 +818,8 @@ mod tests {
             d.dma[off as usize / 4]
         }
         fn dma_write32(&mut self, off: u64, value: u32) {
-            assert!(off < IO_CQ && !(crate::PAGE..DATA).contains(&off));
+            // The CPU never writes the CQs; j933: the bulk pages and PRP list are its to fill.
+            assert!((off < IO_CQ || off >= crate::BULK) && !(crate::PAGE..DATA).contains(&off));
             let mut d = self.0.borrow_mut();
             d.barrier = false;
             d.dma[off as usize / 4] = value;
@@ -889,6 +967,76 @@ mod tests {
             assert!(!p.queue.poisoned());
         }
     }
+    #[test]
+    fn bulk_writes_and_reads_move_64_kib_through_the_prp_list() {
+        let (d, mut io, mut line) = rig();
+        let mut p = pair();
+        unmask(&mut io).unwrap();
+        let mut stats = Stats::default();
+        let lba = 5000;
+        for word in 0..(crate::BULK_PAGES * crate::PAGE / 4) {
+            io.dma_write32(
+                crate::BULK + word * 4,
+                (word as u32).wrapping_mul(2_654_435_761),
+            );
+        }
+        p.bulk_irq(
+            &mut io,
+            &mut line,
+            startup(),
+            memory(),
+            true,
+            lba,
+            128,
+            9,
+            &mut stats,
+        )
+        .unwrap();
+        p.flush_irq(&mut io, &mut line, startup(), memory(), &mut stats)
+            .unwrap();
+        for k in 0..128u64 {
+            let sector = d.borrow().stable[&(lba + k)];
+            let word = k * 128 + 5;
+            let got = u32::from_le_bytes(sector[20..24].try_into().unwrap());
+            assert_eq!(got, (word as u32).wrapping_mul(2_654_435_761), "sector {k}");
+        }
+        for word in 0..(crate::BULK_PAGES * crate::PAGE / 4) {
+            io.dma_write32(crate::BULK + word * 4, 0);
+        }
+        p.bulk_irq(
+            &mut io,
+            &mut line,
+            startup(),
+            memory(),
+            false,
+            lba + 120,
+            16,
+            9,
+            &mut stats,
+        )
+        .unwrap();
+        // The first eight sectors read back are the bulk write's last eight (120..127).
+        let got = io.dma_read32(crate::BULK + 7 * 512 + 20);
+        assert_eq!(got, ((127 * 128 + 5) as u32).wrapping_mul(2_654_435_761));
+        assert!(p
+            .bulk_irq(
+                &mut io,
+                &mut line,
+                startup(),
+                memory(),
+                false,
+                0,
+                129,
+                9,
+                &mut stats
+            )
+            .is_err());
+        assert!(
+            !p.queue.poisoned(),
+            "a refused bulk request never reaches the queue"
+        );
+    }
+
     #[test]
     fn failed_write_or_flush_poisons_and_no_later_dma_is_reused() {
         for flush in [false, true] {

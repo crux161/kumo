@@ -1,5 +1,6 @@
 //j922
 //j932
+//j933
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -3478,18 +3479,28 @@ fn attempt_sora(
             // SAFETY: the loader wrote `cmdline_len` bytes there in its LoaderData allocation,
             // which stays mapped and is never handed out by the frame allocator; the
             // destination is inside the fresh frame, after the struct (asserted in kumo-abi).
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    boot.cmdline.ptr as *const u8,
-                    (bootinfo_frame as *mut u8).add(kumo_abi::boot::SNAPSHOT_CMDLINE_OFFSET),
-                    cmdline_len,
-                );
+            // Byte-sized volatile reads: after the MMU switch the source may sit in a Device-mapped
+            // block (stage_a cleaned it to PoC first), where a wide unaligned memcpy load faults.
+            for i in 0..cmdline_len {
+                unsafe {
+                    let byte = core::ptr::read_volatile((boot.cmdline.ptr as *const u8).add(i));
+                    (bootinfo_frame as *mut u8)
+                        .add(kumo_abi::boot::SNAPSHOT_CMDLINE_OFFSET + i)
+                        .write(byte);
+                }
             }
             snapshot.cmdline = kumo_abi::RawSlice::from_raw_parts(
                 kumo_abi::boot::SNAPSHOT_CMDLINE_OFFSET as u64,
                 cmdline_len as u64,
             );
         }
+        crate::klog!(
+            "BOOT CMDLINE       Check     version={} ptr={:#x} len={} copied={}\n",
+            boot.version,
+            boot.cmdline.ptr,
+            boot.cmdline.len,
+            snapshot.cmdline.len
+        );
         unsafe { (bootinfo_frame as *mut BootInfo).write(snapshot) };
         // The struct was written through this CPU's cacheable mapping; clean the page to
         // the point of coherency before wrapping it in a VMO for Sora. Without this, Sora's

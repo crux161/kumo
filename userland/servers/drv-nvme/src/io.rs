@@ -2,6 +2,7 @@
 //j802
 //j803
 //j805
+//j933
 //! NV5: one polled I/O queue pair and bounded, read-only media access.
 //! Set Features (Number of Queues) asks for one SQ/CQ; Create I/O CQ precedes
 //! Create I/O SQ, and teardown deletes the SQ before its CQ. Reads are one PRP
@@ -124,6 +125,61 @@ pub fn write_command(
     words[0] = 0x01;
     Ok(words)
 }
+/// j933 (SH8-g G-c): one Read or Write of up to 64 KiB through the bulk pages, with PRP1 the
+/// first page and PRP2 the second page or the PRP list (NVMe 1.3 §4.3). Bounded like Read: plain
+/// blocks, a whole namespace range, at most `BULK_PAGES` pages, and within MDTS (2^mdts MPSMIN
+/// pages; 0 = no limit). Returns the command and the PRP list entries to place at `PRP_LIST`
+/// (`list_len` of them; zero when two pages or fewer). — TEAL
+pub fn bulk_command(
+    ns: &Namespace,
+    write: bool,
+    lba: u64,
+    blocks: u16,
+    physical: u64,
+    mdts: u8,
+) -> Result<([u32; 16], [u64; crate::BULK_PAGES as usize], usize), Error> {
+    if !ns.plain_blocks() || blocks == 0 || matches!(ns.id, 0 | u32::MAX) {
+        return Err(Error::Range);
+    }
+    let bytes = u64::from(blocks) * u64::from(ns.lba_bytes);
+    let pages = bytes.div_ceil(PAGE);
+    if pages > crate::BULK_PAGES || (mdts != 0 && mdts < 32 && pages > 1u64 << mdts) {
+        return Err(Error::Range);
+    }
+    if !lba
+        .checked_add(u64::from(blocks))
+        .is_some_and(|end| end <= ns.size)
+    {
+        return Err(Error::Range);
+    }
+    let base = page(physical.checked_add(crate::BULK).ok_or(Error::Memory)?)?;
+    let last = base + (crate::BULK_PAGES - 1) * PAGE;
+    page(last)?;
+    let list = page(physical.checked_add(crate::PRP_LIST).ok_or(Error::Memory)?)?;
+    let mut entries = [0u64; crate::BULK_PAGES as usize];
+    let (prp2, list_len) = match pages {
+        1 => (0, 0),
+        2 => (base + PAGE, 0),
+        n => {
+            for (i, entry) in entries.iter_mut().take(n as usize - 1).enumerate() {
+                *entry = base + (i as u64 + 1) * PAGE;
+            }
+            (list, n as usize - 1)
+        }
+    };
+    let mut w = [0; 16];
+    w[0] = if write { 0x01 } else { 0x02 };
+    w[1] = ns.id;
+    w[6] = base as u32;
+    w[7] = (base >> 32) as u32;
+    w[8] = prp2 as u32;
+    w[9] = (prp2 >> 32) as u32;
+    w[10] = lba as u32;
+    w[11] = (lba >> 32) as u32;
+    w[12] = u32::from(blocks - 1);
+    Ok((w, entries, list_len))
+}
+
 /// Flush one namespace, no data pointer or command-specific fields.
 pub fn flush_command(ns: &Namespace) -> Result<[u32; 16], Error> {
     if matches!(ns.id, 0 | u32::MAX) || !ns.plain_blocks() {
@@ -244,6 +300,37 @@ mod tests {
             physical: 0x6000_0000,
         }
     }
+    #[test]
+    fn bulk_commands_cover_one_two_and_many_pages_inside_the_bulk_area() {
+        let ns = namespace();
+        let m = memory();
+        let base = m.physical + crate::BULK;
+        let (w, _, n) = bulk_command(&ns, false, 10, 8, m.physical, 9).unwrap();
+        assert_eq!((w[0], w[6], w[8], w[12], n), (0x02, base as u32, 0, 7, 0));
+        let (w, _, n) = bulk_command(&ns, true, 10, 16, m.physical, 9).unwrap();
+        assert_eq!((w[0], w[8], n), (0x01, (base + PAGE) as u32, 0));
+        let (w, list, n) = bulk_command(&ns, false, 10, 128, m.physical, 9).unwrap();
+        assert_eq!(w[8] as u64, m.physical + crate::PRP_LIST);
+        assert_eq!(n, 15);
+        assert_eq!(list[0], base + PAGE);
+        assert_eq!(list[14], base + 15 * PAGE);
+        assert_eq!(w[12], 127);
+        assert_eq!(w[1], ns.id);
+        // Past the bulk area, past MDTS, past the namespace, or nothing: refused.
+        assert!(bulk_command(&ns, false, 0, 129, m.physical, 9).is_err());
+        assert!(bulk_command(&ns, false, 0, 128, m.physical, 3).is_err());
+        assert!(bulk_command(&ns, false, ns.size - 1, 2, m.physical, 9).is_err());
+        assert!(bulk_command(&ns, false, 0, 0, m.physical, 9).is_err());
+        assert!(
+            bulk_command(&ns, false, 0, 8, m.physical, 0).is_ok(),
+            "MDTS 0 has no limit"
+        );
+        assert!(
+            bulk_command(&ns, false, 0, 8, 0xffff_0000, 9).is_err(),
+            "below 4 GiB only"
+        );
+    }
+
     fn namespace() -> Namespace {
         Namespace {
             id: 1,

@@ -2,12 +2,17 @@
 #j801
 #j803
 #j805
+#j933
 [package]
 name = "drv-nvme"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+
+[features]
+# Proof-only comparison with the same workload on the sector fallback. — KESTREL
+sector-proof = []
 
 [dependencies]
 kumo-pcie.workspace = true

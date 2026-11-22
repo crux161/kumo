@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j810
 //j904
 //j905
 //j906
 //j932
+//j933
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -778,6 +778,15 @@ unsafe fn boot_and_jump(
         unsafe { ax88_oracle::run(boot_services, con_out) };
     }
 
+    // j933 (SH8-g): the root step's extent file, read the same way as `nijigumo.conf`.
+    #[cfg(feature = "nvme-prepare-root")]
+    nvme_oracle::set_root_extents(unsafe {
+        read_esp_file(
+            boot_services,
+            root,
+            niji_uefi::nvme_prepare_root::EXTENT_PATH,
+        )
+    });
     #[cfg(feature = "nvme-oracle")]
     {
         let reference = niji_uefi::nvme::eligible(unsafe { (*boot_ptr).board_id() })
