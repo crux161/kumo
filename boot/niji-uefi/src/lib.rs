@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j810
 //j905
 //j910
 //j932
 //j933
+//j934
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
@@ -448,6 +448,12 @@ pub struct BootConfig<'a> {
     /// checks it with [`kumo_abi::boot::parse_uuid`] and forwards it in `BootInfo.cmdline` as
     /// `root=uuid:<hex>`; Sora mounts the RedoxFS volume whose header carries that UUID.
     pub root: Option<&'a str>,
+    /// j934 (SH8-h): a zstd copy of the SH8-g root extent file, with the compressed stream's
+    /// SHA-256 and the decoded length, exactly as `initrd_zstd` (Z1). Only root-preparation
+    /// images carry it; [`BootConfig::root_extents_zstd`] yields all three or nothing.
+    pub root_extents_zstd_path: Option<&'a str>,
+    pub root_extents_zstd_sha256: Option<[u8; 32]>,
+    pub root_extents_size: Option<u64>,
 }
 
 /// The compressed-initrd triple from a manifest: path, compressed-stream SHA-256, decoded size.
@@ -479,6 +485,15 @@ pub fn parse_sha256_hex(text: &str) -> Option<[u8; 32]> {
 
 impl<'a> BootConfig<'a> {
     /// The compressed initrd, when the manifest names all of its path, digest and size.
+    /// j934: the compressed root extent file, when the manifest names its path, digest and size.
+    pub fn root_extents_zstd(&self) -> Option<InitrdZstd<'a>> {
+        Some(InitrdZstd {
+            path: self.root_extents_zstd_path?,
+            sha256: self.root_extents_zstd_sha256?,
+            size: self.root_extents_size.filter(|size| *size > 0)?,
+        })
+    }
+
     pub fn initrd_zstd(&self) -> Option<InitrdZstd<'a>> {
         Some(InitrdZstd {
             path: self.initrd_zstd_path?,
@@ -499,6 +514,9 @@ impl<'a> BootConfig<'a> {
         let mut initrd_zstd_sha256: Option<[u8; 32]> = None;
         let mut initrd_size: Option<u64> = None;
         let mut root: Option<&'a str> = None;
+        let mut root_extents_zstd_path: Option<&'a str> = None;
+        let mut root_extents_zstd_sha256: Option<[u8; 32]> = None;
+        let mut root_extents_size: Option<u64> = None;
         let mut dtb = DtbSource::Firmware;
         for raw in text.lines() {
             let line = match raw.split_once('#') {
@@ -522,6 +540,9 @@ impl<'a> BootConfig<'a> {
                 "initrd_zstd_sha256" => initrd_zstd_sha256 = parse_sha256_hex(value),
                 "initrd_size" => initrd_size = value.parse().ok(),
                 "root" => root = Some(value),
+                "root_extents_zstd" => root_extents_zstd_path = Some(value),
+                "root_extents_zstd_sha256" => root_extents_zstd_sha256 = parse_sha256_hex(value),
+                "root_extents_size" => root_extents_size = value.parse().ok(),
                 "dtb" => {
                     dtb = if value.eq_ignore_ascii_case("firmware") {
                         DtbSource::Firmware
@@ -544,6 +565,9 @@ impl<'a> BootConfig<'a> {
             initrd_zstd_sha256,
             initrd_size,
             root,
+            root_extents_zstd_path,
+            root_extents_zstd_sha256,
+            root_extents_size,
         })
     }
 
@@ -567,6 +591,24 @@ impl<'a> BootConfig<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_extents_zstd_needs_all_three_keys() {
+        extern crate std;
+        let sha = "ab".repeat(32);
+        let full = std::format!(
+            "kernel = k\nroot_extents_zstd = \\EFI\\KUMO\\root-nvme.ext.zst\nroot_extents_zstd_sha256 = {sha}\nroot_extents_size = 582090912\n"
+        );
+        let cfg = BootConfig::parse(&full).unwrap();
+        let z = cfg.root_extents_zstd().unwrap();
+        assert_eq!(
+            (z.path, z.size, z.sha256[0]),
+            ("\\EFI\\KUMO\\root-nvme.ext.zst", 582090912, 0xab)
+        );
+        let partial = BootConfig::parse("kernel = k\nroot_extents_size = 9\n").unwrap();
+        assert!(partial.root_extents_zstd().is_none());
+        assert!(cfg.initrd_zstd().is_none(), "the initrd keys are separate");
+    }
 
     #[test]
     fn root_key_becomes_one_canonical_cmdline_word() {

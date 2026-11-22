@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j929
 //j930
 //j931
 //j932
 //j933
+//j934
 
 extern crate alloc;
 
@@ -13776,7 +13776,9 @@ fn fsd_crash_proof(
         for _ in 0..attempts {
             let mut reply = [0u8; 32];
             if channel_write(session, frame.as_ptr(), n) != 0
-                || !wait_readable(session, 1_000_000_000)
+                // j934 (SH8-h): a server busy with a real build (Cargo reading its toolchain off the
+                // NVMe root) can take seconds to answer one stat; 1 s gave up on the opi5.
+                || !wait_readable(session, 60_000_000_000)
             {
                 break;
             }

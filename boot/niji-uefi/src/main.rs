@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j904
 //j905
 //j906
 //j932
 //j933
+//j934
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -280,6 +280,8 @@ type EfiHandleProtocol = extern "efiapi" fn(
 ) -> EfiStatus;
 type EfiExitBootServices = extern "efiapi" fn(image_handle: EfiHandle, map_key: usize) -> EfiStatus;
 type EfiStall = extern "efiapi" fn(microseconds: usize) -> EfiStatus;
+/// j934: `SetWatchdogTimer(timeout_seconds, code, data_size, data)`; 0 seconds disables it.
+type EfiSetWatchdogTimer = unsafe extern "efiapi" fn(usize, u64, usize, *const u16) -> EfiStatus;
 type EfiLocateHandleBuffer = extern "efiapi" fn(
     search_type: u32,
     protocol: *const EfiGuid,
@@ -328,7 +330,7 @@ struct EfiBootServices {
     exit_boot_services: EfiExitBootServices,
     get_next_monotonic_count: *const c_void,
     stall: EfiStall,
-    set_watchdog_timer: *const c_void,
+    set_watchdog_timer: EfiSetWatchdogTimer,
     connect_controller: *const c_void,
     disconnect_controller: *const c_void,
     open_protocol: *const c_void,
@@ -780,13 +782,7 @@ unsafe fn boot_and_jump(
 
     // j933 (SH8-g): the root step's extent file, read the same way as `nijigumo.conf`.
     #[cfg(feature = "nvme-prepare-root")]
-    nvme_oracle::set_root_extents(unsafe {
-        read_esp_file(
-            boot_services,
-            root,
-            niji_uefi::nvme_prepare_root::EXTENT_PATH,
-        )
-    });
+    nvme_oracle::set_root_extents(unsafe { load_root_extents(boot_services, root, con_out) });
     #[cfg(feature = "nvme-oracle")]
     {
         let reference = niji_uefi::nvme::eligible(unsafe { (*boot_ptr).board_id() })
@@ -2153,12 +2149,69 @@ unsafe fn load_initrd_zstd(
     root: PayloadSource,
     con_out: *mut EfiSimpleTextOutputProtocol,
 ) -> Option<(*mut c_void, usize)> {
+    unsafe {
+        load_manifest_zstd(
+            boot_services,
+            root,
+            con_out,
+            |cfg| cfg.initrd_zstd(),
+            INITRD_MAX_BYTES,
+            "initrd zstd  ",
+            "raw initrd",
+        )
+    }
+}
+
+/// j934 (SH8-h): the largest root extent file a re-image boot will decode.
+#[cfg(feature = "nvme-prepare-root")]
+const ROOT_EXTENTS_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// j934 (SH8-h): the SH8-g root extent file, decoded from the manifest's zstd copy when it names
+/// one (Z1's checks: the compressed stream's SHA-256 before decoding, a declared size bounded
+/// before allocating), else the raw file as j933 read it.
+#[cfg(feature = "nvme-prepare-root")]
+unsafe fn load_root_extents(
+    boot_services: *mut EfiBootServices,
+    root: PayloadSource,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+) -> Option<(*mut c_void, usize)> {
+    unsafe {
+        load_manifest_zstd(
+            boot_services,
+            root,
+            con_out,
+            |cfg| cfg.root_extents_zstd(),
+            ROOT_EXTENTS_MAX_BYTES,
+            "root extents ",
+            "raw extent file",
+        )
+        .or_else(|| {
+            read_esp_file(
+                boot_services,
+                root,
+                niji_uefi::nvme_prepare_root::EXTENT_PATH,
+            )
+        })
+    }
+}
+
+/// A zstd payload the manifest names (path, compressed SHA-256, decoded size), verified and
+/// decoded into fresh LoaderData pages. `label` and `fallback` only shape the console lines.
+unsafe fn load_manifest_zstd(
+    boot_services: *mut EfiBootServices,
+    root: PayloadSource,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+    pick: for<'c> fn(&BootConfig<'c>) -> Option<niji_uefi::InitrdZstd<'c>>,
+    max_bytes: u64,
+    label: &str,
+    fallback: &str,
+) -> Option<(*mut c_void, usize)> {
     let (conf_buf, conf_len) = unsafe { read_esp_file(boot_services, root, BOOT_CONFIG_ESP_PATH) }?;
     let conf = unsafe { core::slice::from_raw_parts(conf_buf as *const u8, conf_len) };
     let zstd = core::str::from_utf8(conf)
         .ok()
         .and_then(BootConfig::parse)
-        .and_then(|cfg| cfg.initrd_zstd());
+        .and_then(|cfg| pick(&cfg));
     // Copy the path out before the manifest's pool buffer is freed.
     let mut path_buf = [0u8; 96];
     let picked = zstd.and_then(|z| {
@@ -2171,11 +2224,13 @@ unsafe fn load_initrd_zstd(
     unsafe { ((*boot_services).free_pool)(conf_buf) };
     let (path_len, sha256, size) = picked?;
     let path = core::str::from_utf8(&path_buf[..path_len]).ok()?;
-    if size > INITRD_MAX_BYTES {
+    if size > max_bytes {
         kprint!(
             con_out,
-            "initrd zstd  : declared size {} refused; raw initrd\r\n",
-            size
+            "{}: declared size {} refused; {}\r\n",
+            label,
+            size,
+            fallback
         );
         return None;
     }
@@ -2183,14 +2238,14 @@ unsafe fn load_initrd_zstd(
     let (zbuf, zlen) = match unsafe { read_esp_file(boot_services, root, path) } {
         Some(found) => found,
         None => {
-            kprint!(con_out, "initrd zstd  : {} not found; raw initrd\r\n", path);
+            kprint!(con_out, "{}: {} not found; {}\r\n", label, path, fallback);
             return None;
         }
     };
     let compressed = unsafe { core::slice::from_raw_parts(zbuf as *const u8, zlen) };
     let started = counter_ticks();
     if kumo_sha256::digest(compressed) != sha256 {
-        kprint!(con_out, "initrd zstd  : SHA-256 mismatch; raw initrd\r\n");
+        kprint!(con_out, "{}: SHA-256 mismatch; {}\r\n", label, fallback);
         unsafe { ((*boot_services).free_pool)(zbuf) };
         return None;
     }
@@ -2209,8 +2264,10 @@ unsafe fn load_initrd_zstd(
     if status != EFI_SUCCESS || address == 0 {
         kprint!(
             con_out,
-            "initrd zstd  : {} pages refused; raw initrd\r\n",
-            page_count
+            "{}: {} pages refused; {}\r\n",
+            label,
+            page_count,
+            fallback
         );
         unsafe { ((*boot_services).free_pool)(zbuf) };
         return None;
@@ -2224,7 +2281,8 @@ unsafe fn load_initrd_zstd(
         Ok(n) if n as u64 == size => {
             kprint!(
                 con_out,
-                "initrd zstd  : {} -> {} bytes, sha256 ok ({} ms), decoded in {} ms, heap peak {} KiB\r\n",
+                "{}: {} -> {} bytes, sha256 ok ({} ms), decoded in {} ms, heap peak {} KiB\r\n",
+                label,
                 zlen,
                 n,
                 hashed.unwrap_or(0),
@@ -2236,14 +2294,16 @@ unsafe fn load_initrd_zstd(
         Ok(n) => {
             kprint!(
                 con_out,
-                "initrd zstd  : decoded {} bytes, manifest says {}; raw initrd\r\n",
+                "{}: decoded {} bytes, manifest says {}; {}\r\n",
+                label,
                 n,
-                size
+                size,
+                fallback
             );
             None
         }
         Err(_) => {
-            kprint!(con_out, "initrd zstd  : decode failed; raw initrd\r\n");
+            kprint!(con_out, "{}: decode failed; {}\r\n", label, fallback);
             None
         }
     }

@@ -2,6 +2,7 @@
 //j931
 //j932
 //j933
+//j934
 //! `cargo xtask redoxfs-image <path> --size <MiB> [--uuid <text>] [--force] [--persona-cargo] [--sdk-source <path>] [--root] [--sparse]` (SH8-d, D-c/D4;
 //! j933: `--sparse` writes the SH8-g extent file instead of a dense image).
 //!
@@ -192,51 +193,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let seed = uuid_text.unwrap_or_else(|| path.display().to_string());
     let uuid = uuid_from_seed(&seed);
-    if cargo_tree && root_tree {
-        return Err("--root and --persona-cargo are separate disks".into());
-    }
-    let files = if root_tree {
-        // j932 (SH8-f): a root disk carries the pinned Linux probes at their FHS paths; the
-        // skeleton directories come from ROOT_SKELETON.
-        let root = super::workspace_root()?;
-        super::pinned_files(&root, &super::PERSONA_PAYLOADS, "persona payloads")?
-    } else if cargo_tree {
-        let root = super::workspace_root()?;
-        let mut files = super::pinned_files(&root, &super::PERSONA_PAYLOADS, "persona payloads")?;
-        files.extend(super::pinned_files(
-            &root,
-            &super::PERSONA_RUSTC,
-            "scripts/persona-rustc.sh",
-        )?);
-        let link_sources: Vec<_> = super::PERSONA_LINK
-            .iter()
-            .map(|(source, target, hash)| {
-                let source = match (
-                    sdk_source.as_ref(),
-                    source.strip_prefix("build/sysroot/aarch64-unknown-kumo/"),
-                ) {
-                    (Some(sdk), Some(relative)) => sdk.join(relative),
-                    _ => root.join(source),
-                };
-                (source, *target, *hash)
-            })
-            .collect();
-        let link: Vec<_> = link_sources
-            .iter()
-            .map(|(path, target, hash)| {
-                (path.to_str().expect("SDK source is UTF-8"), *target, *hash)
-            })
-            .collect();
-        files.extend(super::pinned_files(
-            &root,
-            &link,
-            "use --sdk-source pointing at SH7-g's pinned SDK (hashes are checked)",
-        )?);
-        files.extend(super::persona_cargo_files(&root)?);
-        files
-    } else {
-        Vec::new()
-    };
+    // j934 (SH8-h): `--root --persona-cargo` is one root disk carrying the SH7-g tree too.
+    let files = root_files(root_tree, cargo_tree.then_some(sdk_source.as_deref()))?;
     let dirs: &[&str] = if root_tree { &ROOT_SKELETON } else { &[] };
     let volume = populated_sparse(mib, uuid, dirs, &files)?;
     // j933: an extent file for nvme-prepare-root, or the dense image QEMU attaches.
@@ -271,16 +229,93 @@ fn uuid_from_seed(seed: &str) -> [u8; 16] {
     uuid
 }
 
+/// The files a disk carries (j934): with `root`, the pinned Linux probes at their FHS paths;
+/// with `cargo` (its SDK source), SH7-g's whole tree: payloads, compiler, host std, SDK and
+/// workspace, every hash checked. Both: the union, a path present twice must be byte-identical.
+fn root_files(
+    root: bool,
+    cargo: Option<Option<&std::path::Path>>,
+) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let workspace = super::workspace_root()?;
+    let mut files = Vec::new();
+    if root {
+        files.extend(super::pinned_files(
+            &workspace,
+            &super::PERSONA_PAYLOADS,
+            "persona payloads",
+        )?);
+    }
+    if let Some(sdk_source) = cargo {
+        files.extend(super::pinned_files(
+            &workspace,
+            &super::PERSONA_PAYLOADS,
+            "persona payloads",
+        )?);
+        files.extend(super::pinned_files(
+            &workspace,
+            &super::PERSONA_RUSTC,
+            "scripts/persona-rustc.sh",
+        )?);
+        let link_sources: Vec<_> = super::PERSONA_LINK
+            .iter()
+            .map(|(source, target, hash)| {
+                let source = match (
+                    sdk_source,
+                    source.strip_prefix("build/sysroot/aarch64-unknown-kumo/"),
+                ) {
+                    (Some(sdk), Some(relative)) => sdk.join(relative),
+                    _ => workspace.join(source),
+                };
+                (source, *target, *hash)
+            })
+            .collect();
+        let link: Vec<_> = link_sources
+            .iter()
+            .map(|(path, target, hash)| {
+                (path.to_str().expect("SDK source is UTF-8"), *target, *hash)
+            })
+            .collect();
+        files.extend(super::pinned_files(
+            &workspace,
+            &link,
+            "use --sdk-source pointing at SH7-g's pinned SDK (hashes are checked)",
+        )?);
+        files.extend(super::persona_cargo_files(&workspace)?);
+    }
+    dedupe(files)
+}
+
+/// Keep the first of identical `(path, bytes)` pairs; two different files at one path refuse.
+fn dedupe(files: Vec<(&'static str, Vec<u8>)>) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let mut seen: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut out: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for (path, bytes) in files {
+        match seen.get(path) {
+            Some(&at) if out[at].1 == bytes => {}
+            Some(_) => return Err(format!("two different files staged at {path}")),
+            None => {
+                seen.insert(path, out.len());
+                out.push((path, bytes));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// j933 (SH8-g): where the root-preparation image carries the extent file (its ESP path).
 pub const ROOT_EXTENT_ESP_PATH: &str = "EFI/KUMO/root-nvme.ext";
 
 /// j933 (SH8-g, G-a): the opi5 NVMe root, pinned: the partition's size, the FHS skeleton, the
 /// pinned Linux probes, and the UUID from `kumo_gpt::sh8g::ROOT_UUID_SEED`. Returns the
 /// extent file and the UUID the boot manifest's `root =` line names.
-pub fn nvme_root_extents(root: &std::path::Path) -> Result<(Vec<u8>, [u8; 16]), String> {
+///
+/// j934 (SH8-h): `cargo` (its SDK source) adds SH7-g's tree, as `--root --persona-cargo` does.
+pub fn nvme_root_extents(
+    cargo: Option<Option<&std::path::Path>>,
+) -> Result<(Vec<u8>, [u8; 16]), String> {
     let mib = kumo_gpt::sh8g::ROOT_BLOCKS / 2048;
     let uuid = uuid_from_seed(kumo_gpt::sh8g::ROOT_UUID_SEED);
-    let files = super::pinned_files(root, &super::PERSONA_PAYLOADS, "persona payloads")?;
+    let files = root_files(true, cargo)?;
     let volume = populated_sparse(mib, uuid, &ROOT_SKELETON, &files)?;
     Ok((volume.extents(uuid), uuid))
 }
@@ -602,6 +637,17 @@ mod tests {
             replay_extents(&torn, 0).is_err(),
             "the digest covers every byte"
         );
+    }
+
+    #[test]
+    fn a_path_staged_twice_must_be_the_same_file() {
+        let same = dedupe(vec![
+            ("/bin/a", vec![1]),
+            ("/bin/a", vec![1]),
+            ("/bin/b", vec![2]),
+        ]);
+        assert_eq!(same.unwrap().len(), 2);
+        assert!(dedupe(vec![("/bin/a", vec![1]), ("/bin/a", vec![9])]).is_err());
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//j928
 //j929
 //j930
 //j931
 //j933
+//j934
 
 use std::env;
 use std::fmt;
@@ -526,22 +526,77 @@ fn stage_uefi_bootloader(
     let extent_path = out_dir
         .join(plan.hardware.to_string())
         .join(redoxfs_image::ROOT_EXTENT_ESP_PATH);
+    let zstd_path = extent_path.with_extension("ext.zst");
+    let keys_path = root_extent_keys_path(out_dir, plan);
+    // Only the root-preparation image carries the extent file (raw or compressed) and its keys.
+    let _ = fs::remove_file(&extent_path);
+    let _ = fs::remove_file(&zstd_path);
+    let _ = fs::remove_file(&keys_path);
     if prepare_root {
-        let (extents, uuid) = redoxfs_image::nvme_root_extents(root)?;
+        // j934 (SH8-h): KUMO_NVME_ROOT_TREE=cargo adds SH7-g's tree, from the SDK snapshot that
+        // KUMO_PERSONA_SDK_SOURCE names (its pinned hashes still apply).
+        let cargo = match env::var("KUMO_NVME_ROOT_TREE").as_deref() {
+            Err(_) | Ok("") | Ok("probes") => None,
+            Ok("cargo") => Some(env::var("KUMO_PERSONA_SDK_SOURCE").ok().map(PathBuf::from)),
+            Ok(other) => {
+                return Err(format!(
+                    "KUMO_NVME_ROOT_TREE must be probes or cargo, not {other}"
+                ))
+            }
+        };
+        let (extents, uuid) =
+            redoxfs_image::nvme_root_extents(cargo.as_ref().map(|sdk| sdk.as_deref()))?;
         if let Some(parent) = extent_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("create {}: {err}", parent.display()))?;
         }
         fs::write(&extent_path, &extents)
             .map_err(|err| format!("write {}: {err}", extent_path.display()))?;
+        // j934: a large tree travels compressed (Z1's scheme): Nijigumo checks the compressed
+        // stream's SHA-256 against the manifest, then decodes. The raw file stays only if there
+        // is no `zstd` on the host.
+        if command_exists("zstd") {
+            let status = Command::new("zstd")
+                .args(["-3", "-T0", "-q", "-f", "-o"])
+                .arg(&zstd_path)
+                .arg(&extent_path)
+                .status()
+                .map_err(|e| format!("zstd: {e}"))?;
+            if !status.success() {
+                return Err("zstd failed on the root extent file".into());
+            }
+            let compressed =
+                fs::read(&zstd_path).map_err(|e| format!("read {}: {e}", zstd_path.display()))?;
+            let digest: String = kumo_sha256::digest(&compressed)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            fs::write(
+                &keys_path,
+                format!(
+                    "root_extents_zstd = {}\nroot_extents_zstd_sha256 = {digest}\nroot_extents_size = {}\n",
+                    esp_uefi_path(&format!("{}.zst", redoxfs_image::ROOT_EXTENT_ESP_PATH)),
+                    extents.len()
+                ),
+            )
+            .map_err(|e| format!("write {}: {e}", keys_path.display()))?;
+            let _ = fs::remove_file(&extent_path);
+            println!(
+                "xtask: root extents compressed {} -> {} bytes",
+                extents.len(),
+                compressed.len()
+            );
+        }
         println!(
-            "xtask: SH8-g root extents staged ({} bytes, root = uuid:{})",
+            "xtask: SH8-g root extents staged ({} bytes, {}, root = uuid:{})",
             extents.len(),
+            if cargo.is_some() {
+                "with the SH7-g Cargo tree"
+            } else {
+                "probes"
+            },
             uuid.iter().map(|b| format!("{b:02x}")).collect::<String>()
         );
-    } else {
-        // Only the root-preparation image carries the extent file.
-        let _ = fs::remove_file(&extent_path);
     }
     if prepare_root && reimage {
         args.extend(["--features", "nvme-prepare-root-reimage"]);
@@ -709,6 +764,12 @@ fn stage_initrd_zstd(
     }))
 }
 
+/// j934: where the root-preparation staging leaves the manifest lines for its zstd extent file
+/// (beside the ESP tree, never in it).
+fn root_extent_keys_path(out_dir: &Path, plan: &ImagePlan) -> PathBuf {
+    out_dir.join(format!("{}.root-extents.conf", plan.hardware))
+}
+
 /// Write the boot manifest into the staged ESP tree. Returns its staged path.
 fn stage_boot_manifest(
     out_dir: &Path,
@@ -723,6 +784,9 @@ fn stage_boot_manifest(
         fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
     let mut manifest = render_boot_manifest(plan, pl011_console_base, initrd_zstd);
+    if let Ok(keys) = fs::read_to_string(root_extent_keys_path(out_dir, plan)) {
+        manifest.push_str(&keys);
+    }
     // j933 (SH8-g, D6): a proof image names its root explicitly; default images never do.
     match env::var("KUMO_ROOT_UUID") {
         Ok(hex) if kumo_abi::boot::parse_uuid(hex.as_bytes()).is_some() => {

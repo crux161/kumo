@@ -1,8 +1,8 @@
-//j800
 //j801
 //j804
 //j805
 //j933
+//j934
 //! Default-off pre-EBS Identify reference through firmware's NVMe queues, then
 //! (NV5) LBA 0, LBA 1 and the last LBA through firmware's whole-namespace Block I/O.
 //! No drv-nvme dependency or direct controller write. Media preparation is a
@@ -492,6 +492,21 @@ unsafe fn prepare_root(
         }
     }
     print_line(con, format_args!("SH8G BAKSHA {}\r\n", Hex(sha.finish())));
+    // j934 (SH8-h, closing j933's G-e1 gap): partition 1's raw bytes, which this step never
+    // writes, hashed before any write and again after the last phase.
+    let fat_before = match fat_receipt(&mut disk) {
+        Some(receipt) => receipt,
+        None => halt(con, nvme::Error::Data),
+    };
+    // One hash per line: the firmware console wraps at 100 columns.
+    print_line(
+        con,
+        format_args!("SH8G FATSHA before first8 {}\r\n", Hex(fat_before.0)),
+    );
+    print_line(
+        con,
+        format_args!("SH8G FATSHA before seed {}\r\n", Hex(fat_before.1)),
+    );
     print_line(con, format_args!("SH8G PREP waiting for host receipt\r\n"));
     let input = unsafe { (*st).con_in };
     if input.is_null() {
@@ -530,6 +545,14 @@ unsafe fn prepare_root(
         );
         return;
     }
+    // j934 (SH8-h): firmware arms a 5-minute watchdog when it starts a boot option (UEFI 2.x
+    // §7.5). A large re-image outlasts it (the first SH8-h run was reset 2 min 41 s into
+    // its writes); disable it for this one-shot step, which flushes and verifies every phase.
+    let watchdog = unsafe { ((*bs).set_watchdog_timer)(0, 0, 0, ptr::null()) };
+    print_line(
+        con,
+        format_args!("SH8G PREP watchdog disabled (status {watchdog:#x})\r\n"),
+    );
     print_line(
         con,
         format_args!(
@@ -543,15 +566,66 @@ unsafe fn prepare_root(
             format_args!("SH8G PREP phase {phase}/4 flushed and verified\r\n"),
         )
     }) {
-        Ok(count) => print_line(
-            con,
-            format_args!("SH8G PREP complete: {count} sectors written/flushed/readback\r\n"),
-        ),
+        Ok(count) => {
+            let Some(fat_after) = fat_receipt(&mut disk) else {
+                halt(con, nvme::Error::Data)
+            };
+            print_line(
+                con,
+                format_args!("SH8G FATSHA after first8 {}\r\n", Hex(fat_after.0)),
+            );
+            print_line(
+                con,
+                format_args!("SH8G FATSHA after seed {}\r\n", Hex(fat_after.1)),
+            );
+            print_line(
+                con,
+                format_args!(
+                    "SH8G FATSHA partition 1 {}\r\n",
+                    if fat_after == fat_before {
+                        "unchanged"
+                    } else {
+                        "CHANGED"
+                    }
+                ),
+            );
+            if fat_after != fat_before {
+                print_line(
+                    con,
+                    format_args!("SH8G PREP failed: partition 1 changed\r\n"),
+                );
+                halt(con, nvme::Error::Data);
+            }
+            print_line(
+                con,
+                format_args!("SH8G PREP complete: {count} sectors written/flushed/readback\r\n"),
+            )
+        }
         Err(e) => {
             print_line(con, format_args!("SH8G PREP failed {e:?}\r\n"));
             halt(con, nvme::Error::Data);
         }
     }
+}
+
+/// j934: SHA-256 of partition 1's first eight sectors (VBR, FSInfo, reserved) and of J804's seed
+/// sectors (the root directory and HELLO.TXT), each hashed with its LBA.
+#[cfg(feature = "nvme-prepare-root")]
+fn fat_receipt(disk: &mut FirmwareDisk) -> Option<([u8; 32], [u8; 32])> {
+    use niji_uefi::nvme_prepare::{self as prep, Disk};
+    let mut digest_of = |first: u64, last: u64| {
+        let mut sha = kumo_sha256::Sha256::new();
+        let mut b = [0; 512];
+        for lba in first..=last {
+            disk.read(lba, &mut b).ok()?;
+            sha.update(&lba.to_le_bytes());
+            sha.update(&b);
+        }
+        Some(sha.finish())
+    };
+    let first8 = digest_of(prep::START, prep::START + 7)?;
+    let seed = digest_of(prep::START + prep::DATA, prep::START + prep::DATA + 1)?;
+    Some((first8, seed))
 }
 
 #[cfg(all(feature = "nvme-prepare", not(feature = "nvme-prepare-root")))]

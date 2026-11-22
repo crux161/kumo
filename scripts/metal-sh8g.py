@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j933
+#j934
 """SH8-g (j933): the RedoxFS root on the Orange Pi 5 Plus's NVMe (DESIGN/010 §7 item 4).
 
 --prepare: one PXE boot of the image built with KUMO_NVME_PREPARE_ROOT=1 (and
@@ -188,10 +189,12 @@ def wake(board, log):
         raise
 
 
-def run_prepare(board, work, go, reimage=False, wait_for_boot=False):
+def run_prepare(board, work, go, reimage=False, wait_for_boot=False, verdict_timeout=400,
+                complete_timeout=900):
     tftp = stage(board, work, "prepare", PREPARE_BOOT, None)
-    if not (tftp / "EFI/KUMO/root-nvme.ext").is_file():
-        raise RuntimeError("the staged image has no root-nvme.ext; build with KUMO_NVME_PREPARE_ROOT=1")
+    # j934: SH8-h's large tree travels as root-nvme.ext.zst; the timeout covers its fetch.
+    if not any((tftp / f"EFI/KUMO/{name}").is_file() for name in ("root-nvme.ext", "root-nvme.ext.zst")):
+        raise RuntimeError("the staged image has no root extent file; build with KUMO_NVME_PREPARE_ROOT=1")
     log = work / "prepare.log"
     manifest = {}
     pxehost = board.start_pxehost(tftp, work / "pxehost-prepare.log")
@@ -201,7 +204,7 @@ def run_prepare(board, work, go, reimage=False, wait_for_boot=False):
             print("Private PXE server and serial capture ready; waiting for target reset", flush=True)
         else:
             wake(board, log)
-        deadline = time.monotonic() + 400
+        deadline = time.monotonic() + verdict_timeout
         while True:
             raw = board.capture_text(log)
             if "SH8G PREP waiting for host receipt" in raw or "SH8G PREP already prepared" in raw:
@@ -229,7 +232,7 @@ def run_prepare(board, work, go, reimage=False, wait_for_boot=False):
             if reimage and "SH8G PREP re-image build" not in board.capture_text(log):
                 raise RuntimeError("--reimage, but the firmware did not report a re-image build")
             board.send_raw(b"K933-REIMAGE\r" if reimage else b"K933-ROOT\r")
-            board.wait_for("SH8G PREP complete", log, 900)
+            board.wait_for("SH8G PREP complete", log, complete_timeout)
             manifest["written"] = True
         else:
             manifest["written"] = False
