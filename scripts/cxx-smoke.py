@@ -2,6 +2,7 @@
 #j736
 #j738
 #j740
+#J935_r01_001
 """Build G7l's C++ runtime and optionally prove it in a disposable full UEFI image."""
 import argparse
 from pathlib import Path
@@ -39,6 +40,16 @@ def stage_image(source, destination, elf, commands=b"dmesg -n 6\nrelibc g7l\nech
         out.extend(data)
     assert found == {b"etc/autoexec", b"bin/relibc-smoke"}
     path.write_bytes(out)
+    # The proof changes the raw initrd. Nijigumo otherwise prefers the unchanged
+    # compressed copy and silently boots the original payload. — KESTREL
+    manifest = path.parent / "nijigumo.conf"
+    if manifest.exists():
+        keys = {"initrd_zstd", "initrd_zstd_sha256", "initrd_size"}
+        manifest.write_text("".join(
+            line for line in manifest.read_text().splitlines(keepends=True)
+            if line.partition("=")[0].strip() not in keys
+        ))
+    path.with_name("initrd.img.zst").unlink(missing_ok=True)
 
 
 def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", green=GREEN, tag="G7l"):

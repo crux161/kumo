@@ -1,0 +1,20 @@
+#J935_r01_001
+[package]
+name = "unwind-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "unwind-smoke"
+path = "main.rs"
+
+[dependencies]
+kumo-abi = { path = "../../../lib/kumo-abi" }
+kumo-rt = { path = "../../../userland/kumo-rt" }
+
+[profile.release]
+opt-level = 2
+panic = "unwind"

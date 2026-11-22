@@ -1,6 +1,7 @@
 #!/bin/sh
 #j853
 #j857
+#J935_r01_001
 # Build KUMO's Rust std smoke from the pinned nightly's rust-src: stage the library tree,
 # alias the vendored libc to the linux surface for target_os = "kumo" (the same mechanical
 # admission relibc's kumo.patch makes in its headers), apply toolchain/rust/overlay, and
@@ -13,6 +14,13 @@ LIBCRATE="libc-0.2.185"
 TARGET="$ROOT/targets/aarch64-unknown-kumo.json"
 TOOL="$ROOT/toolchain/rust"
 SMOKE="$TOOL/smoke"
+PANIC=abort
+NAME=std-smoke
+case "${1:-}" in
+    "") ;;
+    --unwind) PANIC=unwind; NAME=unwind-smoke; SMOKE="$TOOL/unwind-smoke" ;;
+    *) printf 'usage: rust-std-check.sh [--unwind]\n' >&2; exit 2 ;;
+esac
 
 fail() { printf 'rust-std-check: %s\n' "$1" >&2; exit 1; }
 
@@ -22,7 +30,13 @@ rustc +"$TOOLCHAIN" --version >/dev/null 2>&1 || fail "toolchain $TOOLCHAIN miss
 RUST_SRC="$(rustc +"$TOOLCHAIN" --print sysroot)/lib/rustlib/src/rust"
 [ -d "$RUST_SRC/library/std" ] || fail "rust-src missing for $TOOLCHAIN"
 
-stage="${KUMO_RUST_STD_STAGE_OUT:-$ROOT/target/rust-std-stage}"
+default_stage="$ROOT/target/rust-std-stage"
+default_target="$ROOT/target/rust-std-smoke"
+if [ "$PANIC" = unwind ]; then
+    default_stage="$ROOT/target/rust-unwind-stage"
+    default_target="$ROOT/target/rust-unwind-smoke"
+fi
+stage="${KUMO_RUST_STD_STAGE_OUT:-$default_stage}"
 rm -rf "$stage"
 mkdir -p "$stage"
 cp -R "$RUST_SRC/library/." "$stage/library/"
@@ -93,7 +107,7 @@ if [ -d "$TOOL/overlay" ]; then
 fi
 
 # 3. The start object; relibc's static archive is the C side of the link.
-clang --target=aarch64-unknown-none -c "$SMOKE/start.S" -o "$stage/start.o" \
+clang --target=aarch64-unknown-none -c "$TOOL/smoke/start.S" -o "$stage/start.o" \
     || fail "compiling start.S"
 SYSROOT="${KUMO_SYSROOT:-$ROOT/target/kumo-sysroot}"
 [ -f "$SYSROOT/lib/libc.a" ] || fail "no $SYSROOT/lib/libc.a; run scripts/relibc-headers.sh first"
@@ -113,25 +127,34 @@ done
 
 # 5. Build std for the target against the staged tree.
 export __CARGO_TESTS_ONLY_SRC_ROOT="$stage/library"
-export CARGO_TARGET_DIR="${KUMO_RUST_STD_TARGET_DIR:-$ROOT/target/rust-std-smoke}"
-# An empty libunwind: rustc's std link line asks for it on unix, but panic=abort and the
-# gate program never unwind. Any genuinely referenced symbol surfaces below, in the shim.
+export CARGO_TARGET_DIR="${KUMO_RUST_STD_TARGET_DIR:-$default_target}"
+# The normal panic-abort build keeps its empty unwind archive. SH9-a opts into
+# the pinned native runtime and omits the shim's backtrace stubs. — KESTREL
 stublibs="$stage/stublibs"
 mkdir -p "$stublibs"
 armar="$(command -v llvm-ar || command -v ar)"
 [ -n "$armar" ] || fail "no ar/llvm-ar for the unwind stub"
-"$armar" rcs "$stublibs/libunwind.a"
+shim_flags=""
+panic_flags=""
+if [ "$PANIC" = unwind ]; then
+    python3 "$ROOT/toolchain/unwind/build.py" --sysroot "$SYSROOT" --out "$stage/unwind"
+    cp "$stage/unwind/libunwind.a" "$stublibs/libunwind.a"
+    shim_flags="-DKUMO_NATIVE_UNWIND"
+    panic_flags="-Cpanic=unwind -Clink-arg=--eh-frame-hdr -Clink-arg=-T$ROOT/toolchain/unwind/sections.ld"
+else
+    "$armar" rcs "$stublibs/libunwind.a"
+fi
 # The kumo shim: the C symbols std references that relibc does not provide.
-clang --target=aarch64-unknown-none -O2 -ffreestanding -fno-builtin \
+clang --target=aarch64-unknown-none -O2 -ffreestanding -fno-builtin $shim_flags \
     -c "$TOOL/shim/shim.c" -o "$stage/shim.o" || fail "compiling the shim"
 "$armar" rcs "$stublibs/libkumo_shim.a" "$stage/shim.o"
-export RUSTFLAGS="-C link-arg=-T$SMOKE/link.ld -C link-arg=$stage/start.o -C link-arg=$stublibs/libkumo_shim.a -C link-arg=$SYSROOT/lib/libc.a -C link-arg=-L$SYSROOT/lib -C link-arg=-L$stublibs -C link-arg=-z -C link-arg=muldefs"
+export RUSTFLAGS="-C link-arg=-T$TOOL/smoke/link.ld -C link-arg=$stage/start.o -C link-arg=$stublibs/libkumo_shim.a -C link-arg=$SYSROOT/lib/libc.a -C link-arg=-L$SYSROOT/lib -C link-arg=-L$stublibs -C link-arg=-z -C link-arg=muldefs $panic_flags"
 cd "$SMOKE"
-cargo +"$TOOLCHAIN" build --release -Z build-std=core,alloc,std,panic_abort -Zjson-target-spec \
+cargo +"$TOOLCHAIN" build --release -Z "build-std=core,alloc,std,panic_$PANIC" -Zjson-target-spec \
     --config 'source.crates-io.replace-with="kumo-std-vendor"' \
     --config "source.kumo-std-vendor.directory=\"$vendor_union\"" \
     --target "$TARGET"
 
-out="$ROOT/target/rust-std-smoke/aarch64-unknown-kumo/release/std-smoke"
+out="$CARGO_TARGET_DIR/aarch64-unknown-kumo/release/$NAME"
 [ -f "$out" ] || fail "smoke binary missing at $out"
 printf 'KUMO std smoke: %s\n' "$out"

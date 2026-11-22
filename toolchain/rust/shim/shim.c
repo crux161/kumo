@@ -1,6 +1,7 @@
 // j853
 // j871
 // j873
+//J935_r01_001
 // The KUMO std shim: the few C symbols std references that relibc does not provide.
 // Freestanding C, no headers. Everything outside the surface below refuses by name
 // (ENOSYS) rather than pretending.
@@ -102,7 +103,8 @@ long syscall(long n, ...) {
     return result;
 }
 
-// The backtrace printer's unwinder: there is no frame unwinder yet; report end-of-stack.
+// Abort-only builds report end-of-stack; SH9-a uses the real native unwinder.
+#ifndef KUMO_NATIVE_UNWIND
 unsigned long _Unwind_GetIP(void *ctx) {
     (void)ctx;
     return 0;
@@ -113,6 +115,7 @@ int _Unwind_Backtrace(void *trace, void *arg) {
     (void)arg;
     return 5; // _URC_END_OF_STACK
 }
+#endif
 
 // std's random path: the getrandom function (not the syscall()) with /dev/urandom as the
 // fallback, which kumo cannot provide. Same documented clock-mixed generator as SYS_getrandom.

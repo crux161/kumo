@@ -1,0 +1,148 @@
+{
+  "repository": "https://github.com/llvm/llvm-project",
+  "ref": "llvmorg-22.1.8",
+  "subtree": "libunwind",
+  "tree": "003b7ffa113289bb340f576fd62521a3a7dc62be",
+  "files": {
+    "LICENSE.TXT": {
+      "git_blob": "1e3120621caeb62648745a42f7a9a25d1e2731ab",
+      "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d"
+    },
+    "include/CMakeLists.txt": {
+      "git_blob": "eefd4305d06cc11f320751abe38fbe18fec73d43",
+      "sha256": "b0c334f8ea5866dce3dbf267fe50518299eb3cb5460c3889426e152138f09bda"
+    },
+    "include/__libunwind_config.h": {
+      "git_blob": "980d11ef5d4f237f7ad10af086cc6cf711acadaf",
+      "sha256": "9c4d2213e9b6dd77da80d066e7a320ddbf3b62a8e511026e4c7a2e10ec9059f8"
+    },
+    "include/libunwind.h": {
+      "git_blob": "56ca7110274a30c842d845a4c1ab8761bcd57388",
+      "sha256": "34d08a481ab71fc699971638cb58693cc9fcc6dafe4680963cb937359cfa6edb"
+    },
+    "include/libunwind.modulemap": {
+      "git_blob": "775841ecb5f1883d4b9d4b6d76e51e336e37b2a2",
+      "sha256": "48f339450fa40a3fddec84d4fc75a7197fce4b36f75925d3f3a22a54aa3ffe90"
+    },
+    "include/mach-o/compact_unwind_encoding.h": {
+      "git_blob": "4c48e33c3c177d9cdf7e4805fc4797628ff54ac4",
+      "sha256": "06f58e9d0058583b6da91ca2328fa663f80d089496a4979754ee7608fe9bd877"
+    },
+    "include/unwind.h": {
+      "git_blob": "b1775d3a3decc76e1a0916fead1aafbc6fa0fb51",
+      "sha256": "e4a58637fc8ca1d29cd600c3c4416aafed50085edf276fa076214c8d81c263f0"
+    },
+    "include/unwind_arm_ehabi.h": {
+      "git_blob": "68e02e47602d60de9f9d33267e270cb5f73fc5aa",
+      "sha256": "04cf22a069866ae35bf075c36f8d9112700bb9772653d80d9c6c4c856f4e7dbb"
+    },
+    "include/unwind_itanium.h": {
+      "git_blob": "d94a6183be2901e3167779691726b307970254a7",
+      "sha256": "c8cc61d806e13a2e75e93f1c15afd432f93a99283d27d15f5a28a3ebee989cba"
+    },
+    "src/AddressSpace.hpp": {
+      "git_blob": "3711189f57b1d115c82811b18017b56d74284e2c",
+      "sha256": "66ebbc93ca448bbac17cf5666e417fc8962e67298930d88ff5a3530550699bf3"
+    },
+    "src/CMakeLists.txt": {
+      "git_blob": "6e947039fb0d52f1b388a7a1236790ce83e169a4",
+      "sha256": "11a81e95e8719c7b359b2ae328f8e056856163766baff9afa36eb7221de0ddda"
+    },
+    "src/CompactUnwinder.hpp": {
+      "git_blob": "cd2e0e3431314adb770af082de1f645d1a48c8bc",
+      "sha256": "9a4d4db5484c6805b75e04c6beb41ef0eed5c2f51b5f6969fa717f8410950a9f"
+    },
+    "src/DwarfInstructions.hpp": {
+      "git_blob": "165c4a99e9a92f1deac33fb8f959481a3136b1ac",
+      "sha256": "1dc010b5854544a4c7635d230078f39a85afa5035ea1a7a42269edd43a521984"
+    },
+    "src/DwarfParser.hpp": {
+      "git_blob": "8e080fb33c5f81f833d441a11ae62fd2da9dc28f",
+      "sha256": "97daf4400e58df77a01faa6a037b9def3b5f852829d70a41d0e383386da5cc30"
+    },
+    "src/EHHeaderParser.hpp": {
+      "git_blob": "b5d927027f64c195c1e7bef5ac6ef22ab84c536f",
+      "sha256": "09a9460a2d7c6eba4f5f47e6e353cff3d283d3f6ff242a085cf9d7d591a1a7f1"
+    },
+    "src/FrameHeaderCache.hpp": {
+      "git_blob": "296064d8e2e675994a39227e2912c893892b8612",
+      "sha256": "ba9d7a8ae3c936fce48639f3f0964f67657cc8ffcccdb75416d3fa7c304845e9"
+    },
+    "src/RWMutex.hpp": {
+      "git_blob": "344d35641f07a8037f9cb2535106479b8a6d26f2",
+      "sha256": "3d6f718c49944207310eafc2231767016a971c6be6612d31dcc673312f23e724"
+    },
+    "src/Registers.hpp": {
+      "git_blob": "88c2d3b4e8c9bbe15c52b0e404370b4847a7ba27",
+      "sha256": "138d88e237a4584f431159af9afcba15e3d585f196065bb48b4b7231d239db4b"
+    },
+    "src/Unwind-EHABI.cpp": {
+      "git_blob": "05475c6ac1e2fe60db522a0c138f5acb3f5b1945",
+      "sha256": "352ab8ec8eaa93a790c261c418ffea18fc78d55ba805601df369a310dc086417"
+    },
+    "src/Unwind-EHABI.h": {
+      "git_blob": "ff3b5fc6fea77fba0f4ebc4d74e72bac984935fa",
+      "sha256": "c04fdebcd31e26de7615b82751373cc64ef83d02b24dbaaf0e112d0a559acc6b"
+    },
+    "src/Unwind-seh.cpp": {
+      "git_blob": "0b1930b44d1c648b89099b6f2f796b4233f1c877",
+      "sha256": "058ae089c7d42ade35b730f87443b34018b21bea75a4ea2226e9fffdf7500160"
+    },
+    "src/Unwind-sjlj.c": {
+      "git_blob": "a3551b328950d13022fa3bbd31b9361ce9acd681",
+      "sha256": "25be6bc007751639556d0e896a0479affd8b23138e6cc3f4b2d8d7f257e1b678"
+    },
+    "src/Unwind-wasm.c": {
+      "git_blob": "b0d6cd2d00fc59eae87f3366802d7470eb64a1d2",
+      "sha256": "ab81b5759fc30425ec59fa395c90dd04d48eef8b7b1541924d32074d5917130e"
+    },
+    "src/UnwindCursor.hpp": {
+      "git_blob": "5838dbcaa9980adc472919dcb6ed274706d4e00e",
+      "sha256": "d3495f491599c203fa187c57ae1faf1655b49ae6114e4c7af8bd7c34097db535"
+    },
+    "src/UnwindLevel1-gcc-ext.c": {
+      "git_blob": "32c872ffade1fd0c02c6e9d30a56fb48c2080193",
+      "sha256": "3bed106de18fec9d1c52cb7bc3d5db89d3225252f3c0312597d159edbbd6e802"
+    },
+    "src/UnwindLevel1.c": {
+      "git_blob": "7368b3cb803362370cbc95f731538d2486beafcf",
+      "sha256": "376b863ccf09f1502e675dec7cc1154a4450e588bacd7768fb768fd1be7b4c04"
+    },
+    "src/UnwindRegistersRestore.S": {
+      "git_blob": "76a80344034f7175e08a189e42a2dc2592845735",
+      "sha256": "340577c57e5879b6974517fa599a23a4fde8687f078ddd49d78076d37e41d32a"
+    },
+    "src/UnwindRegistersSave.S": {
+      "git_blob": "f988fd461def170a20b8cb2828533fb32191e84d",
+      "sha256": "786a1dcb895230704a27e661ebd5c363b50f3ddcf0387ed4507e8de3b1d1d75d"
+    },
+    "src/Unwind_AIXExtras.cpp": {
+      "git_blob": "97b6c3e5e01aea352eef078dd520abf4b220b331",
+      "sha256": "e1b8b544fd6f9aeca43856a93d001f82b9ce6c586d4c3c048dc964874e5a31f2"
+    },
+    "src/assembly.h": {
+      "git_blob": "84c9d526f1d7594e456b5a31c11adff57f79551a",
+      "sha256": "1b802ab55f7b949a9e8b1a1c7c82b6a84d068610aeb823993bdeee1964c98eb3"
+    },
+    "src/config.h": {
+      "git_blob": "f017403fa2234f7234e784eefeafe8eae6b1a59b",
+      "sha256": "fd99264860ced6f5b5cd4d5e0ef6eb444a4ab511a47a8b0d91bfab254ab21a1e"
+    },
+    "src/dwarf2.h": {
+      "git_blob": "68ad882347203ca193d05bcb2e3f34d4500edca0",
+      "sha256": "e10d240e2f19de7121a8afaf3d4841a65936723e69d636f7e3241e14802d0bfc"
+    },
+    "src/libunwind.cpp": {
+      "git_blob": "7ffffc2a30c0ae61c20446a0c91d7548ba695927",
+      "sha256": "413a02f5f0355e07fe3ac97588c3a63ea04836b5b6b1587643bf6a32f4550492"
+    },
+    "src/libunwind_ext.h": {
+      "git_blob": "b3762c24d7da47b9e23595418cc095a2994d3d92",
+      "sha256": "18f02a65758991c3cd371121861c2a213d6699f929e70104ed791ce32979d945"
+    },
+    "src/shadow_stack_unwind.h": {
+      "git_blob": "b00ca2c9327c74cc40f678cb4db3b56ed18dc405",
+      "sha256": "c18056e575fcf2deed7ccfe469c1c7e6c1f390f64b28cac5aa304de3bb7a50fa"
+    }
+  }
+}
