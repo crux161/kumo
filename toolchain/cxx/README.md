@@ -2,6 +2,7 @@
 <!-- j736 -->
 <!-- j737 -->
 <!-- J936_r02_001 -->
+<!-- J939_r05_001 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -100,3 +101,15 @@ Logs, executable and input hashes are saved under `build/verification/sh9-b1`.
 This is the exception ABI slice, not the full libc++ runtime or a native compiler.
 Streams, filesystem, locale, dynamic loading, dynamic TLS destructors, SMP,
 native rustc/cargo bootstrap and Orange Pi execution remain separate gates.
+
+
+## SH9-c1: libc++ filesystem path lexical operations
+
+The opt-in path slice adds the pinned LLVM 22.1.8 `filesystem/path.cpp` and `string.cpp` support, plus their
+compiler-discovered header closure to `SOURCE.lock`. It enables filesystem declarations
+only in a generated test config, links a static `libkumo-cxx-fs-path.a`, and proves
+root/decomposition, extension handling, lexical normalization, append, replacement, and
+path iteration under QEMU and on Orange Pi 5 Plus. The path proof does not call filesystem
+syscalls; status, directory iteration, streams, locale, dynamic loading, and native compiler
+acceptance remain separate. Build and run with `python3 toolchain/cxx/build-fs-path.py`
+and `python3 scripts/cxx-fs-path-smoke.py --run`.
