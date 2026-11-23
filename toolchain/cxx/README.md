@@ -1,6 +1,7 @@
 # The measured KUMO C++ runtime — G7l
 <!-- j736 -->
 <!-- j737 -->
+<!-- J936_r02_001 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -53,3 +54,49 @@ same correction. The other relibc platform paths retain their previous offset.
 
 G7l passes both full UEFI QEMU and Orange Pi 5 Plus metal acceptance (J737).
 The same smoke returned through its static destructor and reached login over PXE. Runtime and build decisions — SAKER, 2026-10-31.
+
+## SH9-b1: native exception ABI and RTTI
+
+The opt-in EH build extends the same LLVM 22.1.8 source pin. It builds libc++abi's
+Itanium exception runtime and RTTI, libc++'s exception/message support, and SH9-a's
+static libunwind against the native relibc sysroot. G7l's no-exception archive and
+the default SDK keep their existing build paths.
+
+```sh
+scripts/relibc-headers.sh
+python3 toolchain/cxx/build-eh.py
+cargo xtask image --arch aarch64 --hardware qemu-virt-aarch64
+python3 scripts/cxx-eh-smoke.py --run
+# Stage a disposable ESP for later board acceptance:
+python3 scripts/cxx-eh-smoke.py --image build/images/orange-pi-5-plus --stage build/proofs/sh9-b1-opi
+```
+
+The offline build uses host clang/LLVM tools targeting bare AArch64, with native
+headers and libraries only. `SOURCE.lock` records the exact upstream revision,
+Git blob IDs and SHA256 for the measured source/header dependency closure; builds
+verify and stage only those files. Both upstream license files are retained.
+The generated config selects pthreads and Itanium ABI, and disables unsupported
+library facilities. The same staged guard admission as G7l avoids Linux futex
+numbers; relibc supplies the real pthread implementation. The manifest records
+compiler version and all compilation inputs, and the final ELF must have no
+undefined symbols. No target Linux C++ binary is used.
+
+Outputs live in `target/cxx-eh`: `libkumo-cxx-eh.a`, `cxx-eh-smoke`, `link.map`,
+`undefined.txt` and `manifest.json`. The linker fragment must precede the
+canonical relibc script so its frame records are consumed first. Assertions
+reject empty unwind tables. relibc still owns TLS, startup and exit registration.
+Link either the EH archive or G7l's archive into one static image, never both.
+
+The three full-UEFI boots check adjusted base-class catches and dynamic casts,
+exact nested cleanup order, rethrow and exception messages, throwing local-static
+initialization/retry, `bad_alloc`, overlapping catches and `exception_ptr` across
+four native pthreads, initialized TLS isolation, and process-exit destructors.
+Separate `noexcept` and uncaught-exception cases must call the installed terminate
+handler and return control to the shell. The positive verdict appears only from
+the exit destructor. Every boot must reach login without a fault in its proof
+window; the existing two pre-proof QEMU board-UART faults remain the sole allowance.
+Logs, executable and input hashes are saved under `build/verification/sh9-b1`.
+
+This is the exception ABI slice, not the full libc++ runtime or a native compiler.
+Streams, filesystem, locale, dynamic loading, dynamic TLS destructors, SMP,
+native rustc/cargo bootstrap and Orange Pi execution remain separate gates.
