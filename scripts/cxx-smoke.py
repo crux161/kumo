@@ -3,6 +3,7 @@
 #j738
 #j740
 #J935_r01_001
+#J940_r06_001
 """Build G7l's C++ runtime and optionally prove it in a disposable full UEFI image."""
 import argparse
 from pathlib import Path
@@ -52,10 +53,11 @@ def stage_image(source, destination, elf, commands=b"dmesg -n 6\nrelibc g7l\nech
     path.with_name("initrd.img.zst").unlink(missing_ok=True)
 
 
-def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", green=GREEN, tag="G7l"):
+def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", green=GREEN, tag="G7l", commands=None):
     work = elf.parent / f"qemu-{time.time_ns()}"
     work.mkdir(parents=True)
-    commands = f"dmesg -n 6\nrelibc {tag.lower()}\necho {tag}-after-launch\n".encode()
+    if commands is None:
+        commands = f"dmesg -n 6\nrelibc {tag.lower()}\necho {tag}-after-launch\n".encode()
     stage_image(image, work / "esp", elf, commands)
     dtb = work / "esp/EFI/KUMO/dtb/qcom/sc8280xp-lenovo-thinkpad-x13s.dtb"
     dtb.parent.mkdir(parents=True, exist_ok=True)

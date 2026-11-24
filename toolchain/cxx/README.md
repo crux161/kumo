@@ -3,6 +3,7 @@
 <!-- j737 -->
 <!-- J936_r02_001 -->
 <!-- J939_r05_001 -->
+<!-- J940_r06_001 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -113,3 +114,27 @@ path iteration under QEMU and on Orange Pi 5 Plus. The path proof does not call 
 syscalls; status, directory iteration, streams, locale, dynamic loading, and native compiler
 acceptance remain separate. Build and run with `python3 toolchain/cxx/build-fs-path.py`
 and `python3 scripts/cxx-fs-path-smoke.py --run`.
+
+
+## SH9-c2: libc++ read-only filesystem status
+
+The opt-in SH9-c2 builder extends the pinned LLVM 22.1.8 source closure with
+`filesystem/operations.cpp` and its exact include dependencies. It proves libc++
+`status`, `exists`, and file-kind mapping against KUMO's existing relibc `stat`
+path: VFS root directory status, the synthetic `/dev/null` character-device
+entry, and `ENOENT`/`not_found` semantics for a missing VFS path. The runner queries the existing VFS root and synthetic device node directly
+through relibc `fstatat`; it needs no mounted-volume grant. It makes no
+filesystem changes and adds no VFS/kernel calls.
+
+The upstream operations translation unit also contains unrelated copy support.
+Because this no-locale KUMO target has no `sendfile`, the builder generates a
+private header declaration only so that translation unit can compile; the
+status smoke links with section garbage collection and asserts no `sendfile`
+reference remains in the final ELF. The status archive is scoped to these
+read-only queries, not the remaining filesystem operations.
+
+```sh
+python3 toolchain/cxx/build-fs-status.py
+python3 scripts/cxx-fs-status-smoke.py --run
+python3 scripts/metal-sh9-c2.py --proof build/verification/r06/sh9-c2/cxx-fs-status-smoke
+```
