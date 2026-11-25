@@ -4511,6 +4511,27 @@
       "git_blob": "6397a94932b6357399357e2f65704abe408fd3ff",
       "sha256": "8e14d2521c70bc1a857fa6e41cd929b44a102a234bfb863e90f05ea0dc86d512",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/system_error.cpp"
-    }},
+    },
+    "libcxx/include/deque": {
+      "git_blob": "890cb78828c698ec75a59df432a8846981531ed1",
+      "sha256": "a459c644e64e6198062401de12a132cf0d1fa4f9861bad0244e2a078d6b8bf90",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/deque"
+    },
+    "libcxx/include/stack": {
+      "git_blob": "537b82210b9d4a08d7d731fa4075f1abd448c5d0",
+      "sha256": "65cd6d258b538c6cfe76a919db81eb332802e6eac20f43d86fabe167da98e613",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/stack"
+    },
+    "libcxx/src/filesystem/directory_entry.cpp": {
+      "git_blob": "152715243906c5187e5ed893b530ca162338d777",
+      "sha256": "31d078ca4c1aa52cb2b7e62697db01658cd2d8273985930f898bfb71608f7194",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/filesystem/directory_entry.cpp"
+    },
+    "libcxx/src/filesystem/directory_iterator.cpp": {
+      "git_blob": "7d00c4933fc3e5e890a3830bbffc6a8e17af4f85",
+      "sha256": "1c1db855e0ac6081eedac45f924e4950a919f9346cfc58428f2fea07b8dcc8f7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/filesystem/directory_iterator.cpp"
+    }
+  },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"
 }

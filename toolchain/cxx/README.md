@@ -1,9 +1,9 @@
 # The measured KUMO C++ runtime — G7l
-<!-- j736 -->
 <!-- j737 -->
 <!-- J936_r02_001 -->
 <!-- J939_r05_001 -->
 <!-- J940_r06_001 -->
+<!-- J941_r07_001 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -137,4 +137,29 @@ read-only queries, not the remaining filesystem operations.
 python3 toolchain/cxx/build-fs-status.py
 python3 scripts/cxx-fs-status-smoke.py --run
 python3 scripts/metal-sh9-c2.py --proof build/verification/r06/sh9-c2/cxx-fs-status-smoke
+```
+
+
+## SH9-c3: libc++ read-only directory iteration
+
+The opt-in SH9-c3 builder adds the pinned LLVM 22.1.8 `filesystem/directory_iterator.cpp` and
+`filesystem/directory_entry.cpp`, plus the `<stack>` and `<deque>` headers the recursive iterator
+needs, and links them over the SH9-c2 status archive. libc++ iterates through relibc's existing
+`opendir`/`readdir`/`closedir` (entry kinds come from `d_type`) and refreshes an entry through
+`stat`. No VFS or kernel call is added.
+
+The `relibc` word grants the process a fatfs session on the RAM FAT image, which it sees as `/`.
+The proof uses the fixtures the image builder always lays down: `/EFI` holds exactly `BOOT`,
+which holds exactly the six-byte `BOOTAA64.EFI`; `/HELLO.TXT` is six bytes. It checks one-level
+iteration with entry kinds and `file_size()`, that the root listing from libc++ is exactly the
+one relibc's own `readdir` gives (each entry once, `.` and `..` skipped), recursive depth and
+`disable_recursion_pending`, and `ENOENT`/`ENOTDIR` through `error_code` and as a thrown
+`filesystem_error`. The builder fails if the ELF links any mutating call (`mkdir`, `unlink`,
+`rename`, `utimensat`, ...). File contents, mutations, `space`, permissions and symlinks are
+still separate gates.
+
+```sh
+python3 toolchain/cxx/build-fs-dir.py
+python3 scripts/cxx-fs-dir-smoke.py --run
+python3 scripts/metal-sh9-c3.py --proof build/verification/r07/sh9-c3/cxx-fs-dir-smoke
 ```
