@@ -1,8 +1,8 @@
-//j894
 //j911
 //j913
 //j922
 //j924
+//J943_r09_001
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -1998,6 +1998,32 @@ pub fn process_exit(code: u64) -> ! {
 )))]
 pub fn process_exit(_code: u64) -> ! {
     crate::exit_hook::run();
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// End only the calling thread. Since SH5 (j873) `process_exit` is a group exit that ends every
+/// sibling, so a thread that finishes before its peers must leave this way. The kernel ends the
+/// whole process when the last live thread leaves, as `ProcessExit(0)`. No user stack is
+/// released: (0, 0) names none. Exit hooks are the process's, so they do not run here.
+/// — TEAL (J943_r09_001)
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
+pub fn thread_exit() -> ! {
+    syscall(Syscall::ThreadExit, 0, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
+pub fn thread_exit() -> ! {
     loop {
         core::hint::spin_loop();
     }

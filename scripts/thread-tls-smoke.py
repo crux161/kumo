@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j640
 #J942_r08_001
+#J943_r09_001
 """Prove AArch64 thread-pointer preservation in the full scheduled UEFI image.
 
 Only a disposable ESP copy's autoexec changes. Two residents share one address space,
@@ -110,22 +111,33 @@ def main():
                 b"equal-priority compute peers made even progress",
                 b"FIFO queue and synchronous completion",
                 b"startup+printf+argv+tls+calloc+file+write+tty+winsize+stdin -> OK",
-                b"sora: VmoCreate SIMD preserved",
+                # Sora's "VmoCreate SIMD preserved" notice is no longer here: a default image
+                # never shows Sora's early lines on the serial, so this smoke could not pass.
+                # graphics-smoke.py asserts it with the verbose image it needs. — TEAL (J943_r09_001)
             ]:
                 assert marker in transcript, f"missing {marker!r}; inspect {serial}"
             before, proof = transcript.split(b"threads: two threads, one address space", 1)
-            # The standing boot tries the board-specific serial service twice on QEMU;
-            # its absent 0x11000000 UART gives a contained external abort before this proof.
-            # Match only those baseline reports; any fault during the proof still fails. — KESTREL
-            early_faults = before.split(b"TOWER (reversed): MICROSERVICE CONTAINED")[1:]
-            assert len(early_faults) in (0, 2), f"unexpected early fault count; inspect {serial}"
-            for fault in early_faults:
-                assert b"cause=FAULT" in fault and b"FAR=0x0000000011000000" in fault, f"unexpected early fault; inspect {serial}"
-                assert b"synchronous external abort on read" in fault, f"unexpected early fault; inspect {serial}"
-            assert before.count(b"TOWER") == len(early_faults), f"unexpected early kernel fault; inspect {serial}"
-            assert b" -> FAIL" not in proof and b"TOWER" not in proof, f"unexpected proof failure; inspect {serial}"
-            print(f"Pre-proof baseline UART external aborts: {len(early_faults)}; no fault during TLS proof")
-            print("Thread TLS UEFI smoke green: fresh zero, futex and timer preservation, real relibc TLS, queues, SIMD, login")
+            # The standing boot tries the board-specific serial service twice on QEMU; its absent
+            # 0x11000000 UART gives a contained external abort. — KESTREL
+            # Those services now start alongside the autoexec, so the two reports can land inside
+            # this proof's window. Match them by signature wherever they fall, and require that
+            # neither victim is the threads or relibc process; any other fault still fails.
+            # — TEAL (J943_r09_001)
+            proof_koids = set(re.findall(rb"(?:threads|relibc): proc koid=0x([0-9a-f]+)", transcript))
+            assert len(proof_koids) == 2, f"missing threads/relibc process koids; inspect {serial}"
+            faults = transcript.split(b"TOWER (reversed): MICROSERVICE CONTAINED")[1:]
+            assert len(faults) in (0, 2), f"unexpected fault count; inspect {serial}"
+            for fault in faults:
+                assert b"cause=FAULT" in fault and b"FAR=0x0000000011000000" in fault, f"unexpected fault; inspect {serial}"
+                assert b"synchronous external abort on read" in fault, f"unexpected fault; inspect {serial}"
+                victim = re.search(rb"victim koid=0x0*([0-9a-f]+)", fault)
+                assert victim, f"fault without a victim; inspect {serial}"
+                assert all(int(victim.group(1), 16) != int(koid, 16) for koid in proof_koids), \
+                    f"the baseline UART fault hit a proof process; inspect {serial}"
+            assert transcript.count(b"TOWER") == len(faults), f"unexpected kernel fault; inspect {serial}"
+            assert b" -> FAIL" not in proof, f"unexpected proof failure; inspect {serial}"
+            print(f"Baseline board-UART external aborts: {len(faults)}, none in a proof process")
+            print("Thread TLS UEFI smoke green: fresh zero, futex and timer preservation, real relibc TLS, queues, deferred work, login")
         finally:
             process.terminate()
             try:

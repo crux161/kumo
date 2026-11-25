@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j497
 //j498
 //j499
 //j500
 //j640
+//J943_r09_001
 
 //! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then work queues.
 //!
@@ -52,6 +52,7 @@ use kumo_abi::Handle;
 use kumo_dispatch::{ConcurrentQueue, Group, Once, Semaphore, SerialQueue, Timeline};
 use kumo_rt::{
     channel_write, clock_get, debug_write, futex_wait, futex_wake, process_exit, sleep_ns, startup,
+    thread_exit,
 };
 
 extern crate alloc;
@@ -906,5 +907,12 @@ extern "C" fn main(
         );
     }
 
-    process_exit(0)
+    // Since SH5 (j873) `process_exit` is a group exit: thread 1 calling it here ended thread 0
+    // in the middle of D4e's 60 ms of deadlines, so the deferred report never printed. Thread 1
+    // leaves alone; thread 0, last out, ends the process. — TEAL (J943_r09_001)
+    if me == 0 {
+        process_exit(0)
+    } else {
+        thread_exit()
+    }
 }
