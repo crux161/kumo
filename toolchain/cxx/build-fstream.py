@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #J942_r08_001
+#J944_r10_001
 """Build the pinned libc++ locale layer and read-only file streams for native KUMO."""
 import argparse
 import hashlib
@@ -45,13 +46,13 @@ def source_dependencies(depfile):
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sysroot", type=Path, default=ROOT / "target/kumo-sysroot")
-    parser.add_argument("--out", type=Path, default=ROOT / "target/cxx-fstream")
-    parser.add_argument("--eh-out", type=Path, default=ROOT / "target/cxx-eh")
-    args = parser.parse_args()
-    sysroot, out, eh_out = args.sysroot.resolve(), args.out.resolve(), args.eh_out.resolve()
+def build(sysroot, out, eh_out, *, units=UNITS, smoke=TOOL / "fstream-smoke.cpp",
+          archive_name="libkumo-cxx-locale.a", elf_name="cxx-fstream-smoke", reached=RELIBC_LOCALE_CALLS,
+          read_only=True, label="SH9-c4 libc++ file streams", scope=None):
+    """Build one localized libc++ slice. SH9-c4 is the defaults; SH9-c5 (build-fs-write.py)
+    adds the filesystem units, requires its mutating calls instead of refusing them, and
+    shares everything else. — TEAL (J944_r10_001)"""
+    sysroot, out, eh_out = sysroot.resolve(), out.resolve(), eh_out.resolve()
     libc = sysroot / "lib/libc.a"
     if not libc.is_file():
         raise RuntimeError(f"missing native relibc sysroot: {libc}")
@@ -97,16 +98,16 @@ def main():
              "-ffreestanding", "-fno-pic", "-fno-pie", "-fno-stack-protector", "-fexceptions", "-frtti",
              "-funwind-tables", "-ffunction-sections", "-fdata-sections"]
     objects, deps = [], []
-    for unit in UNITS:
-        obj, dep = out / f"{unit}.o", out / f"{unit}.d"
+    for unit in units:
+        stem = unit.replace("/", "_")
+        obj, dep = out / f"{stem}.o", out / f"{stem}.d"
         run(["clang++", *flags, "-D_LIBCPP_BUILDING_LIBRARY", "-MD", "-MF", dep,
              "-c", stage / f"libcxx/src/{unit}.cpp", "-o", obj])
         objects.append(obj)
         deps.append(dep)
-    smoke = TOOL / "fstream-smoke.cpp"
     smoke_obj, smoke_dep = out / "smoke.o", out / "smoke.d"
     run(["clang++", *flags, "-MD", "-MF", smoke_dep, "-c", smoke, "-o", smoke_obj])
-    archive = out / "libkumo-cxx-locale.a"
+    archive = out / archive_name
     archive.unlink(missing_ok=True)
     run(["llvm-ar", "rcs", archive, *objects])
     crt = out / "crt0.o"
@@ -114,7 +115,7 @@ def main():
     eh_archive, unwind_archive = eh_out / "libkumo-cxx-eh.a", eh_out / "unwind/libunwind.a"
     if not eh_archive.is_file() or not unwind_archive.is_file():
         raise RuntimeError("SH9-b1 exception and unwind archives were not built")
-    elf = out / "cxx-fstream-smoke"
+    elf = out / elf_name
     link_map = out / "link.map"
     run(["ld.lld", "-static", "--gc-sections", "--eh-frame-hdr", "-z", "noexecstack",
          "-T", TOOL / "eh-sections.ld", "-T", ROOT / "toolchain/relibc/smoke/link.ld",
@@ -123,14 +124,14 @@ def main():
     undefined = run(["llvm-nm", "--undefined-only", elf], capture=True)
     (out / "undefined.txt").write_text(undefined)
     if undefined.strip():
-        raise RuntimeError(f"unresolved symbols in file stream smoke:\n{undefined}")
+        raise RuntimeError(f"unresolved symbols in {label} smoke:\n{undefined}")
     linked = {line.split()[-1] for line in run(["llvm-nm", elf], capture=True).splitlines()
               if line.split()[-2:-1] in (["T"], ["t"])}
-    missing = [name for name in RELIBC_LOCALE_CALLS if name not in linked]
+    missing = [name for name in reached if name not in linked]
     if missing:
         raise RuntimeError(f"the smoke does not reach relibc's {missing}")
-    if MUTATORS & linked:
-        raise RuntimeError(f"file stream smoke links mutating calls: {sorted(MUTATORS & linked)}")
+    if read_only and MUTATORS & linked:
+        raise RuntimeError(f"{label} smoke links mutating calls: {sorted(MUTATORS & linked)}")
 
     inputs = {Path(__file__).resolve(), (TOOL / "build-eh.py").resolve(), smoke.resolve(), lock_path.resolve(),
               (TOOL / "eh-config-site.h").resolve(), (TOOL / "eh-sections.ld").resolve(),
@@ -142,8 +143,8 @@ def main():
     manifest = {
         "llvm_revision": lock["revision"],
         "llvm_ref": lock["ref"],
-        "scope": "libc++ locale layer (classic locale, default rune table) and read-only ifstream over "
-                 "relibc FILE; relibc strtod_l/strtof_l/strtold_l/strftime_l reached; no VFS or kernel calls",
+        "scope": scope or ("libc++ locale layer (classic locale, default rune table) and read-only ifstream over "
+                           "relibc FILE; relibc strtod_l/strtof_l/strtold_l/strftime_l reached; no VFS or kernel calls"),
         "config": "_LIBCPP_HAS_FILESYSTEM 1, _LIBCPP_HAS_LOCALIZATION 1, _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE",
         "clang": run(["clang++", "--version"], capture=True).strip(),
         "inputs_sha256": {str(path): sha(path) for path in sorted(inputs) if path.is_file()},
@@ -152,7 +153,17 @@ def main():
         "elf_bytes": elf.stat().st_size,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"SH9-c4 libc++ file streams compile/link green: {elf}", flush=True)
+    print(f"{label} compile/link green: {elf}", flush=True)
+    return elf
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sysroot", type=Path, default=ROOT / "target/kumo-sysroot")
+    parser.add_argument("--out", type=Path, default=ROOT / "target/cxx-fstream")
+    parser.add_argument("--eh-out", type=Path, default=ROOT / "target/cxx-eh")
+    args = parser.parse_args()
+    build(args.sysroot, args.out, args.eh_out)
 
 
 if __name__ == "__main__":

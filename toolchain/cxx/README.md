@@ -1,9 +1,9 @@
 # The measured KUMO C++ runtime — G7l
-<!-- J936_r02_001 -->
 <!-- J939_r05_001 -->
 <!-- J940_r06_001 -->
 <!-- J941_r07_001 -->
 <!-- J942_r08_001 -->
+<!-- J944_r10_002 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -193,4 +193,32 @@ scripts/relibc-headers.sh
 python3 toolchain/cxx/build-fstream.py
 python3 scripts/cxx-fstream-smoke.py --run
 python3 scripts/metal-sh9-c4.py --proof build/verification/r08/sh9-c4/cxx-fstream-smoke
+```
+
+
+## SH9-c5: libc++ writes
+
+`build-fs-write.py` reuses SH9-c4's localized build (`build-fstream.py`'s `build()`) and adds
+`filesystem/operations.cpp`, `directory_iterator.cpp`, `directory_entry.cpp`, `path.cpp` and
+`filesystem_error.cpp`. With localization on and no `<sys/sendfile.h>`, `copy_file` takes
+libc++'s portable fstream path, so SH9-c2's `sendfile` declaration is not used. The builder
+requires the ELF to reach relibc's `mkdir`, `rename`, `remove`, `truncate`, `openat`,
+`fdopendir` and `unlinkat` (the last three are `remove_all`'s descriptor walk).
+
+The proof works on the RAM FAT image the `relibc` launch is granted, so nothing it writes
+outlives the boot, and builds and removes `/SH9C5` with 8.3 names. It covers
+`create_directory`/`create_directories` (existing and missing parents); `ofstream` write,
+append, truncate and `resize_file`; `copy_file`, its `file_exists` refusal and
+`overwrite_existing`; `equivalent` across two spellings of one FAT name; `rename` and the
+listing after it; and `remove`, the non-empty-directory refusal and `remove_all` (four entries).
+
+`copy_file` and `equivalent` need real `st_dev`/`st_ino`. Before J944_r10_001 relibc reported
+zero for both, so every file was "the same file". The VFS stat and open replies now carry the
+server's file id (FAT short-entry slot, RedoxFS node), which relibc reports as `st_ino`.
+
+```sh
+scripts/relibc-headers.sh
+python3 toolchain/cxx/build-fs-write.py
+python3 scripts/cxx-fs-write-smoke.py --run
+python3 scripts/metal-sh9-c5.py --proof build/verification/r10/sh9-c5/cxx-fs-write-smoke
 ```
