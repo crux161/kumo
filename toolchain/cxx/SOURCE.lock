@@ -4531,6 +4531,196 @@
       "git_blob": "7d00c4933fc3e5e890a3830bbffc6a8e17af4f85",
       "sha256": "1c1db855e0ac6081eedac45f924e4950a919f9346cfc58428f2fea07b8dcc8f7",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/filesystem/directory_iterator.cpp"
+    },
+    "libcxx/include/__ios/fpos.h": {
+      "git_blob": "af114421c839f07f72818cd3fd9317e8dc9ee749",
+      "sha256": "121394697ce2361cefcdd1571977686eae2db8ceef7b5b1b38eba6a403e9d5c0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__ios/fpos.h"
+    },
+    "libcxx/include/__locale_dir/check_grouping.h": {
+      "git_blob": "93e9e404bb5f38dd8e957a56df20ed50fa98b350",
+      "sha256": "f1da1ebf0af45e64f1fb05ca7aa4fc242e1356eb2513287fbbc1220e56e465db",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/check_grouping.h"
+    },
+    "libcxx/include/__locale_dir/get_c_locale.h": {
+      "git_blob": "e8bac9a87095b5ece9c8f81f914e6f4d01ac2309",
+      "sha256": "3d91eb0d528ab084653a6e379f01b6eeff01e461cf59e6607c17f2df845dd0b1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/get_c_locale.h"
+    },
+    "libcxx/include/__locale_dir/locale_base_api.h": {
+      "git_blob": "0474c1db359dea406b4313e22fe12daaf6c61aad",
+      "sha256": "939d2dc9bdf9f5fbb84196368bc63d588542c2e6444fb2587f9db8bb63442a56",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/locale_base_api.h"
+    },
+    "libcxx/include/__locale_dir/locale_base_api/bsd_locale_fallbacks.h": {
+      "git_blob": "8cdbe0cd15051c15e33f347b39da8f63f81fccbb",
+      "sha256": "58fdcdf9f55206bd241fb90163b1d39327401527754b24035d58b3512ab81439",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/locale_base_api/bsd_locale_fallbacks.h"
+    },
+    "libcxx/include/__locale_dir/messages.h": {
+      "git_blob": "686f472840c222226b2e53fa1e3757c47ded8f13",
+      "sha256": "3ccda938cdf60c02a7a045be6768eb075a3befa32e397b28068db9e5aacff817",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/messages.h"
+    },
+    "libcxx/include/__locale_dir/money.h": {
+      "git_blob": "12ba38467d805fc43ea8907ec5e72fde82f2ec2d",
+      "sha256": "90b2871df666917a9584ff02e895a795355bd4b83bc4fca1f4fbb5ce4693e044",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/money.h"
+    },
+    "libcxx/include/__locale_dir/num.h": {
+      "git_blob": "b7ea02e7cb7f7e464182372e4a53cb244dad4381",
+      "sha256": "097863ec394da7e7422c745f348a529ba9bb61718bad824916103c5d14d5d470",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/num.h"
+    },
+    "libcxx/include/__locale_dir/pad_and_output.h": {
+      "git_blob": "bdd4d2856dad69704a66f2282069f4203a6d4065",
+      "sha256": "5590b1ee64889b0636063145f14f1cbc1d1e57c880fd5b3061c3232bb2cb14fc",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/pad_and_output.h"
+    },
+    "libcxx/include/__locale_dir/scan_keyword.h": {
+      "git_blob": "78dd0a46a8ee1a344a8d27421cbb08e0f98f7168",
+      "sha256": "60f94c9eaaae375ac559b0d5130cfeec6aa63b587a1620b6e73bb9c2c1c4ee01",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/scan_keyword.h"
+    },
+    "libcxx/include/__locale_dir/time.h": {
+      "git_blob": "78698e96519186788f7dd831e20228e887057278",
+      "sha256": "963629dd1682423b0f7acc490210b9bb7d31d67c46b9cef4c868b3da90b52490",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/time.h"
+    },
+    "libcxx/include/__locale_dir/wbuffer_convert.h": {
+      "git_blob": "a6818aadf5d0b536da244743ae55b5c8faf89c87",
+      "sha256": "73be26e86222438221cb69cddb52a0efe80a897651b5beeeaf2f8c87209e8d1d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/wbuffer_convert.h"
+    },
+    "libcxx/include/__locale_dir/wstring_convert.h": {
+      "git_blob": "42a56eb8573eaf2b0fe4977d01a4abacc95d2806",
+      "sha256": "e69bb0754715e5fc318273fec9323e4580c91c3a93929e9a1d8e5decb18f0d6f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__locale_dir/wstring_convert.h"
+    },
+    "libcxx/include/__ostream/basic_ostream.h": {
+      "git_blob": "62770be72f98323c204fe9a67646ac59d6276035",
+      "sha256": "af677742af9271da5f6dd602abb379c3c0d773efc4a9aa11f24e690c0e3e71b0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__ostream/basic_ostream.h"
+    },
+    "libcxx/include/__ostream/print.h": {
+      "git_blob": "c5906c41b95b56a99fbbe5d1b4257673007e1ba8",
+      "sha256": "971da176275a3495490538b5aaaba03eed4d3e633d9074a0ccfa67eecbe715a0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__ostream/print.h"
+    },
+    "libcxx/include/__ostream/put_character_sequence.h": {
+      "git_blob": "aa771b34d58b5f80a8944cd158235ebb5ab29973",
+      "sha256": "c7d47009ef4dd9db79ddd2062210cd670d0346f693a30ed53d3555dbf3a8e9a2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__ostream/put_character_sequence.h"
+    },
+    "libcxx/include/__type_traits/is_char_like_type.h": {
+      "git_blob": "ca440b52fcd458f9aed333337eafbce3725830d0",
+      "sha256": "9678bd464b9cc93bc6ce180df711a1400dbe6d7e345cf96cd47dda621ce2612a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/__type_traits/is_char_like_type.h"
+    },
+    "libcxx/include/bitset": {
+      "git_blob": "37253f5722389893fecfa2bb07f0768d5f190e57",
+      "sha256": "d57adf00131d9fd3f40234833bce5529cda33dd112e0834fb5e1fa8ad963588d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/bitset"
+    },
+    "libcxx/include/clocale": {
+      "git_blob": "9ca82fa15be254d1493a12b79afe58240cb5b234",
+      "sha256": "58d3f7630dac6cda5a9dcb997ddc2a14d142058474e9feb0adf5cb54a294e115",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/clocale"
+    },
+    "libcxx/include/codecvt": {
+      "git_blob": "33ade1d298a7e304dcf4588c3864b737331e90b5",
+      "sha256": "8672b00a3602378d69596d3704f49d880e4f6adaf11e7dba8aeb92bb06de5021",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/codecvt"
+    },
+    "libcxx/include/fstream": {
+      "git_blob": "ec7b633b86be40ed3176e9bf5ff04e902422c58d",
+      "sha256": "e3f8994d84e0af37700d64ff5777aacba96ed6594b5b5c3205b6442d7dc4d5f4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/fstream"
+    },
+    "libcxx/include/iomanip": {
+      "git_blob": "d65d66d71659746c94b3c8f034f9aa5098c2c5d9",
+      "sha256": "6f008f5a28a6a6e92247ddb4372f069332189402bc52cd78a4638e761702d249",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/iomanip"
+    },
+    "libcxx/include/ios": {
+      "git_blob": "9cf0aa8998ed1b68448b9c588d11717097a60408",
+      "sha256": "4d9992011bb810183c607c8d44e0d35e42c8a428cc17ddcf66663689aa45cfd4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/ios"
+    },
+    "libcxx/include/istream": {
+      "git_blob": "dfa22e9f3bfb7c7b84f51ade9d50dbd814e03f96",
+      "sha256": "17e8ec74785a793a45b47ce43f133b2f3a3e6b53ecff2d01e8840c9c27f582c7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/istream"
+    },
+    "libcxx/include/locale": {
+      "git_blob": "b50f9c87c7281a101923cdcda5a94bbb6f7169b0",
+      "sha256": "3126595465388c0a5b74b568b2be6ae61a708a915935394e717aab2685543332",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/locale"
+    },
+    "libcxx/include/ostream": {
+      "git_blob": "8ec17b68503f801891c822a18521f3ceda085752",
+      "sha256": "f193fb44780e6aed1fb4cf9da83142fcceb62efc7d4087cd051c117db12fce81",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/ostream"
+    },
+    "libcxx/include/print": {
+      "git_blob": "0ff314c22dcd998772f07dbfe0fd61a617025f37",
+      "sha256": "de084faba36a7e1272152b5518b9a180e464efc19e68d70a28ca26d85bc2d1eb",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/print"
+    },
+    "libcxx/include/sstream": {
+      "git_blob": "a42e8fbc9b72e4f6b7235ca56468877ffa3a5587",
+      "sha256": "cc0e6b91c7f2b52fcaa4941049d7ae67f4eaea14b1ef5f876c8f4f93062a4ceb",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/sstream"
+    },
+    "libcxx/include/streambuf": {
+      "git_blob": "f9dd5b74518fd009f53654074b2ee34306b93105",
+      "sha256": "95e5b3a626a556769d95e6378868caed5631b27b829d7612e8547e8a761a247e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/streambuf"
+    },
+    "libcxx/src/call_once.cpp": {
+      "git_blob": "237969aacbab91c55f1ffac94d7af62ee9960ee0",
+      "sha256": "0b736a909e2f73fb6fcb1d39118addcc46eeff43dbdcce800d130f92608ec02b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/call_once.cpp"
+    },
+    "libcxx/src/fstream.cpp": {
+      "git_blob": "55a4442b9c782224e68c6d464825ecf55ddae0bd",
+      "sha256": "a11eda3d54d0ac6a53c622b1164e1ff1b5369c9aa786bd54e6762082022259fb",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/fstream.cpp"
+    },
+    "libcxx/src/include/sso_allocator.h": {
+      "git_blob": "4e6761c580b5d0482221f12e02e44c00d8543410",
+      "sha256": "f529f1440e67b2ec9519ccc66f45f0efe445e880a34f95705e17ef731e0b6590",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/include/sso_allocator.h"
+    },
+    "libcxx/src/ios.cpp": {
+      "git_blob": "02ce4841187fb67f83e8533fb0f258119ae07b52",
+      "sha256": "1c26a8fe9e565af612953459c6f0f3e4a2a9abde47f76ab5eecff470812c1dfe",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/ios.cpp"
+    },
+    "libcxx/src/ios.instantiations.cpp": {
+      "git_blob": "a8d267f7cfd42d33456967c0af5d2016402acc6c",
+      "sha256": "056091dc3a95f5e6a978fb7c0f4f41dce9affe9d84de16597cc90a008a73f597",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/ios.instantiations.cpp"
+    },
+    "libcxx/src/locale.cpp": {
+      "git_blob": "6be0537735c8fd3de829577642365f951aa0ed53",
+      "sha256": "b9ec1857ae606c0ee3890f755c98b4eb2a73d91b6418aa84d37b1ea33e358304",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/locale.cpp"
+    },
+    "libcxx/src/new_helpers.cpp": {
+      "git_blob": "2119d82b3e00f94063d8010a51037996fbcf35f5",
+      "sha256": "82b6b57506edc48dcbb13eaa5bf533e680167f983a2a2cf85064c003cb8cdb38",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/new_helpers.cpp"
+    },
+    "libcxx/src/ostream.cpp": {
+      "git_blob": "e0f14a8917927bebea6926cc4710dd1e637e61a8",
+      "sha256": "d6d55652b11b601b2b499679a517aa648a4927d37ac80ac219345fbda5bd7420",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/ostream.cpp"
+    },
+    "libcxx/src/std_stream.h": {
+      "git_blob": "772e8b91ae349977d0c820f5db75c8e08892260e",
+      "sha256": "852fcbb090e5729367c1f441a801dbe7351070aecd9e5aa1bb0ff3a151cc3cd6",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/std_stream.h"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

@@ -987,3 +987,120 @@ index 81f2389..092e2d7 100644
      #[cfg(target_os = "redox")]
      unsafe {
          let tcb = thread.tcb_selfref.get().read();
+diff --git a/src/header/stdlib/mod.rs b/src/header/stdlib/mod.rs
+--- a/src/header/stdlib/mod.rs
++++ b/src/header/stdlib/mod.rs
+@@ -16,6 +16,7 @@
+     error::{Errno, ResultExt},
+     fs::File,
+     header::{
++        bits_locale_t::locale_t,
+         ctype,
+         errno::{self, *},
+         fcntl::{O_ACCMODE, O_CLOEXEC, O_CREAT, O_EXCL, O_PATH, O_RDWR, open},
+@@ -1499,8 +1500,31 @@
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn strtof(s: *const c_char, endptr: *mut *mut c_char) -> c_float {
+     strto_float_impl!(c_float, s, endptr)
++}
++
++// KUMO (J942_r08_001): the `_l` forms libc++'s locale layer calls. relibc has only the C
++// locale, so like `strcoll_l` and `isalpha_l` these ignore `loc`. — TEAL
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strtod.html>.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn strtod_l(
++    s: *const c_char,
++    endptr: *mut *mut c_char,
++    _loc: locale_t,
++) -> c_double {
++    unsafe { strtod(s, endptr) }
+ }
+
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strtod.html>.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn strtof_l(
++    s: *const c_char,
++    endptr: *mut *mut c_char,
++    _loc: locale_t,
++) -> c_float {
++    unsafe { strtof(s, endptr) }
++}
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strtol.html>.
+ ///
+ /// Converts the initial portion of the string pointed to by `nptr` to a type
+diff --git a/src/header/stdlib/cbindgen.toml b/src/header/stdlib/cbindgen.toml
+--- a/src/header/stdlib/cbindgen.toml
++++ b/src/header/stdlib/cbindgen.toml
+@@ -16,6 +16,7 @@
+ include_guard = "_RELIBC_STDLIB_H"
+ after_includes = """
+ #include <bits/open-flags.h> // for O_* constants, shared with fcntl.h
++#include <bits/locale-t.h> // for locale_t (strtod_l and friends; KUMO J942_r08_001)
+ """
+ trailer = """
+ #ifndef _RELIBC_STDLIB_EXTRA_H
+@@ -26,6 +27,7 @@
+ #endif
+
+ long double strtold(const char *nptr, char **endptr);
++long double strtold_l(const char *nptr, char **endptr, locale_t loc);
+
+ #ifdef __cplusplus
+ }
+diff --git a/src/c/stdlib.c b/src/c/stdlib.c
+--- a/src/c/stdlib.c
++++ b/src/c/stdlib.c
+@@ -4,6 +4,13 @@
+     return (long double)strtod(nptr, endptr);
+ }
+
++/* KUMO (J942_r08_001): relibc has only the C locale, so the locale is ignored.
++ * locale_t is a pointer; this file includes no headers, hence void *. — TEAL */
++long double strtold_l(const char *nptr, char **endptr, void *loc) {
++    (void)loc;
++    return strtold(nptr, endptr);
++}
++
+ double relibc_ldtod(const long double* val) {
+     return (double)(*val);
+ }
+diff --git a/src/header/time/mod.rs b/src/header/time/mod.rs
+--- a/src/header/time/mod.rs
++++ b/src/header/time/mod.rs
+@@ -6,6 +6,7 @@
+     c_str::{CStr, CString},
+     error::{Errno, ResultExt},
+     header::{
++        bits_locale_t::locale_t,
+         errno::{EFAULT, ENOMEM, EOVERFLOW, ETIMEDOUT},
+         signal::sigevent,
+         stdlib::getenv,
+@@ -519,12 +520,20 @@
+     if ret < maxsize { ret } else { 0 }
+ }
+
+-// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strftime.html>.
+-// TODO: needs locale_t
+-// #[unsafe(no_mangle)]
+-/*pub extern "C" fn strftime_l(s: *mut char, maxsize: size_t, format: *const c_char, timeptr: *const tm, locale: locale_t) -> size_t {
+-    unimplemented!();
+-}*/
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strftime.html>.
++///
++/// KUMO (J942_r08_001): relibc has only the C locale, so `loc` is ignored, as in
++/// `strcoll_l`. — TEAL
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn strftime_l(
++    s: *mut c_char,
++    maxsize: size_t,
++    format: *const c_char,
++    timeptr: *const tm,
++    _loc: locale_t,
++) -> size_t {
++    unsafe { strftime(s, maxsize, format, timeptr) }
++}
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/time.html>.
+ #[unsafe(no_mangle)]

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j640
+#J942_r08_001
 """Prove AArch64 thread-pointer preservation in the full scheduled UEFI image.
 
 Only a disposable ESP copy's autoexec changes. Two residents share one address space,
@@ -35,6 +36,17 @@ def set_autoexec(path):
         out.extend(data)
     assert found, "image has no autoexec"
     path.write_bytes(out)
+    # Since Z1 the image also carries initrd.img.zst, which Nijigumo prefers: left in place,
+    # the edited autoexec never runs and the boot waits out the timeout at login. Drop the
+    # compressed copy and its manifest keys, as cxx-smoke.py does. — TEAL (J942_r08_001)
+    manifest = path.parent / "nijigumo.conf"
+    if manifest.exists():
+        keys = {"initrd_zstd", "initrd_zstd_sha256", "initrd_size"}
+        manifest.write_text("".join(
+            line for line in manifest.read_text().splitlines(keepends=True)
+            if line.partition("=")[0].strip() not in keys
+        ))
+    path.with_name("initrd.img.zst").unlink(missing_ok=True)
 
 
 def main():

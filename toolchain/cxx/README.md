@@ -1,9 +1,9 @@
 # The measured KUMO C++ runtime — G7l
-<!-- j737 -->
 <!-- J936_r02_001 -->
 <!-- J939_r05_001 -->
 <!-- J940_r06_001 -->
 <!-- J941_r07_001 -->
+<!-- J942_r08_001 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -162,4 +162,35 @@ still separate gates.
 python3 toolchain/cxx/build-fs-dir.py
 python3 scripts/cxx-fs-dir-smoke.py --run
 python3 scripts/metal-sh9-c3.py --proof build/verification/r07/sh9-c3/cxx-fs-dir-smoke
+```
+
+
+## SH9-c4: libc++ locale layer and read-only file streams
+
+libc++ provides `<fstream>` only with its locale layer, so SH9-c4 builds a second, opt-in
+configuration: `_LIBCPP_HAS_FILESYSTEM 1`, `_LIBCPP_HAS_LOCALIZATION 1` and
+`_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE` (relibc is not a libc libc++ has a ctype table for).
+`build-fstream.py` adds the pinned `locale.cpp`, `ios.cpp`, `ios.instantiations.cpp`,
+`fstream.cpp`, `ostream.cpp`, `call_once.cpp` and `new_helpers.cpp` with their header closure,
+and links `libkumo-cxx-locale.a` over the SH9-b1 EH archives. The default configuration and
+every earlier archive are unchanged.
+
+For an unrecognised libc, libc++'s locale layer calls `strtof_l`, `strtod_l`, `strtold_l` and
+`strftime_l`. relibc lacked them; `toolchain/relibc/kumo.patch` now adds them, ignoring the
+locale like relibc's existing `_l` calls (relibc has only the C locale). Rebuild the sysroot
+with `scripts/relibc-headers.sh` first. The builder refuses a sysroot without them, and
+refuses an ELF that does not reach all four or that links a mutating call.
+
+The proof reads `/HELLO.TXT` line-wise and through `istreambuf_iterator`; reads
+`/EFI/BOOT/BOOTAA64.EFI` in binary mode with `seekg`/`tellg`, a mid-file read, a full read
+and a read past the end; checks a missing file's failed open and `ios_base::failure`; and
+drives the classic locale's number extraction (`double`, `int`, `float`, `long double`),
+number insertion and `put_time`. Writing streams, wide characters and named locales remain
+separate gates.
+
+```sh
+scripts/relibc-headers.sh
+python3 toolchain/cxx/build-fstream.py
+python3 scripts/cxx-fstream-smoke.py --run
+python3 scripts/metal-sh9-c4.py --proof build/verification/r08/sh9-c4/cxx-fstream-smoke
 ```
