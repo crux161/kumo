@@ -1,8 +1,8 @@
-//j875
 //j877
 //j881
 //j884
 //j897
+//J944_r10_001
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -182,7 +182,11 @@ const VFS_EXISTS: u8 = 0x09;
 const VFS_NOT_EMPTY: u8 = 0x0a;
 const VFS_WOULD_BLOCK: u8 = 0x0b;
 const VFS_NOT_SUPPORTED: u8 = 0x0c;
-const VFS_STAT_REPLY_LEN: usize = 12;
+// J944_r10_001: stat and open replies end in the server's 8-byte file id; the pre-id lengths
+// are still accepted and read as id 0. A nonzero id is reported as st_ino on device VFS_DEV.
+const VFS_STAT_REPLY_LEN: usize = 20;
+const VFS_STAT_REPLY_LEN_V1: usize = 12;
+const VFS_DEV: u64 = 1;
 const VFS_STAT_KIND_FILE: u8 = 0;
 const VFS_STAT_KIND_DIRECTORY: u8 = 1;
 const VFS_LOCK_SH: u8 = 1 << 0;
@@ -192,7 +196,8 @@ const VFS_LOCK_UN: u8 = 1 << 2;
 const LOCK_REQUEST_LEN: usize = 6;
 const VFS_MAX_PATH: usize = 255;
 const VFS_READ_REQUEST_LEN: usize = 17;
-const VFS_OPEN_REPLY_LEN: usize = 13;
+const VFS_OPEN_REPLY_LEN: usize = 21;
+const VFS_OPEN_REPLY_LEN_V1: usize = 13;
 const VFS_WRITE_HEADER_LEN: usize = 15;
 const VFS_WRITE_REPLY_LEN: usize = 5;
 /// The server's inline read payload ceiling, so one reply always fits one buffer.
@@ -320,6 +325,8 @@ enum FdSlot {
         /// Bit 0: O_APPEND (SH3-d2d) — writes start at the recorded end. Carried by
         /// dup and try_clone with the rest of the slot.
         flags: u8,
+        /// The server's id for the file (J944_r10_001): fstat's st_ino. 0 = unknown.
+        ino: u64,
     },
     /// A directory opened with O_DIRECTORY (SH3-d2c): the resolved path this launch's
     /// server lists, plus the entry-index cursor posix_getdents resumes from. getdents
@@ -328,6 +335,8 @@ enum FdSlot {
         path: [u8; VFS_MAX_PATH],
         path_len: u16,
         cursor: u32,
+        /// The server's id for the directory (J944_r10_001): fstat's st_ino. 0 = unknown.
+        ino: u64,
     },
     /// A socket in this process's netstack session; the id names it inside KNS1.
     Socket {
@@ -1800,8 +1809,16 @@ fn vfs_chmod(path: &[u8], mode: mode_t) -> Result<()> {
 /// timestamps stay zero — the wire reply carries none — while kind, mode (synthetic, per
 /// SH3-d), and size are real. `stat::default()` seeds the struct so every field is
 /// written even when the caller's out-pointer is uninitialized. — TIMBERDOODLE
-fn fill_stat(mut buf: Out<'_, stat>, file_type: mode_t, mode: u16, nlink: u64, size: u64) {
+///
+/// J944_r10_001: the reply now carries the server's file id. A nonzero id becomes st_ino on
+/// device VFS_DEV, so st_dev/st_ino name one file, as POSIX requires and libc++'s
+/// `equivalent`/`copy_file` rely on; with all zeros every file was "the same file". — TEAL
+fn fill_stat(mut buf: Out<'_, stat>, file_type: mode_t, mode: u16, nlink: u64, size: u64, ino: u64) {
     let mut st = stat::default();
+    if ino != 0 {
+        st.st_dev = VFS_DEV as _;
+        st.st_ino = ino as _;
+    }
     st.st_mode = file_type | mode_t::from(mode & 0o7777);
     st.st_nlink = nlink as _;
     st.st_size = size as _;
@@ -1817,6 +1834,17 @@ fn fd_slot(fildes: c_int) -> Option<&'static mut FdSlot> {
     }
     // One table, one writer; see `FD_TABLE`.
     unsafe { (&raw mut FD_TABLE).cast::<FdSlot>().add(index).as_mut() }
+}
+
+/// The file id after a reply's pre-id fields, or 0 when the reply ends there (J944_r10_001).
+fn reply_id(reply: &[u8], n: usize, at: usize) -> u64 {
+    if n < at + 8 {
+        return 0;
+    }
+    reply
+        .get(at..at + 8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map_or(0, u64::from_le_bytes)
 }
 
 /// Claim the lowest free descriptor at or above 3, as POSIX requires of `open`.
@@ -3160,40 +3188,40 @@ impl Pal for Sys {
             let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
             match *slot {
                 FdSlot::Closed => return Err(Errno(EBADF)),
-                FdSlot::File { size, .. } => {
-                    fill_stat(buf, 0o100000, 0o644, 1, size); // S_IFREG
+                FdSlot::File { size, ino, .. } => {
+                    fill_stat(buf, 0o100000, 0o644, 1, size, ino); // S_IFREG
                     return Ok(());
                 }
                 FdSlot::Input(_) | FdSlot::Output(_) => {
                     // A granted channel reads as a character device, as POSIX tty/pipe
                     // fstat does.
-                    fill_stat(buf, 0o020000, 0o666, 1, 0); // S_IFCHR
+                    fill_stat(buf, 0o020000, 0o666, 1, 0, 0); // S_IFCHR
                     return Ok(());
                 }
                 FdSlot::Socket { .. } => {
-                    fill_stat(buf, 0o140000, 0o666, 1, 0); // S_IFSOCK
+                    fill_stat(buf, 0o140000, 0o666, 1, 0, 0); // S_IFSOCK
                     return Ok(());
                 }
                 FdSlot::Null => {
                     // j897: Linux's /dev/null is character device 1:3, mode 0666.
-                    fill_stat(buf, 0o020000, 0o666, 1, 0); // S_IFCHR
+                    fill_stat(buf, 0o020000, 0o666, 1, 0, 0); // S_IFCHR
                     return Ok(());
                 }
                 FdSlot::Epoll { .. } => {
                     // An epoll instance is an anonymous inode, as on Linux.
-                    fill_stat(buf, 0o020000, 0o600, 1, 0); // S_IFCHR
+                    fill_stat(buf, 0o020000, 0o600, 1, 0, 0); // S_IFCHR
                     return Ok(());
                 }
-                FdSlot::Dir { .. } => {
+                FdSlot::Dir { ino, .. } => {
                     // The same synthetic directory shape the path branch reports
                     // (SH3-d2c): fdopendir's S_IFDIR gate and stat's nlink ride on it.
-                    fill_stat(buf, 0o040000, 0o755, 2, 0); // S_IFDIR
+                    fill_stat(buf, 0o040000, 0o755, 2, 0, ino); // S_IFDIR
                     return Ok(());
                 }
             }
         };
         if path == DEV_NULL {
-            fill_stat(buf, 0o020000, 0o666, 1, 0); // S_IFCHR (j897)
+            fill_stat(buf, 0o020000, 0o666, 1, 0, 0); // S_IFCHR (j897)
             return Ok(());
         }
         let mut resolved = [0u8; VFS_MAX_PATH];
@@ -3207,7 +3235,7 @@ impl Pal for Sys {
         if reply[0] != VFS_OK {
             return Err(vfs_errno(reply[0]));
         }
-        if n < VFS_STAT_REPLY_LEN {
+        if n < VFS_STAT_REPLY_LEN_V1 {
             return Err(Errno(EIO));
         }
         let kind = reply[1];
@@ -3218,7 +3246,7 @@ impl Pal for Sys {
             VFS_STAT_KIND_FILE => (0o100000, 1),      // S_IFREG
             _ => (0, 0),
         };
-        fill_stat(buf, file_type, mode, nlink, size);
+        fill_stat(buf, file_type, mode, nlink, size, reply_id(&reply, n, VFS_STAT_REPLY_LEN_V1));
         Ok(())
     }
 
@@ -3872,7 +3900,7 @@ impl Pal for Sys {
             if stat_reply[0] != VFS_OK {
                 return Err(vfs_errno(stat_reply[0]));
             }
-            if n < VFS_STAT_REPLY_LEN {
+            if n < VFS_STAT_REPLY_LEN_V1 {
                 return Err(Errno(EIO));
             }
             if stat_reply[1] != VFS_STAT_KIND_DIRECTORY {
@@ -3886,6 +3914,7 @@ impl Pal for Sys {
                     path: dir_path,
                     path_len: path.len() as u16,
                     cursor: 0,
+                    ino: reply_id(&stat_reply, n, VFS_STAT_REPLY_LEN_V1),
                 };
             }
             return Ok(fildes);
@@ -3903,16 +3932,18 @@ impl Pal for Sys {
         if reply[0] != VFS_OK {
             return Err(vfs_errno(reply[0]));
         }
-        if n < VFS_OPEN_REPLY_LEN {
+        if n < VFS_OPEN_REPLY_LEN_V1 {
             return Err(vfs_errno(u8::MAX));
         }
         let handle = u32::from_le_bytes(reply[1..5].try_into().unwrap());
         let size = u64::from_le_bytes(reply[5..13].try_into().unwrap());
+        let ino = reply_id(&reply, n, VFS_OPEN_REPLY_LEN_V1);
         if let Some(slot) = fd_slot(fildes) {
             *slot = FdSlot::File {
                 handle,
                 offset: 0,
                 size,
+                ino,
                 flags: if oflag & O_APPEND != 0 {
                     FD_FILE_APPEND
                 } else {
@@ -3981,6 +4012,7 @@ impl Pal for Sys {
             path,
             path_len,
             cursor,
+            ..
         }) = fd_slot(fildes).map(|slot| *slot)
         else {
             return Err(Errno(EBADF));
@@ -4434,6 +4466,7 @@ impl Pal for Sys {
                 mut offset,
                 mut size,
                 flags,
+                ino,
             }) => {
                 let mut total = 0usize;
                 while total < buf.len() {
@@ -4491,6 +4524,7 @@ impl Pal for Sys {
                         offset,
                         size,
                         flags,
+                        ino,
                     };
                 }
                 Ok(total)

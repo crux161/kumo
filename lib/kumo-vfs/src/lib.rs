@@ -1,9 +1,9 @@
 #![no_std]
-//j865
 //j869
 //j891
 //j924
 //j929
+//J944_r10_001
 
 //! `kumo-vfs` — the wire protocol for KUMO's filesystem servers.
 //!
@@ -127,8 +127,10 @@ pub const LOCK_KNOWN: u8 = LOCK_SH | LOCK_EX | LOCK_UN;
 /// Wire length of a [`Request::Lock`] frame: `op(1) + handle(4) + operation(1)`.
 pub const LOCK_REQUEST_LEN: usize = 6;
 
-/// Wire length of a successful stat reply: `status(1) + kind(1) + mode(2) + size(8)`.
-pub const STAT_REPLY_LEN: usize = 12;
+/// Wire length of a successful stat reply: `status(1) + kind(1) + mode(2) + size(8) + id(8)`.
+pub const STAT_REPLY_LEN: usize = 20;
+/// The shortest stat reply a parser accepts: the pre-id form, read as id 0 (unknown).
+pub const STAT_REPLY_LEN_V1: usize = 12;
 /// Stat kind: a regular file.
 pub const STAT_KIND_FILE: u8 = 0;
 /// Stat kind: a directory.
@@ -175,8 +177,13 @@ pub const READ_VMO_MAX: u32 = 4 * 1024 * 1024;
 /// Wire length of a successful `ReadVmo` reply: `status(1) + count(4)`.
 pub const READ_VMO_REPLY_LEN: usize = 5;
 
-/// Wire length of a successful `Open` reply: `status(1) + handle(4) + size(8)`.
-pub const OPEN_REPLY_LEN: usize = 13;
+/// Wire length of a successful `Open` reply: `status(1) + handle(4) + size(8) + id(8)`.
+///
+/// J944_r10_001: `id` is the server's stable identity for the opened file (see
+/// [`StatReply::id`]), so a client can answer `fstat`'s `st_ino` without another round trip.
+pub const OPEN_REPLY_LEN: usize = 21;
+/// The shortest `Open` reply a parser accepts: the pre-id form, read as id 0 (unknown).
+pub const OPEN_REPLY_LEN_V1: usize = 13;
 /// Wire length of a successful `Write` reply: `status(1) + written(4)`.
 pub const WRITE_REPLY_LEN: usize = 5;
 
@@ -639,12 +646,13 @@ impl<'a> Request<'a> {
     }
 }
 
-/// Encode a successful `Open` reply carrying the new `handle` and the file `size`.
-pub fn encode_open_ok(handle: u32, size: u64) -> [u8; OPEN_REPLY_LEN] {
+/// Encode a successful `Open` reply carrying the new `handle`, the file `size` and its `id`.
+pub fn encode_open_ok(handle: u32, size: u64, id: u64) -> [u8; OPEN_REPLY_LEN] {
     let mut b = [0u8; OPEN_REPLY_LEN];
     b[0] = VFS_OK;
     b[1..5].copy_from_slice(&handle.to_le_bytes());
     b[5..13].copy_from_slice(&size.to_le_bytes());
+    b[13..21].copy_from_slice(&id.to_le_bytes());
     b
 }
 
@@ -779,16 +787,30 @@ pub enum VfsError {
 
 /// Parse an `Open` reply: `(handle, size)` on [`VFS_OK`], else the error status.
 pub fn parse_open_reply(resp: &[u8]) -> Result<(u32, u64), VfsError> {
+    parse_open_reply_id(resp).map(|(handle, size, _)| (handle, size))
+}
+
+/// Parse an `Open` reply with the file's id: `(handle, size, id)`. A pre-id reply
+/// ([`OPEN_REPLY_LEN_V1`] bytes) reads as id 0, which means "unknown".
+pub fn parse_open_reply_id(resp: &[u8]) -> Result<(u32, u64, u64), VfsError> {
     match resp.first() {
         None => Err(VfsError::Empty),
         Some(&VFS_OK) => {
-            let b = resp.get(..OPEN_REPLY_LEN).ok_or(VfsError::Malformed)?;
+            let b = resp.get(..OPEN_REPLY_LEN_V1).ok_or(VfsError::Malformed)?;
             let handle = u32::from_le_bytes(b[1..5].try_into().map_err(|_| VfsError::Malformed)?);
             let size = u64::from_le_bytes(b[5..13].try_into().map_err(|_| VfsError::Malformed)?);
-            Ok((handle, size))
+            let id = trailing_id(resp, OPEN_REPLY_LEN_V1);
+            Ok((handle, size, id))
         }
         Some(&status) => Err(VfsError::Status(status)),
     }
+}
+
+/// The 8-byte id after a reply's pre-id fields, or 0 when the reply ends there.
+fn trailing_id(resp: &[u8], at: usize) -> u64 {
+    resp.get(at..at + 8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map_or(0, u64::from_le_bytes)
 }
 
 /// Interpret a `Read` reply `[status][data…]`: the data slice on [`VFS_OK`], else
@@ -837,13 +859,14 @@ pub fn parse_write_reply(resp: &[u8]) -> Result<u32, VfsError> {
     }
 }
 
-/// Encode a successful stat reply: kind, synthetic POSIX mode, and byte size.
-pub fn encode_stat_ok(kind: u8, mode: u16, size: u64) -> [u8; STAT_REPLY_LEN] {
+/// Encode a successful stat reply: kind, synthetic POSIX mode, byte size, and file id.
+pub fn encode_stat_ok(kind: u8, mode: u16, size: u64, id: u64) -> [u8; STAT_REPLY_LEN] {
     let mut b = [0u8; STAT_REPLY_LEN];
     b[0] = VFS_OK;
     b[1] = kind;
     b[2..4].copy_from_slice(&mode.to_le_bytes());
     b[4..12].copy_from_slice(&size.to_le_bytes());
+    b[12..20].copy_from_slice(&id.to_le_bytes());
     b
 }
 
@@ -853,6 +876,10 @@ pub struct StatReply {
     pub kind: u8,
     pub mode: u16,
     pub size: u64,
+    /// J944_r10_001: the server's stable, nonzero identity for this file on its volume, which
+    /// POSIX clients report as `st_ino`. Two paths with the same id name the same file. 0 means
+    /// the server did not say (a pre-id reply). — TEAL
+    pub id: u64,
 }
 
 /// Parse a stat reply; the kind must be one this protocol defines.
@@ -860,7 +887,7 @@ pub fn parse_stat_reply(resp: &[u8]) -> Result<StatReply, VfsError> {
     match resp.first() {
         None => Err(VfsError::Empty),
         Some(&VFS_OK) => {
-            let b = resp.get(..STAT_REPLY_LEN).ok_or(VfsError::Malformed)?;
+            let b = resp.get(..STAT_REPLY_LEN_V1).ok_or(VfsError::Malformed)?;
             let kind = b[1];
             if kind != STAT_KIND_FILE && kind != STAT_KIND_DIRECTORY {
                 return Err(VfsError::Malformed);
@@ -869,6 +896,7 @@ pub fn parse_stat_reply(resp: &[u8]) -> Result<StatReply, VfsError> {
                 kind,
                 mode: u16::from_le_bytes([b[2], b[3]]),
                 size: u64::from_le_bytes(b[4..12].try_into().map_err(|_| VfsError::Malformed)?),
+                id: trailing_id(resp, STAT_REPLY_LEN_V1),
             })
         }
         Some(&status) => Err(VfsError::Status(status)),
@@ -1039,9 +1067,19 @@ mod tests {
 
     #[test]
     fn open_reply_round_trips() {
-        let reply = encode_open_ok(7, 6);
+        let reply = encode_open_ok(7, 6, 0x0009_0040);
         assert_eq!(reply.len(), OPEN_REPLY_LEN);
         assert_eq!(parse_open_reply(&reply), Ok((7, 6)));
+        assert_eq!(parse_open_reply_id(&reply), Ok((7, 6, 0x0009_0040)));
+        // A pre-id reply still parses; its id reads as unknown.
+        assert_eq!(
+            parse_open_reply_id(&reply[..OPEN_REPLY_LEN_V1]),
+            Ok((7, 6, 0))
+        );
+        assert_eq!(
+            parse_open_reply_id(&reply[..OPEN_REPLY_LEN_V1 - 1]),
+            Err(VfsError::Malformed)
+        );
     }
 
     #[test]
@@ -1218,23 +1256,30 @@ mod tests {
 
     #[test]
     fn stat_reply_round_trips_and_rejects_malformed() {
-        let ok = encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0);
+        let ok = encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0, 1);
         assert_eq!(
             parse_stat_reply(&ok),
             Ok(StatReply {
                 kind: STAT_KIND_DIRECTORY,
                 mode: 0o755,
                 size: 0,
+                id: 1,
             })
         );
-        let file = encode_stat_ok(STAT_KIND_FILE, 0o644, 4096);
+        let file = encode_stat_ok(STAT_KIND_FILE, 0o644, 4096, 0x0009_0040);
         assert_eq!(
             parse_stat_reply(&file),
             Ok(StatReply {
                 kind: STAT_KIND_FILE,
                 mode: 0o644,
                 size: 4096,
+                id: 0x0009_0040,
             })
+        );
+        // A pre-id reply still parses; its id reads as unknown.
+        assert_eq!(
+            parse_stat_reply(&file[..STAT_REPLY_LEN_V1]).map(|stat| stat.id),
+            Ok(0)
         );
         assert_eq!(parse_stat_reply(&[]), Err(VfsError::Empty));
         assert_eq!(parse_stat_reply(&[VFS_OK]), Err(VfsError::Malformed));

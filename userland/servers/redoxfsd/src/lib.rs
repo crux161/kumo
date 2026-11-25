@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //j928
 //j929
+//J944_r10_001
 //! `redoxfsd`, the RedoxFS-backed `kumo-vfs` handler core (SH8-b, PLAN/008 S5/S6).
 //!
 //! It is the mount-scoped `fatfs` server's protocol with RedoxFS underneath. One process
@@ -446,7 +447,8 @@ impl<D: Disk> RedoxServer<D> {
             writable: options & OPEN_WRITE != 0,
         };
         match self.sessions[session].insert(file) {
-            Some(handle) => write_frame(reply, &encode_open_ok(handle, size)),
+            // J944_r10_001: the RedoxFS node id is the file's VFS id (POSIX st_ino).
+            Some(handle) => write_frame(reply, &encode_open_ok(handle, size, u64::from(node))),
             None => write_status(reply, VFS_BAD_HANDLE),
         }
     }
@@ -780,7 +782,10 @@ impl<D: Disk> RedoxServer<D> {
                     STAT_KIND_FILE
                 };
                 let mode = node.data().mode() & Node::MODE_PERM;
-                write_frame(reply, &encode_stat_ok(kind, mode, node.data().size()))
+                write_frame(
+                    reply,
+                    &encode_stat_ok(kind, mode, node.data().size(), u64::from(node.id())),
+                )
             }
             Err(error) => write_status(reply, status_of(error)),
         }

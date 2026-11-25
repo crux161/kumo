@@ -1,9 +1,9 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j891
 //j892
 //j924
 //j925
+//J944_r10_001
 //j929
 
 //! `fatfs` — the FAT-backed vfs handler core.
@@ -821,7 +821,10 @@ fn open<R: SectorReader + SectorWriter>(
     let Some(handle) = open_files.insert(entry, options) else {
         return write_status(reply, VFS_BAD_HANDLE);
     };
-    write_frame(reply, &encode_open_ok(handle, entry.size as u64))
+    write_frame(
+        reply,
+        &encode_open_ok(handle, entry.size as u64, file_id(&entry)),
+    )
 }
 
 fn read<R: SectorReader>(
@@ -1138,6 +1141,20 @@ fn rename<R: SectorReader + SectorWriter>(
 
 /// Stat `path` (SH3): the kind and byte size, with the synthetic POSIX mode FAT
 /// cannot store (0755 for directories, 0644 for files).
+/// The VFS file id of the volume root (J944_r10_001). No short entry can produce it: an entry's
+/// id has its sector in the high bits, and the boot sector (sector 0) holds no entries.
+const ROOT_FILE_ID: u64 = 1;
+
+/// The VFS file id of a resolved entry: its short-entry slot, `(sector << 16) | offset`, the
+/// position Linux vfat also uses for inode numbers. Every spelling of a name resolves to the same
+/// slot, so two paths share an id exactly when they name the same file. A rename moves the
+/// slot, so the id changes with it, as on Linux vfat after a remount. — TEAL (J944_r10_001)
+fn file_id(entry: &DirEntry) -> u64 {
+    entry.location.map_or(0, |location| {
+        (u64::from(location.sector) << 16) | u64::from(location.offset)
+    })
+}
+
 /// A path naming the filesystem root: no components at all (`""`, `"/"`, `"//"`).
 fn is_root_path(path: &[u8]) -> bool {
     !path.iter().any(|&b| b != b'/')
@@ -1152,7 +1169,10 @@ fn stat<R: SectorReader + SectorWriter>(
     // The volume root has no directory entry for resolve_path to find; POSIX stats "/"
     // as a directory. Answer for it directly (SH3-d2a). — TIMBERDOODLE
     if is_root_path(path) {
-        return write_frame(reply, &encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0));
+        return write_frame(
+            reply,
+            &encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0, ROOT_FILE_ID),
+        );
     }
     match volume.resolve_path(io, path) {
         None => write_status(reply, VFS_NOT_FOUND),
@@ -1162,7 +1182,10 @@ fn stat<R: SectorReader + SectorWriter>(
             } else {
                 (STAT_KIND_FILE, 0o644)
             };
-            write_frame(reply, &encode_stat_ok(kind, mode, entry.size as u64))
+            write_frame(
+                reply,
+                &encode_stat_ok(kind, mode, entry.size as u64, file_id(&entry)),
+            )
         }
     }
 }
@@ -1179,7 +1202,10 @@ fn stat_with_modes<R: SectorReader + SectorWriter>(
     // The root has no directory entry and therefore no location key, so its mode is the
     // synthetic default rather than anything a chmod could have recorded.
     if is_root_path(path) {
-        return write_frame(reply, &encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0));
+        return write_frame(
+            reply,
+            &encode_stat_ok(STAT_KIND_DIRECTORY, 0o755, 0, ROOT_FILE_ID),
+        );
     }
     match volume.resolve_path(io, path) {
         None => write_status(reply, VFS_NOT_FOUND),
@@ -1193,7 +1219,10 @@ fn stat_with_modes<R: SectorReader + SectorWriter>(
                 .location
                 .and_then(|location| modes.get(location))
                 .unwrap_or(default_mode);
-            write_frame(reply, &encode_stat_ok(kind, mode, entry.size as u64))
+            write_frame(
+                reply,
+                &encode_stat_ok(kind, mode, entry.size as u64, file_id(&entry)),
+            )
         }
     }
 }
@@ -1420,6 +1449,34 @@ mod tests {
             &mut reply,
         );
         assert_eq!(parse_open_reply(&reply[..n]), Ok((1, 6)));
+    }
+
+    /// J944_r10_001: a file's id is its short-entry slot; open and stat agree on it, distinct
+    /// files differ, every spelling of a name shares it, and the root is 1.
+    #[test]
+    fn file_ids_name_files_by_their_short_entry_slot() {
+        let volume = mounted();
+        let mut table = OpenTable::new();
+        let mut stat_id = |path: &[u8]| {
+            let mut table = OpenTable::new();
+            let request = encode_request(Request::stat(path));
+            let mut reply = [0u8; 64];
+            let n = dispatch(&volume, &mut FixtureDisk, &mut table, &request, &mut reply);
+            kumo_vfs::parse_stat_reply(&reply[..n]).expect("stat").id
+        };
+        // HELLO.TXT and EFI share root sector 96 at offsets 0 and 32; BOOT is sector 98's first.
+        assert_eq!(stat_id(b"/HELLO.TXT"), 96 << 16);
+        assert_eq!(stat_id(b"/EFI"), (96 << 16) | 32);
+        assert_eq!(stat_id(b"/EFI/BOOT"), 98 << 16);
+        assert_eq!(stat_id(b"/"), ROOT_FILE_ID);
+        assert_eq!(stat_id(b"/hello.txt"), stat_id(b"/HELLO.TXT"));
+        let request = encode_request(Request::open(b"/HELLO.TXT"));
+        let mut reply = [0u8; 64];
+        let n = dispatch(&volume, &mut FixtureDisk, &mut table, &request, &mut reply);
+        assert_eq!(
+            kumo_vfs::parse_open_reply_id(&reply[..n]),
+            Ok((1, 6, 96 << 16))
+        );
     }
 
     #[test]

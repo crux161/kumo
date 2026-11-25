@@ -1,5 +1,6 @@
 //j928
 //j929
+//J944_r10_001
 //! Host proofs for redoxfsd's VFS handler, over the drv-blk protocol and a driver with a
 //! volatile write cache (KESTREL's j926 model: only CMD_FLUSH makes bytes stable).
 use super::*;
@@ -306,6 +307,37 @@ fn a_tree_written_through_the_vfs_survives_power_loss_and_remount() {
     );
     assert_eq!(c.status(Request::Rmdir { path: b"/ws" }), VFS_OK);
     assert!(c.list("/").is_empty());
+}
+
+/// J944_r10_001: the VFS file id is the RedoxFS node id. Open and stat agree on it, distinct
+/// files and directories differ, it is never 0, and a rename keeps it (the node moves, not the
+/// file).
+#[test]
+fn file_ids_are_node_ids_and_survive_rename() {
+    let mut server = fresh();
+    let mut c = Client::on(&mut server, 0);
+    assert_eq!(c.status(Request::Mkdir { path: b"/d" }), VFS_OK);
+    let reply = c.call(Request::OpenOptions {
+        path: b"/d/a",
+        options: OPEN_READ | OPEN_WRITE | OPEN_CREATE,
+    });
+    let (_, _, opened) = kumo_vfs::parse_open_reply_id(&reply).expect("open");
+    c.create("/d/b");
+    let a = c.stat("/d/a").expect("stat a").id;
+    let b = c.stat("/d/b").expect("stat b").id;
+    let dir = c.stat("/d").expect("stat d").id;
+    let root = c.stat("/").expect("stat root").id;
+    assert_eq!(opened, a);
+    assert!(a != 0 && b != 0 && dir != 0 && root != 0);
+    assert!(a != b && a != dir && b != dir && dir != root);
+    assert_eq!(
+        c.status(Request::Rename {
+            from: b"/d/a",
+            to: b"/d/c"
+        }),
+        VFS_OK
+    );
+    assert_eq!(c.stat("/d/c").expect("stat c").id, a);
 }
 
 #[test]

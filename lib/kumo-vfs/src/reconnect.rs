@@ -1,4 +1,5 @@
 //j929
+//J944_r10_001
 //! A client session that survives its server's restart (SH8-c, DESIGN/002 §2, DESIGN/010 §3).
 //!
 //! A filesystem server killed mid-request takes its sessions with it, but not the mount's
@@ -25,8 +26,8 @@
 //! [`VFS_IO_ERROR`] once (Linux loses flocks across an NFS server reboot too).
 
 use crate::{
-    encode_open_ok, encode_status, parse_open_reply, Request, MAX_PATH, OPEN_CREATE,
-    VFS_BAD_HANDLE, VFS_EXISTS, VFS_IO_ERROR, VFS_NOT_FOUND, VFS_OK,
+    encode_open_ok, encode_status, parse_open_reply, parse_open_reply_id, Request, MAX_PATH,
+    OPEN_CREATE, VFS_BAD_HANDLE, VFS_EXISTS, VFS_IO_ERROR, VFS_NOT_FOUND, VFS_OK,
 };
 
 /// How a session exchange failed.
@@ -263,7 +264,7 @@ impl<L: SessionLink, const N: usize> Reconnecting<L, N> {
     }
 
     fn opened(&mut self, path: &[u8], options: u8, reply: &mut [u8], len: usize) -> usize {
-        let Ok((server, size)) = parse_open_reply(&reply[..len]) else {
+        let Ok((server, size, id)) = parse_open_reply_id(&reply[..len]) else {
             return len;
         };
         let Some(slot) = self.entries.iter().position(Option::is_none) else {
@@ -285,7 +286,9 @@ impl<L: SessionLink, const N: usize> Reconnecting<L, N> {
             locked: false,
             lock_lost: false,
         });
-        let frame = encode_open_ok(slot as u32 + 1, size);
+        // The client sees its stable slot as the handle, but the file's id is the server's:
+        // it names the file, not the session (J944_r10_001).
+        let frame = encode_open_ok(slot as u32 + 1, size, id);
         let n = frame.len().min(reply.len());
         reply[..n].copy_from_slice(&frame[..n]);
         n
@@ -436,7 +439,7 @@ mod tests {
                         let slot = self.open.iter().position(Option::is_none).unwrap();
                         let server = self.epoch * 100 + slot as u32;
                         self.open[slot] = Some((server, file));
-                        let frame = encode_open_ok(server, 7);
+                        let frame = encode_open_ok(server, 7, 0);
                         reply[..frame.len()].copy_from_slice(&frame);
                         frame.len()
                     }
