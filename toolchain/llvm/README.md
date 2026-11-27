@@ -1,7 +1,8 @@
 <!-- J948_r14_001 -->
 <!-- J949_r15_001 -->
 <!-- J950_r16_001 -->
-# LLVM for native KUMO — Support, Demangle, BinaryFormat and TargetParser
+<!-- J951_r17_001 -->
+# LLVM for native KUMO — bootstrap libraries
 
 The first native bootstrap slice of PLAN/022 SH9. LLVM's `Support` and `Demangle` libraries
 (llvmorg-22.1.8, the same revision as `toolchain/cxx`) are built for `aarch64-unknown-kumo`
@@ -14,9 +15,12 @@ its format, DWARF and metadata helpers. It uses the same revision, libc++ layer,
 SH9-d3 builds all 15 TargetParser units as `libLLVMTargetParser.a`, including four tables generated
 by the matching LLVM 22.1.8 host `llvm-tblgen`. It closes BinaryFormat's TargetParser dependency.
 
+SH9-d4 builds all 36 Object units as `libLLVMObject.a` and proves native ELF and regular GNU
+archive readers. Its general binary/IR factories and writers still need later link components.
+
 ## Sources
 
-`SOURCE.lock` pins the measured closure: 809 files, 21,352,000 bytes. SH9-d1's 467 files hold every Support and
+`SOURCE.lock` pins the measured closure: 1,014 files, 24,685,189 bytes. SH9-d1's 467 files hold every Support and
 Demangle unit; the headers they and the proof include; the Unix layer (`lib/Support/Unix/*.inc`);
 BLAKE3's portable and NEON sources (not its x86 SIMD); `third-party/siphash`; the CMake config
 templates; and `llvm/LICENSE.TXT`, which also covers SipHash. Each file has its git blob ID and
@@ -34,6 +38,10 @@ SH9-d3 adds 274 upstream files (13,796,728 bytes): 15 TargetParser units, their 
 closure and Unix host implementation, the two component/table CMake lists, and 238 TableGen
 inputs. The latter include instruction and intrinsic definitions needed to parse the four
 upstream target descriptions; this does not build IR, CodeGen or an instruction backend.
+
+SH9-d4 adds 205 upstream files (3,333,189 bytes): every Object unit and its CMake recipe, the
+measured headers they require (including MC and IR declarations), and the enum-table recipes
+and definitions those headers include. The libc++ layer gains the pinned `<cinttypes>` header.
 
 ## The KUMO port (`kumo.patch`)
 
@@ -151,5 +159,51 @@ python3 scripts/llvm-targetparser-smoke.py --run
 python3 scripts/metal-sh9-d3.py
 ```
 
-Object, MC, IR and native `llvm-mc`/`lld` remain later slices. LLVM's process-launch integration
+Object's remaining facilities, MC, IR and native `llvm-mc`/`lld` remain later slices. LLVM's process-launch integration
 for driver-style tools and PLAN/014's SMP acceptance gates remain open.
+
+## Object ELF/archive readers (SH9-d4)
+
+`build-object.py` builds Support, Demangle, BinaryFormat, TargetParser and all 36 upstream Object
+units, checked against Object's pinned CMake source list. No new KUMO patch is needed. It links
+`object-smoke.cpp` against the resulting archives, libc++ and relibc with a 4 MiB main stack and
+no undefined symbols. Section garbage collection is enabled for this cut.
+
+Object's complete upstream link set also includes **BitReader, Core, MC, IRReader, MCParser and
+TextAPI**, which this cut leaves unbuilt and records in its manifest. The proof uses
+`ObjectFile::createELFObjectFile` and `Archive::create` directly. The general `createBinary` and
+symbolic-file routes, bitcode, other formats, archive/object writers and disassembly await the
+remaining components. A compiled archive is not a claim that all its entry points can link yet.
+
+The native proof checks:
+
+- ELF64LE AArch64 identity, section kinds and exact text/rodata bytes, BSS size and alignment.
+- Defined/undefined and global symbols, function type, value, size and section association.
+- AArch64 ABS64 relocation type/name, symbol, offset and signed addend.
+- ELF32BE ARM identity and big-endian data reads. Upstream's `getArch()` reports ARM independently
+  of byte order; the typed ELF reader supplies the endian distinction.
+- Truncated ELF headers, section-table bounds and invalid symbol string offsets as errors.
+- GNU archive member iteration, long names, indexed symbol lookup, absent symbols and truncation
+  errors, including parsing both member objects directly.
+- Exact file bytes and ELF/archive parsing through `MemoryBuffer::getFile` on the granted RAM
+  volume; the temporary files are removed.
+
+`make-object-fixtures.py` assembles `object-fixture.S` on the **host** for AArch64 and big-endian
+ARM, creates a deterministic GNU archive and an object with a bad symbol-name offset, and embeds
+the input bytes in a generated header. This tests native reading, not native assembly or linking.
+The runner archives the original object/archive inputs and their producer versions/hashes.
+
+In Object mode, `gen-target-tables.py` also emits the IR attributes, intrinsic enum, runtime
+libcall and CodeGen value-type headers needed to compile Object's sources, using matching
+22.1.8 TableGen and the same pinned-input checks. These are definitions, without building the
+Core/IR or CodeGen libraries. The manifest records the extra table hashes separately; the proof
+runner archives the complete generated include tree. Repeated tables and fixtures are byte-identical.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/llvm-object-smoke.py --run
+python3 scripts/metal-sh9-d4.py
+```
+
+Next: MC and its prerequisites, then the IR components needed to close Object's remaining
+entry points. Native `llvm-mc`/`lld`, LLVM process launching and SMP acceptance remain open.

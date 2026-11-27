@@ -2,6 +2,7 @@
 #J948_r14_001
 #J949_r15_001
 #J950_r16_001
+#J951_r17_001
 """Build LLVM's bootstrap libraries (llvmorg-22.1.8) for native KUMO.
 
 The sources are the measured closure pinned in toolchain/llvm/SOURCE.lock; toolchain/llvm/kumo.patch
@@ -50,19 +51,21 @@ def units(source):
 
 
 def main(component="support"):
-    if component not in ("support", "binaryformat", "targetparser"):
+    if component not in ("support", "binaryformat", "targetparser", "object"):
         raise ValueError(f"unknown LLVM bootstrap component: {component}")
-    targetparser = component == "targetparser"
-    binaryformat = component in ("binaryformat", "targetparser")
+    object_library = component == "object"
+    targetparser = component in ("targetparser", "object")
+    binaryformat = component in ("binaryformat", "targetparser", "object")
+    whole_closure = component == "targetparser"
     tag, label = {"support": ("SH9-d1", "LLVM Support"), "binaryformat": ("SH9-d2", "LLVM BinaryFormat"),
-                  "targetparser": ("SH9-d3", "LLVM TargetParser")}[component]
+                  "targetparser": ("SH9-d3", "LLVM TargetParser"), "object": ("SH9-d4", "LLVM Object")}[component]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sysroot", type=Path, default=ROOT / "target/kumo-sysroot")
     parser.add_argument("--out", type=Path, default=ROOT / f"target/llvm-{component}")
     parser.add_argument("--libcxx-out", type=Path, default=ROOT / "target/cxx-libcxx")
     parser.add_argument("--eh-out", type=Path, default=ROOT / "target/cxx-eh")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
-    parser.add_argument("--tblgen", type=Path, help="LLVM 22.1.8 llvm-tblgen (TargetParser only)")
+    parser.add_argument("--tblgen", type=Path, help="LLVM 22.1.8 llvm-tblgen (TargetParser/Object)")
     args = parser.parse_args()
     sysroot, out = args.sysroot.resolve(), args.out.resolve()
     libcxx_out, eh_out = args.libcxx_out.resolve(), args.eh_out.resolve()
@@ -102,7 +105,9 @@ def main(component="support"):
         shutil.rmtree(generated)
     runpy.run_path(str(TOOL / "gen-config.py"))["generate"](source / "llvm/include/llvm/Config", generated)
     tablegen = (runpy.run_path(str(TOOL / "gen-target-tables.py"))["generate"](
-        source, generated, lock, args.tblgen) if targetparser else None)
+        source, generated, lock, args.tblgen, object_tables=object_library) if targetparser else None)
+    fixtures = (runpy.run_path(str(TOOL / "make-object-fixtures.py"))["generate"](
+        out / "fixtures", generated) if object_library else None)
 
     out.mkdir(parents=True, exist_ok=True)
     common = ["--target=aarch64-unknown-none", f"--sysroot={sysroot}", "-D__kumo__", "-O2", "-ffreestanding",
@@ -126,7 +131,8 @@ def main(component="support"):
 
     support_units, demangle_units = units(source)
     library_units = {"Support": support_units, "Demangle": demangle_units}
-    for name in (["BinaryFormat"] if binaryformat else []) + (["TargetParser"] if targetparser else []):
+    for name in ((["BinaryFormat"] if binaryformat else []) + (["TargetParser"] if targetparser else [])
+                 + (["Object"] if object_library else [])):
         # Keep every unit from each pinned upstream component's source list. — KESTREL
         cmake = source / f"llvm/lib/{name}/CMakeLists.txt"
         names = re.findall(r"^  (\w+\.cpp)$", cmake.read_text(), re.MULTILINE)
@@ -153,8 +159,8 @@ def main(component="support"):
     elf = out / f"llvm-{component}-smoke"
     # Retain every BinaryFormat/TargetParser function to prove the complete link closure. — KESTREL
     link_archives = (["--whole-archive", *archives[2:], "--no-whole-archive", *archives[:2]]
-                     if targetparser else archives)
-    run(["ld.lld", "-static", *([] if targetparser else ["--gc-sections"]), "--eh-frame-hdr", "-z", "noexecstack",
+                     if whole_closure else archives)
+    run(["ld.lld", "-static", *([] if whole_closure else ["--gc-sections"]), "--eh-frame-hdr", "-z", "noexecstack",
          "-T", CXX / "eh-sections.ld", "-T", script, f"-Map={out / 'link.map'}", "-o", elf, crt, smoke_obj,
          "--start-group", *link_archives, layer / "lib/libc++.a", layer / "lib/libc++abi.a",
          layer / "lib/libunwind.a", libc, "--end-group"])
@@ -180,15 +186,22 @@ def main(component="support"):
             elif any(path.is_relative_to(root) for root in resource_roots):
                 resource_inputs[str(path)] = sha(path)
 
+    unbuilt = ["TargetParser"] if binaryformat and not targetparser else []
+    if object_library:
+        cmake = (source / "llvm/lib/Object/CMakeLists.txt").read_text()
+        links = re.search(r"LINK_COMPONENTS\s+([^)]*)\)", cmake).group(1).split()
+        unbuilt = [name for name in links if name not in library_units]
     manifest = {
         "llvm_revision": lock["revision"],
         "llvm_ref": lock["ref"],
         "scope": f"LLVM {' + '.join(library_units)} for aarch64-unknown-kumo against the installed libc++ layer; "
                  "platform port staged by toolchain/llvm/kumo.patch; config rendered by gen-config.py",
-        "unbuilt_link_components": ["TargetParser"] if binaryformat and not targetparser else [],
-        "whole_archive_components": ["BinaryFormat", "TargetParser"] if targetparser else [],
-        "gc_sections": not targetparser,
+        "unbuilt_link_components": unbuilt,
+        "whole_archive_components": ["BinaryFormat", "TargetParser"] if whole_closure else [],
+        "gc_sections": not whole_closure,
+        "proof_scope": "native ELF and archive readers" if object_library else label,
         "tablegen": tablegen,
+        "fixtures": fixtures,
         "units": {name.lower(): len(paths) for name, paths in library_units.items()},
         "source_dependencies": sorted(dependencies),
         "source_closure_files": len(lock["files"]),
@@ -198,9 +211,10 @@ def main(component="support"):
         "compiler_resource_inputs_sha256": dict(sorted(resource_inputs.items())),
         "inputs_sha256": {str(path): sha(path) for path in (
             Path(__file__).resolve(), lock_path, TOOL / "kumo.patch", TOOL / "gen-config.py", smoke,
-            CXX / "build-libcxx.py", libc, layer / "lib/libc++.a", layer / "include/c++/v1/__config_site",
+            CXX / "build-libcxx.py", CXX / "SOURCE.lock", libc, layer / "lib/libc++.a", layer / "include/c++/v1/__config_site",
             *((TOOL / f"build-{component}.py",) if component != "support" else ()),
-            *((TOOL / "gen-target-tables.py",) if targetparser else ()))},
+            *((TOOL / "gen-target-tables.py",) if targetparser else ()),
+            *((TOOL / "make-object-fixtures.py", TOOL / "object-fixture.S") if object_library else ()))},
         "generated_sha256": {str(path.relative_to(generated)): sha(path)
                              for path in sorted(generated.rglob("*")) if path.is_file()},
         "archives_sha256": {path.name: sha(path) for path in archives},

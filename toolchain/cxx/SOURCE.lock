@@ -5996,6 +5996,11 @@
       "git_blob": "a1686bc7c502e7f08a736436f0483cbeb6502b27",
       "sha256": "f69f4fcdd5f099539e618914a15251311cd2137a529d174e4f7eb8fef4878193",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/queue"
+    },
+    "libcxx/include/cinttypes": {
+      "git_blob": "4c7e2c5a5bf38219d8d17eeb69606deaf203009a",
+      "sha256": "1c9774fbea033dcdc57432a65720347debce198d38788b8699621dfbbcc961ed",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/cinttypes"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

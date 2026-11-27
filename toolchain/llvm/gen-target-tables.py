@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #J950_r16_001
-"""Generate TargetParser's four upstream tables with the pinned LLVM TableGen version."""
+#J951_r17_001
+"""Generate bootstrap LLVM tables with the pinned LLVM TableGen version."""
 import hashlib
 import os
 from pathlib import Path
@@ -14,9 +15,15 @@ TABLES = (
     ("RISCV", "RISCV", "riscv-target-def", "RISCVTargetParserDef.inc"),
     ("PowerPC", "PPC", "target-features", "PPCGenTargetFeatures.inc"),
 )
+OBJECT_TABLES = (
+    ("IR/Attributes.td", "attrs", "IR/Attributes.inc"),
+    ("IR/Intrinsics.td", "intrinsic-enums", "IR/IntrinsicEnums.inc"),
+    ("IR/RuntimeLibcalls.td", "runtime-libcalls", "IR/RuntimeLibcalls.inc"),
+    ("CodeGen/ValueTypes.td", "vt", "CodeGen/GenVT.inc"),
+)
 
 
-def generate(source, generated, lock, requested=None):
+def generate(source, generated, lock, requested=None, *, object_tables=False):
     version = lock["ref"].removeprefix("llvmorg-")
     if requested is not None or os.environ.get("LLVM_TBLGEN"):
         candidate = str(requested) if requested is not None else os.environ["LLVM_TBLGEN"]
@@ -35,14 +42,20 @@ def generate(source, generated, lock, requested=None):
     out = generated / "llvm/TargetParser"
     out.mkdir(parents=True, exist_ok=True)
     dependencies = set()
-    for target, entry, action, name in TABLES:
-        td = source / "llvm/lib/Target" / target / (entry + ".td")
+    recipes = [(f"llvm/lib/Target/{target}/{entry}.td", action, f"llvm/TargetParser/{name}")
+               for target, entry, action, name in TABLES]
+    if object_tables:
+        recipes += [("llvm/include/llvm/" + td, action, "llvm/" + dest)
+                    for td, action, dest in OBJECT_TABLES]
+    for primary, action, destination in recipes:
+        td = source / primary
         # LLVM 22's depfile lists includes, omitting the main .td input. — KESTREL
-        primary = str(td.relative_to(source))
         if primary not in lock["files"]:
             raise RuntimeError(f"unpinned TableGen input: {primary}")
         dependencies.add(primary)
-        output, depfile = out / name, out / (name + ".d")
+        output = generated / destination
+        output.parent.mkdir(parents=True, exist_ok=True)
+        depfile = output.with_name(output.name + ".d")
         command = [str(tool), "-gen-" + action, "-I", str(source / "llvm/include"),
                    "-I", str(td.parent), str(td), "-o", str(output), "-d", str(depfile)]
         subprocess.run(command, check=True)
@@ -61,4 +74,7 @@ def generate(source, generated, lock, requested=None):
         "source_dependencies": sorted(dependencies),
         "outputs_sha256": {name: hashlib.sha256((out / name).read_bytes()).hexdigest()
                            for _, _, _, name in TABLES},
+        **({"object_outputs_sha256": {
+            "llvm/" + dest: hashlib.sha256((generated / "llvm" / dest).read_bytes()).hexdigest()
+            for _, _, dest in OBJECT_TABLES}} if object_tables else {}),
     }
