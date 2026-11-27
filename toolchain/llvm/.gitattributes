@@ -1,0 +1,3 @@
+# J948_r14_001: vendor/ holds exact upstream LLVM bytes pinned by SOURCE.lock; their whitespace is
+# upstream's, so whitespace checks do not apply to it. Everything KUMO authors here is still checked.
+vendor/** -whitespace

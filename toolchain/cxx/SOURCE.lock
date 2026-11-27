@@ -5976,6 +5976,26 @@
       "git_blob": "79815aadc7323d5238cad053cb6994b4c1f6fbf6",
       "sha256": "d8f2f3789a7f0ca7282782bc6551008a7c5bfb519ae35b30906a6a6fd0a51d08",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/random.cpp"
+    },
+    "libcxx/include/execution": {
+      "git_blob": "652f38d1c126fe0e0a7e258c4a457e0f53548b67",
+      "sha256": "194233c53af3cb9b301b17bd0688de44fb080a0283394735c889f3ea94bb3dd1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/execution"
+    },
+    "libcxx/include/inttypes.h": {
+      "git_blob": "cd487a8408275ccfdcf05ae00c29b5a42036ffb3",
+      "sha256": "100c664b7d8302c4bcc6368c193f8039a2150c438c3a081dbd7144e64507ad9d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/inttypes.h"
+    },
+    "libcxx/include/list": {
+      "git_blob": "a5c84cad51489a6cb3e90014756a7ec4c652d287",
+      "sha256": "1cc863a5c79bc2e537590cadcf38086fdee2effbcdd50719b39df28ed53be403",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/list"
+    },
+    "libcxx/include/queue": {
+      "git_blob": "a1686bc7c502e7f08a736436f0483cbeb6502b27",
+      "sha256": "f69f4fcdd5f099539e618914a15251311cd2137a529d174e4f7eb8fef4878193",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/queue"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

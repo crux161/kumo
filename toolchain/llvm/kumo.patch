@@ -1,0 +1,94 @@
+diff --git a/llvm/lib/Support/Unix/Path.inc b/llvm/lib/Support/Unix/Path.inc
+--- a/llvm/lib/Support/Unix/Path.inc
++++ b/llvm/lib/Support/Unix/Path.inc
+@@ -130,7 +130,7 @@
+     defined(__CYGWIN__) || defined(__DragonFly__) || defined(_AIX) ||          \
+     defined(__GNU__) ||                                                        \
+     (defined(__sun__) && defined(__svr4__) || defined(__HAIKU__)) ||           \
+-    defined(__managarm__)
++    defined(__managarm__) || defined(__kumo__)
+ static int test_dir(char ret[PATH_MAX], const char *dir, const char *bin) {
+   struct stat sb;
+   char fullpath[PATH_MAX];
+@@ -326,6 +326,12 @@
+       return std::string(real_path);
+     break; // Found entry, but realpath failed.
+   }
++#elif defined(__kumo__)
++  // KUMO (J948_r14_001): no /proc/self/exe and no dladdr; argv[0] (absolute,
++  // relative, or found on PATH) is the executable, as on OpenBSD and Haiku.
++  char exe_path[PATH_MAX];
++  if (getprogpath(exe_path, argv0) != NULL)
++    return exe_path;
+ #elif defined(HAVE_DLOPEN)
+   // Use dladdr to get executable path if available.
+   Dl_info DLInfo;
+@@ -564,6 +570,10 @@
+   // The file system can have an arbitrary structure on z/OS; must go with the
+   // conservative answer.
+   return false;
++#elif defined(__kumo__)
++  // KUMO (J948_r14_001): every volume a process is granted (RAM FAT, USB, NVMe,
++  // RedoxFS) is served by a local filesystem server.
++  return true;
+ #else
+   return !!(STATVFS_F_FLAG(Vfs) & MNT_LOCAL);
+ #endif
+@@ -916,8 +926,9 @@
+   assert(Mode == mapped_file_region::readonly);
+   if (!Mapping)
+     return;
+-#if defined(__MVS__) || defined(_AIX)
++#if defined(__MVS__) || defined(_AIX) || defined(__kumo__)
+     // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
++    // KUMO (J948_r14_001): VMO mappings take no paging hints.
+ #elif defined(POSIX_MADV_DONTNEED)
+   ::posix_madvise(Mapping, Size, POSIX_MADV_DONTNEED);
+ #else
+@@ -929,7 +940,7 @@
+   assert(Mode == mapped_file_region::readonly);
+   if (!Mapping)
+     return;
+-#if defined(__MVS__) || defined(_AIX)
++#if defined(__MVS__) || defined(_AIX) || defined(__kumo__)
+   // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
+ #elif defined(POSIX_MADV_WILLNEED)
+   ::posix_madvise(Mapping, Size, POSIX_MADV_WILLNEED);
+diff --git a/llvm/lib/Support/Unix/Program.inc b/llvm/lib/Support/Unix/Program.inc
+--- a/llvm/lib/Support/Unix/Program.inc
++++ b/llvm/lib/Support/Unix/Program.inc
+@@ -336,7 +336,7 @@
+
+ #if defined(_AIX)
+ static pid_t(wait4)(pid_t pid, int *status, int options, struct rusage *usage);
+-#elif !defined(__Fuchsia__)
++#elif !defined(__Fuchsia__) && !defined(__kumo__)
+ using ::wait4;
+ #endif
+
+@@ -408,7 +408,15 @@
+   // Parent process: Wait for the child process to terminate.
+   int status = 0;
+   ProcessInfo WaitResult;
+-#ifndef __Fuchsia__
++#if defined(__kumo__)
++  // KUMO (J948_r14_001): relibc has waitpid but not wait4, and no rusage, so
++  // no ProcessStatistics are reported.
++  if (ProcStat)
++    ProcStat->reset();
++  do {
++    WaitResult.Pid = ::waitpid(ChildPid, &status, WaitPidOptions);
++  } while (WaitUntilTerminates && WaitResult.Pid == -1 && errno == EINTR);
++#elif !defined(__Fuchsia__)
+   rusage Info;
+   if (ProcStat)
+     ProcStat->reset();
+@@ -455,7 +463,7 @@
+     sigaction(SIGALRM, &Old, nullptr);
+   }
+
+-#ifndef __Fuchsia__
++#if !defined(__Fuchsia__) && !defined(__kumo__)
+   if (ProcStat) {
+     std::chrono::microseconds UserT = toDuration(Info.ru_utime);
+     std::chrono::microseconds KernelT = toDuration(Info.ru_stime);
