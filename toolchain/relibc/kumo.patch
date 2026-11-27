@@ -1550,3 +1550,74 @@ diff --git a/src/c/stdlib.c b/src/c/stdlib.c
  long double strtold_l(const char *nptr, char **endptr, void *loc) {
      (void)loc;
      return strtold(nptr, endptr);
+diff --git a/src/header/unistd/mod.rs b/src/header/unistd/mod.rs
+--- a/src/header/unistd/mod.rs
++++ b/src/header/unistd/mod.rs
+@@ -559,9 +559,28 @@
+ }
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getentropy.html>.
+-// #[unsafe(no_mangle)]
+-pub extern "C" fn getentropy(buffer: *mut c_void, length: size_t) -> c_int {
+-    unimplemented!();
++// KUMO (J947_r13_001): exported; upstream left it commented out with the stub.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn getentropy(buffer: *mut c_void, length: size_t) -> c_int {
++    // KUMO (J947_r13_001): upstream was unimplemented!() and panicked. POSIX: at most
++    // GETENTROPY_MAX (256) bytes, filled completely or not at all; EIO when the system has no
++    // entropy to give (KUMO: the kernel CSPRNG was never seeded from firmware). — TEAL
++    const GETENTROPY_MAX: size_t = 256;
++    if length > GETENTROPY_MAX {
++        ERRNO.set(errno::EINVAL);
++        return -1;
++    }
++    if length == 0 {
++        return 0;
++    }
++    let buf = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
++    match Sys::getrandom(buf, 0) {
++        Ok(count) if count == length => 0,
++        Ok(_) | Err(_) => {
++            ERRNO.set(errno::EIO);
++            -1
++        }
++    }
+ }
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/geteuid.html>.
+diff --git a/src/header/sys_random/cbindgen.toml b/src/header/sys_random/cbindgen.toml
+--- a/src/header/sys_random/cbindgen.toml
++++ b/src/header/sys_random/cbindgen.toml
+@@ -2,6 +2,17 @@
+ #include <bits/size-t.h>  // for size_t from sys/types.h
+ #include <bits/ssize-t.h> // for ssize_t from sys/types.h
+ """
++# KUMO (J947_r13_001): getentropy is defined in unistd; declare it here too, as glibc does,
++# because libc++'s getentropy-based random_device includes <sys/random.h> for it.
++trailer = """
++#ifdef __cplusplus
++extern "C" {
++#endif
++int getentropy(void *buffer, size_t length);
++#ifdef __cplusplus
++}
++#endif
++"""
+ include_guard = "_RELIBC_SYS_RANDOM_H"
+ language = "C"
+ no_includes = true
+diff --git a/src/header/sys_random/mod.rs b/src/header/sys_random/mod.rs
+--- a/src/header/sys_random/mod.rs
++++ b/src/header/sys_random/mod.rs
+@@ -22,6 +22,11 @@
+ /// If this bit is set, then random bytes are drawn from the `random` source
+ /// instead of the `urandom` source.
+ pub const GRND_RANDOM: c_uint = 2;
++/// See <https://www.man7.org/linux/man-pages/man2/getrandom.2.html>.
++///
++/// KUMO (J947_r13_001): Linux's value. Return bytes even before the system has entropy; they
++/// are not cryptographically secure until it does (on KUMO: until firmware seeded the kernel).
++pub const GRND_INSECURE: c_uint = 4;
+
+ /// See <https://www.man7.org/linux/man-pages/man2/getrandom.2.html>.
+ ///

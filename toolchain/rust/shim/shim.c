@@ -2,6 +2,7 @@
 // j871
 // j873
 //J935_r01_001
+//J947_r13_001
 // The KUMO std shim: the few C symbols std references that relibc does not provide.
 // Freestanding C, no headers. Everything outside the surface below refuses by name
 // (ENOSYS) rather than pretending.
@@ -22,6 +23,12 @@ typedef unsigned long usize;
 #define SYSCALL_FUTEX_WAIT 28
 #define SYSCALL_FUTEX_WAKE 29
 #define SYSCALL_CLOCK_GET 26
+// J947_r13_001: RandomRead(buf, len, flags) -> (status, count); ShouldWait while unseeded.
+#define SYSCALL_RANDOM_READ 67
+#define RANDOM_READ_MAX 256
+#define KUMO_SHOULD_WAIT 0xfffffffbUL
+#define GRND_INSECURE 4
+#define EIO 5
 
 static long svc2(long n, long a0, long a1) {
     register long x8 __asm__("x8") = n;
@@ -35,9 +42,9 @@ static unsigned long clock_now(void) {
     return (unsigned long)svc2(SYSCALL_CLOCK_GET, 0, 0);
 }
 
-// Non-cryptographic bytes from the monotonic clock plus the output address. KUMO has no
-// kernel entropy object yet (recorded deviation): HashMap seeds are unguessable-ish, not
-// security-grade.
+// Non-cryptographic bytes from the monotonic clock plus the output address. J947_r13_001: used
+// only when the kernel CSPRNG was never seeded (no firmware entropy) and the caller passed
+// GRND_INSECURE, as std's HashMap keys do; everything else reads the kernel generator.
 static unsigned long rng_state;
 static unsigned long rng_next(void) {
     unsigned long s = rng_state;
@@ -83,13 +90,37 @@ long syscall(long n, ...) {
     } else if (n == SYS_GETRANDOM) {
         unsigned char *buf = __builtin_va_arg(ap, unsigned char *);
         usize len = __builtin_va_arg(ap, usize);
-        for (usize i = 0; i < len; ++i) {
-            if (i % 8 == 0) {
-                rng_state = rng_next();
+        unsigned int flags = __builtin_va_arg(ap, unsigned int);
+        usize done = 0;
+        result = 0;
+        while (done < len) {
+            usize take = len - done < RANDOM_READ_MAX ? len - done : RANDOM_READ_MAX;
+            register long x8 __asm__("x8") = SYSCALL_RANDOM_READ;
+            register long x0 __asm__("x0") = (long)(buf + done);
+            register long x1 __asm__("x1") = (long)take;
+            register long x2 __asm__("x2") = 0;
+            __asm__ volatile("svc #0" : "+r"(x0), "+r"(x1) : "r"(x8), "r"(x2) : "memory");
+            if (x0 == 0) {
+                done += (usize)x1;
+            } else if ((unsigned long)x0 == KUMO_SHOULD_WAIT && (flags & GRND_INSECURE)) {
+                for (usize i = done; i < len; ++i) {
+                    if ((i - done) % 8 == 0) {
+                        rng_state = rng_next();
+                    }
+                    buf[i] = (unsigned char)(rng_state >> (((i - done) % 8) * 8));
+                }
+                done = len;
+            } else {
+                result = (unsigned long)x0 == KUMO_SHOULD_WAIT ? -EAGAIN : -EIO;
+                break;
             }
-            buf[i] = (unsigned char)(rng_state >> ((i % 8) * 8));
         }
-        result = (long)len;
+        if (result == 0) {
+            result = (long)len;
+        } else {
+            *__errno_location() = (int)-result;
+            result = -1;
+        }
     }
     __builtin_va_end(ap);
     if (result == -ENOSYS) {

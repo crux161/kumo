@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #J945_r11_001
 #J946_r12_001
+#J947_r13_001
 """Build the complete libc++ (wide characters included) for native KUMO and install it as a sysroot layer."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -17,8 +18,8 @@ TOOL = ROOT / "toolchain/cxx"
 # Every LIBCXX_SOURCES unit for threads + localization + filesystem, as upstream's
 # libcxx/src/CMakeLists.txt lists them, minus what the ABI archive (build-eh.py) already holds
 # (exception, stdexcept, verbose_abort, and libc++abi's operator new/delete in place of new.cpp)
-# and random.cpp: relibc's KUMO getrandom is a clock-seeded xorshift, not an entropy source, so
-# std::random_device stays off (_LIBCPP_HAS_RANDOM_DEVICE 0) until one exists. — TEAL
+# J947_r13_001 (SH9-c8): random.cpp is in. std::random_device reads getentropy, which relibc now
+# answers from the kernel CSPRNG (ChaCha20 keyed from firmware entropy). — TEAL
 UNITS = (
     "algorithm", "any", "bind", "call_once", "charconv", "chrono", "error_category", "expected",
     "filesystem/filesystem_clock", "filesystem/filesystem_error", "filesystem/path", "functional", "hash",
@@ -27,12 +28,14 @@ UNITS = (
     "vector", "atomic", "barrier", "condition_variable_destructor", "condition_variable", "future",
     "mutex_destructor", "mutex", "shared_mutex", "thread", "fstream", "ios", "ios.instantiations",
     "iostream", "locale", "ostream", "regex", "strstream", "filesystem/directory_entry",
-    "filesystem/directory_iterator", "filesystem/operations", "filesystem/int128_builtins",
+    "filesystem/directory_iterator", "filesystem/operations", "filesystem/int128_builtins", "random",
 )
 RELIBC_CALLS = ("strtod_l", "strtof_l", "strtold_l", "strftime_l",
                 # SH9-c7 (J946_r12_001): what wide characters need from relibc.
                 "wcstof", "wcstold", "wcscoll_l", "wcsxfrm_l", "iswctype_l", "towupper_l", "towlower_l",
-                "iswalpha_l", "iswspace_l")
+                "iswalpha_l", "iswspace_l",
+                # SH9-c8 (J947_r13_001): random_device's source.
+                "getentropy", "getrandom")
 MAIN_STACK = 1024 * 1024
 
 
@@ -140,6 +143,11 @@ def main():
     # SH9-c7: wide characters on. relibc now has the wide _l calls, wcstof/wcstold and a sized
     # mbstate_t (kumo.patch, J946_r12_001); LLVM's ConvertUTFWrapper needs std::wstring. — TEAL
     site = site.replace("#define _LIBCPP_HAS_WIDE_CHARACTERS 0", "#define _LIBCPP_HAS_WIDE_CHARACTERS 1")
+    # SH9-c8: random_device over getentropy. __config has no case for this libc and also
+    # defines _LIBCPP_USING_DEV_RANDOM; that only adds an unused descriptor member to
+    # random_device, because random.cpp takes the getentropy branch first. — TEAL
+    site = site.replace("#define _LIBCPP_HAS_RANDOM_DEVICE 0",
+                        "#define _LIBCPP_HAS_RANDOM_DEVICE 1\n#define _LIBCPP_USING_GETENTROPY")
     install = out / "install"
     if install.exists():
         shutil.rmtree(install)
@@ -219,7 +227,7 @@ def main():
                  "include/c++/v1 + lib/{libc++,libc++abi,libunwind}.a; headers are the measured closure",
         "units": list(UNITS),
         "config": "_LIBCPP_HAS_FILESYSTEM 1, _LIBCPP_HAS_LOCALIZATION 1, _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE, "
-                  "_LIBCPP_HAS_WIDE_CHARACTERS 1, _LIBCPP_HAS_RANDOM_DEVICE 0",
+                  "_LIBCPP_HAS_WIDE_CHARACTERS 1, _LIBCPP_HAS_RANDOM_DEVICE 1 (getentropy)",
         "clang": run(["clang++", "--version"], capture=True).strip(),
         "inputs_sha256": {str(path): sha(path) for path in sorted(inputs) if path.is_file()},
         "installed_sha256": {str(path.relative_to(install)): sha(path) for path in sorted(libdir.iterdir())},

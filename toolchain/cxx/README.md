@@ -1,9 +1,9 @@
 # The measured KUMO C++ runtime — G7l
-<!-- J941_r07_001 -->
 <!-- J942_r08_001 -->
 <!-- J944_r10_002 -->
 <!-- J945_r11_001 -->
 <!-- J946_r12_001 -->
+<!-- J947_r13_001 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -236,7 +236,7 @@ include path and `LIBC_NAMESPACE=__llvm_libc_common_utils` as `FindLibcCommonUti
 
 Two facilities are deliberately absent. `std::random_device` (`random.cpp`): relibc's KUMO
 `getrandom` is a clock-seeded xorshift, not an entropy source, so the unit stays off
-(`_LIBCPP_HAS_RANDOM_DEVICE 0`) until a real one exists; the `<random>` engines and
+(`_LIBCPP_HAS_RANDOM_DEVICE 0`) until a real one exists (SH9-c8 added one; see below); the `<random>` engines and
 distributions are header-only and are proven. Wide characters (`_LIBCPP_HAS_WIDE_CHARACTERS 0`):
 enabling them needs `wcscoll_l`, `wcsxfrm_l` and more from relibc, which is SH9-c7. LLVM needs
 `std::wstring` (`ConvertUTFWrapper`). (SH9-c7 turned them on; see below.)
@@ -293,4 +293,42 @@ SH9-c6's narrow proof runs against the wide build too.
 scripts/relibc-headers.sh
 python3 scripts/cxx-libcxx-wide-smoke.py --run
 python3 scripts/metal-sh9-c7.py --proof build/verification/r12/sh9-c7/cxx-libcxx-wide-smoke
+```
+
+
+## SH9-c8: entropy and `std::random_device`
+
+KUMO had no entropy source: relibc's `getrandom`, the Rust std shim's `SYS_getrandom` and the
+persona shim's `getrandom` were all clock-seeded generators. SH9-c8 adds one, as CRUX chose:
+
+- **Seed.** Nijigumo reads 32 bytes from the firmware's `EFI_RNG_PROTOCOL` before
+  ExitBootServices and passes them in BootInfo, which is ABI v4 (`rng_seed`,
+  `FLAG_RNG_SEED_PRESENT`). The Orange Pi's edk2 offers the protocol. On QEMU, edk2 offers it
+  only with `-device virtio-rng-device`.
+- **Kernel generator** (`kernel/src/rng.rs`). ChaCha20 (checked against RFC 8439 and OpenSSL)
+  keyed with SHA-256 over a domain label and the seed, with fast key erasure: every request first
+  replaces the key with keystream it never returns. The kernel takes the seed before the first
+  BootInfo snapshot and zeroes it in every copy it hands on, so no process can read it.
+- **Syscall.** `RandomRead` (67) fills up to 256 bytes for any process. A kernel the firmware gave
+  nothing stays unseeded and answers `ShouldWait`. It never falls back to a clock.
+- **libc.** relibc's `getrandom`, the Rust std shim and the persona shim read the kernel. When the
+  kernel is unseeded they follow Linux's rules before its pool is ready: `GRND_INSECURE` callers
+  (Rust std's `HashMap` keys) still get the old clock bytes, and every other caller gets `EAGAIN`.
+  `getentropy` (upstream was an unexported `unimplemented!()`) now works with POSIX limits and
+  fails with `EIO` when unseeded. It is declared in `<sys/random.h>`, as glibc does, with
+  `GRND_INSECURE` beside it.
+- **libc++.** `random.cpp` is built with `_LIBCPP_HAS_RANDOM_DEVICE 1` and
+  `_LIBCPP_USING_GETENTROPY`. `__config` has no case for this libc and also defines
+  `_LIBCPP_USING_DEV_RANDOM`, which only adds an unused member to `random_device`.
+
+The proof is one ELF booted twice. The seeded boot (with `virtio-rng`) draws 64
+`random_device` values, two `getentropy` buffers and a 1000-byte `getrandom`, and checks
+`getentropy`'s 256-byte limit. The unseeded boot (no RNG device) checks that `random_device`
+throws `EIO`, `getentropy` fails with `EIO`, blocking `getrandom` fails with `EAGAIN`, and
+`GRND_INSECURE` still answers. On the Orange Pi the board's own firmware seeds the kernel.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/cxx-libcxx-random-smoke.py --run
+python3 scripts/metal-sh9-c8.py --proof build/verification/r13/sh9-c8/cxx-libcxx-random-smoke
 ```

@@ -1,8 +1,8 @@
-//j916
 //j917
 //j919
 //j924
 //j925
+//J947_r13_001
 //! SH7-d3c-2: the minimum Linux thread (the ratified SH7-d3 cut, T1).
 //!
 //! **Threads.** A Linux `clone` with musl's pthread flag set becomes a KUMO `ThreadSpawn` in
@@ -782,16 +782,37 @@ pub fn prctl(option: u64, arg: u64) -> i64 {
 /// Bits of state for [`getrandom`]: splitmix64 over the kernel clock.
 static RANDOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Linux `getrandom`. KUMO has no entropy source a user program can read yet, so this is a
-/// splitmix64 stream reseeded from the monotonic clock on every call: unpredictable enough for
-/// HashMap keys (what Rust's runtime asks for), **not** for keys or nonces. Never blocks.
+/// Linux `getrandom`. J947_r13_001: the kernel CSPRNG (`RandomRead`, ChaCha20 keyed from
+/// firmware entropy) answers. A kernel the firmware never seeded refuses; then, as Linux does
+/// before its pool is ready, only `GRND_INSECURE` callers (Rust's HashMap keys) get bytes, from
+/// the splitmix64 clock stream below, which is **not** for keys or nonces; everyone else gets
+/// `EAGAIN`. Never blocks: nothing would ever seed the kernel later. — TEAL
 pub fn getrandom(buf: u64, len: u64, flags: u64) -> i64 {
     // GRND_NONBLOCK 1, GRND_RANDOM 2, GRND_INSECURE 4.
+    const GRND_INSECURE: u64 = 4;
     if flags & !7 != 0 {
         return -errno::EINVAL;
     }
     let len = len.min(i32::MAX as u64);
     let mut done = 0u64;
+    while done < len {
+        let take = (len - done).min(kumo_abi::sys::RANDOM_READ_MAX as u64) as usize;
+        // SAFETY: the caller's buffer, as Linux's getrandom writes it.
+        let chunk = unsafe { core::slice::from_raw_parts_mut((buf + done) as *mut u8, take) };
+        match kumo_rt::random_read(chunk) {
+            Ok(count) => done += count as u64,
+            Err(status) if status == kumo_abi::Errno::ShouldWait.status() => {
+                if flags & GRND_INSECURE == 0 {
+                    return -errno::EAGAIN;
+                }
+                break;
+            }
+            Err(_) => return -errno::EIO,
+        }
+    }
+    if done == len {
+        return len as i64;
+    }
     while done < len {
         let mut z = RANDOM
             .fetch_add(clock_get() | 1, Ordering::Relaxed)

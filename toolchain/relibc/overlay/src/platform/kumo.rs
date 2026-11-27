@@ -1,8 +1,8 @@
-//j877
 //j881
 //j884
 //j897
 //J944_r10_001
+//J947_r13_001
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -54,6 +54,11 @@ const SYSCALL_VMO_READ: u64 = 13;
 const SYSCALL_VMAR_MAP: u64 = 15;
 const SYSCALL_PROCESS_EXIT: u64 = 21;
 const SYSCALL_CLOCK_GET: u64 = 26;
+/// J947_r13_001: RandomRead(buf, len, flags) -> (status, count), at most RANDOM_READ_MAX bytes.
+const SYSCALL_RANDOM_READ: u64 = 67;
+const RANDOM_READ_MAX: usize = 256;
+/// `Errno::ShouldWait` as the kernel returns it: the CSPRNG was never seeded.
+const KUMO_STATUS_SHOULD_WAIT: u64 = (-5i32) as u32 as u64;
 const SYSCALL_FUTEX_WAIT: u64 = 28;
 const SYSCALL_FUTEX_WAKE: u64 = 29;
 const SYSCALL_HANDLE_DUPLICATE: u64 = 1;
@@ -426,6 +431,24 @@ fn syscall4(number: u64, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
         );
     }
     result
+}
+
+/// J947_r13_001 `RandomRead`: fill `buf` from the kernel CSPRNG; returns (status, count).
+fn random_read(buf: &mut [u8]) -> (u64, u64) {
+    let status;
+    let count;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_RANDOM_READ,
+            inlateout("x0") buf.as_mut_ptr() as u64 => status,
+            inlateout("x1") buf.len() as u64 => count,
+            in("x2") 0u64,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status, count)
 }
 
 /// SH5 `ThreadSpawn`: a sibling thread entering `entry` with `sp`; returns (status, koid).
@@ -3546,14 +3569,34 @@ impl Pal for Sys {
     /// KUMO has no entropy object yet (recorded deviation): bytes are mixed from the
     /// monotonic clock and an internal counter, and that is not cryptographic. HashMap
     /// seeding is its consumer today; security-grade randomness is a later concern.
+    /// J947_r13_001: the kernel CSPRNG (ChaCha20 keyed from firmware entropy) answers. A kernel
+    /// the firmware never seeded refuses; then, as Linux before its pool is ready, only
+    /// `GRND_INSECURE` callers (Rust std's HashMap keys) get the clock xorshift below, and every
+    /// other caller gets EAGAIN (nothing would ever seed the kernel later, so it never blocks).
+    /// — TEAL
     fn getrandom(buf: &mut [u8], flags: c_uint) -> Result<usize> {
-        use crate::header::errno::EINVAL;
+        use crate::header::errno::{EAGAIN, EINVAL, EIO};
 
         const GRND_NONBLOCK: c_uint = 1;
         const GRND_INSECURE: c_uint = 4;
         if flags & !(GRND_NONBLOCK | GRND_INSECURE) != 0 {
             return Err(Errno(EINVAL));
         }
+        let mut done = 0;
+        while done < buf.len() {
+            let take = (buf.len() - done).min(RANDOM_READ_MAX);
+            match random_read(&mut buf[done..done + take]) {
+                (0, count) => done += count as usize,
+                (KUMO_STATUS_SHOULD_WAIT, _) if flags & GRND_INSECURE != 0 => break,
+                (KUMO_STATUS_SHOULD_WAIT, _) => return Err(Errno(EAGAIN)),
+                _ => return Err(Errno(EIO)),
+            }
+        }
+        if done == buf.len() {
+            return Ok(done);
+        }
+        let total = buf.len();
+        let buf = &mut buf[done..];
         static STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let mut state = STATE.load(Ordering::Relaxed);
         if state == 0 {
@@ -3572,7 +3615,7 @@ impl Pal for Sys {
             *byte = state as u8;
         }
         STATE.store(state, Ordering::Relaxed);
-        Ok(buf.len())
+        Ok(total)
     }
 
     fn getresgid(

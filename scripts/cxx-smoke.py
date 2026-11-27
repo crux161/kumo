@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j736
 #j738
 #j740
 #J935_r01_001
 #J940_r06_001
+#J947_r13_001
 """Build G7l's C++ runtime and optionally prove it in a disposable full UEFI image."""
 import argparse
 from pathlib import Path
@@ -53,7 +53,10 @@ def stage_image(source, destination, elf, commands=b"dmesg -n 6\nrelibc g7l\nech
     path.with_name("initrd.img.zst").unlink(missing_ok=True)
 
 
-def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", green=GREEN, tag="G7l", commands=None):
+def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", green=GREEN, tag="G7l", commands=None,
+         qemu_args=()):
+    """`qemu_args` adds devices to both QEMU runs, e.g. SH9-c8's `-device virtio-rng-device`, which
+    gives edk2 an EFI_RNG_PROTOCOL and so the kernel CSPRNG its seed (J947_r13_001)."""
     work = elf.parent / f"qemu-{time.time_ns()}"
     work.mkdir(parents=True)
     if commands is None:
@@ -62,7 +65,8 @@ def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", gree
     dtb = work / "esp/EFI/KUMO/dtb/qcom/sc8280xp-lenovo-thinkpad-x13s.dtb"
     dtb.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["qemu-system-aarch64", "-machine", f"virt,gic-version=3,dumpdtb={dtb}",
-                    "-cpu", "cortex-a72", "-m", "512", "-display", "none", "-device", "ramfb", "-net", "none"],
+                    "-cpu", "cortex-a72", "-m", "512", "-display", "none", "-device", "ramfb", "-net", "none",
+                    *qemu_args],
                    capture_output=True, check=True, timeout=15)
     firmware = Path("/opt/homebrew/share/qemu")
     shutil.copyfile(firmware / "edk2-arm-vars.fd", work / "vars.fd")
@@ -76,7 +80,7 @@ def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", gree
             "-serial", f"file:{serial}",
             "-drive", f"if=pflash,format=raw,file={firmware / 'edk2-aarch64-code.fd'},readonly=on",
             "-drive", f"if=pflash,format=raw,file={work / 'vars.fd'}",
-            "-drive", f"file=fat:rw:{work / 'esp'},format=raw,if=virtio", "-net", "none",
+            "-drive", f"file=fat:rw:{work / 'esp'},format=raw,if=virtio", "-net", "none", *qemu_args,
         ], stdout=log, stderr=log)
         try:
             deadline = time.monotonic() + timeout
