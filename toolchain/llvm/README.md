@@ -1,6 +1,7 @@
 <!-- J948_r14_001 -->
 <!-- J949_r15_001 -->
-# LLVM for native KUMO — Support, Demangle and BinaryFormat
+<!-- J950_r16_001 -->
+# LLVM for native KUMO — Support, Demangle, BinaryFormat and TargetParser
 
 The first native bootstrap slice of PLAN/022 SH9. LLVM's `Support` and `Demangle` libraries
 (llvmorg-22.1.8, the same revision as `toolchain/cxx`) are built for `aarch64-unknown-kumo`
@@ -10,9 +11,12 @@ on KUMO.
 SH9-d2 adds all 14 upstream BinaryFormat units as `libLLVMBinaryFormat.a`, with a native proof of
 its format, DWARF and metadata helpers. It uses the same revision, libc++ layer, relibc and port.
 
+SH9-d3 builds all 15 TargetParser units as `libLLVMTargetParser.a`, including four tables generated
+by the matching LLVM 22.1.8 host `llvm-tblgen`. It closes BinaryFormat's TargetParser dependency.
+
 ## Sources
 
-`SOURCE.lock` pins the measured closure: 535 files, about 8 MB. SH9-d1's 467 files hold every Support and
+`SOURCE.lock` pins the measured closure: 809 files, 21,352,000 bytes. SH9-d1's 467 files hold every Support and
 Demangle unit; the headers they and the proof include; the Unix layer (`lib/Support/Unix/*.inc`);
 BLAKE3's portable and NEON sources (not its x86 SIMD); `third-party/siphash`; the CMake config
 templates; and `llvm/LICENSE.TXT`, which also covers SipHash. Each file has its git blob ID and
@@ -25,6 +29,11 @@ The builder checks BinaryFormat's units against that pinned CMake list. Both bui
 LLVM inputs their depfiles measured and reject unpinned LLVM files or host system headers;
 compiler intrinsic headers are allowed only from the C/C++ drivers' resource directories and
 their hashes are recorded separately.
+
+SH9-d3 adds 274 upstream files (13,796,728 bytes): 15 TargetParser units, their measured include
+closure and Unix host implementation, the two component/table CMake lists, and 238 TableGen
+inputs. The latter include instruction and intrinsic definitions needed to parse the four
+upstream target descriptions; this does not build IR, CodeGen or an instruction backend.
 
 ## The KUMO port (`kumo.patch`)
 
@@ -39,6 +48,9 @@ Applied to a staged copy only, so `vendor/` stays upstream. Every hunk is `__kum
 - `Unix/Program.inc` `Wait`: relibc has `waitpid` but not `wait4` or `rusage`, so it waits with
   `waitpid` and reports no `ProcessStatistics`. Spawning still fails cleanly at run time, because
   KUMO has no exec.
+- `TargetParser/Triple.h` and `Triple.cpp`: a KUMO-only `Kumo` OS enum, type-name and exact
+  `kumo` spelling recognition. It is appended after existing OS values, which retain their numbers.
+  Native tools can parse and normalize their own triple and compute its ELF data layout.
 
 ## Configuration (`gen-config.py`)
 
@@ -102,9 +114,42 @@ python3 scripts/llvm-binaryformat-smoke.py --run
 python3 scripts/metal-sh9-d2.py
 ```
 
-BinaryFormat's upstream link components are Support and TargetParser. This slice vendors the
-TargetParser headers, without building that library. The proof exercises helpers that link with
-Support/Demangle alone; entry points that call TargetParser (such as Mach-O CPU selection and
-XCOFF CPU-name normalization) await a native TargetParser. The manifest records that unbuilt
-dependency. Object parsing, MC, IR and native `llvm-mc`/`lld` remain later slices; TargetParser
-must be closed as their prerequisite. Driver-style tools still need a process-launch path.
+BinaryFormat's upstream link components are Support and TargetParser. The SH9-d2 builder/proof
+uses helpers that link with Support/Demangle alone and records TargetParser as unbuilt in that
+configuration. Use SH9-d3 below to build the complete dependency set and exercise Mach-O CPU
+selection and XCOFF CPU-name normalization.
+
+## TargetParser (SH9-d3)
+
+`build-targetparser.py` builds Support, Demangle, BinaryFormat and TargetParser. Its proof links
+both BinaryFormat and TargetParser with `--whole-archive`, without section garbage collection,
+so every function in those archives must resolve. No link components remain unbuilt. It retains
+the same 4 MiB main stack. The native proof checks:
+
+- The KUMO OS enum, triple parsing/normalization, ELF data layout, process/default triples, and
+  upstream's conservative host fallback (`generic` CPU and no detected features).
+- Generated AArch64 architecture/CPU/extension tables and ARM parsing, including invalid names.
+- Generated RISC-V CPU tables, ISA extensions, ABI selection and invalid-ISA errors.
+- Generated PPC features, CPU aliases and X86/LoongArch/CSKY/Xtensa name tables.
+- Subtarget feature lists and bitsets spanning multiple words, and AMDGPU architecture names.
+- BinaryFormat's formerly unresolved dependencies: ARM parsing, triple architecture names and
+  bitness through Mach-O CPU/subtype selection, PPC normalization through XCOFF, plus refusal
+  of a non-Mach-O triple with an `Expected` error.
+
+`gen-target-tables.py` requires `llvm-tblgen` **22.1.8**. An incompatible generator fails before
+emitting headers. Select it with `--tblgen` or `LLVM_TBLGEN`; default discovery checks
+`llvm-tblgen-22`, Homebrew's `llvm@22`, then `llvm-tblgen` on PATH. It generates ARM/AArch64
+architecture tables, RISC-V definitions and PPC target features from the pinned descriptions.
+Every included `.td` and each primary input must be pinned; LLVM 22's depfile omits the primary
+input, so the generator records it explicitly. The manifest records the tool version/hash,
+measured inputs and output hashes. The proof runner archives the generated tables too.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/llvm-targetparser-smoke.py --run
+# Optional: --tblgen /path/to/llvm-22.1.8/bin/llvm-tblgen
+python3 scripts/metal-sh9-d3.py
+```
+
+Object, MC, IR and native `llvm-mc`/`lld` remain later slices. LLVM's process-launch integration
+for driver-style tools and PLAN/014's SMP acceptance gates remain open.

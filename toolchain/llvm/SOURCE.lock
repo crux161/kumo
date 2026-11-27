@@ -2676,6 +2676,1376 @@
       "git_blob": "19d5b9897e47ccee9117c9b778f363ca61415f2f",
       "sha256": "be5924518db6694765893f80f2daf2ce3bd9e48f778380fdb4647c12493632db",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/XCOFF.cpp"
+    },
+    "llvm/include/llvm/ADT/Bitfields.h": {
+      "git_blob": "be9546e9cc4cb8a0616ceb9b0ac97ab3d5f7e998",
+      "sha256": "713b28c6f81869dfde8917b66ee0bc5ac848a9c11ae3bd394b25577dab485f50",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/ADT/Bitfields.h"
+    },
+    "llvm/include/llvm/ADT/Bitset.h": {
+      "git_blob": "3541db49dd974a03d0170ab3fabf363de520d968",
+      "sha256": "22e138def7d7c588a87c24941f296a75bc6d9ca01d015b6f3b59f23fa497aac0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/ADT/Bitset.h"
+    },
+    "llvm/include/llvm/CodeGen/SDNodeProperties.td": {
+      "git_blob": "d32904283a11a91f0c226af250f55a7cab54f310",
+      "sha256": "ad0f08727a4b8831bb6fc92f7c0a8c8e2cbe677d186961ab22298e7f08ae7b2f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/CodeGen/SDNodeProperties.td"
+    },
+    "llvm/include/llvm/CodeGen/ValueTypes.td": {
+      "git_blob": "d7f3c683e2fa2d009e4ca312ca78de3379401eb6",
+      "sha256": "4326364bfd0da0a7db48cca3abf4b8be25365f41ecbd26d666bc57ce274b095d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/CodeGen/ValueTypes.td"
+    },
+    "llvm/include/llvm/IR/Intrinsics.td": {
+      "git_blob": "1c63b4eb905787f9e5c26f018f832e35fcb0c73b",
+      "sha256": "d57c3a1c49b65b823f5894f3d2fb12b3b4267cffac9d52021637c49879bcf300",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/Intrinsics.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsAArch64.td": {
+      "git_blob": "fd56e0e3f9e7b304178c4221ce4f6415d0d5c3f4",
+      "sha256": "0da4c31ebc8caa4a905f310b18970f0664785271bfe454b9211f135e9940b760",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsAArch64.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsAMDGPU.td": {
+      "git_blob": "a8eba9ed126b79db90ad44d3748ef196647d70c9",
+      "sha256": "ce67b4e5e830695433390d65c225fbf8d024dbc0d86457b69bba2163f18a6c39",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsAMDGPU.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsARM.td": {
+      "git_blob": "4f51a3fa0ba72e97b9b0af514d1ca339b5ef1ad6",
+      "sha256": "5c9d58bc436e2a467d2d009b2b05dcfc11c5937a4a0f7c7df69b1a8e4e147d74",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsARM.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsBPF.td": {
+      "git_blob": "d02eaa6d0dff691e5da77bf5c686f9d6a64f31a1",
+      "sha256": "2bebcc163dcc2370af45fb46481af018dd9aa815cbce88f70d5eddcb77a37910",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsBPF.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsDirectX.td": {
+      "git_blob": "6e6eb2d0ece9dbc77ad1cbd77eb2e70f3a9b4c73",
+      "sha256": "74eb8cae5ce22cc6d4bfc69c8d3401bc9869b82999f552f613647eaa463ed21b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsDirectX.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsHexagon.td": {
+      "git_blob": "20ba51ade35a70fc653a95284452d6644dd4f592",
+      "sha256": "a7c0025b55bc41979c6284b63052d0a1fefb4737a5f70f4273cafb3e9c484a54",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsHexagon.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsHexagonDep.td": {
+      "git_blob": "dde4132791f068975efc8f0d07dab8791c25e375",
+      "sha256": "3ca0a27bc851f43b9c3d4fce298eb2853f1d38047a1228fee3231d8fcf3ddaca",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsHexagonDep.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsLoongArch.td": {
+      "git_blob": "1c46965d995fef2562b4aea88b1c20096a5b9198",
+      "sha256": "04a9fbf8c098092bfb03e0c1c61a415a2f6da569307a88ef793e50ad2274b613",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsLoongArch.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsMips.td": {
+      "git_blob": "8d12786d52e126ad68e0d479a1ff5625bc103495",
+      "sha256": "493944047975ec06a4d47b5f95504276125ee21d386f70d180b9bf597f6c0358",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsMips.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsNVVM.td": {
+      "git_blob": "76677d5741eab54b4409f294d33232d2692c72b2",
+      "sha256": "326cf16419161dd8324e0dacb24291a14928b2479f7591d48d20b2c73b2bf411",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsNVVM.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsPowerPC.td": {
+      "git_blob": "446113c4670dd0ae92b575f749ce071b37163719",
+      "sha256": "642e92470a0ba17c00be1582c77e4ced01f508c3ec9aada38b8fffe9dd7b3b42",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsPowerPC.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsRISCV.td": {
+      "git_blob": "9088e5e6a357b6f75cdd928e28285f0514135873",
+      "sha256": "70f84c9f158f7fce51c4d9c02d47eeb4ac58c7895cc0010342d34bbf354f1d88",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsRISCV.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsRISCVXAndes.td": {
+      "git_blob": "9b7c7e7d4c73c2ae4774f0933a1c712fc8d77d79",
+      "sha256": "e92539a3055199ad9b4a6b26f145517195367cf55138d5073b07a7c0675ee62b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsRISCVXAndes.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsRISCVXCV.td": {
+      "git_blob": "465665c838bae02afe5b2e528d5c353776778a68",
+      "sha256": "137a06b4cc07aa5b529eac297a227884dc042813e0a7bc99d6b31299a557c1c4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsRISCVXCV.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsRISCVXMIPS.td": {
+      "git_blob": "d231feb7d661874b86465dd7d6bdbcd0068c7f20",
+      "sha256": "bbc2bc4b0cadd4b4fde5607e9412356fca0f5337f8649f9388f5782a5176638b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsRISCVXMIPS.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsRISCVXTHead.td": {
+      "git_blob": "c851f34a41c7dc04d5db09cebfa3ae1749ba9f86",
+      "sha256": "5b56b8d77c33c81e3cf0e3f356cbdda75ba6a4eebabbc6f3163fe632d62cfa42",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsRISCVXTHead.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsRISCVXsf.td": {
+      "git_blob": "b1bb24e863b3567fea59e8e2d48ff587f6800ee2",
+      "sha256": "92975043545fd053399f5e48df4f877938821e01afb6197fc433496d4c0b7db7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsRISCVXsf.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsSPIRV.td": {
+      "git_blob": "d782d4f5fae0b0caf4874d0f648aab9141c6e173",
+      "sha256": "30756812bb0b6da895cc1ab29d7095c4245f214f5c45f1d638b40316268d9b0e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsSPIRV.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsSystemZ.td": {
+      "git_blob": "38b7463c7b0785938ea04d8506416d291a736c26",
+      "sha256": "b713b46d76392f4ed8508e017cec3d3e8d507f620d35c3fccaab6a9d914623e2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsSystemZ.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsVE.td": {
+      "git_blob": "633bc6603bf231118c43091bed9be425810a1625",
+      "sha256": "e8076e9ae872c06c22a64f33ffa704fb036e4d4ac9cb99aa8f351286ea922ee3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsVE.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsVEVL.gen.td": {
+      "git_blob": "0c44dfb9076548eced0a5cf0fc2a01a7a652fbdf",
+      "sha256": "f6000bb47bb52de73fcb75c1138a2800b7e122130380b8059bca8e3fbff34170",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsVEVL.gen.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsWebAssembly.td": {
+      "git_blob": "c1e4b97e96bc8131c2395bc3b6904a66f0b347e9",
+      "sha256": "fdb09b539cbbcd1ddcf04a72c7396160d8b540de8ecd5af7902ddf64b3dcad81",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsWebAssembly.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsX86.td": {
+      "git_blob": "b75a0485d626370992ca398bcc4b8ede302cc4ad",
+      "sha256": "10442d688dba131af16f36b77e5a03beeb9d39b81d74d9b2187d1b78d6397666",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsX86.td"
+    },
+    "llvm/include/llvm/IR/IntrinsicsXCore.td": {
+      "git_blob": "d2afc3497833c7fd279953f154bde9c8c2143b16",
+      "sha256": "a50108b9a0c53bae9047648ea20a21707582e57bbe0655f79349cd8a7bf1b483",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/IR/IntrinsicsXCore.td"
+    },
+    "llvm/include/llvm/Support/CodeGen.h": {
+      "git_blob": "848796ef574f851fc28451fe9bd4c7e8c9e2ccb8",
+      "sha256": "3e250450cc5c23ea4aa8068e47089b3bb95eb559d3837d739e7da8cb329bb3c8",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Support/CodeGen.h"
+    },
+    "llvm/include/llvm/TableGen/SearchableTable.td": {
+      "git_blob": "f10e1597d8da76ec090aea860ba631ad31825a01",
+      "sha256": "c04c7704c2fed0cbc7fd424c91d713cfc8e64717d534186747a59c960c3f0342",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TableGen/SearchableTable.td"
+    },
+    "llvm/include/llvm/Target/GenericOpcodes.td": {
+      "git_blob": "1b65b8b73527db20eba78f22c6192898519776cf",
+      "sha256": "5f7d5d1f975cef13b24392e7a1a0d570066adb7591e73f434036df0b376cee66",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/GenericOpcodes.td"
+    },
+    "llvm/include/llvm/Target/GlobalISel/Combine.td": {
+      "git_blob": "0ab2d9487a29546e2ad5f20f1fce22ce3ae1c5e8",
+      "sha256": "314789a73aff92b8b76fdf1865357918b4359e233fe6fff97835f8d04350eb9d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/GlobalISel/Combine.td"
+    },
+    "llvm/include/llvm/Target/GlobalISel/RegisterBank.td": {
+      "git_blob": "51578b66b160bb6e6a8fefd82da750dbe163f162",
+      "sha256": "af5273f7166d12eec238225434721587ec040870effdda7acdc42f573e878827",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/GlobalISel/RegisterBank.td"
+    },
+    "llvm/include/llvm/Target/GlobalISel/SelectionDAGCompat.td": {
+      "git_blob": "a69e0897793154188fea1a1138a513d6f2e324ed",
+      "sha256": "85ae52ed97b981c0c6830fa1d7834d938b469bb46fb12f94d745b8f6ee5f7376",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/GlobalISel/SelectionDAGCompat.td"
+    },
+    "llvm/include/llvm/Target/GlobalISel/Target.td": {
+      "git_blob": "dd21efe07741654ca6869edb07082d55a8d0d3cc",
+      "sha256": "5778d968acafc20ab57632bf97d8d9ad2c9553213a78a81deb46505486d2871a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/GlobalISel/Target.td"
+    },
+    "llvm/include/llvm/Target/Target.td": {
+      "git_blob": "315de55b75510a02c759aa63d1c2ad009c8c0f28",
+      "sha256": "148fe04a35d40ada613890e0a81aff54d23db19c55d8b402bcbf50855bfe0d46",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/Target.td"
+    },
+    "llvm/include/llvm/Target/TargetCallingConv.td": {
+      "git_blob": "75d8ae44935b107504eda045685439f71d2ef990",
+      "sha256": "e5da7c15040d7011f9bab47890fa0030b8d0d1140bb6e4972cf39bbb10f3f94b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/TargetCallingConv.td"
+    },
+    "llvm/include/llvm/Target/TargetInstrPredicate.td": {
+      "git_blob": "b5419cb9f3867f072accff85d6da995da303a005",
+      "sha256": "fad4a3643a0df8318095979139756b205d1f6d7237ec0eb59145d2efe9c74143",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/TargetInstrPredicate.td"
+    },
+    "llvm/include/llvm/Target/TargetItinerary.td": {
+      "git_blob": "a432d4e42b61df3eb2f36a2d45299fd4b24df6ba",
+      "sha256": "73a3c6bad33c08e514e4dc441794be0ed28d84bbe6e92eedd0d750e71feee8db",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/TargetItinerary.td"
+    },
+    "llvm/include/llvm/Target/TargetMacroFusion.td": {
+      "git_blob": "3913a6f92015a8cea200f55c3d782499654c0620",
+      "sha256": "a97739d36bd5b57daaee54bd747f2e6ada3da3a101e6ccd442b602261a8e5964",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/TargetMacroFusion.td"
+    },
+    "llvm/include/llvm/Target/TargetPfmCounters.td": {
+      "git_blob": "cfe432a992b71f5863452f192dbc4f3eb7c841a5",
+      "sha256": "0e79bd458e646ae0bc0163c07e608fec94b2c23be61e58b04155d6449fba447a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/TargetPfmCounters.td"
+    },
+    "llvm/include/llvm/Target/TargetSchedule.td": {
+      "git_blob": "c68323389b827a97b7090a7f63778169826cee60",
+      "sha256": "05d2298d785b9c7824392b0021cfc745ef553d00bcec8884e3d2d135cde9177a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/TargetSchedule.td"
+    },
+    "llvm/include/llvm/Target/TargetSelectionDAG.td": {
+      "git_blob": "bcb4500942111369b6e40c6b40dd93836290f864",
+      "sha256": "ad81f0d98689da781639625463f779ca37873c607b624e30cae7fae619617314",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Target/TargetSelectionDAG.td"
+    },
+    "llvm/include/llvm/TargetParser/AArch64CPUFeatures.inc": {
+      "git_blob": "46a45a1e91f65eae9023a6c69166619c302caaa6",
+      "sha256": "bb13ece8b5e26980bc744fad5a298a76cac977da05f729e97715f18aadf11e37",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/AArch64CPUFeatures.inc"
+    },
+    "llvm/include/llvm/TargetParser/AArch64FeatPriorities.inc": {
+      "git_blob": "f0291926bbe756914038bbf70f32eb4e0060b8ad",
+      "sha256": "a2a5ceb32f627c209e4aea72374df1896fc55d1d15137eeae715e355ba0e34b3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/AArch64FeatPriorities.inc"
+    },
+    "llvm/include/llvm/TargetParser/AArch64TargetParser.h": {
+      "git_blob": "224bcaf79412d8c9853d55883fe7b225d233de0a",
+      "sha256": "804e6e77ee0e897740309d5f669514fba5b5fd5625c32b81d037f1e5f43b2fbd",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/AArch64TargetParser.h"
+    },
+    "llvm/include/llvm/TargetParser/CMakeLists.txt": {
+      "git_blob": "3811367be614e5766ac32e8d2a47bcc134007e96",
+      "sha256": "7536d49d6af356ad922ab52e5c0addc154076af9dda76ee4ae961d8f4d99b367",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/CMakeLists.txt"
+    },
+    "llvm/include/llvm/TargetParser/CSKYTargetParser.def": {
+      "git_blob": "c93d6fdf8cce19b56944654fb0da5d48a7afea1e",
+      "sha256": "cd9c9435dabc604995e2e86d23dba4375c06a9e065a3fe1276c94234e1ca569a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/CSKYTargetParser.def"
+    },
+    "llvm/include/llvm/TargetParser/CSKYTargetParser.h": {
+      "git_blob": "8eab03ca01490684f1c27f32d20afc30e70e0af2",
+      "sha256": "4a6dd669c8777037389875b6b5f7be0eab4378b0d45a57b5eb9a6fec8fd009a7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/CSKYTargetParser.h"
+    },
+    "llvm/include/llvm/TargetParser/Host.h": {
+      "git_blob": "b44b9b9a4d06964f88343b992ebc409313081ba5",
+      "sha256": "d7ebbb3ae1369d0a7d3d587cf2a01827991379ba7fe02abb0d8af57bbf770864",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/Host.h"
+    },
+    "llvm/include/llvm/TargetParser/LoongArchTargetParser.def": {
+      "git_blob": "e369b0d0d32fe6e4dc8e12d075fd557cbead9c9a",
+      "sha256": "86c630c2b003b7c1a5b25577d2f1920f8ea8979c08ba5ae359eca69209cd94de",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/LoongArchTargetParser.def"
+    },
+    "llvm/include/llvm/TargetParser/LoongArchTargetParser.h": {
+      "git_blob": "a874fb327bb6c361ed61418c74837ffe71d465ae",
+      "sha256": "2ecda08c865deef842ae813caacdd6d4b2e5fc882929b44c98f32fe981bdf5ac",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/LoongArchTargetParser.h"
+    },
+    "llvm/include/llvm/TargetParser/PPCTargetParser.def": {
+      "git_blob": "da4be3e39f2c7f5ace5af51d4fdfe5f468e91fd2",
+      "sha256": "926cd68460cde9db709a70362bcc141657161af13c4e98afc1f3da0b92a123ab",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/PPCTargetParser.def"
+    },
+    "llvm/include/llvm/TargetParser/RISCVISAInfo.h": {
+      "git_blob": "20dbb60c96ab733f20ddd7368252336d8670a66e",
+      "sha256": "c9d512775821dbcbe6e5b7aeebb8e5d63eed371a4622f87decbd98df24e186d9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/RISCVISAInfo.h"
+    },
+    "llvm/include/llvm/TargetParser/RISCVTargetParser.h": {
+      "git_blob": "0b4c45e445bb60aa2ff6e4c1214ae8648197e85d",
+      "sha256": "a4acb5a2c2bc58079354c496d296efc655549c8a78f34dd9a4165f9f444ed302",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/RISCVTargetParser.h"
+    },
+    "llvm/include/llvm/TargetParser/X86TargetParser.def": {
+      "git_blob": "09592bcea27f416ce015b8b63017a391ee96106f",
+      "sha256": "09167585c48e7b86be538c9bc66f0ceb53a60e0c25cf663e2b0e47e358899c5f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/X86TargetParser.def"
+    },
+    "llvm/include/llvm/TargetParser/X86TargetParser.h": {
+      "git_blob": "46061f9d1fc7d0fedc319740aca36870c57abcab",
+      "sha256": "fe31de74ec93d02230f436d6581ffb99249458b2baedc35eced9a19b3f46f493",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/X86TargetParser.h"
+    },
+    "llvm/include/llvm/TargetParser/XtensaTargetParser.def": {
+      "git_blob": "b0afe6f161770e4da7e146e6a497759ae4a079a1",
+      "sha256": "68505e100e16996f0f1a4c3dece7b6c50860c1b1fbba115f09b767eb68093ee0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/XtensaTargetParser.def"
+    },
+    "llvm/include/llvm/TargetParser/XtensaTargetParser.h": {
+      "git_blob": "41369b1d644995ee38e7415b64f93f49222ad13d",
+      "sha256": "2a39958b561d4e1ea9ea3ad906228e9997b981a3baa62662267f652c2072a94d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/XtensaTargetParser.h"
+    },
+    "llvm/lib/Target/AArch64/AArch64CallingConvention.td": {
+      "git_blob": "e2a79a49a9e9225f0cfcf2eb7e59e1415aeadca9",
+      "sha256": "34df4b920d243d82e318e54bccc6a5334a373829901bb568404838e728483851",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64CallingConvention.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64Combine.td": {
+      "git_blob": "278314792bfb95b63b48662182455e87deda8197",
+      "sha256": "57b5845a357614eb727e5ec5cdc840d2a6378d018d8d8acc3a49afc538edd02d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64Combine.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64FMV.td": {
+      "git_blob": "12939997401ac4bfde1794c7562f4367023aa404",
+      "sha256": "737f980f45ae29e073118531ba71a4c6238f349d8f6ffa1eb1a140b327acb041",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64FMV.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64Features.td": {
+      "git_blob": "4beec8c91067aa0bbff0d056788ea6c2649edf56",
+      "sha256": "c167bd06dee2a484356f7cc20e6a35704f3d330a0342c6ed9b475ab546a850bd",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64Features.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64InstrAtomics.td": {
+      "git_blob": "5d9215dd7123310def81d0eead7668e3b9873808",
+      "sha256": "33aee6f575bcd7aabf2fe1e42bb9ebc9472517cc9227909cfd2c326ab5f73e4d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64InstrAtomics.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64InstrFormats.td": {
+      "git_blob": "ae6f84d9f442074e9bfb24995dd3669cce9fc999",
+      "sha256": "29c44b28962abe68ca35e878ae6966498897dbcfec581f7cde6728558a759c15",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64InstrFormats.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64InstrGISel.td": {
+      "git_blob": "d0c08036e7d411bd01b700cf7d09d1db2f42f046",
+      "sha256": "feaaa963bd119ea2d06b05be4adac10e6b87a8a783b1fa688f13fdd73369f156",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64InstrGISel.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64InstrInfo.td": {
+      "git_blob": "279507c8dba226ddab129307b10b7706ab942cb7",
+      "sha256": "d1a699b11fe3b1c6af33aa603df73193b04f6455cbdbb0f6ee8fe7b4cbf02082",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64InstrInfo.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64PfmCounters.td": {
+      "git_blob": "c7132b40ca2fe33e444126c414e0f39c5be322bc",
+      "sha256": "01497bc614736938c317b01d3bd9679447739a1c5bef173fbee353d20e6a1a6e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64PfmCounters.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64Processors.td": {
+      "git_blob": "6f38673c50e23054520f9f18931bdcbb70a75f61",
+      "sha256": "7de70e67373de0a6920a87355c819750563336c8bd04ffc4ce6783f55f5d0a78",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64Processors.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64RegisterBanks.td": {
+      "git_blob": "2b597b8606921e46acc24f75875789fbb38a59fc",
+      "sha256": "d93404d0d84135b7674b8390c1a20485fe6a912ef120f171ac053fa83d48b4b0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64RegisterBanks.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64RegisterInfo.td": {
+      "git_blob": "cd94a2590c6d2922cd721bca2c8df33ff064dd26",
+      "sha256": "babe84874e40521c4c919e81ccf7a51ef138ece979f8d8c041f1a2de69a6df1c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64RegisterInfo.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SMEInstrInfo.td": {
+      "git_blob": "905eed50dee9a0f00f78e2dffc0b34f5a91b37cd",
+      "sha256": "22232fa7ecb8cc89830d59680b2142f926014963ca86c02afbcb90bae7c69e2c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SMEInstrInfo.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SVEInstrInfo.td": {
+      "git_blob": "d290d73fd0373c0943ac36879ec73ad67c4ab31f",
+      "sha256": "d604a92b6143f0a8b47003ccfa612bffe4f905d38e5f22ac48ff7b4693229e60",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SVEInstrInfo.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedA320.td": {
+      "git_blob": "a3f02303b2df6532ec7e3d6dc7dea540da00bd52",
+      "sha256": "051d7d79813e7ab21031a461b73860ac03f1b7971183155026b5a679b0140274",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedA320.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedA510.td": {
+      "git_blob": "e2e2214dd28ba016ac400e990f5b706cc7c0d982",
+      "sha256": "f4ffa9e51d27b1a7f468051329b46218dbb097c5c206fb3b198e9d3bacc36844",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedA510.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedA53.td": {
+      "git_blob": "66715b9d1db8b99acfc39ee6f7f924dec1c98fe5",
+      "sha256": "2a2acbf9323570813795130911bf3a66fd0bf9677f4461c6312c76ed34cee425",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedA53.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedA55.td": {
+      "git_blob": "cb77be350d12444ffddc426de28d4aff9c79c21b",
+      "sha256": "8dabd6efbdbb44ae5a17c23bc5a7ef6d857b62be8319ad28dd5327ebd63b4b73",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedA55.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedA57.td": {
+      "git_blob": "ebbc3b72b50609e6c385ad74320f22b0a73291b6",
+      "sha256": "d8e41266c007efcdf6b0be574a5455c8f07228ddb9be81efee8e3ca042272d0a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedA57.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedA57WriteRes.td": {
+      "git_blob": "fd16e98bff80519c627d709726c2153719ec751d",
+      "sha256": "5ac91534e8189e2de67e7f06a2b324fc51377294855d8e60af8985cb796e31f3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedA57WriteRes.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedA64FX.td": {
+      "git_blob": "d6fe84a2c9c9b4c031aaddf2ddcb43daa6f6db13",
+      "sha256": "ac591a7a12d6291e2916ab0faaeec3cddbad56e0df2ee83b5af0fd35307ee2b5",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedA64FX.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedAmpere1.td": {
+      "git_blob": "269f4ec5e5fb16266eed65fc4cbf8a337ce74244",
+      "sha256": "2b635846ae4d6e9f67d107df5412772d5c92a2e19aba385b994ab3794a055e88",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedAmpere1.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedAmpere1B.td": {
+      "git_blob": "67f8593f1577a3037ef3186150d62781933d70b3",
+      "sha256": "6d26eb440767ee31f55334bd6115ee92aafcb91ba34d6986a28a189b6ab5933f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedAmpere1B.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedCyclone.td": {
+      "git_blob": "48324654949c06bc963beea73c1fd71436797dfd",
+      "sha256": "9f2becc99d281add938a01f76761aa131628f83b3268404cb1294b6751fe48df",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedCyclone.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedExynosM3.td": {
+      "git_blob": "6fc4ec3ae41b773059b056b201bebb1818396acd",
+      "sha256": "44fda044760ac91ff513ffd84837592a1183aacd5eecdb662e54c2c67d7ea34b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedExynosM3.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedExynosM4.td": {
+      "git_blob": "b75264602dbc1163371b7be039cb72acfd754c05",
+      "sha256": "f10ee6d658f519b76b4b6e6c141b413eab7a9f93a01cdda2704d260d4561dcea",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedExynosM4.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedExynosM5.td": {
+      "git_blob": "6b5a6da76b3a81edaa79a3bf1b3481e049e6a543",
+      "sha256": "c3d1f4ac33c9a9a4eea452461386c5baecee558659a9b22daef0acf6ca5557e1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedExynosM5.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedFalkor.td": {
+      "git_blob": "e9172e82b099d1a2bf71e2e2dc867add68849540",
+      "sha256": "2b3a1c94c1780e08f8941b522100e3d204b6a831717e73db65e32ce24058d0c3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedFalkor.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedFalkorDetails.td": {
+      "git_blob": "375e3652c9e8784e685c8707470c2dc2bd217ae9",
+      "sha256": "c73c1d96f5ba3e03573de51ad24080ec01e781871572fe36416b6b6bfcd8f19c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedFalkorDetails.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedKryo.td": {
+      "git_blob": "258b34c38898cdabf278b9556803656ec03cd21a",
+      "sha256": "385008faf5c7eab66e43fb2f5c150fd2919719b56dcec8809e545879f39ac275",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedKryo.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedKryoDetails.td": {
+      "git_blob": "bc5ad0f8becedabc58fa256d3f096a060f700e96",
+      "sha256": "1c7c03c2240d0cb57f6801ed731eea5957d8be1151d97533dfde9dedf91f5fa1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedKryoDetails.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedNeoverseN1.td": {
+      "git_blob": "80e5bff5abba7acbff81a13f4a6f8968cfefaedb",
+      "sha256": "5e696e7f33537d6ccf507153c8ac76b683374bc1207a8cf298664d7aeb17eb70",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedNeoverseN1.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedNeoverseN2.td": {
+      "git_blob": "b054d07e462791406e6f8f3b310d709180431be5",
+      "sha256": "e539c0bfdcd2c24dfd96957f2042d85d766ce47c305f0504ea0e068e6a35b578",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedNeoverseN2.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedNeoverseN3.td": {
+      "git_blob": "b38ca140fe2c765321f2c8653a7ea06e9acb6173",
+      "sha256": "6f45d09b2df97332f19719a81af1ce2628b3213c936cfd58aaac7fccfef780e6",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedNeoverseN3.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedNeoverseV1.td": {
+      "git_blob": "a279e28cf8da5b9f653b772e78cfc0e1fa4914d3",
+      "sha256": "58236088a84ce8eb37117fb1d4e83ccf097395f3601785054872f5a8a24db037",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedNeoverseV1.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedNeoverseV2.td": {
+      "git_blob": "b718d14db43ba6f6dec3d99ed057b8331ffdc6bd",
+      "sha256": "5d5a83647b216bc90aeb9eadf1aec362ab38f4921b4fe518574457f2d002ec0f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedNeoverseV2.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedNeoverseV3.td": {
+      "git_blob": "308b81cbfa40f37c00868e9fe625f7c905556640",
+      "sha256": "07ac4db6ceed076784129674de732b93ab3ef61bd6c50c410cf2c1dda4630535",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedNeoverseV3.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedNeoverseV3AE.td": {
+      "git_blob": "f64e87902a5f8a0424e46f5fed1df430bc41f90b",
+      "sha256": "cfb42084b9c7472951009f3cbd6728b31b415d686a32a39bb762cbf1f7ca59b1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedNeoverseV3AE.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedOlympus.td": {
+      "git_blob": "ce7f36815a294d4da7712f7223d47189ce70d10c",
+      "sha256": "b1469c9cfd931309c2fec0b39219da73336ca77b57f0832209e44bae3ddbf996",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedOlympus.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedOryon.td": {
+      "git_blob": "435eaf99c617588cd59f5710afb6aec37041c5a1",
+      "sha256": "f769c9cd0edafbe5b782ba1d88582a76c32ee5911f463e9039a619b76572ee17",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedOryon.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedPredExynos.td": {
+      "git_blob": "f68fc3675f89b50c7221c9d9a9426a7bcf7de4e8",
+      "sha256": "084243dd1505777b17b0c3fa879eabb8d04f2d2594099f9310c9c0b445bedfae",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedPredExynos.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedPredNeoverse.td": {
+      "git_blob": "f841e6072d2b4c4c72a2c542340cb1404551e960",
+      "sha256": "3191988452e1cb77260a083b45b413e5bee8149c2e3d576e6db9b29bb165f185",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedPredNeoverse.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedPredicates.td": {
+      "git_blob": "854d3ce564831dba20c6a75c008bd1b26785e2e9",
+      "sha256": "32e90663f47bac985adeed63fc159325644d9a0a89fe4077f60063ee07817104",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedPredicates.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedTSV110.td": {
+      "git_blob": "1c577a25bf7390c081960887e95677fd7f771398",
+      "sha256": "8a914a583346f25ff3c20d752eab08ad5ddb05208130da86ef8b1e15a9f50b39",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedTSV110.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedThunderX.td": {
+      "git_blob": "8df3f56e45738cdc9c939db4031b57d43b3e0ac3",
+      "sha256": "101c75662515cc3bb033ea4a169d58bb92e9e3478aa3e1690ac0c314ae3f3c36",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedThunderX.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedThunderX2T99.td": {
+      "git_blob": "ef4baa3dedff937bc73103b37bf44589d995e927",
+      "sha256": "e21c3c405b317326c0997d58b73e823a53218661b767d68a6bd8f5115eb46cab",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedThunderX2T99.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SchedThunderX3T110.td": {
+      "git_blob": "796bd4b8b5c9ae69e7b12781fba98583309b3887",
+      "sha256": "503661cc8e569d79f25cf0abfe7b424f2465bf1b986bb4be917d2913254674b8",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SchedThunderX3T110.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64Schedule.td": {
+      "git_blob": "b8572c9b457231c2780cc8bb4568271fee4b96b0",
+      "sha256": "82239989e691a5034dad489b33c9ee4086a45e89106c50d9538b1a778dbd09fe",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64Schedule.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64SystemOperands.td": {
+      "git_blob": "cb098751fd74d5f044aecf093025f8aaeb7352c7",
+      "sha256": "bf9cbe68d91d2d202010ce287016c481281dc353a18c54353116f7e7591157e3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64SystemOperands.td"
+    },
+    "llvm/lib/Target/AArch64/SMEInstrFormats.td": {
+      "git_blob": "99836aeed7c0a41cf6e095752649a9f6ee164ba5",
+      "sha256": "2f847da81e3db3ef5ded9215c31cb984cbf7a11f14075a88639e324f9b94cac2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/SMEInstrFormats.td"
+    },
+    "llvm/lib/Target/AArch64/SVEInstrFormats.td": {
+      "git_blob": "35b0872dc593ca7d307fe26ab059fed3f5431edb",
+      "sha256": "ae0e64092ae2f67333b37697aee3307c12ff01efd9dac5f6ec3a8d76fe7da49a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/SVEInstrFormats.td"
+    },
+    "llvm/lib/Target/ARM/ARMArchitectures.td": {
+      "git_blob": "bfcecfe27091f327050a5bca9fed583ff3c1adb1",
+      "sha256": "5f4fb312d6a80ba4ec45e3145e45f5705b0670c56336d8d3c28613a6fada3159",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMArchitectures.td"
+    },
+    "llvm/lib/Target/ARM/ARMCallingConv.td": {
+      "git_blob": "ca3e827659c24d4992e1d37b0af15b96cbe762be",
+      "sha256": "205d29d784edb1c616d8b70e685b31476b4cd68bf4834c3a72cd28b4c67d7a17",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMCallingConv.td"
+    },
+    "llvm/lib/Target/ARM/ARMFeatures.td": {
+      "git_blob": "e562b2170db5c06cb38a62f774de3175081c7338",
+      "sha256": "b65d1b2045a7bfec9c1e669ceaa913f09e48618998c6b51a75b9f4320e1c2e29",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMFeatures.td"
+    },
+    "llvm/lib/Target/ARM/ARMInstrCDE.td": {
+      "git_blob": "5d4e3acf5b581c256cb982fce9e0b7ccfaeca95b",
+      "sha256": "a55e3bcd3a1e235253ba5e7383a7deef262894e358c0e76f0864282156f3c637",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMInstrCDE.td"
+    },
+    "llvm/lib/Target/ARM/ARMInstrFormats.td": {
+      "git_blob": "1cd1a9a0f7331f93741517403bea036544a961cb",
+      "sha256": "71a29badead426828d40c83596b0b877c8ee376630b31e941aeea180c5677d65",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMInstrFormats.td"
+    },
+    "llvm/lib/Target/ARM/ARMInstrInfo.td": {
+      "git_blob": "ddc89415cfb209c12727681333ef94f50dd03bb9",
+      "sha256": "544ea249c422bfc9455e3f745e20b452f48184461a7e201f3c959bfb32e8c3f0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMInstrInfo.td"
+    },
+    "llvm/lib/Target/ARM/ARMInstrMVE.td": {
+      "git_blob": "1e9c141f13f8339e0b5021085bae153771d6045b",
+      "sha256": "b90e7a1ef0f83c6a9f63bdfdb3a46f991663834b9c518de55a8027217497d1ab",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMInstrMVE.td"
+    },
+    "llvm/lib/Target/ARM/ARMInstrNEON.td": {
+      "git_blob": "90e74a5f54f7b2c1374f90431a25fafca57f6f4b",
+      "sha256": "b34d2ff61478d5f753047ffc379f02d26fb56eac0bc02a540f9e6a9dea7d2f67",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMInstrNEON.td"
+    },
+    "llvm/lib/Target/ARM/ARMInstrThumb.td": {
+      "git_blob": "4c5d81012da326d4cd8ffa884a304c341a2d2282",
+      "sha256": "2a74dfd32286df2a65d8b037579d28026944cc07fcde331a3ecc859394e8d68e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMInstrThumb.td"
+    },
+    "llvm/lib/Target/ARM/ARMInstrThumb2.td": {
+      "git_blob": "596196c4d042501aa4ee90179b6ff5b8dab5be6f",
+      "sha256": "9e78f9a2098de6536655bbb76fd134925c40114e22d2c68a6a6250da88f9399a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMInstrThumb2.td"
+    },
+    "llvm/lib/Target/ARM/ARMInstrVFP.td": {
+      "git_blob": "5f5f703fbabf1f8bd83663f3f488419bafb0f1d9",
+      "sha256": "74beda79594b359a419e48aa28b42097d7d5eed53dc131a693b1b6ecdbff9052",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMInstrVFP.td"
+    },
+    "llvm/lib/Target/ARM/ARMPredicates.td": {
+      "git_blob": "c638e96a355d1f3f2b2fae1ae0a5f2f79f358749",
+      "sha256": "09ad12cf5c485793cd3caeb3d19953eb2bea1df3dd2040f6586b55530e617143",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMPredicates.td"
+    },
+    "llvm/lib/Target/ARM/ARMProcessors.td": {
+      "git_blob": "b60569e7b40c3fd1614f266c3aef787609d8b048",
+      "sha256": "8ef8cf65944110b2c8871c2dfd7505ecc0931425f46f6d11406510a100315dcb",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMProcessors.td"
+    },
+    "llvm/lib/Target/ARM/ARMRegisterBanks.td": {
+      "git_blob": "e4ebf793f9b0e54453e597face6afddcb40d7bb2",
+      "sha256": "2696426f8c1deafffa54ab9410adc13fa0230424e94f23a4a9d3b4394561224a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMRegisterBanks.td"
+    },
+    "llvm/lib/Target/ARM/ARMRegisterInfo.td": {
+      "git_blob": "de4219577c78c41067cc10d39b29fab8f675bc32",
+      "sha256": "383efb8f2c23c9512324b3ff18601cf8b834fb4fa2e35ebddcbd77eb8ba3afb9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMRegisterInfo.td"
+    },
+    "llvm/lib/Target/ARM/ARMSchedule.td": {
+      "git_blob": "b28de7873b3059cf462253c42396289915c4a6f0",
+      "sha256": "164fee781588bd7b05ba707ec2f04c92e1cb804e1290635a9bc19def5ff2387c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMSchedule.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleA57.td": {
+      "git_blob": "2dad18368947a0926ec473f5ae6bee1649ec6b27",
+      "sha256": "57c3e80bb364ff7fb930fbfac4e868ff03cba442e9b6b9c7313fd7991021c6e4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleA57.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleA57WriteRes.td": {
+      "git_blob": "025023c5f41a9e855282e06e72350cf77cd8d368",
+      "sha256": "ea1e05ff842b4f23f5685a63a40a8f1fb1df8d96e5b3a2d84c8a6f032cd0d2c7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleA57WriteRes.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleA8.td": {
+      "git_blob": "1be0ee4334a8346adc29adc1c56f41ee202bec07",
+      "sha256": "daf7ce103fc3ab6c3663943e41972189972f87ba8da05cedf4d444fa7cfaa884",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleA8.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleA9.td": {
+      "git_blob": "a0f56a69b2bb14a0bea9b75c1bd95df1a5150649",
+      "sha256": "ea31ce5c4b904d9f80a4dbd60606bdcd7f28058b2fea112cff6ff98109357042",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleA9.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleM4.td": {
+      "git_blob": "bfa5fc0d713196f09e497ba2368e8fe1fff05a3b",
+      "sha256": "22a424b54c8f01945ba86f42d5d2574f11db2ecdd776b6bcae8f0d2ddba5aeee",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleM4.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleM55.td": {
+      "git_blob": "ff05936e8ba45c447fcda8688bc16c5130700529",
+      "sha256": "613f10144a7d18af899c7b4a2c3dda39ecb4b501d88665ebe9717c786ba0d440",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleM55.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleM7.td": {
+      "git_blob": "99d2e4a832220aef1de3794c9196f0dc1513786a",
+      "sha256": "32b96836338e2aef120ce8c1a1bc9bdfaa72b8bf547520e0d06a8eaacd95439b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleM7.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleM85.td": {
+      "git_blob": "e9938d857e6afc5a5180ffc0f47e7716047856ba",
+      "sha256": "3c8825f066f837a2befe04d3275aafac5bf13f44aa5a2e6060ef2d1be9b39fc3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleM85.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleR52.td": {
+      "git_blob": "c350180baa250d88cb8b02ed1c11e7d1f22959d0",
+      "sha256": "2301b5b4833774e5af95a9fcaf75a48ff2382a520aad558f33b72f22d6d295b6",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleR52.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleSwift.td": {
+      "git_blob": "8d53119f4747b5e2b620ba8dd333aa04bbd550b3",
+      "sha256": "f59b0a78c3782b3c849736d4c6648fae2b0d81f6fd2f2a2e6eca47fa30cd2894",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleSwift.td"
+    },
+    "llvm/lib/Target/ARM/ARMScheduleV6.td": {
+      "git_blob": "9b86097329c06fe97876fc93b1a5f66e179f78f1",
+      "sha256": "877abe4f2dcf51b623862946ef93fb98678dd9e8addad946b3ad2c7eea6ee5bf",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMScheduleV6.td"
+    },
+    "llvm/lib/Target/ARM/ARMSystemRegister.td": {
+      "git_blob": "d68cab1d0ebb60ac55849a0bd1d70895eb103baa",
+      "sha256": "96a9d1922e0543b2684593e2b1a2dc13341ae087df588e91d5bde75335760693",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARMSystemRegister.td"
+    },
+    "llvm/lib/Target/PowerPC/GISel/PPCRegisterBanks.td": {
+      "git_blob": "f2237d825cb4a14dad9b8d4d5f46b51b102f9d21",
+      "sha256": "10bce3702602e32058f4c3a5c0c4d78fa833df4b56db6294fff5f14e09a616e1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/GISel/PPCRegisterBanks.td"
+    },
+    "llvm/lib/Target/PowerPC/P10InstrResources.td": {
+      "git_blob": "4695a6f9940ef94405d03179645a01171d283d4f",
+      "sha256": "a074f74f5c7746e8894a06f7fd83a32ef50959ae9fffe2b4002b7277f0d73b73",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/P10InstrResources.td"
+    },
+    "llvm/lib/Target/PowerPC/P9InstrResources.td": {
+      "git_blob": "3f5f7d396555cbfdc23185c91b652fb50576b216",
+      "sha256": "55c57e845cbb4b8153318dd0e3649ef9ce558a6605b1da1a4a3768aa6aa784d0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/P9InstrResources.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCCallingConv.td": {
+      "git_blob": "5d4fe06ebdddddc022af0c2e9e0b380df578a42e",
+      "sha256": "fb1c1842254d536437f10bd2f6c7b6297c000df92cf7284b38d83ef5713d14b1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCCallingConv.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstr64Bit.td": {
+      "git_blob": "d258b5bd564583da170e02d532c29637e3280378",
+      "sha256": "381a351e1b26c86d4d193cf448ce09ea67acc75969bb7a293639c69181ed36b2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstr64Bit.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrAltivec.td": {
+      "git_blob": "fe1eea2b33615ab70d20df576a08366862d3c923",
+      "sha256": "252856f3f4b4e64297797cca35228c6219945739db164258d8488a5e9379e682",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrAltivec.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrDFP.td": {
+      "git_blob": "f4908e325e13c1a37cfb24ef7a092c85502260fd",
+      "sha256": "40478ae7a4e4e5feb9e3009420e8fb8cf99f75c37fc340446909979fbb4f6d57",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrDFP.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrFormats.td": {
+      "git_blob": "1a77b00588311afba843e6648eb9d028e4049868",
+      "sha256": "811aec9d9f69f0e798f0e20e8c6a8ee97e6de96110e9f1e030acd34eb27f1c38",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrFormats.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrFuture.td": {
+      "git_blob": "39e6f4f139c11e469f89000d89cc34172242e3a8",
+      "sha256": "30045f7684c636d87fb715d7df5179faf1061ca39a67ae9bff5e10b9aac52b36",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrFuture.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrFutureMMA.td": {
+      "git_blob": "076c7465994cfe9a3b0cd12dd1d6799756632516",
+      "sha256": "e0840b514197073cbf3b7caaed7d828e142665926c728ecc3457b27b7ff7a1ab",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrFutureMMA.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrHTM.td": {
+      "git_blob": "6b5da44c91c2bd9f83ccf5e8535f20464bef38ab",
+      "sha256": "dabd3d78ae969878505e1f4d092043c1b6362966e2af37be648172075cf24b69",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrHTM.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrInfo.td": {
+      "git_blob": "130ee2a7c4a977dfd984650c1f6db904dcf7f858",
+      "sha256": "b9ad44b0590cee02ecc8a4756769ee8bd6f51cb3ae3cc6dafb4bb0428336a8d3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrInfo.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrMMA.td": {
+      "git_blob": "fc3cde3f464bb9e0e91d1c4dd24a16ca7b11f82c",
+      "sha256": "12b2f7c81859e95fd3c327d3007ea36564eb1265ece1d9f97a098d82c73e512f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrMMA.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrP10.td": {
+      "git_blob": "bd9a999237c098ed7f8fc3f3875068c98cc2e1c8",
+      "sha256": "91b5cfdea10b3a67fc8166392f2c482a120b7dc69ab7fc20013b1df2bf3770d4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrP10.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrSPE.td": {
+      "git_blob": "5104cc6f5607180fea9e64b06ecae7abc90e12a6",
+      "sha256": "2ce14a0080b6e48bb69c59727c083f87c89b584bb6da8a6dc357e0585fb033fd",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrSPE.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCInstrVSX.td": {
+      "git_blob": "ed4b58fef3a265c37413d7fd97425a3b7fac4cde",
+      "sha256": "fe69c136133e6947f6534a77c28e86c8d24d9a1017a4a3bb6c87e7e1cec8ecf7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCInstrVSX.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCPfmCounters.td": {
+      "git_blob": "20b9efdc9df9b0ea467a4ddf83d1a0a3f4e43c00",
+      "sha256": "d326a2a277684e21de3a62324c331f821754c925f9ddb57a023420595d7159af",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCPfmCounters.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCRegisterInfo.td": {
+      "git_blob": "5b9ce2400c7cb2b91618aef475d8321b44710b84",
+      "sha256": "30d6d7f4c112cab36f9882ae208ed19f4f937f76ec7aedad3cfde45cf165a5bd",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCRegisterInfo.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCRegisterInfoDMR.td": {
+      "git_blob": "1c3e7621825bdf1edeb50e6f097342317181f5b3",
+      "sha256": "97dcf2bcffa1cd41a4add80866162a3390299ed87aa9c0c7a6abc6aeaf7d280b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCRegisterInfoDMR.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCRegisterInfoMMA.td": {
+      "git_blob": "57f4545516a009db0c01ce53439eff2e6b8acc10",
+      "sha256": "2b602a76c87f7efa61f5fb619bb7b9390735c940f4354a2e6e72626d6987c48c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCRegisterInfoMMA.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCSchedPredicates.td": {
+      "git_blob": "f23557c9bf86853a7143dd310838ec692376f48e",
+      "sha256": "87736363e98aa4f6e662e91ed0bf62ce8e1f8e72bd4094749b4a919acda1c9ca",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCSchedPredicates.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCSchedule.td": {
+      "git_blob": "f65dbae16d3a6fa5440b3c6233307d3f6067590a",
+      "sha256": "1030be37aa4697ae344c7af84fd1c90686271a2e1434d9033bbec8bede0868ba",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCSchedule.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCSchedule440.td": {
+      "git_blob": "708261fc7cc8adf5e612a0c1f58ccbd09a6c4f90",
+      "sha256": "1ed567f431bdab7657a74ee60ebca1aa671322aa67f53e53007c9e3b5e699c7a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCSchedule440.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleA2.td": {
+      "git_blob": "c2b298524e00a1b0468a4f0717d44905e00a2d3e",
+      "sha256": "140c70adc0da59351fabf0d4e0d39ce0a67d5deab1296f70a0c636b1e390e290",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleA2.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleE500.td": {
+      "git_blob": "74744dda54f763d08c744c060a217401e9ab5b61",
+      "sha256": "a610d5f0c103dce9ebed4f41555fcd69f8b065282752bb85e5fa850b21ddb8f1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleE500.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleE500mc.td": {
+      "git_blob": "1a1c041565b679ed8939630cec64677c0f594d5d",
+      "sha256": "dd84cf50ec89cab62921ba3fb7849c31e9ba5cc19f823861e949b36f7364bb45",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleE500mc.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleE5500.td": {
+      "git_blob": "4480d7fba4fb890838672da3d7bbdd458c44896c",
+      "sha256": "eba3e75333b83db38bf2b485b8a9ad5d65ee2612f71ef1d996db91c1c1c67df9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleE5500.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleG3.td": {
+      "git_blob": "8f1907f2c0163bec15b400e06f0de3decf0bcfc3",
+      "sha256": "41fabdeeb9eacc1be7c1cab03615820d756ad3eab5d176d7cbf1bcb26db69b6b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleG3.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleG4.td": {
+      "git_blob": "0eabc49d7841dd378828f79640d7b8205e22d1ed",
+      "sha256": "94308dfdec25414afce06f3f45b8209c9b21fcece19c306be22f4d07405c7067",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleG4.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleG4Plus.td": {
+      "git_blob": "9c84aec638d775f900bb6ff5b0b8b4f61090a035",
+      "sha256": "01eea2c126d59e4b7ae793d09070d25f951038ab4321777817cc0fc64f18ee3f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleG4Plus.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleG5.td": {
+      "git_blob": "0870735377968e95fdb805e854ad7796828abba2",
+      "sha256": "ee87c8a79052ffd75f2e1b87d7adaa697c70cda049f2665c8ba5294496b2824a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleG5.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleP10.td": {
+      "git_blob": "f922f8a7d9852b14a18a5ede5790c5081c9e7aac",
+      "sha256": "8ed525a642cce3c459ed7d976ac4229e94a367a87c7b4e490dcb4f9897720218",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleP10.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleP7.td": {
+      "git_blob": "bf7f2f7a9c999a4fe601e8f9d2049ea7d0021acd",
+      "sha256": "d90c56c83fc33459064fd277d50424c6d703ceec22079c46531e9e8f66f53b55",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleP7.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleP8.td": {
+      "git_blob": "3a2d9d9b3bc19f64224055bdbc2a08027dfcb5e1",
+      "sha256": "8d1f04a30001faaf0f4adbeb65667c54b234059299ec10e727e0aa5e9e5dbe75",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleP8.td"
+    },
+    "llvm/lib/Target/PowerPC/PPCScheduleP9.td": {
+      "git_blob": "36befceef4ac18086489fe6bcee2b60ecf3396ee",
+      "sha256": "9026fb295cddc3e9e375c62306e42eecd27f5f519b32a269ad0418e4459a2c9a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPCScheduleP9.td"
+    },
+    "llvm/lib/Target/RISCV/GISel/RISCVRegisterBanks.td": {
+      "git_blob": "b1ef815fe37352174131b37ceb1d396500367533",
+      "sha256": "2f47366dfa1fb4452e9a6e8814534e641d3544dfdf4effbd2716576b04d8459e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/GISel/RISCVRegisterBanks.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVCallingConv.td": {
+      "git_blob": "da6b95da121608ba4dde5f344f57635596a3f29a",
+      "sha256": "fc78d39320d741b1d9b870eb2711074534629c53a0517d2e1e6f01e50a72e87c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVCallingConv.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVFeatures.td": {
+      "git_blob": "494371901e64d7d8ad296ba79bf8250c711b68f1",
+      "sha256": "805b4e4408b3bbced16e55a35a80835c74e8af58e02619adb88dc82d778522f2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVFeatures.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrFormats.td": {
+      "git_blob": "fee1d1596ff5c8657e3b06477798830e66320247",
+      "sha256": "796caf2720af46032d94a6c3f1ca4f8a0252abcdb2342914a9e414a91acb4eec",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrFormats.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrFormatsC.td": {
+      "git_blob": "4c7cd05723ac8f6b360a502a72207c5126e84022",
+      "sha256": "acd4379c3bd71c8cd059c66b17617861551c7baf61ca0ee14330b6a5e7aaa4f9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrFormatsC.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrFormatsV.td": {
+      "git_blob": "6ac6c5698ef27dad4a58d807b53e17bd2d8959f9",
+      "sha256": "e5b5b5914e19caf96d2f7952d6bcab7d1dd340190e1988747bef759ac3d8e3b2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrFormatsV.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrGISel.td": {
+      "git_blob": "bd3ecd737bede79c859612ddb0c58b46365c1ac7",
+      "sha256": "40f87a06048fecdfb19a43dbe117e97908553509e4fb6ba1551fcbbe7b56c5f3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrGISel.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfo.td": {
+      "git_blob": "ff582b8e741cd1cc4c803604394da20db2cd7ca2",
+      "sha256": "773f84c80ea22198051c108e1349ebdeb4a7d504a35a672559348a90703f26d5",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfo.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoA.td": {
+      "git_blob": "f5fd9acd8b303d22460ea292545fc5ab8f4055fb",
+      "sha256": "82ec3aca02f004cd9988b5e597729bfdfb435f5d45fc26353a61f91e2916d279",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoA.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoC.td": {
+      "git_blob": "24e7a0ee5a79f1f1956b68ac15ff3128025e23db",
+      "sha256": "c17c53c877c3e4392640affe2274bcbe62fb23294cfe8163beca4d381c7762c1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoC.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoD.td": {
+      "git_blob": "deacd41e6469a08cd5465c5fc635d14502bf06ef",
+      "sha256": "e3a0fc69eb870adcd9c740b3707a9aa6df926d3b03a5c57543e6a4e0a44f7cb6",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoD.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoF.td": {
+      "git_blob": "13b23a573da0e1c545f592e4e640e62635fa4790",
+      "sha256": "de3dfa0a3831c92a77b8b1202b98998ce3b47f42d7c8b0c03f68df17a5ca686d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoF.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoM.td": {
+      "git_blob": "fdf0195a2b669216a72d3fa5257332651af47f55",
+      "sha256": "badfbe36f2a7a02a94a918415a1a6a8262d23d5d6c37f8c7e50a7e8cacc6065b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoM.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoP.td": {
+      "git_blob": "e97e9a0139e475140651b3ed7a3cde73f6b05c92",
+      "sha256": "af64152847b0a2f529627f6ed382d4ec2c33eab727ecfcdacbfde576bf418218",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoP.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoQ.td": {
+      "git_blob": "da78c13c0edcc484a8a46b7cb011d66f3218d980",
+      "sha256": "e8b62cec0218aafe6221320ce7772f042f001bac388d3e0add2e20567b5234e0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoQ.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoSFB.td": {
+      "git_blob": "e83246a82b28e4fb2307a5b6140f446e54d28281",
+      "sha256": "eb95208685bb5b7db5695b0ec387866bb5fca487eb7a3f913814ac2e20a67ef2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoSFB.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoV.td": {
+      "git_blob": "eb890be0d85f5ab85ab78a4b86756620a7a57399",
+      "sha256": "931a29ba71b650f4e2b660575f6621843fd98414b82dc4e2d238623057df90f3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoV.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoVPseudos.td": {
+      "git_blob": "566cf632f7745a3ea8350c85bb58267e82ebfa40",
+      "sha256": "5b829f16d4c4f005f23e90a03f802373a29f79db63555c326143083137178e67",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoVPseudos.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoVSDPatterns.td": {
+      "git_blob": "4a57b7f7f15b3dbac347b72a76166042f74a767d",
+      "sha256": "84dcfcc12be8c19d5871f099c8a01704daa82ab69fcb91757a9bd1be96dfbc96",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoVSDPatterns.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoVVLPatterns.td": {
+      "git_blob": "77a48cd1a0fc9a28a6131dc418bd33182d52274f",
+      "sha256": "640000992e18463004c8e9d34f0a4e3dcf93e8c78ccdc1dbde5cb93d95cdf9b7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoVVLPatterns.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXAndes.td": {
+      "git_blob": "d9865f02b6e0c02617eafaeab8ecc1fafe3979f0",
+      "sha256": "04369a9b63704bbcef6ec6b4e3422635fd535cfeb54a6e74817a3c8fe31c27a1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXAndes.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXCV.td": {
+      "git_blob": "c388bd84a2c7ac7b1d265ed7bdadc7bdbc1a331c",
+      "sha256": "192a18a01f21907b2b9972dc9beb0f732ea0b751e128ae1bf6260ffb59dc99f9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXCV.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXMips.td": {
+      "git_blob": "0b5bee1f33908092debf537cbdfd26fdb62a2c00",
+      "sha256": "fe08a442b3e1e4de1571ef7a9aeea436ce64330219674cb5f04338ab15669268",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXMips.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXRivos.td": {
+      "git_blob": "39a7aeda947076403d71f1dd4017dca25d1df092",
+      "sha256": "1c2ced4a1f4fd60a6447c6a019920923124a43cc2091029ff9a127d30c84cfc9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXRivos.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXSf.td": {
+      "git_blob": "bbc26a15e91a8aca9a80d2e3b01027d696b508f3",
+      "sha256": "423996db5dd05410e01bcf44dd5158b089d4badde5284ea590d21e7d642c1821",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXSf.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXSfmm.td": {
+      "git_blob": "0004926fa3ca0f312fad624387c940354fee348b",
+      "sha256": "a50abb0f0feb82862995070468b0d202b5d0cd883a2e733f65d581576c83e743",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXSfmm.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXSpacemiT.td": {
+      "git_blob": "0f9b795069b981a8df4067a9b59c9d79124ffc20",
+      "sha256": "a36984216c7bf696e3cd6cfb1458156dd10a670cb69e3b9fdf3d093bcb7f183f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXSpacemiT.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXTHead.td": {
+      "git_blob": "c2b25c6294019c56f8606a463c90af8089b5080d",
+      "sha256": "c06d86ca25fa46b7a04b947f2cd75d644fb2ebd55585887aa6ef93d256a5d6d6",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXTHead.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXVentana.td": {
+      "git_blob": "b1a7a18a3bf852ede6aa4488c6b5adc7ec9f60d8",
+      "sha256": "4de49258d2767ac0545354cc1d8dedefc0b018d07353a1f71fbb32daa102f063",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXVentana.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXqccmp.td": {
+      "git_blob": "228b75e33c0809810eb52c8ca94ecce2afae38ea",
+      "sha256": "ab9f9023b819c25269091c2285ea99b0773f86271aba68d18464416f5e43b8c2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXqccmp.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXqci.td": {
+      "git_blob": "74e987d88f19d25ff49e8999ce1c48acb581308e",
+      "sha256": "38a8cf15a97e9791ca4349fde7a46484490e0750eda30ce4c07264ba31d48044",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXqci.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoXwch.td": {
+      "git_blob": "bb1862cc88d646932e990bbc6a1c3a3d97204b93",
+      "sha256": "a293339dd11412ea21ab95c0d27c9ef1de33dc6fc38ea188a80852effef830f4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoXwch.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZa.td": {
+      "git_blob": "20e2142c70b48893ec5c019bf31052058ef9a558",
+      "sha256": "c7ce3ae859b569882d5ea512c8d2f9a910266942e7c48cdae4d67773c9f32a1d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZa.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZalasr.td": {
+      "git_blob": "5f944034955464ec86de59f007f4534dedf4313f",
+      "sha256": "1bdfdf19d12a40777c23949407aac67dd2d07d3deded4a26b787188ea4cf66b9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZalasr.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZb.td": {
+      "git_blob": "129e392baa02d4387461fa4db450eb4569ccb723",
+      "sha256": "24e8c96e2085735a14f5366da5a353f3e8ff7c4d87675744c44829f4cb3a72b9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZb.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZc.td": {
+      "git_blob": "ed1a60aa49caba979f9e0725deb972988109b558",
+      "sha256": "ddcdd5b3b9ae7ca7017d67c433343992aee7b67a3c4faa68baa2e424ee6d8953",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZc.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZclsd.td": {
+      "git_blob": "962ad3c5a3151159d74a5ca099a034c50bd26a04",
+      "sha256": "d90837a7d5f7e83ad4f7c6e3859327320bbc6e032a5f62204fea4b0537b364b1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZclsd.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZcmop.td": {
+      "git_blob": "76dc027ffd1dbaaeadf79799f9ec4b4bc74e5624",
+      "sha256": "8fdd730cfb2cb4e91afcc7912ebb9182014654b6cad83a5c63534394d8ed72c5",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZcmop.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZfa.td": {
+      "git_blob": "a2737d247fe312a0c103ec760a6e704903116806",
+      "sha256": "609274c0c7b5e6bbac8c4aaaae0c43255c48615627dec00783d77173d2e54919",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZfa.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZfbfmin.td": {
+      "git_blob": "cdb43b11dd922340c37b1b735131d485f832974b",
+      "sha256": "dad7157dc4a77076d09e6e3c3cfa880dbacc0725dedaa4b0672c723cc3c8c35a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZfbfmin.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZfh.td": {
+      "git_blob": "c172d1739ba614d30ce72d4017a69750cd944377",
+      "sha256": "fd514eef5f53bbaa58a3a3349ed5b2f97e9b21d01e755263f97736f72f9c90d3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZfh.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZibi.td": {
+      "git_blob": "0ffb6b963790b31fa8a64c3d6e4f506d4dfe6572",
+      "sha256": "22465240129aaf5dba3f6b9de219e9f4243938d0dfc523f62ecf81fdaae629d1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZibi.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZicbo.td": {
+      "git_blob": "3ddcb1d615dbb329174ea5ce1c9720a1cebab20f",
+      "sha256": "4d9cdd344a6b4215a330ff4b8b29e893d6ab210849d719a4131077a03e306553",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZicbo.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZicfiss.td": {
+      "git_blob": "efd06c29dc99f3f2d05293ba98e4eb2f0ba84204",
+      "sha256": "e4f8560b8a3265417ddce0499590baf9c41a05527c86a38fcdc435af865d8d51",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZicfiss.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZicond.td": {
+      "git_blob": "fcd3987bc10abb6dff7804ab6591474da6e33fe6",
+      "sha256": "ae7c89ba7570119cad1768852bfcaf599a24dbc7a4aa6328a76a217380531a25",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZicond.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZilsd.td": {
+      "git_blob": "4fc859f2547c110ea2dbcfe9346a8e7a643b5b03",
+      "sha256": "f7165fb70434b0c91ab04b620d5ca9d7dc1cb8a2e3867eae3b411c38ab5201a9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZilsd.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZimop.td": {
+      "git_blob": "0d08176f97992f6574466bf33474115aaf96f46c",
+      "sha256": "6dd247ee9ce37ffc1078f9359a82e47a14dd6844e8275cbaa60786017b78e045",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZimop.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZk.td": {
+      "git_blob": "522b05761b41cefcd69085bf0107a16f839a690b",
+      "sha256": "73256ee8b697aab4beab427ac97ce2def3d7f75d3cdf488a5cb2baca978c8037",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZk.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZvfbf.td": {
+      "git_blob": "866e831fdcd94575f30539d61833b55c6833f153",
+      "sha256": "98210a421e0548eb858c6dbb98a076ddfecdee67668978606a02757cb9e33e23",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZvfbf.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZvfofp8min.td": {
+      "git_blob": "3f6b16dc6f70ff123384fb5e1f58389a498b4e55",
+      "sha256": "769ffc5513e0d9e4b5416e3117765272c593a6cb1c77184e296bb93459a2268a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZvfofp8min.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZvk.td": {
+      "git_blob": "e4c76d7810c4bede0c296876e4e47c909bb68fb4",
+      "sha256": "5cd22a6b4bfdcbe0fd9c936e4b0719d09dd8a7f8c84e93e51f5f2a5eaa9c63bd",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZvk.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrInfoZvqdotq.td": {
+      "git_blob": "c1a07351b9f2b223a73a3d8620315368f2bd349c",
+      "sha256": "789d2b8b7aa58d8625213fd2d90e84746139d674411ce923bd631bf07cd7b33c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrInfoZvqdotq.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVInstrPredicates.td": {
+      "git_blob": "8851ee44ac9379125eb88d2c131c4d63471a3ef6",
+      "sha256": "ed04b9fc515b13ea1a9d54e1abcc20849ef75742295d08cc2d9814a48a6e7955",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVInstrPredicates.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVMacroFusion.td": {
+      "git_blob": "39e099bc947b2df919897908f053c6635e9728cc",
+      "sha256": "e58c3f4e54914d7bcdfe5272dc9c2c48e89d53829dbfa5f6fa186c0e72335ff7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVMacroFusion.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVPfmCounters.td": {
+      "git_blob": "013e789a9e9217cb1c1090935bc331630daa26fd",
+      "sha256": "b38fd37f4f66bb27660e7869fdf8264ae1acd28d353be0526794706238925af3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVPfmCounters.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVProcessors.td": {
+      "git_blob": "5becfd2ad502b512333f020a9bb0729f67c2854a",
+      "sha256": "d65badf22d70f1dada5995ad8dc83307beb840b230ca15d543ff90c3505dcdce",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVProcessors.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVProfiles.td": {
+      "git_blob": "92389fecd0b1d80a4a3094fbb636a028c2a14d53",
+      "sha256": "f84d0c0486fdddaa28f742677ce2a8e1b5e5c380ec342e55a63c3a3206de53e4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVProfiles.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVRegisterInfo.td": {
+      "git_blob": "906ae6d91c83f37fdb2768f1e8f12e5612a8de35",
+      "sha256": "f724badf7764c029a57418d166a02761ea31ea76b6373857e605bdcea3f60c90",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVRegisterInfo.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedAndes45.td": {
+      "git_blob": "71563b0ac136bc6f9cebef1d17eb20fab1d7e769",
+      "sha256": "f34fb73fca59746967f5d14b2392abe5febcb0d05168c03ac35b1085beda0083",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedAndes45.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedGenericOOO.td": {
+      "git_blob": "3786754527336ceb01d6f473c09a452fd75fe412",
+      "sha256": "f22c8613ca2f20b957f6e84eb36b038dea15775110d5c1101dc4c222159924fe",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedGenericOOO.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedMIPSP8700.td": {
+      "git_blob": "c0d6ef72a839ede6cfde91a7675d85940e5b89f4",
+      "sha256": "b9b755b186e1a6460ba5c382056a47274f4e162c1c70bdfe12a6801f7b3b4aa2",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedMIPSP8700.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedRocket.td": {
+      "git_blob": "7d072b56e582c77b07a3a83f582780189b3f4ad7",
+      "sha256": "e669fc36806ae83b469006f82d5d7d3824b88b92b6177a59503b01e15109200d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedRocket.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSiFive7.td": {
+      "git_blob": "f8a7013a19a1a754f4bee2e743303bc0ddc1a48f",
+      "sha256": "f50cf803ff11048bb71b0fb2fb4e5e1acc61e60352f25ff4f045925c508165cc",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSiFive7.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSiFiveP400.td": {
+      "git_blob": "c4ae4d7d829be72464da8f0d3ef2fe409ff106a0",
+      "sha256": "9436397a8daa3d05ac7d41f96663a07fa1fe5f666481427d4d76333faae2da98",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSiFiveP400.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSiFiveP500.td": {
+      "git_blob": "9058514560c7d40906ea84e0eaf4fde368a2f6a6",
+      "sha256": "5c1e20f7c6e784d676d9fbae9a9aaa3ce1883373ee1e5b12fd812f40624e4bdc",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSiFiveP500.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSiFiveP600.td": {
+      "git_blob": "db9b17f193a56af25a8b1a0b17f69da07aad4586",
+      "sha256": "071631921883781e603d91bf5c47a4e20899a5330f36443be75860a5dca69eaa",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSiFiveP600.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSiFiveP800.td": {
+      "git_blob": "b0e1c7056c34d0c5d933d15c0625e7328267b7d7",
+      "sha256": "1434121c3b2ad4a7a346d91a1b0e40a484acfd7ade30ce757cc1d4ca552b241e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSiFiveP800.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSpacemitX60.td": {
+      "git_blob": "3d97bb05692912dc73c2ebbf03f121446f3331c1",
+      "sha256": "1ac3cff0ed7a4f307641db47b7015e02a02d47c5904033fa75f454bd9751baff",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSpacemitX60.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSyntacoreSCR1.td": {
+      "git_blob": "56fd45d7c97211213cafcfac0d044f503b27a784",
+      "sha256": "9eab74cee1699ed8b327e6439f4b813b0b43731af025fcc3200a318ac94e3a95",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSyntacoreSCR1.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSyntacoreSCR345.td": {
+      "git_blob": "9165697d0b49342647bad8cb5523f28807466a50",
+      "sha256": "01469f689c434255873efafbaa5e825275f480e0df3909ab20d21d4c41180395",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSyntacoreSCR345.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedSyntacoreSCR7.td": {
+      "git_blob": "3ebc77d2772695986cca766b6978b5fa59162cbf",
+      "sha256": "16e710af2f669d7e694ea24a4ccf018b8bae127a7539a5f7a1ec07fc34f5a1b0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedSyntacoreSCR7.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedTTAscalonD8.td": {
+      "git_blob": "08ee180b2cb0fbcabfd757e53154e1324ab53bf1",
+      "sha256": "981fb05f2ada3bf5a65f064d24f6d91e78d740330755c0265eead659e2573048",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedTTAscalonD8.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedXiangShanNanHu.td": {
+      "git_blob": "989ebbd32733fd8f45032dd0864a41c28bcf485c",
+      "sha256": "7980a285b03160998f295cf283d90701c2a7b3be9fae2772473ce4d064681cc5",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedXiangShanNanHu.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSchedule.td": {
+      "git_blob": "dfb4bade9d59c3203aa28e612edbffb23533d709",
+      "sha256": "e829d7c8dbc18584671eb467533741f4f982bb077839831bed3d22429b389285",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSchedule.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVScheduleV.td": {
+      "git_blob": "601308b377c6fb9e14a87ea2ba29a460850d6825",
+      "sha256": "a495f1562ea8e83553e212c27125ca79e20aa84234d981505b281ac958ce7b4f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVScheduleV.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVScheduleXSf.td": {
+      "git_blob": "1ee6dc19af13477298220ff66ce4a5811ec6db42",
+      "sha256": "5d77de0d058bff02d91347551a66aaffc7d9e98b3f76fb49ae4adec2cd8eab89",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVScheduleXSf.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVScheduleZb.td": {
+      "git_blob": "93381f439e0dfc80abd53adb1ede0bbc7b24a7dd",
+      "sha256": "755d3dc4abeed02fe2676f7058345f00009ef46d9ddfad999b94a19c58effd43",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVScheduleZb.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVScheduleZvk.td": {
+      "git_blob": "62d9bab0fac85f116e8085ab3d48807584be7e77",
+      "sha256": "a2c13b223de13369293cf87addf7424eb60a3d89f66f331465d9d92e741f5790",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVScheduleZvk.td"
+    },
+    "llvm/lib/Target/RISCV/RISCVSystemOperands.td": {
+      "git_blob": "7f038ee728284b5c712da21a09422f1d92230d33",
+      "sha256": "bc6367710792d08b7fa05676b8d59368da61944d6e142bdfafc7382952b6c5e1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCVSystemOperands.td"
+    },
+    "llvm/lib/TargetParser/AArch64TargetParser.cpp": {
+      "git_blob": "2c0211b3a2919f67eb924c069c5f83b690fcb9c2",
+      "sha256": "3a63cc614cd91e92b56198d299bacb35d32d0d2e1a05218df8242440bf5f9be8",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/AArch64TargetParser.cpp"
+    },
+    "llvm/lib/TargetParser/ARMTargetParser.cpp": {
+      "git_blob": "709e5f05e3bb9aac08743761ce6edecf6605432d",
+      "sha256": "9071ceeb210bc9fa7512709153fdcc157a77ab333260461881977da42f6f487f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/ARMTargetParser.cpp"
+    },
+    "llvm/lib/TargetParser/ARMTargetParserCommon.cpp": {
+      "git_blob": "15ba1ebd0c03778a5be2a4dd0c105fe263835d94",
+      "sha256": "490a6c15d9026d78a21e3283646325368b6dbf465bbf7cf30b386a68c1de78f0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/ARMTargetParserCommon.cpp"
+    },
+    "llvm/lib/TargetParser/CMakeLists.txt": {
+      "git_blob": "e1a30199e1ade984f5b82b766fd83f949846df97",
+      "sha256": "471691f6ae1a73dc943ef4236a45b00120e7338f962abe10525c6a472b945ee9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/CMakeLists.txt"
+    },
+    "llvm/lib/TargetParser/CSKYTargetParser.cpp": {
+      "git_blob": "5fea08e38e2db63c73b1a8c60398edb23b19b0b6",
+      "sha256": "a34dee8cacd0eb867ef05fbf9558e9059921c724cd8c85b3095c87b0627bfde1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/CSKYTargetParser.cpp"
+    },
+    "llvm/lib/TargetParser/Host.cpp": {
+      "git_blob": "b01dca93dee0cedd00e666300579ca91a70d63d3",
+      "sha256": "87d483582d5efb98c82d31e826b165f96690b1470edac1cab734bc9dce57d17c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/Host.cpp"
+    },
+    "llvm/lib/TargetParser/LoongArchTargetParser.cpp": {
+      "git_blob": "a568a108aa02f29b6d36b702b503c5ae186bd6e9",
+      "sha256": "cafc42e935545498fcbb7498b4c499288067bde86f85e73e2ebd82b459d960b0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/LoongArchTargetParser.cpp"
+    },
+    "llvm/lib/TargetParser/PPCTargetParser.cpp": {
+      "git_blob": "106d07107ac8c4f5335ee3b69921eabcef0e5f27",
+      "sha256": "4a41e56f22282868be947b33a2e34cc11f237c81a8814c6a393987a8002b3b11",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/PPCTargetParser.cpp"
+    },
+    "llvm/lib/TargetParser/RISCVISAInfo.cpp": {
+      "git_blob": "54afb4a49119492029c2c59db9e20a801f54e0f7",
+      "sha256": "96e91cd9c713dad2774ec841cddffa887d705721b01b24708adc41884d56da0d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/RISCVISAInfo.cpp"
+    },
+    "llvm/lib/TargetParser/RISCVTargetParser.cpp": {
+      "git_blob": "d0bd39f15afc48773c1afa6c60cea491becda49b",
+      "sha256": "5c109dee10ed19d6d218b2e47c958a6a0537b6719c96587f8a4c37624e4a2905",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/RISCVTargetParser.cpp"
+    },
+    "llvm/lib/TargetParser/SubtargetFeature.cpp": {
+      "git_blob": "36c67f661d9a58556b47f310d230ccf46a2d5f4a",
+      "sha256": "41bb167858d1402c6f08d7623d64b045042604dd4e288fdfce398ba816d0f495",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/SubtargetFeature.cpp"
+    },
+    "llvm/lib/TargetParser/TargetDataLayout.cpp": {
+      "git_blob": "b8c3b4325558c33e5a77ab6f6a720d1b06712cbe",
+      "sha256": "2af65bbb8bc2e5a6866eea8a728809c0b755396316d3bc5650e32fdff5219f1b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/TargetDataLayout.cpp"
+    },
+    "llvm/lib/TargetParser/TargetParser.cpp": {
+      "git_blob": "b34295b6a1cb17ae01f5e2ac0d0a2826d51f71fe",
+      "sha256": "8d976ca1dd6c161429678fc518e1292efc2a3b3bd38b1e001ef9134991eb805d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/TargetParser.cpp"
+    },
+    "llvm/lib/TargetParser/Triple.cpp": {
+      "git_blob": "a4f9dd42c0fecf31e677df215c4a7c0bfbc525ba",
+      "sha256": "2ad941ac0b4291d136220fa452252517b7ee819428de224178f98a482bdc3a67",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/Triple.cpp"
+    },
+    "llvm/lib/TargetParser/Unix/Host.inc": {
+      "git_blob": "38b942d053c1dc9aa3f831da8083d225001ffb10",
+      "sha256": "72b4ffb90ecd826b9560c079582052993bd32187d40e6a535be803fbf8575ee4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/Unix/Host.inc"
+    },
+    "llvm/lib/TargetParser/X86TargetParser.cpp": {
+      "git_blob": "2810849e4af9e5e80cef1ef46a939bb77a86a3db",
+      "sha256": "ab70a86303ed5ec9d8441d146086b225890a7f3dbb2a2c1ac45ea2c3525d18f3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/X86TargetParser.cpp"
+    },
+    "llvm/lib/TargetParser/XtensaTargetParser.cpp": {
+      "git_blob": "208722ae0603789f65154dec9d3e4ba1ffd2e183",
+      "sha256": "d849170984f55a1b2fd6578ff38646d2bd0865cd20cb84d48bca9ee9714204b5",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/TargetParser/XtensaTargetParser.cpp"
+    },
+    "llvm/lib/Target/ARM/ARM.td": {
+      "git_blob": "1f71d810983dbb4f32c8477eda22e665cf569bd3",
+      "sha256": "49e745e2c4d9c3367adc2b271e804cc1bff0be3a99389b1aad205501ef24f25c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/ARM/ARM.td"
+    },
+    "llvm/lib/Target/AArch64/AArch64.td": {
+      "git_blob": "db3b19fcf43dd65fe8d3f16838639ce981f21014",
+      "sha256": "431cd7bb2e6443d16d25e9d0a94c57a5d8db9d78d7e2f3aa1bf00c3031ada3d9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/AArch64/AArch64.td"
+    },
+    "llvm/lib/Target/RISCV/RISCV.td": {
+      "git_blob": "f6f82fd9bb55f845411f5a5cb5562020e67c8b74",
+      "sha256": "ff292dbda339389aae9381de5e289efd69439b86baf4aadcf4afe744f1e02949",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/RISCV/RISCV.td"
+    },
+    "llvm/lib/Target/PowerPC/PPC.td": {
+      "git_blob": "dc00aebe311f945876666897950a044f8a20b260",
+      "sha256": "00eca03e46530f86b51c97030cea5c501461081554443c51bf8ce0aad950278f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Target/PowerPC/PPC.td"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

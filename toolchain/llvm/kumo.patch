@@ -92,3 +92,42 @@ diff --git a/llvm/lib/Support/Unix/Program.inc b/llvm/lib/Support/Unix/Program.i
    if (ProcStat) {
      std::chrono::microseconds UserT = toDuration(Info.ru_utime);
      std::chrono::microseconds KernelT = toDuration(Info.ru_stime);
+diff --git a/llvm/include/llvm/TargetParser/Triple.h b/llvm/include/llvm/TargetParser/Triple.h
+--- a/llvm/include/llvm/TargetParser/Triple.h
++++ b/llvm/include/llvm/TargetParser/Triple.h
+@@ -252,7 +252,12 @@
+     Serenity,
+     Vulkan, // Vulkan SPIR-V
+     CheriotRTOS,
++#ifdef __kumo__
++    Kumo,
++    LastOSType = Kumo
++#else
+     LastOSType = CheriotRTOS
++#endif
+   };
+   enum EnvironmentType {
+     UnknownEnvironment,
+diff --git a/llvm/lib/TargetParser/Triple.cpp b/llvm/lib/TargetParser/Triple.cpp
+--- a/llvm/lib/TargetParser/Triple.cpp
++++ b/llvm/lib/TargetParser/Triple.cpp
+@@ -309,6 +309,9 @@
+   case Hurd: return "hurd";
+   case IOS: return "ios";
+   case KFreeBSD: return "kfreebsd";
++#ifdef __kumo__
++  case Kumo: return "kumo";
++#endif
+   case Linux: return "linux";
+   case Lv2: return "lv2";
+   case MacOSX: return "macosx";
+@@ -714,6 +717,9 @@
+       .StartsWith("fuchsia", Triple::Fuchsia)
+       .StartsWith("ios", Triple::IOS)
+       .StartsWith("kfreebsd", Triple::KFreeBSD)
++#ifdef __kumo__
++      .Case("kumo", Triple::Kumo)
++#endif
+       .StartsWith("linux", Triple::Linux)
+       .StartsWith("lv2", Triple::Lv2)
+       .StartsWith("macos", Triple::MacOSX)
