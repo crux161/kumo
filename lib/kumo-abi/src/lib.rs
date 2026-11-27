@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j824
 //j890
 //j893
 //j928
 //j930
+//J947_r13_001
 
 pub mod actor;
 pub mod argv;
@@ -41,4 +41,5 @@ pub use sys::{
 
 // v2: BootInfo carries `board_id` (the baked board identity — DESIGN/017 §4 step 2).
 // v3: PlatformTable carries an explicit loader-selected PL011 console override.
-pub const ABI_VERSION: u32 = 3;
+// v4 (J947_r13_001): BootInfo carries `rng_seed`, firmware entropy for the kernel CSPRNG.
+pub const ABI_VERSION: u32 = 4;

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j907
 //j913
 //j914
 //j887
 //j933
+//J947_r13_001
 
 extern crate alloc;
 
@@ -24,6 +24,7 @@ pub mod kmsg;
 pub mod mm;
 pub mod object;
 pub mod power;
+pub mod rng;
 pub mod sched;
 pub mod shell;
 pub mod syscall;

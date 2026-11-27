@@ -1,8 +1,8 @@
-//j881
 //j916
 //j919
 //j922
 //j924
+//J947_r13_001
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,7 +225,16 @@ pub enum Syscall {
     /// j924: a non-zero length in x2 limits the copy to the mappings wholly inside
     /// `[x1, x1 + x2)`; a mapping that straddles its edge refuses the request.
     VmarSnapshot = 66,
+    /// J947_r13_001 (SH9-c8): fill `[x0, x0 + x1)` (at most [`RANDOM_READ_MAX`] bytes) from the
+    /// kernel CSPRNG, ChaCha20 keyed from the firmware seed. `x2` (flags) must be 0. Returns a
+    /// status in x0 and the byte count in x1. [`Errno::ShouldWait`] when the kernel was never
+    /// seeded: there is no second entropy source yet, so it refuses rather than pretend. Any
+    /// process may call it; randomness carries no authority. — TEAL
+    RandomRead = 67,
 }
+
+/// The most bytes one [`Syscall::RandomRead`] fills, as `getentropy` allows.
+pub const RANDOM_READ_MAX: usize = 256;
 
 /// [`Syscall::PersonaContext`] op: read the open call's foreign `(pc, sp, x8)`.
 pub const PERSONA_CONTEXT_GET: u64 = 0;
@@ -593,6 +602,7 @@ mod tests {
         assert_eq!(Syscall::PersonaReturn as usize, 64);
         assert_eq!(Syscall::PersonaContext as usize, 65);
         assert_eq!(Syscall::VmarSnapshot as usize, 66);
+        assert_eq!(Syscall::RandomRead as usize, 67);
     }
 }
 

@@ -1,6 +1,7 @@
 //j922
 //j932
 //j933
+//J947_r13_001
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -2314,6 +2315,30 @@ fn dispatch_object_syscall(
                 _ => r[0] = u64::MAX,
             }
         }
+    } else if num == Syscall::RandomRead as u64 {
+        // J947_r13_001 (SH9-c8): CSPRNG output into the caller's own memory. Any process may
+        // ask; ShouldWait when the kernel was never seeded (no fallback entropy exists). — TEAL
+        let user_buf = r[0];
+        let len = r[1] as usize;
+        r[1] = 0;
+        r[0] = if r[2] != 0
+            || len > kumo_abi::sys::RANDOM_READ_MAX
+            || !user_range_ok(target, user_buf, len as u64)
+        {
+            Errno::InvalidArgs.status() as u32 as u64
+        } else {
+            let mut bytes = [0u8; kumo_abi::sys::RANDOM_READ_MAX];
+            if crate::rng::fill(&mut bytes[..len]) {
+                // SAFETY: `user_range_ok` proved `[user_buf, user_buf + len)` is the caller's.
+                let dest = unsafe { core::slice::from_raw_parts_mut(user_buf as *mut u8, len) };
+                dest.copy_from_slice(&bytes[..len]);
+                bytes.fill(0);
+                r[1] = len as u64;
+                Errno::Ok.status() as u32 as u64
+            } else {
+                Errno::ShouldWait.status() as u32 as u64
+            }
+        };
     } else if num == Syscall::VmarSnapshot as u64 {
         r[0] = match engine.dispatch(
             target,
@@ -3469,7 +3494,19 @@ fn attempt_sora(
         // cannot reach the loader's allocation; the snapshot's `cmdline` is then that page
         // offset and length, never a pointer. Only a current-ABI loader's bounded line is
         // taken (Nijigumo's own LoaderData, kept by the frame allocator). — TEAL
+        // J947_r13_001: the firmware seed keys the CSPRNG here, before the first BootInfo copy
+        // exists, and never leaves the kernel: the snapshot Sora (and drv-fb) map carries zeros.
+        let seeded = crate::rng::seed_from_boot(boot);
+        crate::klog!(
+            "RNG SEED           Check     {}\n",
+            if seeded {
+                "seeded from firmware (EFI_RNG_PROTOCOL)"
+            } else {
+                "UNSEEDED: no firmware entropy; RandomRead refuses"
+            }
+        );
         let mut snapshot = *boot;
+        snapshot.forget_rng_seed();
         snapshot.cmdline = kumo_abi::RawSlice::empty();
         let cmdline_len = boot.cmdline.len as usize;
         if boot.version == kumo_abi::ABI_VERSION

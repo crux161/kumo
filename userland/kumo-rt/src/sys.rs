@@ -1,8 +1,8 @@
-//j911
 //j913
 //j922
 //j924
 //J943_r09_001
+//J947_r13_001
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -179,6 +179,37 @@ pub fn channel_create() -> u64 {
 )))]
 pub fn channel_create() -> u64 {
     u64::MAX
+}
+
+/// J947_r13_001 (SH9-c8): fill `buf` (at most [`kumo_abi::sys::RANDOM_READ_MAX`] bytes) from
+/// the kernel CSPRNG. `Err` carries the kernel status, [`kumo_abi::Errno::ShouldWait`] when the
+/// kernel was never seeded from firmware.
+#[cfg(target_arch = "aarch64")]
+pub fn random_read(buf: &mut [u8]) -> Result<usize, i32> {
+    let status: u64;
+    let count: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::RandomRead as u64,
+            inlateout("x0") buf.as_mut_ptr() as u64 => status,
+            inlateout("x1") buf.len() as u64 => count,
+            in("x2") 0u64,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    if status == 0 {
+        Ok(count as usize)
+    } else {
+        Err(status as u32 as i32)
+    }
+}
+
+/// Host builds have no kernel generator.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn random_read(_buf: &mut [u8]) -> Result<usize, i32> {
+    Err(kumo_abi::Errno::NotSupported.status())
 }
 
 /// Create a channel pair, returning both handles. `pair.0` = first, `pair.1` = second.

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j905
 //j906
 //j932
 //j933
 //j934
+//J947_r13_001
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -160,6 +160,14 @@ const PXE_BASE_CODE_GUID: EfiGuid = guid(
     0x11d3,
     [0x9a, 0x2d, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
 );
+/// `EFI_RNG_PROTOCOL_GUID` (UEFI 2.x §37.5). J947_r13_001: the firmware's entropy source,
+/// read once before ExitBootServices to seed the kernel CSPRNG through BootInfo.
+const RNG_PROTOCOL_GUID: EfiGuid = guid(
+    0x3152_bca5,
+    0xeade,
+    0x433d,
+    [0x86, 0x2e, 0xc0, 0x1c, 0xdc, 0x29, 0x1f, 0x44],
+);
 const FILE_INFO_GUID: EfiGuid = guid(
     0x0957_6e92,
     0x6d3f,
@@ -168,6 +176,18 @@ const FILE_INFO_GUID: EfiGuid = guid(
 );
 
 // === EFI tables & protocols ==================================================
+
+/// `EFI_RNG_PROTOCOL`: GetInfo, then GetRNG (a NULL algorithm means the firmware's default).
+#[repr(C)]
+struct EfiRngProtocol {
+    get_info: *mut c_void,
+    get_rng: extern "efiapi" fn(
+        this: *mut EfiRngProtocol,
+        algorithm: *const EfiGuid,
+        value_length: usize,
+        value: *mut u8,
+    ) -> EfiStatus,
+}
 
 #[repr(C)]
 struct EfiTableHeader {
@@ -774,6 +794,7 @@ unsafe fn boot_and_jump(
     // explicit PL011 route. The latter is how a Pi 5 image can follow firmware's current RP1
     // PCIe window without pretending that a movable BAR address is a stable BSP fact.
     unsafe { stamp_boot_config(boot_services, root, con_out, boot_ptr) };
+    unsafe { stamp_rng_seed(boot_services, con_out, boot_ptr) };
 
     #[cfg(feature = "ax88-oracle")]
     if unsafe { (*boot_ptr).board_id() } == "orange-pi-5-plus" {
@@ -1414,6 +1435,52 @@ unsafe fn file_size_bytes(file: *mut EfiFileProtocol) -> Option<u64> {
 /// field empty — the kernel reports "unstamped", which is the pre-existing behaviour. This
 /// is deliberately not fatal: the board id is not yet load-bearing, and a boot that reaches
 /// the kernel is worth more than one refused over a missing manifest.
+/// J947_r13_001: ask the firmware's `EFI_RNG_PROTOCOL` for [`BootInfo::RNG_SEED_LEN`] bytes and
+/// stamp them into BootInfo for the kernel CSPRNG. A firmware without the protocol (or one whose
+/// GetRNG fails) leaves the seed absent and says so: the kernel then stays unseeded and refuses
+/// RandomRead rather than inventing entropy. The bytes are never printed. — TEAL
+unsafe fn stamp_rng_seed(
+    boot_services: *mut EfiBootServices,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+    boot_ptr: *mut BootInfo,
+) {
+    let mut rng: *mut EfiRngProtocol = ptr::null_mut();
+    let status = unsafe {
+        ((*boot_services).locate_protocol)(
+            &RNG_PROTOCOL_GUID,
+            ptr::null_mut(),
+            &mut rng as *mut _ as *mut *mut c_void,
+        )
+    };
+    if status != EFI_SUCCESS || rng.is_null() {
+        kprint!(
+            con_out,
+            "rng seed     : none (EFI_RNG_PROTOCOL locate {:#x}); kernel RNG stays unseeded\r\n",
+            status
+        );
+        return;
+    }
+    let mut seed = [0u8; BootInfo::RNG_SEED_LEN];
+    let status = unsafe { ((*rng).get_rng)(rng, ptr::null(), seed.len(), seed.as_mut_ptr()) };
+    if status != EFI_SUCCESS {
+        kprint!(
+            con_out,
+            "rng seed     : none (GetRNG {:#x}); kernel RNG stays unseeded\r\n",
+            status
+        );
+        return;
+    }
+    unsafe {
+        (*boot_ptr).rng_seed = seed;
+        (*boot_ptr).flags |= BootInfo::FLAG_RNG_SEED_PRESENT;
+    }
+    kprint!(
+        con_out,
+        "rng seed     : {} bytes from EFI_RNG_PROTOCOL\r\n",
+        BootInfo::RNG_SEED_LEN
+    );
+}
+
 unsafe fn stamp_boot_config(
     boot_services: *mut EfiBootServices,
     root: PayloadSource,

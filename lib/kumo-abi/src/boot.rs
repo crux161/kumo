@@ -1,10 +1,10 @@
 use core::marker::PhantomData;
 
-//j421
 //j467
 //j480
 //j622
 //j932
+//J947_r13_001
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +192,11 @@ pub struct BootInfo {
     /// the loader from the `nijigumo.conf` `board = <id>` key; empty = unknown (DESIGN/017 §4).
     /// The kernel resolves it with `kumo_bsp::Board::from_id`.
     pub board_id: [u8; 32],
+    /// v4 (J947_r13_001): 32 bytes of firmware entropy (`EFI_RNG_PROTOCOL`) that seed the
+    /// kernel CSPRNG, valid only with [`BootInfo::FLAG_RNG_SEED_PRESENT`]. The kernel takes it
+    /// before anything else reads BootInfo and the snapshot userland sees always carries zeros
+    /// here, so no process can read the seed. — TEAL
+    pub rng_seed: [u8; 32],
 }
 
 impl BootInfo {
@@ -201,6 +206,10 @@ impl BootInfo {
     /// EFI reserved allocation and GCD SystemMemory. Absent on older/unsupported loaders;
     /// Reserved alone is not RAM evidence. Layout/version remain compatible. — KESTREL
     pub const FLAG_FRAMEBUFFER_RESERVED_RAM: u32 = 1 << 2;
+    /// [`BootInfo::rng_seed`] holds firmware entropy (J947_r13_001).
+    pub const FLAG_RNG_SEED_PRESENT: u32 = 1 << 3;
+    /// Length of the [`BootInfo::rng_seed`] byte field.
+    pub const RNG_SEED_LEN: usize = 32;
 
     /// Length of the [`BootInfo::board_id`] byte field.
     pub const BOARD_ID_LEN: usize = 32;
@@ -229,7 +238,20 @@ impl BootInfo {
             cmdline: RawSlice::empty(),
             verified_boot_sig: [0; 64],
             board_id: [0; Self::BOARD_ID_LEN],
+            rng_seed: [0; Self::RNG_SEED_LEN],
         }
+    }
+
+    /// Whether the loader passed firmware entropy in [`BootInfo::rng_seed`].
+    pub const fn has_rng_seed(self) -> bool {
+        self.flags & Self::FLAG_RNG_SEED_PRESENT != 0
+    }
+
+    /// Drop the seed from this copy: zero bytes, flag cleared. The kernel does this to every
+    /// BootInfo it hands on, so the seed exists only in the loader's own memory and the CSPRNG.
+    pub fn forget_rng_seed(&mut self) {
+        self.rng_seed = [0; Self::RNG_SEED_LEN];
+        self.flags &= !Self::FLAG_RNG_SEED_PRESENT;
     }
 
     pub const fn has_framebuffer(self) -> bool {
