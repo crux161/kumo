@@ -1,9 +1,9 @@
 # The measured KUMO C++ runtime — G7l
-<!-- J939_r05_001 -->
 <!-- J940_r06_001 -->
 <!-- J941_r07_001 -->
 <!-- J942_r08_001 -->
 <!-- J944_r10_002 -->
+<!-- J945_r11_001 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -221,4 +221,43 @@ scripts/relibc-headers.sh
 python3 toolchain/cxx/build-fs-write.py
 python3 scripts/cxx-fs-write-smoke.py --run
 python3 scripts/metal-sh9-c5.py --proof build/verification/r10/sh9-c5/cxx-fs-write-smoke
+```
+
+
+## SH9-c6: the complete narrow-character libc++
+
+`build-libcxx.py` compiles every upstream `LIBCXX_SOURCES` unit for threads, localization and
+filesystem (50 units) into one `libc++.a`, built as upstream builds it against libc++abi
+(`-DLIBCXX_BUILDING_LIBCXXABI`). The units SH9-b1's ABI archive already carries (`exception`,
+`stdexcept`, `verbose_abort`, and libc++abi's `operator new`/`delete` in place of `new.cpp`)
+stay there. `charconv.cpp` uses LLVM-libc's shared float and integer parsers, so the closure
+now pins 117 files under `libc/` plus `libc/LICENSE.TXT`, built with the libc root on the
+include path and `LIBC_NAMESPACE=__llvm_libc_common_utils` as `FindLibcCommonUtils.cmake` does.
+
+Two facilities are deliberately absent. `std::random_device` (`random.cpp`): relibc's KUMO
+`getrandom` is a clock-seeded xorshift, not an entropy source, so the unit stays off
+(`_LIBCPP_HAS_RANDOM_DEVICE 0`) until a real one exists; the `<random>` engines and
+distributions are header-only and are proven. Wide characters (`_LIBCPP_HAS_WIDE_CHARACTERS 0`):
+enabling them needs `wcscoll_l`, `wcsxfrm_l` and more from relibc, which is SH9-c7. LLVM needs
+`std::wstring` (`ConvertUTFWrapper`).
+
+The build installs a sysroot layer, `install/include/c++/v1` (the measured header closure plus
+the generated `__config_site`) and `install/lib/{libc++,libc++abi,libunwind}.a`, and compiles
+the proof against that layer alone. Programs linking it need a real main stack: Sora gives
+thread zero what `PT_GNU_STACK` asks for (J741), else 16 KiB, and the first boot overflowed
+16 KiB inside a `bad_alloc` throw. The relibc link script declares `PHDRS`, so lld creates no
+stack header for `-z stack-size` to fill; the builder adds one and writes 1 MiB into it, as
+Mesa's build does.
+
+The proof covers `std::cout` and stream formatting; four threads with a mutex, condition
+variable and `std::barrier`, `std::async`, and `std::shared_mutex`; the standard's fixed
+`mt19937`/`mt19937_64` 10000th outputs and a distribution; ECMAScript `regex_match`,
+`regex_search` and `regex_replace`; `to_chars`/`from_chars` and `std::format`; and `pmr`
+containers over a `monotonic_buffer_resource` whose `null_memory_resource` upstream throws.
+
+```sh
+scripts/relibc-headers.sh
+python3 toolchain/cxx/build-libcxx.py
+python3 scripts/cxx-libcxx-smoke.py --run
+python3 scripts/metal-sh9-c6.py --proof build/verification/r11/sh9-c6/cxx-libcxx-smoke
 ```
