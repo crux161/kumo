@@ -5951,6 +5951,21 @@
       "git_blob": "77a028a48077d14d501b1f0eb1f09deec34d3949",
       "sha256": "bc71e80b498ff828e6bf91f1715c40af40cf52e7f7a1e3f3a8c9a1c6fcd56647",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/vector.cpp"
+    },
+    "libcxx/include/cwchar": {
+      "git_blob": "d41af176f74fddb24d951801273a772e2622c6c2",
+      "sha256": "14959cf4dc67b519b856d97f084fa750a74dc8011a3d940ce35c8367dfa03f8b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/cwchar"
+    },
+    "libcxx/include/cwctype": {
+      "git_blob": "b7f9cbb835e3282c2ef77b79c4d9efb367121220",
+      "sha256": "f89b4f0d27050dfc9d4ac613ee9e92e031b31090b2308a9ca43989891525fcd4",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/cwctype"
+    },
+    "libcxx/include/wctype.h": {
+      "git_blob": "d2607406d8c4c0bad7776819903a01cb4e4d0171",
+      "sha256": "24dbb6aa8f2e33c4c5e07c7dad6decd3a72219b8c936c9eda392c198de783f6f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/wctype.h"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

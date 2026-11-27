@@ -1,9 +1,9 @@
 # The measured KUMO C++ runtime — G7l
-<!-- J940_r06_001 -->
 <!-- J941_r07_001 -->
 <!-- J942_r08_001 -->
 <!-- J944_r10_002 -->
 <!-- J945_r11_001 -->
+<!-- J946_r12_001 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -239,7 +239,7 @@ Two facilities are deliberately absent. `std::random_device` (`random.cpp`): rel
 (`_LIBCPP_HAS_RANDOM_DEVICE 0`) until a real one exists; the `<random>` engines and
 distributions are header-only and are proven. Wide characters (`_LIBCPP_HAS_WIDE_CHARACTERS 0`):
 enabling them needs `wcscoll_l`, `wcsxfrm_l` and more from relibc, which is SH9-c7. LLVM needs
-`std::wstring` (`ConvertUTFWrapper`).
+`std::wstring` (`ConvertUTFWrapper`). (SH9-c7 turned them on; see below.)
 
 The build installs a sysroot layer, `install/include/c++/v1` (the measured header closure plus
 the generated `__config_site`) and `install/lib/{libc++,libc++abi,libunwind}.a`, and compiles
@@ -260,4 +260,37 @@ scripts/relibc-headers.sh
 python3 toolchain/cxx/build-libcxx.py
 python3 scripts/cxx-libcxx-smoke.py --run
 python3 scripts/metal-sh9-c6.py --proof build/verification/r11/sh9-c6/cxx-libcxx-smoke
+```
+
+
+## SH9-c7: wide characters
+
+`build-libcxx.py` now builds the complete library with `_LIBCPP_HAS_WIDE_CHARACTERS 1`. With
+wide characters on, every unit included libc++'s BSD locale fallback, which needs relibc's wide
+`_l` calls, and `string.cpp` needs `wcstof`/`wcstold`. `toolchain/relibc/kumo.patch` adds
+`wcstof`, `wcstold` (C, beside `strtold`), `wcscoll_l`, `wcsxfrm_l`, `iswctype_l`, `towupper_l`,
+`towlower_l` and the twelve `isw*_l` classifiers. All of them ignore the locale, as relibc has
+only the C locale. The patch also fixes three upstream relibc problems that libc++'s wide facets
+would reach:
+
+- `mbstate_t` was a zero-sized type, an empty struct in C, so C++'s `mbstate_t mb = {0};` did
+  not compile. It now has musl's layout, two opaque words. relibc's UTF-8 conversions still keep
+  no shift state.
+- `wcsxfrm` returned 0 and transformed nothing. In the C locale it is now the identity: it copies
+  when the result fits and returns the length.
+- `wcstod` parsed digits and one `.` by hand, so `std::stod(L"3.25e2")` read 3.25. It now narrows
+  the ASCII prefix and calls relibc's `strtod`, so exponents, hex, inf and nan parse, and the end
+  pointer maps back. `wcstof` takes the same path.
+
+The classic locale's `wchar_t` facets answer from libc++'s own tables. The proof also builds a
+locale from `ctype_byname<wchar_t>("C")` and `collate_byname<wchar_t>("C")`, which do call relibc.
+It covers `wstring` and the `sto*` and `to_wstring` conversions (including the `stod` end
+position); `wostringstream`, `wistringstream` and `std::wcout`; `ctype`, `collate` (compare and
+transform) and a `codecvt<wchar_t, char>` round trip; and `wregex` and wide `std::format`.
+SH9-c6's narrow proof runs against the wide build too.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/cxx-libcxx-wide-smoke.py --run
+python3 scripts/metal-sh9-c7.py --proof build/verification/r12/sh9-c7/cxx-libcxx-wide-smoke
 ```

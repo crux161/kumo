@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #J945_r11_001
-"""Build the complete narrow-character libc++ for native KUMO and install it as a sysroot layer."""
+#J946_r12_001
+"""Build the complete libc++ (wide characters included) for native KUMO and install it as a sysroot layer."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -28,7 +29,10 @@ UNITS = (
     "iostream", "locale", "ostream", "regex", "strstream", "filesystem/directory_entry",
     "filesystem/directory_iterator", "filesystem/operations", "filesystem/int128_builtins",
 )
-RELIBC_CALLS = ("strtod_l", "strtof_l", "strtold_l", "strftime_l")
+RELIBC_CALLS = ("strtod_l", "strtof_l", "strtold_l", "strftime_l",
+                # SH9-c7 (J946_r12_001): what wide characters need from relibc.
+                "wcstof", "wcstold", "wcscoll_l", "wcsxfrm_l", "iswctype_l", "towupper_l", "towlower_l",
+                "iswalpha_l", "iswspace_l")
 MAIN_STACK = 1024 * 1024
 
 
@@ -95,6 +99,8 @@ def main():
     parser.add_argument("--out", type=Path, default=ROOT / "target/cxx-libcxx")
     parser.add_argument("--eh-out", type=Path, default=ROOT / "target/cxx-eh")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
+    parser.add_argument("--smoke", type=Path, default=TOOL / "libcxx-smoke.cpp", help="the proof program")
+    parser.add_argument("--elf-name", default="cxx-libcxx-smoke")
     args = parser.parse_args()
     sysroot, out, eh_out = args.sysroot.resolve(), args.out.resolve(), args.eh_out.resolve()
     libc = sysroot / "lib/libc.a"
@@ -131,6 +137,9 @@ def main():
     site = site.replace("#define _LIBCPP_HAS_FILESYSTEM 0", "#define _LIBCPP_HAS_FILESYSTEM 1")
     site = site.replace("#define _LIBCPP_HAS_LOCALIZATION 0",
                         "#define _LIBCPP_HAS_LOCALIZATION 1\n#define _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE")
+    # SH9-c7: wide characters on. relibc now has the wide _l calls, wcstof/wcstold and a sized
+    # mbstate_t (kumo.patch, J946_r12_001); LLVM's ConvertUTFWrapper needs std::wstring. — TEAL
+    site = site.replace("#define _LIBCPP_HAS_WIDE_CHARACTERS 0", "#define _LIBCPP_HAS_WIDE_CHARACTERS 1")
     install = out / "install"
     if install.exists():
         shutil.rmtree(install)
@@ -172,12 +181,12 @@ def main():
 
     # The proof compiles against the installed layer alone: headers from include/c++/v1, archives
     # from lib/. Nothing from the staged source tree is on its include path.
-    smoke = TOOL / "libcxx-smoke.cpp"
+    smoke = args.smoke.resolve()
     smoke_obj, smoke_dep = out / "smoke.o", out / "smoke.d"
     run(["clang++", *common, "-MD", "-MF", smoke_dep, "-c", smoke, "-o", smoke_obj])
     crt = out / "crt0.o"
     run(["clang", "--target=aarch64-unknown-none", "-c", ROOT / "toolchain/relibc/smoke/crt0.S", "-o", crt])
-    elf = out / "cxx-libcxx-smoke"
+    elf = out / args.elf_name
     link_map = out / "link.map"
     # Thread zero's stack is whatever PT_GNU_STACK asks for (Sora, j741), else 16 KiB. libc++'s
     # regex matcher recurses and an exception's two unwind phases need stack of their own; the
@@ -205,12 +214,12 @@ def main():
     manifest = {
         "llvm_revision": lock["revision"],
         "llvm_ref": lock["ref"],
-        "scope": "complete narrow-character libc++ (every LIBCXX_SOURCES unit for threads, localization and "
+        "scope": "complete libc++ with wide characters (every LIBCXX_SOURCES unit for threads, localization and "
                  "filesystem except random_device and the units the ABI archive carries), installed as "
                  "include/c++/v1 + lib/{libc++,libc++abi,libunwind}.a; headers are the measured closure",
         "units": list(UNITS),
         "config": "_LIBCPP_HAS_FILESYSTEM 1, _LIBCPP_HAS_LOCALIZATION 1, _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE, "
-                  "_LIBCPP_HAS_WIDE_CHARACTERS 0, _LIBCPP_HAS_RANDOM_DEVICE 0",
+                  "_LIBCPP_HAS_WIDE_CHARACTERS 1, _LIBCPP_HAS_RANDOM_DEVICE 0",
         "clang": run(["clang++", "--version"], capture=True).strip(),
         "inputs_sha256": {str(path): sha(path) for path in sorted(inputs) if path.is_file()},
         "installed_sha256": {str(path.relative_to(install)): sha(path) for path in sorted(libdir.iterdir())},
@@ -220,7 +229,7 @@ def main():
         "elf_bytes": elf.stat().st_size,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"SH9-c6 complete libc++ compile/link green: {elf} ({len(UNITS)} units)", flush=True)
+    print(f"complete libc++ compile/link green: {elf} ({len(UNITS)} units, {smoke.name})", flush=True)
 
 
 if __name__ == "__main__":

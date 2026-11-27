@@ -1104,3 +1104,449 @@ diff --git a/src/header/time/mod.rs b/src/header/time/mod.rs
 
  /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/time.html>.
  #[unsafe(no_mangle)]
+diff --git a/src/header/wchar/mod.rs b/src/header/wchar/mod.rs
+--- a/src/header/wchar/mod.rs
++++ b/src/header/wchar/mod.rs
+@@ -7,6 +7,7 @@
+ use crate::{
+     c_str::{WStr, Wide},
+     header::{
++        bits_locale_t::locale_t,
+         ctype::isspace,
+         errno::{EILSEQ, ENOMEM, ERANGE},
+         stdio::*,
+@@ -20,8 +21,8 @@
+     platform::{
+         self, ERRNO,
+         types::{
+-            c_char, c_double, c_int, c_long, c_longlong, c_uchar, c_ulong, c_ulonglong, c_void,
+-            size_t, wchar_t, wint_t,
++            c_char, c_double, c_float, c_int, c_long, c_longlong, c_uchar, c_uint, c_ulong,
++            c_ulonglong, c_void, size_t, wchar_t, wint_t,
+         },
+     },
+ };
+@@ -33,9 +34,26 @@
+ pub use utf8::get_char_encoded_length;
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/wchar.h.html>.
++///
++/// KUMO (J946_r12_001): musl's layout, two opaque words. relibc's UTF-8 conversions keep no
++/// shift state, but a zero-sized type is an empty struct in C, and C++'s `mbstate_t mb = {0};`
++/// (libc++'s wide locale facets) does not compile against an empty struct. — TEAL
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+-pub struct mbstate_t;
++pub struct mbstate_t {
++    __opaque1: c_uint,
++    __opaque2: c_uint,
++}
++
++impl mbstate_t {
++    /// The initial conversion state.
++    pub const fn new() -> Self {
++        Self {
++            __opaque1: 0,
++            __opaque2: 0,
++        }
++    }
++}
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/btowc.html>.
+ #[unsafe(no_mangle)]
+@@ -47,7 +65,7 @@
+
+     let uc = c as u8;
+     let c = uc as c_char;
+-    let mut ps: mbstate_t = mbstate_t;
++    let mut ps: mbstate_t = mbstate_t::new();
+     let mut wc: wchar_t = 0;
+     let saved_errno = platform::ERRNO.get();
+     let status = unsafe { mbrtowc(&raw mut wc, ptr::from_ref::<c_char>(&c), 1, &raw mut ps) };
+@@ -142,7 +160,7 @@
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn fputwc(wc: wchar_t, stream: *mut FILE) -> wint_t {
+     //Convert wchar_t to multibytes first
+-    static mut INTERNAL: mbstate_t = mbstate_t;
++    static mut INTERNAL: mbstate_t = mbstate_t::new();
+     let mut bytes: [c_char; MB_CUR_MAX as usize] = [0; MB_CUR_MAX as usize];
+
+     let amount = unsafe { wcrtomb(bytes.as_mut_ptr(), wc, &raw mut INTERNAL) };
+@@ -208,7 +226,7 @@
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/mbrlen.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn mbrlen(s: *const c_char, n: size_t, ps: *mut mbstate_t) -> size_t {
+-    static mut INTERNAL: mbstate_t = mbstate_t;
++    static mut INTERNAL: mbstate_t = mbstate_t::new();
+     unsafe { mbrtowc(ptr::null_mut(), s, n, &raw mut INTERNAL) }
+ }
+
+@@ -222,7 +240,7 @@
+     n: size_t,
+     ps: *mut mbstate_t,
+ ) -> size_t {
+-    static mut INTERNAL: mbstate_t = mbstate_t;
++    static mut INTERNAL: mbstate_t = mbstate_t::new();
+
+     if ps.is_null() {
+         let ps = &raw mut INTERNAL;
+@@ -246,7 +264,7 @@
+     dst_len: size_t,
+     ps: *mut mbstate_t,
+ ) -> size_t {
+-    static mut INTERNAL: mbstate_t = mbstate_t;
++    static mut INTERNAL: mbstate_t = mbstate_t::new();
+
+     if ps.is_null() {
+         let ps = &raw mut INTERNAL;
+@@ -353,7 +371,7 @@
+     if wc == WEOF {
+         return wc;
+     }
+-    static mut INTERNAL: mbstate_t = mbstate_t;
++    static mut INTERNAL: mbstate_t = mbstate_t::new();
+     let mut bytes: [c_char; MB_CUR_MAX as usize] = [0; MB_CUR_MAX as usize];
+
+     let amount = unsafe { wcrtomb(bytes.as_mut_ptr(), wc as wchar_t, &raw mut INTERNAL) };
+@@ -486,7 +504,7 @@
+     n: size_t,
+     mut st: *mut mbstate_t,
+ ) -> size_t {
+-    let mut mbs = mbstate_t {};
++    let mut mbs = mbstate_t::new();
+     if st.is_null() {
+         st = &raw mut mbs;
+     }
+@@ -532,6 +550,14 @@
+     unsafe { wcscmp(ws1, ws2) }
+ }
+
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcscoll.html>.
++///
++/// KUMO (J946_r12_001): relibc has only the C locale, so `loc` is ignored, as in `strcoll_l`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn wcscoll_l(ws1: *const wchar_t, ws2: *const wchar_t, _loc: locale_t) -> c_int {
++    unsafe { wcscoll(ws1, ws2) }
++}
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcscpy.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn wcscpy(ws1: *mut wchar_t, ws2: *const wchar_t) -> *mut wchar_t {
+@@ -668,7 +694,7 @@
+     let mut written = 0;
+     let mut read = 0;
+     let mut buf: [c_char; MB_LEN_MAX as usize] = [0; MB_LEN_MAX as usize];
+-    let mut mbs = mbstate_t {};
++    let mut mbs = mbstate_t::new();
+
+     if ps.is_null() {
+         ps = &raw mut mbs;
+@@ -771,44 +797,46 @@
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstod.html>.
+ #[unsafe(no_mangle)]
+-pub unsafe extern "C" fn wcstod(mut ptr: *const wchar_t, end: *mut *mut wchar_t) -> c_double {
+-    const RADIX: u32 = 10;
++pub unsafe extern "C" fn wcstod(ptr: *const wchar_t, end: *mut *mut wchar_t) -> c_double {
++    // KUMO (J946_r12_001): upstream parsed digits and one '.' by hand (no exponent, hex, inf or
++    // nan, and rounding error per digit), so std::stod(L"3.25e2") read 3.25. A number's text is
++    // ASCII: narrow the ASCII prefix and let relibc's strtod parse it, then map the end back.
++    // — TEAL
++    unsafe { wide_float(ptr, end, |s, e| crate::header::stdlib::strtod(s, e)) }
++}
+
+-    skipws!(ptr);
+-    let negative = unsafe { *ptr } == '-' as wchar_t;
+-    if negative {
+-        ptr = unsafe { ptr.add(1) };
+-    }
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstod.html>.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn wcstof(ptr: *const wchar_t, end: *mut *mut wchar_t) -> c_float {
++    unsafe { wide_float(ptr, end, |s, e| crate::header::stdlib::strtof(s, e)) }
++}
+
+-    let mut result: c_double = 0.0;
+-    while let Some(digit) = char::from_u32(unsafe { *ptr } as _).and_then(|c| c.to_digit(RADIX)) {
+-        result *= 10.0;
+-        if negative {
+-            result -= c_double::from(digit);
+-        } else {
+-            result += c_double::from(digit);
++/// Parse a wide floating-point string through its narrow counterpart. Only the ASCII prefix can
++/// belong to a number, so the copy stops at the first non-ASCII character (or after 512, longer
++/// than any number strtod would take whole); `end` is mapped back by the narrow offset.
++unsafe fn wide_float<T>(
++    ptr: *const wchar_t,
++    end: *mut *mut wchar_t,
++    parse: impl FnOnce(*const c_char, *mut *mut c_char) -> T,
++) -> T {
++    const LIMIT: usize = 512;
++    let mut narrow = [0 as c_char; LIMIT + 1];
++    let mut len = 0;
++    while len < LIMIT {
++        let wc = unsafe { *ptr.add(len) };
++        if wc <= 0 || wc > 0x7f {
++            break;
+         }
+-        ptr = unsafe { ptr.add(1) };
+-    }
+-    if unsafe { *ptr } == '.' as wchar_t {
+-        ptr = unsafe { ptr.add(1) };
+-
+-        let mut scale = 1.0;
+-        while let Some(digit) = char::from_u32(unsafe { *ptr } as _).and_then(|c| c.to_digit(RADIX))
+-        {
+-            scale /= 10.0;
+-            if negative {
+-                result -= c_double::from(digit) * scale;
+-            } else {
+-                result += c_double::from(digit) * scale;
+-            }
+-            ptr = unsafe { ptr.add(1) };
+-        }
++        narrow[len] = wc as c_char;
++        len += 1;
+     }
++    let mut stop: *mut c_char = ptr::null_mut();
++    let value = parse(narrow.as_ptr(), &raw mut stop);
+     if !end.is_null() {
+-        unsafe { *end = ptr.cast_mut() };
++        let used = unsafe { stop.cast_const().offset_from(narrow.as_ptr()) } as usize;
++        unsafe { *end = ptr.add(used).cast_mut() };
+     }
+-    result
++    value
+ }
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstok.html>.
+@@ -958,11 +986,30 @@
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcsxfrm.html>.
+ #[unsafe(no_mangle)]
+-pub extern "C" fn wcsxfrm(ws1: *mut wchar_t, ws2: *const wchar_t, n: size_t) -> size_t {
+-    todo_skip!(0, "wcsxfrm is not implemented");
+-    0
++pub unsafe extern "C" fn wcsxfrm(ws1: *mut wchar_t, ws2: *const wchar_t, n: size_t) -> size_t {
++    // KUMO (J946_r12_001): upstream returned 0 unconditionally. In the C locale (relibc's only
++    // one) collation is wcscmp order, so the transform is the identity: copy when it fits,
++    // and always report the transformed length, as POSIX requires. — TEAL
++    let len = unsafe { wcslen(ws2) };
++    if len < n {
++        unsafe { ptr::copy_nonoverlapping(ws2, ws1, len + 1) };
++    }
++    len
+ }
+
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcsxfrm.html>.
++///
++/// KUMO (J946_r12_001): `loc` is ignored; see `wcsxfrm`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn wcsxfrm_l(
++    ws1: *mut wchar_t,
++    ws2: *const wchar_t,
++    n: size_t,
++    _loc: locale_t,
++) -> size_t {
++    unsafe { wcsxfrm(ws1, ws2, n) }
++}
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wctob.html>.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn wctob(c: wint_t) -> c_int {
+diff --git a/src/header/wctype/mod.rs b/src/header/wctype/mod.rs
+--- a/src/header/wctype/mod.rs
++++ b/src/header/wctype/mod.rs
+@@ -7,7 +7,7 @@
+ use self::casecmp::casemap;
+ use crate::{
+     c_str::CStr,
+-    header::ctype,
++    header::{bits_locale_t::locale_t, ctype},
+     platform::types::{c_char, c_int, wint_t},
+ };
+
+@@ -230,3 +230,96 @@
+         _ => 0,
+     }
+ }
++
++// KUMO (J946_r12_001): the POSIX `_l` forms libc++'s wide locale facets call. relibc has only the
++// C locale, so like `isalpha_l` these ignore `loc` and answer exactly as their plain forms. — TEAL
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswalnum.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswalnum_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswalnum(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswalpha.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswalpha_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswalpha(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswblank.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswblank_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswblank(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswcntrl.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswcntrl_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswcntrl(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswdigit.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswdigit_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswdigit(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswgraph.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswgraph_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswgraph(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswlower.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswlower_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswlower(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswprint.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswprint_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswprint(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswpunct.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswpunct_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswpunct(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswspace.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswspace_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswspace(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswupper.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswupper_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswupper(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswxdigit.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswxdigit_l(wc: wint_t, _loc: locale_t) -> c_int {
++    iswxdigit(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/iswctype.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn iswctype_l(wc: wint_t, desc: wctype_t, _loc: locale_t) -> c_int {
++    iswctype(wc, desc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/towlower.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn towlower_l(wc: wint_t, _loc: locale_t) -> wint_t {
++    towlower(wc)
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/towupper.html>.
++#[unsafe(no_mangle)]
++pub extern "C" fn towupper_l(wc: wint_t, _loc: locale_t) -> wint_t {
++    towupper(wc)
++}
+diff --git a/src/header/stdlib/mod.rs b/src/header/stdlib/mod.rs
+--- a/src/header/stdlib/mod.rs
++++ b/src/header/stdlib/mod.rs
+@@ -718,7 +718,7 @@
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn mblen(s: *const c_char, n: size_t) -> c_int {
+     let mut wc: wchar_t = 0;
+-    let mut state: mbstate_t = mbstate_t {};
++    let mut state: mbstate_t = mbstate_t::new();
+     let result: usize = unsafe { mbrtowc(&raw mut wc, s, n, &raw mut state) };
+
+     if result == -1isize as usize {
+@@ -734,14 +734,14 @@
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/mbstowcs.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn mbstowcs(pwcs: *mut wchar_t, mut s: *const c_char, n: size_t) -> size_t {
+-    let mut state: mbstate_t = mbstate_t {};
++    let mut state: mbstate_t = mbstate_t::new();
+     unsafe { mbsrtowcs(pwcs, &raw mut s, n, &raw mut state) }
+ }
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/mbtowc.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn mbtowc(pwc: *mut wchar_t, s: *const c_char, n: size_t) -> c_int {
+-    let mut state: mbstate_t = mbstate_t {};
++    let mut state: mbstate_t = mbstate_t::new();
+     (unsafe { mbrtowc(pwc, s, n, &raw mut state) }) as c_int
+ }
+
+@@ -1745,14 +1745,14 @@
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstombs.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn wcstombs(s: *mut c_char, mut pwcs: *const wchar_t, n: size_t) -> size_t {
+-    let mut state: mbstate_t = mbstate_t {};
++    let mut state: mbstate_t = mbstate_t::new();
+     unsafe { wcsrtombs(s, &raw mut pwcs, n, &raw mut state) }
+ }
+
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wctomb.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn wctomb(s: *mut c_char, wc: wchar_t) -> c_int {
+-    let mut state: mbstate_t = mbstate_t {};
++    let mut state: mbstate_t = mbstate_t::new();
+     let result: usize = unsafe { wcrtomb(s, wc, &raw mut state) };
+
+     if result == -1isize as usize {
+diff --git a/src/header/wchar/cbindgen.toml b/src/header/wchar/cbindgen.toml
+--- a/src/header/wchar/cbindgen.toml
++++ b/src/header/wchar/cbindgen.toml
+@@ -40,6 +40,19 @@
+
+ #define WEOF (0xffffffffu)
+ """
++# KUMO (J946_r12_001): wcstold is C (src/c/stdlib.c), like strtold.
++trailer = """
++#ifndef _RELIBC_WCHAR_EXTRA_H
++#define _RELIBC_WCHAR_EXTRA_H
++#ifdef __cplusplus
++extern "C" {
++#endif
++long double wcstold(const wchar_t *nptr, wchar_t **endptr);
++#ifdef __cplusplus
++}
++#endif
++#endif
++"""
+ include_guard = "_RELIBC_WCHAR_H"
+ language = "C"
+ style = "Type"
+diff --git a/src/c/stdlib.c b/src/c/stdlib.c
+--- a/src/c/stdlib.c
++++ b/src/c/stdlib.c
+@@ -6,6 +6,14 @@
+
+ /* KUMO (J942_r08_001): relibc has only the C locale, so the locale is ignored.
+  * locale_t is a pointer; this file includes no headers, hence void *. — TEAL */
++/* KUMO (J946_r12_001): wcstold beside strtold, through wcstod; long double is double here, as
++ * for strtold. This file includes no headers, hence the compiler's own wchar_t. — TEAL */
++double wcstod(const __WCHAR_TYPE__ *nptr, __WCHAR_TYPE__ **endptr);
++
++long double wcstold(const __WCHAR_TYPE__ *nptr, __WCHAR_TYPE__ **endptr) {
++    return (long double)wcstod(nptr, endptr);
++}
++
+ long double strtold_l(const char *nptr, char **endptr, void *loc) {
+     (void)loc;
+     return strtold(nptr, endptr);
