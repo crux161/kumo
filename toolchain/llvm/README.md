@@ -1,19 +1,30 @@
 <!-- J948_r14_001 -->
-# LLVM for native KUMO — SH9-d1: Support and Demangle
+<!-- J949_r15_001 -->
+# LLVM for native KUMO — Support, Demangle and BinaryFormat
 
 The first native bootstrap slice of PLAN/022 SH9. LLVM's `Support` and `Demangle` libraries
 (llvmorg-22.1.8, the same revision as `toolchain/cxx`) are built for `aarch64-unknown-kumo`
 against the installed libc++ layer (`toolchain/cxx/build-libcxx.py`) and relibc, and run natively
 on KUMO.
 
+SH9-d2 adds all 14 upstream BinaryFormat units as `libLLVMBinaryFormat.a`, with a native proof of
+its format, DWARF and metadata helpers. It uses the same revision, libc++ layer, relibc and port.
+
 ## Sources
 
-`SOURCE.lock` pins the measured closure: 467 files, about 7 MB. It holds every Support and
+`SOURCE.lock` pins the measured closure: 535 files, about 8 MB. SH9-d1's 467 files hold every Support and
 Demangle unit; the headers they and the proof include; the Unix layer (`lib/Support/Unix/*.inc`);
 BLAKE3's portable and NEON sources (not its x86 SIMD); `third-party/siphash`; the CMake config
 templates; and `llvm/LICENSE.TXT`, which also covers SipHash. Each file has its git blob ID and
 SHA-256, and `vendor/` holds the exact upstream bytes. The libc++ layer gained four headers LLVM
 includes (`<execution>`, `<inttypes.h>`, `<list>`, `<queue>`) in `toolchain/cxx/SOURCE.lock`.
+
+SH9-d2 adds 68 exact upstream files (732,970 bytes): BinaryFormat's CMake source list and all its
+units, their measured header/definition closure, and the TargetParser headers they include.
+The builder checks BinaryFormat's units against that pinned CMake list. Both builds record the
+LLVM inputs their depfiles measured and reject unpinned LLVM files or host system headers;
+compiler intrinsic headers are allowed only from the C/C++ drivers' resource directories and
+their hashes are recorded separately.
 
 ## The KUMO port (`kumo.patch`)
 
@@ -68,3 +79,32 @@ python3 scripts/metal-sh9-d1.py --proof build/verification/r14/sh9-d1/llvm-suppo
 
 This is Support, not a compiler: IR, CodeGen, the AArch64 target, and a native `clang`/`lld`/`rustc`
 are later slices. PLAN/014 (SMP) still gates SH9 acceptance.
+
+## BinaryFormat (SH9-d2)
+
+`build-binaryformat.py` uses the same builder to create Support, Demangle and BinaryFormat
+archives, then links `binaryformat-smoke.cpp` with no unresolved symbols and a 4 MiB main stack.
+No additional KUMO patch is needed. Its proof checks:
+
+- ELF type identification in both byte orders, short/unknown input, archive/Wasm/bitcode/Mach-O
+  magic, architecture-name and enum mappings.
+- A byte-exact ELF header fixture written, identified, read and removed on the granted RAM FAT
+  volume; the file overload's missing-path error.
+- DWARF names and reverse lookup, AArch64 CFI, version-dependent form sizes and version gates.
+- COFF section-name encoding boundaries, Wasm relocation addends, and XCOFF/DXContainer/SFrame
+  tables.
+- MessagePack fixed wire bytes, document and YAML round trips, truncated input and EOF.
+- Typed AMDGPU metadata acceptance and invalid-type rejection.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/llvm-binaryformat-smoke.py --run
+python3 scripts/metal-sh9-d2.py
+```
+
+BinaryFormat's upstream link components are Support and TargetParser. This slice vendors the
+TargetParser headers, without building that library. The proof exercises helpers that link with
+Support/Demangle alone; entry points that call TargetParser (such as Mach-O CPU selection and
+XCOFF CPU-name normalization) await a native TargetParser. The manifest records that unbuilt
+dependency. Object parsing, MC, IR and native `llvm-mc`/`lld` remain later slices; TargetParser
+must be closed as their prerequisite. Driver-style tools still need a process-launch path.

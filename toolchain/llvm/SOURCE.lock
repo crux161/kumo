@@ -2336,6 +2336,346 @@
       "git_blob": "ca4fe45e4fddf1a4ce2df50cda0e6fc80c5d8b44",
       "sha256": "0a39a86eef97c27c63d40586c9ae7d19445ffc5e3f05362677a73d1bc3e6fdb5",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/third-party/siphash/include/siphash/SipHash.h"
+    },
+    "llvm/include/llvm/BinaryFormat/AMDGPUMetadataVerifier.h": {
+      "git_blob": "0102fe655ae2e2db9e6c97a56375da227523d77d",
+      "sha256": "232b44a3be51e92540e8ba6993e54b7a1df96ed34f4f2c7fbd92fbdecec8ff9f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/AMDGPUMetadataVerifier.h"
+    },
+    "llvm/include/llvm/BinaryFormat/COFF.h": {
+      "git_blob": "64fe2160f997015bba01ec1330d5922841afcb60",
+      "sha256": "a44641df4bf2ecf96bbfa86b5145c3679b043a579a5df6afba1ac2852b593339",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/COFF.h"
+    },
+    "llvm/include/llvm/BinaryFormat/DXContainer.h": {
+      "git_blob": "1756ab0b555ff68d16d4c1d750cc76d7599c27f6",
+      "sha256": "08cc37fb68109b773b016892202f730de1b6f927baf11dd7e718ab9620e79722",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/DXContainer.h"
+    },
+    "llvm/include/llvm/BinaryFormat/DXContainerConstants.def": {
+      "git_blob": "f576d958037cd58e982dda00aa8e12602778ecd3",
+      "sha256": "2d208b9bf74838938983a1d0e5884e74a2a80f1294f90c29ada33cb272e583f5",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/DXContainerConstants.def"
+    },
+    "llvm/include/llvm/BinaryFormat/Dwarf.def": {
+      "git_blob": "fbf22cc6f760bb1436a8d4c7b7b3fa5432e27a6e",
+      "sha256": "3926004c081e28c75144a9e739144a4062b547b82e5431e578cae451975a9452",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/Dwarf.def"
+    },
+    "llvm/include/llvm/BinaryFormat/Dwarf.h": {
+      "git_blob": "211c0269c1f29f4be29c27e80ab724502915a505",
+      "sha256": "be4e0505ae2a3ff36290ded7a165cd63247300a4a01188a2342fbafecd83f78c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/Dwarf.h"
+    },
+    "llvm/include/llvm/BinaryFormat/DynamicTags.def": {
+      "git_blob": "1e9b87e1e58a7d35f2637b6ea0846a9ec4a574e3",
+      "sha256": "1bc250c47f6ec5a08a4f5515da5d6c03587138acca8c4621f2634e5d64c32fb1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/DynamicTags.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELF.h": {
+      "git_blob": "bfcf5dab47722fa9d4b2714f20eaebe31ca9bf63",
+      "sha256": "3bed4e6bc42f8a1dc6ca3af0364c35eb2e28f8b0560db3e575f9f362dcf7cd1a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELF.h"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/AArch64.def": {
+      "git_blob": "1cfcdbf67dac5461b4e5610761599ad3bb98b5a4",
+      "sha256": "1ee4f294c67ec10f514f862de741b8e83b4fe593de460f9347ab9fd431c854bf",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/AArch64.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/AMDGPU.def": {
+      "git_blob": "0ff7b4c766cc193fe0f75030e87b70e2bc57970b",
+      "sha256": "3b7d257c6010dd62bff19013ac467b0f81f86281fe6c968b21e39746808bc00c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/AMDGPU.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/ARC.def": {
+      "git_blob": "5691fb3458e21c699a96c2935862d22773888a7b",
+      "sha256": "c51ac68a8f3b26dd7f757bac7c8aba5c0763b6e1593001043dfc2e734f9640b7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/ARC.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/ARM.def": {
+      "git_blob": "7e9fe965241f253e0831dcffe918541b87471eb3",
+      "sha256": "02f5365fc3ee90b43761286fca4cedde41d0d89bfba7285f7c314c6224a52f92",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/ARM.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/AVR.def": {
+      "git_blob": "696fc60b0f5a7acea50182bef11a558360286f47",
+      "sha256": "46a0cb3cf4229f037efc4a74bc6aa83c87b35cac42a5969bb2ba2c8634831b4f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/AVR.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/BPF.def": {
+      "git_blob": "cc18a65d1fd2f7de70f105f5a9321230762fc167",
+      "sha256": "222c4de90c1c4471c0430f277b13c9b0c597a926cee2b1726f48535fd87c2a93",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/BPF.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/CSKY.def": {
+      "git_blob": "c5f2dbae8033c617a1b197c96a222cc1d70427a8",
+      "sha256": "e9734b9ba5c29bc46655eec0bcdf3826fc3ce0adf683fd6bb4b7dd11413b44d1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/CSKY.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/Hexagon.def": {
+      "git_blob": "5021e2b26ce5f3da881f531b9f2cf24b83051fff",
+      "sha256": "d2c513716a515b4a17c909ee1094bab520ef380924915fc24257270564c74699",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/Hexagon.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/Lanai.def": {
+      "git_blob": "77ecb048403d31f195d49329e30636bbb488e120",
+      "sha256": "0b6fc813b5f0d90fb9366d468c12184706a54dd9e32158bf58d98205a1cff949",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/Lanai.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/LoongArch.def": {
+      "git_blob": "96e2c1645b57ae57664d58f84af9d17a5d5f9063",
+      "sha256": "f4e08c606bc65c4c6e55b5632341dd68a1de4c7334a61e451688a6174f9fd19b",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/LoongArch.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/M68k.def": {
+      "git_blob": "11f148566c78d7f108769fb37b31f89211dac840",
+      "sha256": "0b02231939bc9a081edba304b23604c39e7fb2139586d34ab928cffeee246c5e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/M68k.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/MSP430.def": {
+      "git_blob": "96990abf2db4825c13271108ddb8e014703640c5",
+      "sha256": "1cf542849aff17f3ea7b9f96383d1aad46c9a0639506326078a740ca452e5f19",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/MSP430.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/Mips.def": {
+      "git_blob": "bc0088dff3f430d4f6a33d8695a48adc3f664e56",
+      "sha256": "bb2660527dcf846153355659fe635c8c581b9d644a59f60c7594b43649130f14",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/Mips.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/PowerPC.def": {
+      "git_blob": "28036889cca6bb46e64672e0ccbec187b3de81ce",
+      "sha256": "e3b89a623ac3ff0092c7ac5696842e0918b5c7712c30bcd24917d957d4dac3c6",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/PowerPC.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/PowerPC64.def": {
+      "git_blob": "0422aa0606d7dd58b2a08a69d024f5ff312a74fe",
+      "sha256": "493b63bdaf45cc807901c30d1821127dd41c2eb5fd32e3e60e22c7c8840b1e94",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/PowerPC64.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/RISCV.def": {
+      "git_blob": "ac9a089e853a6ff9fb3f0cb6df581d693eb42122",
+      "sha256": "c224ecac1a8bf05b40fb2639ceccc73f88b4cb2fdb5dcc0baf90e0d13c867eec",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/RISCV.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/RISCV_nonstandard.def": {
+      "git_blob": "fb0e29b2aaae5e2f156e230a61bf2ef1fb7448b8",
+      "sha256": "b2440ad35f9402b2eb12a05e25af4c13ba6468e88a5826ab4fb3698474f1fa45",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/RISCV_nonstandard.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/Sparc.def": {
+      "git_blob": "00194bc2e72009a165a11488869aac22b19ead27",
+      "sha256": "7afcc20854b94ae35bf1a07a4daab7a4d2e92a7996c274645da809781255abeb",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/Sparc.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/SystemZ.def": {
+      "git_blob": "d6c0b79d40abe6bcebb45fca671488460e075714",
+      "sha256": "5a24d3b02bdcc925bdc0757bbcc0f9a0ea9a5a652540d5de8fe5189afc6c800f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/SystemZ.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/VE.def": {
+      "git_blob": "9bfdbf1b0960fbae235ebf998c7a4db103669472",
+      "sha256": "865867c19820ba9962f3538636bb3d4689893afec4946c31e249cf09ec94ddbc",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/VE.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/Xtensa.def": {
+      "git_blob": "6791a842181ff4079b603b6e2c6d785a3737f713",
+      "sha256": "79357ebd0302ea1288a6d5d5d68a345a8f27a617c231aba126fe377c4cea5e55",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/Xtensa.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/i386.def": {
+      "git_blob": "1d28cf595cd5cd49ef195d9b3580803dca8b4b16",
+      "sha256": "6c6e3ca0ff835bdd51ee376a5d2c7e4b45866d4a0bb45b1307c332fc417586a0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/i386.def"
+    },
+    "llvm/include/llvm/BinaryFormat/ELFRelocs/x86_64.def": {
+      "git_blob": "a93d92870cf32d608fc82ab43e67acf10ba6020e",
+      "sha256": "2a69d547e7aaa074a3bc8d91a12ed921df89e1b8b8406485bdbcfac4a02825b0",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/ELFRelocs/x86_64.def"
+    },
+    "llvm/include/llvm/BinaryFormat/MachO.def": {
+      "git_blob": "4124c723ec021f327efbdadfa1af554e42c09f10",
+      "sha256": "add0b20cde875dcded90a0113cdccdb4a1e584374d9568b04a3649ddc87b2a1c",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/MachO.def"
+    },
+    "llvm/include/llvm/BinaryFormat/MachO.h": {
+      "git_blob": "5dbdfb13d1a5f9f9ee7819cdd949e5f1c4914cf2",
+      "sha256": "e94187b9065589eca9b003d2f359b460d5b1b4f6ea7104306d995d86ef7781fc",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/MachO.h"
+    },
+    "llvm/include/llvm/BinaryFormat/Magic.h": {
+      "git_blob": "11922d843af9e40a9de002a90662b3a459f0f80d",
+      "sha256": "34175f8c72bf6ca596ec47e118df42b2648c5353567ce1ff4e050e4365665034",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/Magic.h"
+    },
+    "llvm/include/llvm/BinaryFormat/MsgPack.def": {
+      "git_blob": "7ad83ff21c428fa88cadcae74d0217d72199ce51",
+      "sha256": "47ad8771a040b10f243411e4adbb375c4176031aa478e0066bd77d4c7510a49e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/MsgPack.def"
+    },
+    "llvm/include/llvm/BinaryFormat/MsgPack.h": {
+      "git_blob": "01edae0ee0ebdd3cb2b38f95004f4e5a9dbc58aa",
+      "sha256": "89db4e019b0ec96591158da99fee1375c6310675c8455c5d34e27b68a4379a67",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/MsgPack.h"
+    },
+    "llvm/include/llvm/BinaryFormat/MsgPackDocument.h": {
+      "git_blob": "f09feabb102846b3e3a466cfb91f190a16f3ec56",
+      "sha256": "632900e1fadf55c73f72a0db27937367cdf53b346e13ff1afac4c0ed97198dae",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/MsgPackDocument.h"
+    },
+    "llvm/include/llvm/BinaryFormat/MsgPackReader.h": {
+      "git_blob": "66140e66cba4c69a1188c82db239cf2b627ad7f8",
+      "sha256": "501e67db00d2317bcb365a764bc278c38cf8840512559f89d4de6397db7fc4ba",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/MsgPackReader.h"
+    },
+    "llvm/include/llvm/BinaryFormat/MsgPackWriter.h": {
+      "git_blob": "173458b575153ce933cfd6c5346ad10e6bd5684b",
+      "sha256": "2c54ecc4bdb8097de7962d45dbe51bd5b551f1c7f0c0e8bc0ae9384c736f2492",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/MsgPackWriter.h"
+    },
+    "llvm/include/llvm/BinaryFormat/SFrame.h": {
+      "git_blob": "7b58043c603630fec92f09d115a4966b7a12fdde",
+      "sha256": "dcc6647ebcf15aa825e8726a4e462116bfba0037d20e699467b5fb95d63da1d5",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/SFrame.h"
+    },
+    "llvm/include/llvm/BinaryFormat/SFrameConstants.def": {
+      "git_blob": "fddd440e41f32a732c15bd6bbd66ea66c84636c7",
+      "sha256": "08f4591aa4f09b01aa378c03958dd3bc9a59f9a4eed09c81d6a015e2b40e44b8",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/SFrameConstants.def"
+    },
+    "llvm/include/llvm/BinaryFormat/Wasm.h": {
+      "git_blob": "cf90a43d0d7e87cc7ed7c96a1d77ebc122e94dfd",
+      "sha256": "a936ea3741ee03c381228fb35b5440ddb99021facaa8ae1e543123ac2f8b27fc",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/Wasm.h"
+    },
+    "llvm/include/llvm/BinaryFormat/WasmRelocs.def": {
+      "git_blob": "6f5a946b1c63d0f9c36372dce2bc2277c87e8c99",
+      "sha256": "059ec79030bad23cfbd4604e0488df09fbf98c115666df2d1c1af830af389448",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/WasmRelocs.def"
+    },
+    "llvm/include/llvm/BinaryFormat/XCOFF.h": {
+      "git_blob": "9f571b9d5e6037f5fb8cbe31d4aed8c9f9f996b0",
+      "sha256": "50e9297549a7909fbceb638602443f9f10911dee0a7041b6934f4fcb9b2af627",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/XCOFF.h"
+    },
+    "llvm/include/llvm/Support/AMDGPUAddrSpace.h": {
+      "git_blob": "3fe6492584d84939fb64e925deeb02fc1d82c9ac",
+      "sha256": "f960a29d1fc59b0a0b0bd9d29bac4be0a758ef39aa8ae73411c32779ed2ee48f",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Support/AMDGPUAddrSpace.h"
+    },
+    "llvm/include/llvm/Support/EndianStream.h": {
+      "git_blob": "9b0a4bf30e80f1527bdeaa50161d2c0f6a13954b",
+      "sha256": "042e12fb26b163e4c4312e53c7ec2c97bfecdf5665cf0e2fdebb896c2b33fa66",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/Support/EndianStream.h"
+    },
+    "llvm/include/llvm/TargetParser/ARMTargetParser.def": {
+      "git_blob": "27dbfcaf07b42e47c117afff269031d932eae4b9",
+      "sha256": "9784387d5bfab6a6022432a9ccf345fe758fa7c25d181c37914717d9c748bbfc",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/ARMTargetParser.def"
+    },
+    "llvm/include/llvm/TargetParser/ARMTargetParser.h": {
+      "git_blob": "919598c894cd5e9372ddca828e247367368e7d4f",
+      "sha256": "d98481341156851960c7210bb79de1e57b0308ed6a16824be9670d913240f1cf",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/ARMTargetParser.h"
+    },
+    "llvm/include/llvm/TargetParser/ARMTargetParserCommon.h": {
+      "git_blob": "7c8030dd5576a97e27c7ec3203ca4a45969db908",
+      "sha256": "0b0ba705cf98758e08b54d8407b028747bf2535c3e07060e7aa7f38e33a2ec89",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/ARMTargetParserCommon.h"
+    },
+    "llvm/include/llvm/TargetParser/PPCTargetParser.h": {
+      "git_blob": "d3d44afb5f544b5d182fb9814bb9483bc0038426",
+      "sha256": "605b745d06c90be185203b36ec2a7ead309da7a30f3ebac75fa2c6baa04db5aa",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/PPCTargetParser.h"
+    },
+    "llvm/include/llvm/TargetParser/SubtargetFeature.h": {
+      "git_blob": "a48b18745352a1a5361278df02290065b4087b63",
+      "sha256": "aa5d84b9d058b1b704b129ab9c2e7ee44ffe343ee66bea97df574911f28a4c51",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/SubtargetFeature.h"
+    },
+    "llvm/include/llvm/TargetParser/TargetParser.h": {
+      "git_blob": "9dfa50c1ad1bae97d07d6abb7f0a301d8fa59cda",
+      "sha256": "eeba2185202715913225da1c3fa427bab7c5c2a861c8fae46dc3ba7d63fc7d01",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/TargetParser.h"
+    },
+    "llvm/include/llvm/TargetParser/Triple.h": {
+      "git_blob": "9c83abeeb3b19a77dbfbdc27b763812ed8986b80",
+      "sha256": "3723d414f90a7f5402886edbe41cacf307206f6e39801b36df682764f92434b1",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/include/llvm/TargetParser/Triple.h"
+    },
+    "llvm/lib/BinaryFormat/AMDGPUMetadataVerifier.cpp": {
+      "git_blob": "a3cd157e6aa619fee641559996e6081010ae5862",
+      "sha256": "8b1b869279027930237d6c3309dc8bca667b628d9d76e47504dfae12297dff25",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/AMDGPUMetadataVerifier.cpp"
+    },
+    "llvm/lib/BinaryFormat/CMakeLists.txt": {
+      "git_blob": "0c8af1e7a456519009d581648767de51e83c47cc",
+      "sha256": "4295bfef13497b99b03266f9569dce6b8ba6041db284f0f56bd050f5fa710b0a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/CMakeLists.txt"
+    },
+    "llvm/lib/BinaryFormat/COFF.cpp": {
+      "git_blob": "8fbee0218b79bd8bab61d5c2e677c9713ffb7799",
+      "sha256": "a7d9d6dd5c64c52f3dcf4cfeacd83ed097e9938d455d31287ee9ebb77d03dda7",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/COFF.cpp"
+    },
+    "llvm/lib/BinaryFormat/DXContainer.cpp": {
+      "git_blob": "22f518067b3183b9220e664ca4e484aea2415d27",
+      "sha256": "75fb90cb52f4e97a5f7267bccbd96a549e645c76ee84163f1c0f4e142ce02875",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/DXContainer.cpp"
+    },
+    "llvm/lib/BinaryFormat/Dwarf.cpp": {
+      "git_blob": "a6c7e6afdbe7a2b2aaa922ce6ae60b4c7f4473ca",
+      "sha256": "d2d3a932607ebf2f8671a9a955ddaca2ac804e4fd09b6f72fee1791220eb0c51",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/Dwarf.cpp"
+    },
+    "llvm/lib/BinaryFormat/ELF.cpp": {
+      "git_blob": "4b430bc287ff96b77a05fbea8f2dd0a6c04ee973",
+      "sha256": "594bf1a1aa8505e7f9914841f5a800aa168ba367330685acec22188e33db65ba",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/ELF.cpp"
+    },
+    "llvm/lib/BinaryFormat/MachO.cpp": {
+      "git_blob": "369b5ba92713642ffb010449a7d09e66f815ed2b",
+      "sha256": "4d6446b22f976c3111636476099d92a041bb5d1045ae13696becec3151a96302",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/MachO.cpp"
+    },
+    "llvm/lib/BinaryFormat/Magic.cpp": {
+      "git_blob": "bd378337ed3338c3cc1ec5af110fc2a2b65a9cc0",
+      "sha256": "a66f43a2bd637fd30151cbd419bb56da077890015b8d4a48645a9ab5709f462e",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/Magic.cpp"
+    },
+    "llvm/lib/BinaryFormat/MsgPackDocument.cpp": {
+      "git_blob": "b52f02912244484852619c2f9fbb4a9bbf94dfe3",
+      "sha256": "e308ccc093de50bb1ebba375971f272161c4bd59f2ecf8fa9d2c891810a4c502",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/MsgPackDocument.cpp"
+    },
+    "llvm/lib/BinaryFormat/MsgPackDocumentYAML.cpp": {
+      "git_blob": "fbf871f709a647129cfb99c49a3ffad52f4b4456",
+      "sha256": "5ba088f176481f0768aa6716269958b508bc36c23adf4f52d499d65e06632d03",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/MsgPackDocumentYAML.cpp"
+    },
+    "llvm/lib/BinaryFormat/MsgPackReader.cpp": {
+      "git_blob": "99841c5b3bd62766bf5c312f2b81642366ae53c4",
+      "sha256": "877ed2977d95f702c6850c7663074b3958f6456020f173183bca3d1a24cb6da3",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/MsgPackReader.cpp"
+    },
+    "llvm/lib/BinaryFormat/MsgPackWriter.cpp": {
+      "git_blob": "d3b557d005774ce015d38a8e9b2ff7736a3f1994",
+      "sha256": "01bc95b5d3dedcb3e57c775282c86a2ed87b770da5fdf043377aa1d77ee2a23a",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/MsgPackWriter.cpp"
+    },
+    "llvm/lib/BinaryFormat/SFrame.cpp": {
+      "git_blob": "8076a26f27f32b580926a97ab0482a65a0aa35ef",
+      "sha256": "7604f30dd2202154551769bd1659fd3ef565a927343182c4cb2ce809cd8c9075",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/SFrame.cpp"
+    },
+    "llvm/lib/BinaryFormat/Wasm.cpp": {
+      "git_blob": "babeb12e49ef37c7e4634d99bf64dc8cb9cb2329",
+      "sha256": "14abab3ada1dddf3a3b57cf122d331d13c83b5b48a202af2ec4cbdd505f3767d",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/Wasm.cpp"
+    },
+    "llvm/lib/BinaryFormat/XCOFF.cpp": {
+      "git_blob": "19d5b9897e47ccee9117c9b778f363ca61415f2f",
+      "sha256": "be5924518db6694765893f80f2daf2ce3bd9e48f778380fdb4647c12493632db",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/BinaryFormat/XCOFF.cpp"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

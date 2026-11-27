@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #J948_r14_001
-"""Build LLVM's Support and Demangle libraries (llvmorg-22.1.8) for native KUMO.
+#J949_r15_001
+"""Build LLVM's bootstrap libraries (llvmorg-22.1.8) for native KUMO.
 
 The sources are the measured closure pinned in toolchain/llvm/SOURCE.lock; toolchain/llvm/kumo.patch
 ports LLVM's Unix layer to KUMO on a staged copy; gen-config.py renders the CMake config headers.
@@ -46,10 +47,14 @@ def units(source):
     return found, demangle
 
 
-def main():
+def main(component="support"):
+    if component not in ("support", "binaryformat"):
+        raise ValueError(f"unknown LLVM bootstrap component: {component}")
+    binaryformat = component == "binaryformat"
+    tag, label = ("SH9-d2", "LLVM BinaryFormat") if binaryformat else ("SH9-d1", "LLVM Support")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sysroot", type=Path, default=ROOT / "target/kumo-sysroot")
-    parser.add_argument("--out", type=Path, default=ROOT / "target/llvm-support")
+    parser.add_argument("--out", type=Path, default=ROOT / f"target/llvm-{component}")
     parser.add_argument("--libcxx-out", type=Path, default=ROOT / "target/cxx-libcxx")
     parser.add_argument("--eh-out", type=Path, default=ROOT / "target/cxx-eh")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
@@ -113,54 +118,86 @@ def main():
         return obj
 
     support_units, demangle_units = units(source)
+    library_units = {"Support": support_units, "Demangle": demangle_units}
+    if binaryformat:
+        # Keep the complete upstream source list, including formats other than ELF. — KESTREL
+        import re
+        cmake = source / "llvm/lib/BinaryFormat/CMakeLists.txt"
+        names = re.findall(r"^  (\w+\.cpp)$", cmake.read_text(), re.MULTILINE)
+        found = sorted((source / "llvm/lib/BinaryFormat").glob("*.cpp"))
+        if not names or {path.name for path in found} != set(names):
+            raise RuntimeError("BinaryFormat closure differs from its pinned CMake source list")
+        library_units["BinaryFormat"] = found
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        support_objects = list(pool.map(compile_unit, support_units))
-        demangle_objects = list(pool.map(compile_unit, demangle_units))
+        library_objects = {name: list(pool.map(compile_unit, paths)) for name, paths in library_units.items()}
     libdir = out / "install/lib"
     libdir.mkdir(parents=True, exist_ok=True)
-    support_archive, demangle_archive = libdir / "libLLVMSupport.a", libdir / "libLLVMDemangle.a"
-    for archive, members in ((support_archive, support_objects), (demangle_archive, demangle_objects)):
+    archives = [libdir / f"libLLVM{name}.a" for name in library_units]
+    for archive, members in zip(archives, library_objects.values()):
         archive.unlink(missing_ok=True)
         run(["llvm-ar", "rcs", archive, *members])
 
-    smoke = TOOL / "support-smoke.cpp"
+    smoke = TOOL / f"{component}-smoke.cpp"
     smoke_obj = out / "smoke.o"
     run(["clang++", *common, *cxx, "-MD", "-MF", f"{smoke_obj}.d", "-c", smoke, "-o", smoke_obj])
     crt = out / "crt0.o"
     run(["clang", "--target=aarch64-unknown-none", "-c", ROOT / "toolchain/relibc/smoke/crt0.S", "-o", crt])
     libcxx_build = runpy.run_path(str(CXX / "build-libcxx.py"))
     script = libcxx_build["stack_link_script"](out)
-    elf = out / "llvm-support-smoke"
+    elf = out / f"llvm-{component}-smoke"
     run(["ld.lld", "-static", "--gc-sections", "--eh-frame-hdr", "-z", "noexecstack",
          "-T", CXX / "eh-sections.ld", "-T", script, f"-Map={out / 'link.map'}", "-o", elf, crt, smoke_obj,
-         "--start-group", support_archive, demangle_archive, layer / "lib/libc++.a", layer / "lib/libc++abi.a",
+         "--start-group", *archives, layer / "lib/libc++.a", layer / "lib/libc++abi.a",
          layer / "lib/libunwind.a", libc, "--end-group"])
     libcxx_build["set_stack_size"](elf, MAIN_STACK)
     undefined = run(["llvm-nm", "--undefined-only", elf], capture=True)
     (out / "undefined.txt").write_text(undefined)
     if undefined.strip():
-        raise RuntimeError(f"unresolved symbols in the LLVM Support smoke:\n{undefined}")
+        raise RuntimeError(f"unresolved symbols in the {label} smoke:\n{undefined}")
+
+    # Record the measured LLVM inputs, and reject accidental use of an unpinned header. — KESTREL
+    dependencies = set()
+    resource_roots = tuple(Path(run([driver, "-print-resource-dir"], capture=True).strip()).resolve()
+                           for driver in ("clang", "clang++"))
+    resource_inputs = {}
+    for depfile in [*(objects / (str(path.relative_to(source)).replace("/", "_") + ".o.d")
+                      for paths in library_units.values() for path in paths), Path(f"{smoke_obj}.d")]:
+        for path in libcxx_build["dependencies"](depfile, ROOT, (source, generated, layer, sysroot, TOOL, *resource_roots)):
+            if path.is_relative_to(source):
+                name = str(path.relative_to(source))
+                if name not in lock["files"]:
+                    raise RuntimeError(f"unpinned LLVM input: {name}")
+                dependencies.add(name)
+            elif any(path.is_relative_to(root) for root in resource_roots):
+                resource_inputs[str(path)] = sha(path)
 
     manifest = {
         "llvm_revision": lock["revision"],
         "llvm_ref": lock["ref"],
-        "scope": "LLVM Support + Demangle for aarch64-unknown-kumo against the installed libc++ layer; "
+        "scope": f"LLVM {' + '.join(library_units)} for aarch64-unknown-kumo against the installed libc++ layer; "
                  "Unix layer ported by toolchain/llvm/kumo.patch; config rendered by gen-config.py",
-        "units": {"support": len(support_units), "demangle": len(demangle_units)},
+        "unbuilt_link_components": ["TargetParser"] if binaryformat else [],
+        "units": {name.lower(): len(paths) for name, paths in library_units.items()},
+        "source_dependencies": sorted(dependencies),
+        "source_closure_files": len(lock["files"]),
+        "source_closure_bytes": sum((vendor / name).stat().st_size for name in lock["files"]),
         "clang": run(["clang++", "--version"], capture=True).strip(),
+        "clang_c": run(["clang", "--version"], capture=True).strip(),
+        "compiler_resource_inputs_sha256": dict(sorted(resource_inputs.items())),
         "inputs_sha256": {str(path): sha(path) for path in (
             Path(__file__).resolve(), lock_path, TOOL / "kumo.patch", TOOL / "gen-config.py", smoke,
-            CXX / "build-libcxx.py", libc, layer / "lib/libc++.a", layer / "include/c++/v1/__config_site")},
+            CXX / "build-libcxx.py", libc, layer / "lib/libc++.a", layer / "include/c++/v1/__config_site",
+            *((TOOL / "build-binaryformat.py",) if binaryformat else ()))},
         "generated_sha256": {str(path.relative_to(generated)): sha(path)
                              for path in sorted(generated.rglob("*")) if path.is_file()},
-        "archives_sha256": {path.name: sha(path) for path in (support_archive, demangle_archive)},
+        "archives_sha256": {path.name: sha(path) for path in archives},
         "main_stack_bytes": MAIN_STACK,
         "elf_sha256": sha(elf),
         "elf_bytes": elf.stat().st_size,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"SH9-d1 LLVM Support compile/link green: {elf} "
-          f"({len(support_units)} Support + {len(demangle_units)} Demangle units)", flush=True)
+    print(f"{tag} {label} compile/link green: {elf} "
+          f"({' + '.join(f'{len(paths)} {name}' for name, paths in library_units.items())} units)", flush=True)
 
 
 if __name__ == "__main__":
