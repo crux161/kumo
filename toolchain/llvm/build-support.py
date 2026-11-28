@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-#J948_r14_001
-#J949_r15_001
-#J950_r16_001
 #J951_r17_001
 #J952_r18_001
 #J953_r19_001
 #J956_r22_001
+#J958_r24_001
 """Build LLVM's bootstrap libraries (llvmorg-22.1.8) for native KUMO.
 
 The sources are the measured closure pinned in toolchain/llvm/SOURCE.lock; toolchain/llvm/kumo.patch
@@ -54,16 +52,18 @@ def units(source):
 
 
 def main(component="support"):
-    if component not in ("support", "binaryformat", "targetparser", "object", "mc", "process", "redirect"):
+    if component not in ("support", "binaryformat", "targetparser", "object", "mc", "process", "redirect", "core"):
         raise ValueError(f"unknown LLVM bootstrap component: {component}")
+    core_library = component == "core"
     object_library = component == "object"
     mc_library = component == "mc"
-    targetparser = component in ("targetparser", "object", "mc")
-    binaryformat = component in ("binaryformat", "targetparser", "object", "mc")
-    whole_closure = component in ("targetparser", "mc")
+    targetparser = component in ("targetparser", "object", "mc", "core")
+    binaryformat = component in ("binaryformat", "targetparser", "object", "mc", "core")
+    whole_closure = component in ("targetparser", "mc", "core")
     tag, label = {"support": ("SH9-d1", "LLVM Support"), "binaryformat": ("SH9-d2", "LLVM BinaryFormat"),
                   "targetparser": ("SH9-d3", "LLVM TargetParser"), "object": ("SH9-d4", "LLVM Object"),
                   "mc": ("SH9-d5", "LLVM MC"),
+                  "core": ("SH9-d6", "LLVM Core"),
                   "process": ("SH9-p1", "LLVM process launch"),
                   "redirect": ("P2c", "LLVM spawn redirects")}[component]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -72,7 +72,7 @@ def main(component="support"):
     parser.add_argument("--libcxx-out", type=Path, default=ROOT / "target/cxx-libcxx")
     parser.add_argument("--eh-out", type=Path, default=ROOT / "target/cxx-eh")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
-    parser.add_argument("--tblgen", type=Path, help="LLVM 22.1.8 llvm-tblgen (TargetParser/Object/MC)")
+    parser.add_argument("--tblgen", type=Path, help="LLVM 22.1.8 llvm-tblgen (TargetParser/Object/MC/Core)")
     args = parser.parse_args()
     sysroot, out = args.sysroot.resolve(), args.out.resolve()
     libcxx_out, eh_out = args.libcxx_out.resolve(), args.eh_out.resolve()
@@ -112,7 +112,7 @@ def main(component="support"):
         shutil.rmtree(generated)
     runpy.run_path(str(TOOL / "gen-config.py"))["generate"](source / "llvm/include/llvm/Config", generated)
     tablegen = (runpy.run_path(str(TOOL / "gen-target-tables.py"))["generate"](
-        source, generated, lock, args.tblgen, object_tables=object_library or mc_library) if targetparser else None)
+        source, generated, lock, args.tblgen, object_tables=object_library or mc_library or core_library, core_tables=core_library) if targetparser else None)
     fixtures = (runpy.run_path(str(TOOL / "make-object-fixtures.py"))["generate"](
         out / "fixtures", generated) if object_library else None)
 
@@ -143,6 +143,8 @@ def main(component="support"):
         + (["Object"] if object_library else []) + (["MC"] if mc_library else []))}
     if mc_library:
         component_paths["DebugInfoDWARFLowLevel"] = "DebugInfo/DWARF/LowLevel"
+    if core_library:
+        component_paths.update({"Core": "IR", "Remarks": "Remarks", "BitstreamReader": "Bitstream/Reader"})
     for name, directory in component_paths.items():
         # Keep every unit from each pinned upstream component's source list. — KESTREL
         cmake = source / f"llvm/lib/{directory}/CMakeLists.txt"
@@ -198,7 +200,7 @@ def main(component="support"):
                 resource_inputs[str(path)] = sha(path)
 
     unbuilt = ["TargetParser"] if binaryformat and not targetparser else []
-    if object_library or mc_library:
+    if object_library or mc_library or core_library:
         links = set()
         for directory in component_paths.values():
             cmake = (source / f"llvm/lib/{directory}/CMakeLists.txt").read_text()
@@ -215,7 +217,8 @@ def main(component="support"):
         "whole_archive_components": list(library_units)[2:] if whole_closure else [],
         "gc_sections": not whole_closure,
         "proof_scope": ("native ELF and archive readers" if object_library else
-                        "generic MC data directives and DWARF low-level APIs" if mc_library else label),
+                        "generic MC data directives and DWARF low-level APIs" if mc_library else
+                        "native IR construction, verification, printing, metadata and remarks" if core_library else label),
         "tablegen": tablegen,
         "fixtures": fixtures,
         "units": {name.lower(): len(paths) for name, paths in library_units.items()},

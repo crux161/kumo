@@ -5776,6 +5776,1091 @@
       "git_blob": "d466009348c4739eb5076b3b49ee99fa32491fe2",
       "sha256": "ae5ef535a9999cae28fcbd2765cfcf58123d6ef2b9957d04b66d8868e05f78c0",
       "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/XCOFFObjectWriter.cpp"
+    },
+    "llvm/lib/Bitstream/Reader/BitstreamReader.cpp": {
+      "git_blob": "fed9994db2ae8599e4cea7abb0e9cb26ef9beefc",
+      "sha256": "b9948acd070accd938dd6cf54565f3a528fbd20cfeb0f0a5c9f20fd2ea31bad3",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitstream/Reader/BitstreamReader.cpp"
+    },
+    "llvm/lib/Bitstream/Reader/CMakeLists.txt": {
+      "git_blob": "832ccecfb7c9092aa6963d0efee7d67ece0c0c19",
+      "sha256": "217101786330efae3af70dcfa68190eeb4f0e3b64401c88efe0d713a2818b4ce",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitstream/Reader/CMakeLists.txt"
+    },
+    "llvm/lib/IR/AbstractCallSite.cpp": {
+      "git_blob": "b7a10846a0d3d7838966264772f2eac25e1508ca",
+      "sha256": "16b0644502e06fa29d7f060a1f79eb018189bab78ac48f6d389e5f0ae1afc8da",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/AbstractCallSite.cpp"
+    },
+    "llvm/lib/IR/AsmWriter.cpp": {
+      "git_blob": "5cf9532a988fe2ad80f804da3eb128635ef5bd8d",
+      "sha256": "b9f3e5ebe53130735fbe75d165e5fe6402ece202bae5d22961caaf5639996457",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/AsmWriter.cpp"
+    },
+    "llvm/lib/IR/Assumptions.cpp": {
+      "git_blob": "3397f0e455bfb4f022f61b16b6d102b472853e00",
+      "sha256": "b7a97bb91cea9fc66e84eb61046ad70eef2dbc55c0f6857ffa6ab13e2ea10f8b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Assumptions.cpp"
+    },
+    "llvm/lib/IR/Attributes.cpp": {
+      "git_blob": "fe6d3e5edeb09fa2fcd6c2acd692350ef05df592",
+      "sha256": "f77244966282b21990202cdbab08e0c11531f7874ab29f6f13ef08986985ec60",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Attributes.cpp"
+    },
+    "llvm/lib/IR/AutoUpgrade.cpp": {
+      "git_blob": "5d3c2e69db2276d3e0ece533523ea74a59307d03",
+      "sha256": "e1693e28e5d1e284cac8bec2719ea79d1effc0ecf597adc8116cfb052cd4e6a5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/AutoUpgrade.cpp"
+    },
+    "llvm/lib/IR/BasicBlock.cpp": {
+      "git_blob": "3642e935397cbfa5eff6b5e69b1d0ff8c9aca661",
+      "sha256": "81401153f59a5a20ba1bbcb29414fac5824e4db29ebbd12f2cc742385367a066",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/BasicBlock.cpp"
+    },
+    "llvm/lib/IR/BuiltinGCs.cpp": {
+      "git_blob": "163b0383e22c271d8764b58b76d9754964a3e724",
+      "sha256": "d52fc44e0501442bef1b56158c9fe316cf09420587dfa1e1cff85c57b01027db",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/BuiltinGCs.cpp"
+    },
+    "llvm/lib/IR/CMakeLists.txt": {
+      "git_blob": "31821a2d6b20833e5e28f453353c3f624f704b81",
+      "sha256": "95d0864298d5edb3c386ca343d82443f623499331a28d268d92ed68df90be201",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/CMakeLists.txt"
+    },
+    "llvm/lib/IR/Comdat.cpp": {
+      "git_blob": "2cd6db913621b6727bdf5399135949b6076feefb",
+      "sha256": "a9e0d4f001e886c35bc6132ca4c6695cf8c592ae76e943d9dcf09877822a5685",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Comdat.cpp"
+    },
+    "llvm/lib/IR/ConstantFPRange.cpp": {
+      "git_blob": "5b8768601928eaae522d6530aeea10b9c0151554",
+      "sha256": "e7aa1622e7c450e5e05c4c2768d4e63987e51e18cc6fc002101bf5924212aab7",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ConstantFPRange.cpp"
+    },
+    "llvm/lib/IR/ConstantFold.cpp": {
+      "git_blob": "6a9ef2efa321f61a3a994286cb36ea69ad05dbf6",
+      "sha256": "74dd10f8ae256e7363d48c1b0dc63590a3c79853e57fdfac083e0c41d62a7200",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ConstantFold.cpp"
+    },
+    "llvm/lib/IR/ConstantRange.cpp": {
+      "git_blob": "9beaee60d0bc130a63b7fbeb8c6320f9930f4a11",
+      "sha256": "1b55546cc153cce2f6e156bc09fec989a688baafd71a3a4ce0ad0acee5137038",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ConstantRange.cpp"
+    },
+    "llvm/lib/IR/ConstantRangeList.cpp": {
+      "git_blob": "3ee8d6f22b74873adf0391f22ca8d75f0e9dabbf",
+      "sha256": "8bb7b0b3a71189c650fac6d150d7884708440c72329acdad70ae8d8007740a32",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ConstantRangeList.cpp"
+    },
+    "llvm/lib/IR/Constants.cpp": {
+      "git_blob": "2f020274c305a3c210c60992b5d4bb9b7dfb4816",
+      "sha256": "ddcc8e70dc31d75dfdfe41ae2bf6a38097ecd9b0f1e6d57c193accc7fd147988",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Constants.cpp"
+    },
+    "llvm/lib/IR/ConvergenceVerifier.cpp": {
+      "git_blob": "6fa6f83685da2a8bc809af72b6d0be16b3597b2a",
+      "sha256": "cfc39788fc616387f7cd876370ab0773f1112104ef08be2fadb9edc4005e71bd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ConvergenceVerifier.cpp"
+    },
+    "llvm/lib/IR/Core.cpp": {
+      "git_blob": "b7f71bef37f4e7145098d0804b5ba95c8f2b2517",
+      "sha256": "a744ef5c418e139b955510247e0170a928063455c36659c1be6b8fb0a94731a0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Core.cpp"
+    },
+    "llvm/lib/IR/CycleInfo.cpp": {
+      "git_blob": "a9b9129f24f09878e7a2e83668aa299ac1c0b156",
+      "sha256": "a6b1d7255a557c925c6db85f8ca2b32c0071cfe6d15a176debb9e4a7865fb03a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/CycleInfo.cpp"
+    },
+    "llvm/lib/IR/DIBuilder.cpp": {
+      "git_blob": "b01860dba74a9447787093634ef079cca3f929c5",
+      "sha256": "d88be835b65309d3f1c8b00f65eadd13383e8b3a5df38862efc5b2d85560bc71",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DIBuilder.cpp"
+    },
+    "llvm/lib/IR/DIExpressionOptimizer.cpp": {
+      "git_blob": "be9e13a34235a82e1130632b9fd1240d5d5c0d5d",
+      "sha256": "67f27dccd924b948a658f44461f552660e88e345d818ee4322c294ee7b91d2ef",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DIExpressionOptimizer.cpp"
+    },
+    "llvm/lib/IR/DataLayout.cpp": {
+      "git_blob": "05aa6c29c0e50f220f10d2e8080434132e13b006",
+      "sha256": "a7f1b9be8c72244a1672467a160ca085f3bd7d383657fa51030e24d310d6067c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DataLayout.cpp"
+    },
+    "llvm/lib/IR/DebugInfo.cpp": {
+      "git_blob": "1859bc468cac91dc73dbeaa948529f247702c71d",
+      "sha256": "ac41f6ad81f97602870bc91c508cde5c21bd92d0d51beeaa6beaf7ad133e5039",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DebugInfo.cpp"
+    },
+    "llvm/lib/IR/DebugInfoMetadata.cpp": {
+      "git_blob": "79b512d09822bee5b31b0916f77dbca557c96932",
+      "sha256": "f403264dfe14f03aecd45eabcfe59a1e7f85e03bf742002bf23ef8ef4cafc7e9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DebugInfoMetadata.cpp"
+    },
+    "llvm/lib/IR/DebugLoc.cpp": {
+      "git_blob": "a3c98aec98c81588fd4c4a8d2ee3739e249c1807",
+      "sha256": "8bff23e8094df984f2b9b0137d21a4fbf2e3f7cb4f8241bed9ce8e70b8cf09f9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DebugLoc.cpp"
+    },
+    "llvm/lib/IR/DebugProgramInstruction.cpp": {
+      "git_blob": "9efa3c71c0bb886e6e846eab90f1f544dbfcf1f6",
+      "sha256": "307341283b5074a0e381f91a9a8f30b03098557af425962a88d36f42064ced11",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DebugProgramInstruction.cpp"
+    },
+    "llvm/lib/IR/DiagnosticHandler.cpp": {
+      "git_blob": "eb2fe3bfdf140cf450e18ba5cafe763c407c3b73",
+      "sha256": "ff371622afc96d4469b1d18621004a31cade22211782474bbc4ae295bab9238c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DiagnosticHandler.cpp"
+    },
+    "llvm/lib/IR/DiagnosticInfo.cpp": {
+      "git_blob": "8e6d654f6afb336b3866f3d8d770d203bee4d93e",
+      "sha256": "c0c2e94c58708d00a030d485597672e894e47a2545fec198a3b26ae72f510660",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DiagnosticInfo.cpp"
+    },
+    "llvm/lib/IR/DiagnosticPrinter.cpp": {
+      "git_blob": "5ded23403b41e6c544d0d589a4785bf725312668",
+      "sha256": "8b38955bdc9d9b2f796b902aceeca1a5dcf72dfc1fa7f65080aa624e82246ba8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DiagnosticPrinter.cpp"
+    },
+    "llvm/lib/IR/Dominators.cpp": {
+      "git_blob": "e1e88bb2aaff5e6dfe9ec8000b1c7efd6902ea21",
+      "sha256": "323956853f14f24bb990239eadde9df41bc450a01452e1095beffe01e13c90dd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Dominators.cpp"
+    },
+    "llvm/lib/IR/DroppedVariableStats.cpp": {
+      "git_blob": "b8c0dd6e7b1dc3c2a95303304c315c3e6b022880",
+      "sha256": "129ea087e570582d7a7a10cdd45f901f89ae729f08ae762e5e70bdb7310e3ae2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DroppedVariableStats.cpp"
+    },
+    "llvm/lib/IR/DroppedVariableStatsIR.cpp": {
+      "git_blob": "382a024c3ee1586aba1a060f436e7eae9879eff6",
+      "sha256": "3594fa36273db02405342e655408503124b0016c02495a86691c691f3a6f72bd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/DroppedVariableStatsIR.cpp"
+    },
+    "llvm/lib/IR/EHPersonalities.cpp": {
+      "git_blob": "12ae4748e1f4ae34be94d0e18fc6e38f0a828c04",
+      "sha256": "8cd4fd4b0d73cb6407fe625d693736ee9ba4f96ab8cb7d13f0ab98d04e913084",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/EHPersonalities.cpp"
+    },
+    "llvm/lib/IR/FPEnv.cpp": {
+      "git_blob": "c41d7b3181a370f029df246d4a1a0eabe6a26382",
+      "sha256": "7a374f2ed54677a16a984d186437a6e440e432473566e0502be9cfba256a010e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/FPEnv.cpp"
+    },
+    "llvm/lib/IR/Function.cpp": {
+      "git_blob": "31a294447152e7ed9a97c58a8ac33754f174b0c3",
+      "sha256": "e25c2e33a7bb882823baa0e4a367e8db49eaf22a4608c087fe49ab62fe56ca02",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Function.cpp"
+    },
+    "llvm/lib/IR/GCStrategy.cpp": {
+      "git_blob": "67f363d26b25f4c1e1eddef87bbdf56913176105",
+      "sha256": "5b60a7a865238421bd70f4245dac59e8cc4c3cb1eb9bb3ba1c3706365a396aec",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/GCStrategy.cpp"
+    },
+    "llvm/lib/IR/GVMaterializer.cpp": {
+      "git_blob": "dc3b0e0fc2364d48a91a9be80a7e398b324d2108",
+      "sha256": "451715c0a809d6b22a5642085d69313b32e2b7523f4b41eb9a47fb1a9f59439a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/GVMaterializer.cpp"
+    },
+    "llvm/lib/IR/Globals.cpp": {
+      "git_blob": "c3a472b0cc66d588153ac0561a67448c77552432",
+      "sha256": "6ba219007717a2f9779907c478320246ab6ee5f877bd849552306a38b0588a0c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Globals.cpp"
+    },
+    "llvm/lib/IR/IRBuilder.cpp": {
+      "git_blob": "702b1dd9088bc9ae2fe53033e5a6629992af5384",
+      "sha256": "7389ad6bb3d11f9238c842ef468c3d0a7ce2dfacadc2d3e324d73bd08f215344",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/IRBuilder.cpp"
+    },
+    "llvm/lib/IR/IRPrintingPasses.cpp": {
+      "git_blob": "5c062800198fca254b01bb31c14dff135c76e0c0",
+      "sha256": "baa55b79651df0e66b8678af6c4805dd754331a59d32f898386f266044458592",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/IRPrintingPasses.cpp"
+    },
+    "llvm/lib/IR/InlineAsm.cpp": {
+      "git_blob": "922081468a775028d4c2bbab648cda15c61136d3",
+      "sha256": "76387053a4358eb2c80376fb2cc6339632453fbc1187594b7f8ba5a77aa50166",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/InlineAsm.cpp"
+    },
+    "llvm/lib/IR/Instruction.cpp": {
+      "git_blob": "7682c28e23b330af359253bc506e3f533fd58c8d",
+      "sha256": "c8252625511a6a893cd131572ab131c64a48dc3f9bf5775f86a4ac0b86030142",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Instruction.cpp"
+    },
+    "llvm/lib/IR/Instructions.cpp": {
+      "git_blob": "97bf63a404ec0d5d38615c91d9a3aff6be78a415",
+      "sha256": "6502cf502d5c804c4a8634c222f8b8c2bd65049cfbcac5c186908201548bde33",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Instructions.cpp"
+    },
+    "llvm/lib/IR/IntrinsicInst.cpp": {
+      "git_blob": "281cbd4388b5818d586e31b45755dc12a5eb47c5",
+      "sha256": "bd40f3dfded9e27ab99411ca5e759d16acb40004557ec9ab7c9b2e4dbe8c16a4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/IntrinsicInst.cpp"
+    },
+    "llvm/lib/IR/Intrinsics.cpp": {
+      "git_blob": "f46d3e5063e43b5fc0914bc97a20965e9931d128",
+      "sha256": "c3303795fd932d6c4c16a6c11ca775792241ac2ec4b44a345d6d217de61fa598",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Intrinsics.cpp"
+    },
+    "llvm/lib/IR/LLVMContext.cpp": {
+      "git_blob": "10aba759185a7563aac12e23062538879b54a6bf",
+      "sha256": "6e295a94fca9e02b2d0e0b54af06489409ed037bf9fdcd9e374e410fa353ca39",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/LLVMContext.cpp"
+    },
+    "llvm/lib/IR/LLVMContextImpl.cpp": {
+      "git_blob": "8f79398b086eb33d38de7559f756b4d4182aa451",
+      "sha256": "2c7c3d862ff47c171afd34a4b30bbb52372da44908ce6c8361bf0ddb6a96c317",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/LLVMContextImpl.cpp"
+    },
+    "llvm/lib/IR/LLVMRemarkStreamer.cpp": {
+      "git_blob": "9e1e45998f2f1737387d2126de2e8a7370de0e68",
+      "sha256": "b4094076c09a261c8af00dc6bc3bdc7e66d76da01cdeae962bfe1867dfac07b8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/LLVMRemarkStreamer.cpp"
+    },
+    "llvm/lib/IR/LegacyPassManager.cpp": {
+      "git_blob": "47a828842b48194433878976345b3e34f2eda6a0",
+      "sha256": "2537a5c725f0c460e55595bf794882cd75c73c25ebc75effa3640319731e23e8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/LegacyPassManager.cpp"
+    },
+    "llvm/lib/IR/MDBuilder.cpp": {
+      "git_blob": "893f99a19b93659ce84fb2351425843df7c3edf6",
+      "sha256": "e654b6dc3bc2148fea7bb21a0491d82671b8f9c096a6d4a4c68d9ddd216a387e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/MDBuilder.cpp"
+    },
+    "llvm/lib/IR/Mangler.cpp": {
+      "git_blob": "55c825d272a2f0c63e9f39b8c779884692936abf",
+      "sha256": "66ad421eac404072de763f9998a5f7e19f388cd8429e914363a37671bd81a8d4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Mangler.cpp"
+    },
+    "llvm/lib/IR/MemoryModelRelaxationAnnotations.cpp": {
+      "git_blob": "819cad3366787e2b592fb5a799e475da93e9d1a9",
+      "sha256": "83f9a610e54fff70f39bd5bc898895c82c92dca1984cbb58b96aa75f92b18ec9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/MemoryModelRelaxationAnnotations.cpp"
+    },
+    "llvm/lib/IR/Metadata.cpp": {
+      "git_blob": "1add0c7930bc9957211d0a96a5da3135cc9e739e",
+      "sha256": "11a9bcacd4dac2f239371ef5ea9b84fcb511e32afee55db652d88bd474c19868",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Metadata.cpp"
+    },
+    "llvm/lib/IR/Module.cpp": {
+      "git_blob": "e19336efd1c8a93dde87c3f2d8e26be1a87d6369",
+      "sha256": "c65b31481588c1ee26b2beb0980390459956b8e1255094e9f8b0ba6c8a52c839",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Module.cpp"
+    },
+    "llvm/lib/IR/ModuleSummaryIndex.cpp": {
+      "git_blob": "33947542bcf16f0f686c35c57281c0d1f2e259c2",
+      "sha256": "8ddc1be0330ebaae39946aa6fee583f93f60ab4dd3f6c964a9279c51d59f98e5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ModuleSummaryIndex.cpp"
+    },
+    "llvm/lib/IR/NVVMIntrinsicUtils.cpp": {
+      "git_blob": "d745a1cfb72cd6d997a611751ba8ad6a80ede361",
+      "sha256": "82dbc8889a0ecb7c7aaf328c29ecd6a43b431b77fe4b60868ddb03ecbfa9d8c5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/NVVMIntrinsicUtils.cpp"
+    },
+    "llvm/lib/IR/Operator.cpp": {
+      "git_blob": "c3e54a0fc0c7e84b789e38248436554102d5e6d0",
+      "sha256": "35f9250522c0633431794fdf4eb05c0c23dc95dfb6a0e8e8a91a149085d132c5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Operator.cpp"
+    },
+    "llvm/lib/IR/OptBisect.cpp": {
+      "git_blob": "bb9fba66ddf9582034d9751929e79f4838958306",
+      "sha256": "83217baf2165b99ff2f4ca509ac87fe0e37e75e1c9fcfb85b6b24b3469800fa8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/OptBisect.cpp"
+    },
+    "llvm/lib/IR/Pass.cpp": {
+      "git_blob": "dec7c9a9ab18ccd8b7fa2c78840fd7b66e304894",
+      "sha256": "733f5dbe284d03b1787848d791c805eeda13b1464772b631df044b0f8072add5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Pass.cpp"
+    },
+    "llvm/lib/IR/PassInstrumentation.cpp": {
+      "git_blob": "52aad8f84123b171f8166ac1d3c65ed7ab4d3caf",
+      "sha256": "503f90147f01ed107de2a492ef49fd0f667f0b27285074ce3411a6af96331234",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/PassInstrumentation.cpp"
+    },
+    "llvm/lib/IR/PassManager.cpp": {
+      "git_blob": "af22b779ddbb0721529488769314c5219a6f35a8",
+      "sha256": "1013d22535dda019bc70d8b5a5ea92b55e0e68dd1d2a1fa9af9abcb39380e230",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/PassManager.cpp"
+    },
+    "llvm/lib/IR/PassRegistry.cpp": {
+      "git_blob": "a91bb563af4bb97bafa186cb824316074bc5ca95",
+      "sha256": "e4d92bb00cceab8060ce15f9d2d96ea11ec34a8d0378068ed4f3d7b6a57eed49",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/PassRegistry.cpp"
+    },
+    "llvm/lib/IR/PassTimingInfo.cpp": {
+      "git_blob": "cb1b91a98b036ea2ff34119cc408cd8ddde1e7e4",
+      "sha256": "fc5a03d527b7c588280fda866da7c4d74be00b0de336d210a28379e2b0de8c59",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/PassTimingInfo.cpp"
+    },
+    "llvm/lib/IR/PrintPasses.cpp": {
+      "git_blob": "610411a3cf978a73d51e13cca82ae570f8b37c42",
+      "sha256": "7ed5f261e2c67ba7772f3a6310b250058014476ac0c71e45c17b2daaf11ec2d4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/PrintPasses.cpp"
+    },
+    "llvm/lib/IR/ProfDataUtils.cpp": {
+      "git_blob": "d1ada00fb1f64fb533d5d931c1d744ceacbecd89",
+      "sha256": "09bbf733cdc6baed4a46b7cf6587cf7e84b4167652530298798c3ab5899abffc",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ProfDataUtils.cpp"
+    },
+    "llvm/lib/IR/ProfileSummary.cpp": {
+      "git_blob": "12ae81ca8d5f3fc57f7f219a401cf01ba312937d",
+      "sha256": "ddebf9e0be08575c0252cd477267432be98cb590166547434e57287684db123f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ProfileSummary.cpp"
+    },
+    "llvm/lib/IR/PseudoProbe.cpp": {
+      "git_blob": "3c05f4b1f86a2a2b555447c47f48e8e8e17c79f5",
+      "sha256": "27cc175b92e36fd21558eccf27867ad7fa5d0bb67a3fc8875998f953a3396ddc",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/PseudoProbe.cpp"
+    },
+    "llvm/lib/IR/ReplaceConstant.cpp": {
+      "git_blob": "b1864c3dc9eebea2c4bcc59eb07bc5a4a91991bc",
+      "sha256": "5b15e25403be7b46f2c98f7fee6e8a2dec681fd095d43755722376b325a6d120",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ReplaceConstant.cpp"
+    },
+    "llvm/lib/IR/RuntimeLibcalls.cpp": {
+      "git_blob": "63da006fe5ca81df068db914ffc7ec5c24fd9aae",
+      "sha256": "a11aff7248d3df8e6293693d8736eeb196211161a326073ab854d6ed3629ac13",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/RuntimeLibcalls.cpp"
+    },
+    "llvm/lib/IR/SSAContext.cpp": {
+      "git_blob": "20b6ea1e972d4a78d83f975bc8c8a636dc9e03bf",
+      "sha256": "32f0806af36e353ff61d3a611924007fd2b5f9c7cd90898f3aa5f79d18ac29d5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/SSAContext.cpp"
+    },
+    "llvm/lib/IR/SafepointIRVerifier.cpp": {
+      "git_blob": "e35b5b30a7cc12af068e3e180a64a0261447cd3e",
+      "sha256": "01f7e360f71c586e43cd36e039670b36e54ea20da0270df5ea7f1c32d5aafa92",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/SafepointIRVerifier.cpp"
+    },
+    "llvm/lib/IR/Statepoint.cpp": {
+      "git_blob": "508e3cb71ed211a5a5061e6793ef7f38bade7dcf",
+      "sha256": "b5ed30f708c157f14f4cf86d4b2495f6926763666bea9e8d97e3f701f905588d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Statepoint.cpp"
+    },
+    "llvm/lib/IR/StructuralHash.cpp": {
+      "git_blob": "1c617c100c7dc05e0c38f406b02ae53f1a05f31d",
+      "sha256": "8dfd42388dc8623015bc7f78ac898290cc0d624057527153ba2ea790485c834d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/StructuralHash.cpp"
+    },
+    "llvm/lib/IR/Type.cpp": {
+      "git_blob": "299d07b81837b02b8ebc5cf40eec20645ab82bdf",
+      "sha256": "6071ac2508d940da0ea85151ba6ed5721a0fe7865f01c6343045e81ac3ea0efc",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Type.cpp"
+    },
+    "llvm/lib/IR/TypeFinder.cpp": {
+      "git_blob": "963f4b4806e1f96257479b48fd5aa22ba2386eba",
+      "sha256": "ddb1d7f7680a8947be0d3cf21ee179ec14bebd963adfc006cd368e9a9793b079",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/TypeFinder.cpp"
+    },
+    "llvm/lib/IR/TypedPointerType.cpp": {
+      "git_blob": "85f7a5a2ae4c30687cfa651fa2e2cb077fd43f19",
+      "sha256": "7335437d75872dfff0b1de142d6c60b7c301425c87074eebf2501e2e8bf09162",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/TypedPointerType.cpp"
+    },
+    "llvm/lib/IR/Use.cpp": {
+      "git_blob": "504233575594d20751b70b0f9b7cf40493aaef90",
+      "sha256": "6edf150a1137cb1d2ad6cc663a10d39a905ad8515b396684be677c6418eb6b3e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Use.cpp"
+    },
+    "llvm/lib/IR/User.cpp": {
+      "git_blob": "4acfba6766a5d983946c87f41c0d04c49231ecd2",
+      "sha256": "4074311d829def97ac20f0472912c9d83c6b370b709e6d941870822ae29ec18f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/User.cpp"
+    },
+    "llvm/lib/IR/VFABIDemangler.cpp": {
+      "git_blob": "4fcf43616d60c56e4b32a6ce936743c7d49d49fb",
+      "sha256": "ba1e6e2166ce53dbaec36275db5904c75963c2c30aec280d2b9c78264796da18",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/VFABIDemangler.cpp"
+    },
+    "llvm/lib/IR/Value.cpp": {
+      "git_blob": "a43d63077bf9fb3c0e9c36d1444462713c55e001",
+      "sha256": "a86708929784bf5134f52b037f36f657c9312f2e90b46e7bcf751d04f0b7e32a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Value.cpp"
+    },
+    "llvm/lib/IR/ValueSymbolTable.cpp": {
+      "git_blob": "3bf52f6ef024e17cb2099ccd4848083b3f556a1a",
+      "sha256": "d5b5be8374f4afb3229e0dfb474d210ce24bc03ee756a0937a7a0ad27f40aaea",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ValueSymbolTable.cpp"
+    },
+    "llvm/lib/IR/VectorTypeUtils.cpp": {
+      "git_blob": "62e39aab90079ccd2b1f82522c5d2a61ac3da231",
+      "sha256": "81f7e7ea82b73b1fe889785b4b45463a1bda69a0946b818533cb65b20a7c8df6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/VectorTypeUtils.cpp"
+    },
+    "llvm/lib/IR/Verifier.cpp": {
+      "git_blob": "bb552861130d2712e05472651cfa22c29d921a0e",
+      "sha256": "b38bf498183d526487d0c2caf5e3ade86701b011b56df50e154dc32c73faecab",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/Verifier.cpp"
+    },
+    "llvm/lib/Remarks/BitstreamRemarkParser.cpp": {
+      "git_blob": "33eedd6042c3793abd47f44972bf00ea64c2dbe3",
+      "sha256": "bc0e455a170e7078e7579c311047d7876522c7083cc4388983f878fb080b815c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/BitstreamRemarkParser.cpp"
+    },
+    "llvm/lib/Remarks/BitstreamRemarkSerializer.cpp": {
+      "git_blob": "5a401cf9cb72b6d4737beca4fc91eeea83de26a1",
+      "sha256": "c9bafdbb99715b64750b74b981e3f8721dd922ee0dbc9e89428458ed8ef9a002",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/BitstreamRemarkSerializer.cpp"
+    },
+    "llvm/lib/Remarks/CMakeLists.txt": {
+      "git_blob": "9e88ceccd5dbbc201d1f46ab28fd8668bad21b07",
+      "sha256": "2458b17775dd429e82b19a3a1d5c4f6eda37b613f92535bcf91bf64461892d99",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/CMakeLists.txt"
+    },
+    "llvm/lib/Remarks/Remark.cpp": {
+      "git_blob": "09f24e93255e0d0753a9486711bbacb5ebc8b23e",
+      "sha256": "77d30f9267dfcbfd3f20dc8f9a3ef5a5b2cb7ddf37eaf5a1e47a2a08d511ddb2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/Remark.cpp"
+    },
+    "llvm/lib/Remarks/RemarkFormat.cpp": {
+      "git_blob": "f9fd4af20e0479d792a4b459e669049109e5fd32",
+      "sha256": "704ac7f49a314df2c8f19370b03f9400c49fca3615cadbd5002d9824d48bb6f9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/RemarkFormat.cpp"
+    },
+    "llvm/lib/Remarks/RemarkLinker.cpp": {
+      "git_blob": "f0feeccbfe1b86636d9848a889babe80dcf1b235",
+      "sha256": "25b2967b788a803734e7949c1479a9e7b43339734b1e99d35d032fb827068058",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/RemarkLinker.cpp"
+    },
+    "llvm/lib/Remarks/RemarkParser.cpp": {
+      "git_blob": "038fc1d3f4856d9944f7c85ac8c77b67a120926d",
+      "sha256": "88b4bbfb3d0ea02db0f13179a3cebc755341e454cee5b06ef74faef414c12fe0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/RemarkParser.cpp"
+    },
+    "llvm/lib/Remarks/RemarkSerializer.cpp": {
+      "git_blob": "80388b4c47cb026509a9d1f9120d1de3ccc3f438",
+      "sha256": "e48f3af2999f9a709f1482f57e1b49eea66fa3e032fd8188659759e0c07f0e99",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/RemarkSerializer.cpp"
+    },
+    "llvm/lib/Remarks/RemarkStreamer.cpp": {
+      "git_blob": "d9be2f1fcb6a436aa9ca6cf37756e003af1c4dbf",
+      "sha256": "d30a0df5bd07bd2128595c4193f0b9c5d026dd8b439dd16e11b36434117dbe09",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/RemarkStreamer.cpp"
+    },
+    "llvm/lib/Remarks/RemarkStringTable.cpp": {
+      "git_blob": "03d93baba03802d440a1e40303f0b024f6c4b6d1",
+      "sha256": "2bff12c473e0952cbab9902af77b1e4002b4bbac96fb7c56444b627a34d6a84f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/RemarkStringTable.cpp"
+    },
+    "llvm/lib/Remarks/YAMLRemarkParser.cpp": {
+      "git_blob": "baad378d72bd4eadd6ce7c5920b5202b5363cec7",
+      "sha256": "3f8df3db10c01015f0223ed93ea5bdf3163e599aa054bec4d3f8fbcb72163121",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/YAMLRemarkParser.cpp"
+    },
+    "llvm/lib/Remarks/YAMLRemarkSerializer.cpp": {
+      "git_blob": "22e297040575c33d56afd1d385615c2f2113527b",
+      "sha256": "6f3f782dce786d8b918abe050f99b29bdde068c1831e65b0ff3099da31cd4b14",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/YAMLRemarkSerializer.cpp"
+    },
+    "llvm/include/llvm/ADT/GenericCycleImpl.h": {
+      "git_blob": "00f85ca819f3f1cb79cde326c804e5355e54ae45",
+      "sha256": "bc81ee0a3d82baecb1dc0555888c44bf09e6e508cf879ec517b7962138fe9f3a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/GenericCycleImpl.h"
+    },
+    "llvm/include/llvm/ADT/PostOrderIterator.h": {
+      "git_blob": "d9aa452e25d18771ed60347fc83f1445d95cb76d",
+      "sha256": "1db056452b25e5a3985e98640fa5499ab73e15d8616f0185d4c466144b7f0ba4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/PostOrderIterator.h"
+    },
+    "llvm/include/llvm/ADT/SCCIterator.h": {
+      "git_blob": "205fa669a12de20f68c69daaaa4cc7044306be3a",
+      "sha256": "2795b057fc5e4d0eb242a6e06a7e87cfbc2c10e4bbeaf99d64ed8f52be9631a7",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/SCCIterator.h"
+    },
+    "llvm/include/llvm/ADT/SetOperations.h": {
+      "git_blob": "4d4ff4045f813f6388ef4feba744f5bb4b74fffd",
+      "sha256": "a08313cc36b32c2288df0f7a26a26e36f39f9f875079f7fa528468e1f91d015d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/SetOperations.h"
+    },
+    "llvm/include/llvm/ADT/SmallBitVector.h": {
+      "git_blob": "978dc3f07303116255ac410a76d304e19beb77cd",
+      "sha256": "c2719252a3ea3edaed70d8987554bc4b63ace8c7fb393165bafd7ea0bda9df63",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/SmallBitVector.h"
+    },
+    "llvm/include/llvm/ADT/SmallVectorExtras.h": {
+      "git_blob": "061293fae08307eda5eb9d57dcf17cac522b8567",
+      "sha256": "5af21185b0a34175118789e4c4b7a05a6222b9436054ede7f7a69210d052ff55",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/SmallVectorExtras.h"
+    },
+    "llvm/include/llvm/Bitstream/BitstreamReader.h": {
+      "git_blob": "ff42cda71ca661bdc0f1b19e40bf90cda4715e6f",
+      "sha256": "d2273db9aea20c6b11007d23e16b1540193b26cf8b7da4bd56910d288e2415bb",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Bitstream/BitstreamReader.h"
+    },
+    "llvm/include/llvm/IR/AbstractCallSite.h": {
+      "git_blob": "f431e1d8a38ef11aec3d9a463b190c3427cd8991",
+      "sha256": "becf0988288234ac366dba7b9ef93a9e93631bba4d916b86440ad16a4549df6d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/AbstractCallSite.h"
+    },
+    "llvm/include/llvm/IR/AssemblyAnnotationWriter.h": {
+      "git_blob": "d68bcbf85b2b7db4eecd0174793840c9ab32af3b",
+      "sha256": "e3498a63a05b2d7fe30690c310ebd2fe5ef8ff0aedb739696c7e162527bfbdb6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/AssemblyAnnotationWriter.h"
+    },
+    "llvm/include/llvm/IR/Assumptions.h": {
+      "git_blob": "ebc55921e73d36df7272abc000e5decc723ae48e",
+      "sha256": "c4205bc641d42dcefe7b7daf2248308d6cc980b0fa410c7a59510cbc819d395f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/Assumptions.h"
+    },
+    "llvm/include/llvm/IR/AttributeMask.h": {
+      "git_blob": "857761149ff46b5abaab8bd268acd36947034a41",
+      "sha256": "e7c59df0d109e73e42fd11ae7a9c36762ed043a9bb821be20aa15dc6228fd0c9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/AttributeMask.h"
+    },
+    "llvm/include/llvm/IR/AutoUpgrade.h": {
+      "git_blob": "540d60afc5a01de4a4bbe12826b951a1fd4c4d3c",
+      "sha256": "ae39f1dde51be0ba014d6b1228a83909201053e8c1531d68c5b6d2942e71edf1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/AutoUpgrade.h"
+    },
+    "llvm/include/llvm/IR/BuiltinGCs.h": {
+      "git_blob": "aeb16efda96e1f2eb7fd00cb14a914773cec5938",
+      "sha256": "6acf03b2bb8350b75def92d81faa5f9630b131d06ace619d601b5a51d891ca93",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/BuiltinGCs.h"
+    },
+    "llvm/include/llvm/IR/CFG.h": {
+      "git_blob": "96d3b2fbb5b0b0940f15562b1abe2fe4dfa1142e",
+      "sha256": "3aa82bc1393dc8bc76094a0be815f560eb023aee278bb8c2739708797048f718",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/CFG.h"
+    },
+    "llvm/include/llvm/IR/ConstantFPRange.h": {
+      "git_blob": "e772095a266ccbe5a9b41636883a3c4ece2396c4",
+      "sha256": "1a38c417c6a25e677b6db1dc845090dfe7f8f11b5aab0a86bd874f481f6a6d49",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ConstantFPRange.h"
+    },
+    "llvm/include/llvm/IR/ConstantFold.h": {
+      "git_blob": "4056f1feb4dd3d1f8c8554d7d234b1629f666ee5",
+      "sha256": "731038c763c0db9a49a81a645b924971c2a3bf0f817c187e9c1de57c599c0b9f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ConstantFold.h"
+    },
+    "llvm/include/llvm/IR/ConstantRangeList.h": {
+      "git_blob": "104018bc731533e60dde173c720e5c9be4a74c8e",
+      "sha256": "d1f615c7b3f5a27cb4f9c08faeddae050bc36ac03c0dfec4a5a669cf81fd183a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ConstantRangeList.h"
+    },
+    "llvm/include/llvm/IR/ConstrainedOps.def": {
+      "git_blob": "30a82bf633d5757c756c4725f57a187151e6bb94",
+      "sha256": "ea0999824eae058ae8b7c4455a17b0bc6e16efe3f47273b79b02835061df6ac4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ConstrainedOps.def"
+    },
+    "llvm/include/llvm/IR/ConvergenceVerifier.h": {
+      "git_blob": "d336c3b8dabd5a0aa2f8c1f416c85570ac90f41d",
+      "sha256": "b10d6c45902c1ac88222dd6c1337492dae1a587f355c7614c88e0b7bb54896a3",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ConvergenceVerifier.h"
+    },
+    "llvm/include/llvm/IR/CycleInfo.h": {
+      "git_blob": "79867fe3a043da830d0d5843a0578f763b23fda4",
+      "sha256": "23235f9878ad24c4d322c3255b3ff320468545932b3a357afcf0ba4080348834",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/CycleInfo.h"
+    },
+    "llvm/include/llvm/IR/DIBuilder.h": {
+      "git_blob": "49d9e686aeffac6c101a42f0267fce99081009a9",
+      "sha256": "175cd94c164bcd8eb7c813c276ae87209c8faedb86f18fc6c18b73c99db27fc8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/DIBuilder.h"
+    },
+    "llvm/include/llvm/IR/DebugInfo.h": {
+      "git_blob": "922658927ad6a60c8721a462611487b4b996e23c",
+      "sha256": "16cce21419d5f369ef9591af58636b5ee384f4735d835bf762dd9bcd1bc43719",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/DebugInfo.h"
+    },
+    "llvm/include/llvm/IR/DebugInfoFlags.def": {
+      "git_blob": "44946b1fb83b7453dbcbadbea53de311a0f4508c",
+      "sha256": "ed5b4faa89d2d5d58428486eaaacd22c7b0be61c64cd9e7e1b422c5ef1fa05e6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/DebugInfoFlags.def"
+    },
+    "llvm/include/llvm/IR/DebugInfoMetadata.h": {
+      "git_blob": "fbeb93f45985d89b6873c42526741956fe187537",
+      "sha256": "3d913b7132f75b87b3e315688fc74501d9afc0d5ea56ea62cc5ca8bffe52f7c0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/DebugInfoMetadata.h"
+    },
+    "llvm/include/llvm/IR/DerivedUser.h": {
+      "git_blob": "a307315864b425a52a0587ec7b68ca769b490252",
+      "sha256": "3a94c8bebc47cacff8020eae32d0a5904553e406df37001f5a5e8f7ecd4f8b2b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/DerivedUser.h"
+    },
+    "llvm/include/llvm/IR/DiagnosticPrinter.h": {
+      "git_blob": "331fc94aeb314e546964a68f792941b7614c2315",
+      "sha256": "6684473148fb578fa1ae93f92420c0633baa29a7765073fd7491798561a7f6d5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/DiagnosticPrinter.h"
+    },
+    "llvm/include/llvm/IR/Dominators.h": {
+      "git_blob": "1209def5ac0bdbab4783cf7babf30af3ac029c08",
+      "sha256": "f407eff4c400709f1bbc03ea9eb3f5e512b45015d92375f88538fa0b5265ccfd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/Dominators.h"
+    },
+    "llvm/include/llvm/IR/DroppedVariableStats.h": {
+      "git_blob": "8a1dbd6aeb60a2637f48e53a54cdd187c7d23218",
+      "sha256": "2edb36726eb4b52f0a857c0bb2219699d7126bdb159aed1d393b6d544afdcb60",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/DroppedVariableStats.h"
+    },
+    "llvm/include/llvm/IR/DroppedVariableStatsIR.h": {
+      "git_blob": "9fc231999eb4f65da0a15cef5aceb4f31dc9eb98",
+      "sha256": "5546882e210a6769e116283c835ef7495c62649d1ca32ece9eac46fbd1768be0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/DroppedVariableStatsIR.h"
+    },
+    "llvm/include/llvm/IR/EHPersonalities.h": {
+      "git_blob": "39f6817b3dc3875aa06735b0ae4d843b7c48f397",
+      "sha256": "91c06099c5484de4033d211997456d6e02d83bcd3ef175f10be55197228224b5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/EHPersonalities.h"
+    },
+    "llvm/include/llvm/IR/FPEnv.h": {
+      "git_blob": "38395b15c8c09d619995eeb5ae5e143d44907ff1",
+      "sha256": "ab7599d6726ab2c2c043d0ce520a66b3227b63ef52328b73e799eeef187418c1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/FPEnv.h"
+    },
+    "llvm/include/llvm/IR/GCStrategy.h": {
+      "git_blob": "44e46e448b3e3f18e5eed8ecdd207a495f68fcb8",
+      "sha256": "bce8fafd56411bc09d4262f4942602f9c8dbc02d053c59c8e0915d4c00e62c51",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/GCStrategy.h"
+    },
+    "llvm/include/llvm/IR/GVMaterializer.h": {
+      "git_blob": "d62da41ebc296626365bdc05794877798963bde2",
+      "sha256": "12d6587ec294cb13b6ef4f6df55159537babe10a3a0dc122d3da3e934ebbee31",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/GVMaterializer.h"
+    },
+    "llvm/include/llvm/IR/GenericConvergenceVerifierImpl.h": {
+      "git_blob": "ddcce17b77c8b158882da996cef2e370b64ff5dc",
+      "sha256": "501cfc03cc055be0548aca0224b51a9b46f68b83488355eace937857ecc77bf2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/GenericConvergenceVerifierImpl.h"
+    },
+    "llvm/include/llvm/IR/GetElementPtrTypeIterator.h": {
+      "git_blob": "1092b636e023a2c31aab13fe57e29fb722e7ac9d",
+      "sha256": "de7cfdd636d64b377b2a5cf2e87faf5a8eaa9aa029ba31d90df3dbaf8fdd57b1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/GetElementPtrTypeIterator.h"
+    },
+    "llvm/include/llvm/IR/IRBuilder.h": {
+      "git_blob": "bc35caabeb84971ccdbf8d599a9baf642c7178bc",
+      "sha256": "c4c6d0d65103933a2feaa7b51956a53ec05a9e70cedaeb4725bcd2389ae5b276",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/IRBuilder.h"
+    },
+    "llvm/include/llvm/IR/IRPrintingPasses.h": {
+      "git_blob": "1b2d38d6190e91b161ab75c733c6ac6107826f47",
+      "sha256": "072f86f9a589e37f5b586f277a4f2f704845d0d7f4a3fba86b157c0d38dc9f4c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/IRPrintingPasses.h"
+    },
+    "llvm/include/llvm/IR/InstIterator.h": {
+      "git_blob": "8ce73a9b9addf0b632c60bf4438727f1e3c6a080",
+      "sha256": "41deed79b806f2599683cbac95408bb4f69af1ea9c59ebe7c19767c281ba7c8b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/InstIterator.h"
+    },
+    "llvm/include/llvm/IR/InstVisitor.h": {
+      "git_blob": "8e4dc647e5230604f4725430eaaee642fdcce8a7",
+      "sha256": "74dc16654de3adcaf28f5248a7dd7ce953f603bcc82ff71627308b9cca26be67",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/InstVisitor.h"
+    },
+    "llvm/include/llvm/IR/Instructions.h": {
+      "git_blob": "d4ea74c05ae626cb9feee2c3395b4a37fa4097ce",
+      "sha256": "fa914da71ffdef26c650669eb1beb4e9ab3741bb5243b5851a1126e3b7bbec62",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/Instructions.h"
+    },
+    "llvm/include/llvm/IR/IntrinsicInst.h": {
+      "git_blob": "0b25baa465a71a0047f13218d4962476a190889d",
+      "sha256": "1e0dde1cdbbe781d5ec41b281f31ff4ccfedb634d1c8b1b6278c7720c5783ac4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/IntrinsicInst.h"
+    },
+    "llvm/include/llvm/IR/LLVMRemarkStreamer.h": {
+      "git_blob": "96cccebf0d70e9c62700f2a5a47f6a4a4d871216",
+      "sha256": "d04596ade05a61da66d22c6895e5484471a71d763b54be0bef0f10eddbbb65db",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/LLVMRemarkStreamer.h"
+    },
+    "llvm/include/llvm/IR/LegacyPassManager.h": {
+      "git_blob": "770b3d8f6eaa6c6df612e3b4637412d575c54444",
+      "sha256": "011337907f7714a0081488c6d537d2c7cd0ec47500d024c5fe0c4499430f72c3",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/LegacyPassManager.h"
+    },
+    "llvm/include/llvm/IR/LegacyPassManagers.h": {
+      "git_blob": "d25bcafc9cc0576f5d7d9c58bd24ed1034452d64",
+      "sha256": "912633318f08bd0f04abe192ebf3bcfe3a5dd8e78856246fdf25bf43fbfd7796",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/LegacyPassManagers.h"
+    },
+    "llvm/include/llvm/IR/LegacyPassNameParser.h": {
+      "git_blob": "3460de0d90223a4096f609e124484259ecf3a891",
+      "sha256": "7e26e366d84bd9162dc8aa0a079713123b049116b99a912dde7d782a3d904bac",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/LegacyPassNameParser.h"
+    },
+    "llvm/include/llvm/IR/MDBuilder.h": {
+      "git_blob": "df1c66cf24fcb1bacf7739d2ae96bdf5875b844c",
+      "sha256": "ef5d5048a9469ea25a5cb5718713db652aef3c83bb5c6069fbd230b60225b9af",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/MDBuilder.h"
+    },
+    "llvm/include/llvm/IR/MemoryModelRelaxationAnnotations.h": {
+      "git_blob": "fcfb2db85a8808c16611208558ab51b31b85c429",
+      "sha256": "9801ac6cd4b35b4b49416e60b2f70da7d41124f62f4fac42154c51d0cf1eb3d4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/MemoryModelRelaxationAnnotations.h"
+    },
+    "llvm/include/llvm/IR/ModuleSlotTracker.h": {
+      "git_blob": "a3882a81e11779dee2e6f041cb91e42be4c90bc9",
+      "sha256": "9ef6947bec99501568380bc655c169a485183605dc69f47e6ad422c21f74747c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ModuleSlotTracker.h"
+    },
+    "llvm/include/llvm/IR/ModuleSummaryIndex.h": {
+      "git_blob": "d85730c77d5c5b2a35f200b2032c2a331d3a350b",
+      "sha256": "bea5e159954a02fcb50dc5f3d4cfb8d6f2c837c399c9220b8e2bd9fcd0fbf20a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ModuleSummaryIndex.h"
+    },
+    "llvm/include/llvm/IR/NVVMIntrinsicUtils.h": {
+      "git_blob": "067290e57245ade9e02eedfaf1ab7bacd1ebc7cc",
+      "sha256": "8b47778cdaad9defd4e8bd6ed79f28d77fc062967e7e497e4163a97ed5a00279",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/NVVMIntrinsicUtils.h"
+    },
+    "llvm/include/llvm/IR/NoFolder.h": {
+      "git_blob": "9f16c6983313ad470edd7c369bbef938ff2585ac",
+      "sha256": "44b31a08e2bd2e16eb5b25f54b3216996f95f05edbca3fff8c717fa63ec38b0e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/NoFolder.h"
+    },
+    "llvm/include/llvm/IR/Operator.h": {
+      "git_blob": "10816c0e62c29f2b32c785eeee9a9cf695a1ab1d",
+      "sha256": "7d43599b1ee658987eadd70dbca960fc6ffcb3843ca77dbef91afb94e0f3d9ef",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/Operator.h"
+    },
+    "llvm/include/llvm/IR/OptBisect.h": {
+      "git_blob": "77c866ab76d2120ea23196f140a9e7a091b5cb03",
+      "sha256": "db9ad0ee0f703efc02776203b270df18945028f4b6c176b148c569e0f4f31000",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/OptBisect.h"
+    },
+    "llvm/include/llvm/IR/PassInstrumentation.h": {
+      "git_blob": "c25e2891d33d5cd8b5e85184a7f4c4be6236bb42",
+      "sha256": "0a89142092ab201eb187753bed8a60ef102c450cfcac172a668460a7a67d59da",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/PassInstrumentation.h"
+    },
+    "llvm/include/llvm/IR/PassManagerImpl.h": {
+      "git_blob": "ade13f10c54e48fd75b3d15dc6a760ef133c0c9f",
+      "sha256": "97aa3e5d2b85a5a2cc8b36b559f6c748f3eb0a65e77cfd89488c116f25277527",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/PassManagerImpl.h"
+    },
+    "llvm/include/llvm/IR/PassTimingInfo.h": {
+      "git_blob": "03e481a50342bfd8e232c52f3eaabf2185c89c1b",
+      "sha256": "08b904e56d799e34e431a1c0e1672b387c5612ad998788e565f66e05471e8912",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/PassTimingInfo.h"
+    },
+    "llvm/include/llvm/IR/PatternMatch.h": {
+      "git_blob": "88aef4a368f292f8f09aa92da1d07c023927e693",
+      "sha256": "ef6a8ec1450d386bc15bb817a82d43f18337a3e75c80d023ab7284d8881b98e2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/PatternMatch.h"
+    },
+    "llvm/include/llvm/IR/PrintPasses.h": {
+      "git_blob": "0aa1b379c35cf22fb29d4abc5e8c6a45ac9a2b7a",
+      "sha256": "01ef944400ed3d873e60a0dc8f9457bc70d93619a89efed9e5ddbc8196953558",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/PrintPasses.h"
+    },
+    "llvm/include/llvm/IR/ProfDataUtils.h": {
+      "git_blob": "c8cfccbe61e909e20c2b6531c33ba6caed7b0b33",
+      "sha256": "bfcf2d074afa1f11ba8be3a1a488c89445a6e9eb5315740909a054c70d0b154c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ProfDataUtils.h"
+    },
+    "llvm/include/llvm/IR/ReplaceConstant.h": {
+      "git_blob": "cbea22115310b543b394b138067425baa26a2889",
+      "sha256": "760f5ea4164d3626a4d6d7f8c2b3c0ea1df74caaeca8ec8ca0d098ba04b065a8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ReplaceConstant.h"
+    },
+    "llvm/include/llvm/IR/SSAContext.h": {
+      "git_blob": "d0da5e222a8e63c671efc95232eb11576cf27a61",
+      "sha256": "eed6aac2b75197f1b0bdc530f7f78d501d27d1c770d9ea4ec04208b71279bc52",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/SSAContext.h"
+    },
+    "llvm/include/llvm/IR/SafepointIRVerifier.h": {
+      "git_blob": "2ee998e4c68ffe89aeee18aece8244f06a836499",
+      "sha256": "e0eee70e907a7f189cdb33210b095569cadd468245f7a867fcaae30f19cf027e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/SafepointIRVerifier.h"
+    },
+    "llvm/include/llvm/IR/Statepoint.h": {
+      "git_blob": "8c508492f704a5b0b189d46591484b11cfb4621e",
+      "sha256": "7ae5e9c457723f0ae27078499a2d771bcbb42e2472266dfa83b54f1d5e728d5b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/Statepoint.h"
+    },
+    "llvm/include/llvm/IR/StructuralHash.h": {
+      "git_blob": "fc4b97ee2d41e1cec012b7ce580a05c6d67757e1",
+      "sha256": "d5f2e7787c89086b56f1dcff843f62d8161413b9d74c22d2b47f822fda687b95",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/StructuralHash.h"
+    },
+    "llvm/include/llvm/IR/TypeFinder.h": {
+      "git_blob": "dd2b70c65c2d2bb541b57809d9f1ab032b39c679",
+      "sha256": "aa6167a54e98932868bde00b854028c01f852cb8d17804a8f4f96ba005479794",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/TypeFinder.h"
+    },
+    "llvm/include/llvm/IR/TypedPointerType.h": {
+      "git_blob": "6d1486bb319bf324dabd6a0ff734704466c81227",
+      "sha256": "30e918e8920af5d473cba059ab2f27b8cd5eadc7ebe2405ee21753f6bcc2886a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/TypedPointerType.h"
+    },
+    "llvm/include/llvm/IR/VFABIDemangler.h": {
+      "git_blob": "0b287987665ec010c4991e225251a66769e7fbd4",
+      "sha256": "fb9371c392b91026e6106ac52e714cf178f531ec1638bbd115fe90fc652617ba",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/VFABIDemangler.h"
+    },
+    "llvm/include/llvm/IR/VPIntrinsics.def": {
+      "git_blob": "0b0c744487b9251e2a1211d280e33f0c7cc2f71d",
+      "sha256": "b08100d2b9506c5c6aac125c460ec2a062eec6dc818a4425d9a0375670fdf689",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/VPIntrinsics.def"
+    },
+    "llvm/include/llvm/IR/ValueHandle.h": {
+      "git_blob": "05555bd5efb1ba39052b858cac6396c398bba57e",
+      "sha256": "64f06a3368dc2fd58ae44cbc5c93b9ec15a96aaa3455999ff8f67f2c9a070b92",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ValueHandle.h"
+    },
+    "llvm/include/llvm/IR/ValueSymbolTable.h": {
+      "git_blob": "b792ee64a02e6123de0928caa5b1321bbe0e59f1",
+      "sha256": "a358a117bf6b27da4ba486b33cc6ee3d12e00eec437b1e4f9f56fbf15a0c2d8f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ValueSymbolTable.h"
+    },
+    "llvm/include/llvm/IR/VectorTypeUtils.h": {
+      "git_blob": "e3d7fadad60895ca9adcf0f4ed3acfb1409595c3",
+      "sha256": "980b1be03fc5ba0e73c39e2b32aedf95f546e91aae94d86fe6c52eb1815cdd71",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/VectorTypeUtils.h"
+    },
+    "llvm/include/llvm/IR/Verifier.h": {
+      "git_blob": "b15b4d8ca99fed72e73bd1739689e01680d32ce9",
+      "sha256": "1233603dee7aba697e085ad0f7b4fda3222c3a7e9c0aa72dcb9cb2f26d227935",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/Verifier.h"
+    },
+    "llvm/include/llvm/InitializePasses.h": {
+      "git_blob": "e9e3ca3cc93a06065a9c23384d56472754f6f073",
+      "sha256": "4ea18272d35903156cd85c1a9fc73e01babd8a877b9f670011f6d6d41f83f2b8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/InitializePasses.h"
+    },
+    "llvm/include/llvm/Pass.h": {
+      "git_blob": "f3962c3556c951e3becc232d01810252ae67de49",
+      "sha256": "b39a1f9c194fedb7f4cc4bc6044f5fdcfd485a49e8d6af8755a72ab2f754946d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Pass.h"
+    },
+    "llvm/include/llvm/PassInfo.h": {
+      "git_blob": "5734eb8bfb47ed423f4455f5901704ad2051d333",
+      "sha256": "aa7ff33e018fd0a4fa7157e585c08d8d408414d830e1cafa45bcea54ae914bb4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/PassInfo.h"
+    },
+    "llvm/include/llvm/PassRegistry.h": {
+      "git_blob": "f3dada0c0ba6cd48be373bd61532f281213fd1cf",
+      "sha256": "8fca403248267ad032ccccfcc05d27cd4c811c4027263ad725b09a52af130b88",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/PassRegistry.h"
+    },
+    "llvm/include/llvm/ProfileData/InstrProf.h": {
+      "git_blob": "f59ddc3e5932447c37125c3e5b171b2d31325a5b",
+      "sha256": "07310e5029effb0b693a3bf41eb8046b27e8e53be1c8b2805309c92149cf1db9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ProfileData/InstrProf.h"
+    },
+    "llvm/include/llvm/Remarks/BitstreamRemarkContainer.h": {
+      "git_blob": "d4b70e54bf6bc4ce3cd1a5e080d9b07ad926454c",
+      "sha256": "00533c58d6a3e42a67a69739d4ecd427ef5ddc2ed95921504601420e241d2068",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/BitstreamRemarkContainer.h"
+    },
+    "llvm/include/llvm/Remarks/BitstreamRemarkSerializer.h": {
+      "git_blob": "76e2d5b4fd3bc5a065a1f2000de0de21bd61a025",
+      "sha256": "bf25e4147f27646f626eb61532d7fe79a5022f32426bcd997fe710c62656d0b3",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/BitstreamRemarkSerializer.h"
+    },
+    "llvm/include/llvm/Remarks/Remark.h": {
+      "git_blob": "663af6302d6ff3a5d9d18be835d90de3d84421d0",
+      "sha256": "6a5a030adb886b76b3763b49d709e6b316971c8bbf8ff1538931c1fca2bd16c4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/Remark.h"
+    },
+    "llvm/include/llvm/Remarks/RemarkFormat.h": {
+      "git_blob": "eda201d4ee6f147c5099f675c6fc7bd89b61f60a",
+      "sha256": "af2e726db0d8175bc5625847e1ebc74278dbb2c7d4c518a4e5a837d936107d38",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/RemarkFormat.h"
+    },
+    "llvm/include/llvm/Remarks/RemarkLinker.h": {
+      "git_blob": "2d98f2dc5b2193c7ad86a67ae3364c5ad6435cca",
+      "sha256": "1e8688d9e453af6388d5a951b74a5122ad366be59184b5a04861d7efdcca43bf",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/RemarkLinker.h"
+    },
+    "llvm/include/llvm/Remarks/RemarkParser.h": {
+      "git_blob": "e3df74436348ec6d75b380bce7c6f4de000dd7b4",
+      "sha256": "edc27d9b567e9bb1451bc893babb4c51932572bf0531e8473c097268c611a3b9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/RemarkParser.h"
+    },
+    "llvm/include/llvm/Remarks/RemarkSerializer.h": {
+      "git_blob": "1785152b87c70915e54335084e4fea37ca049483",
+      "sha256": "b69b4dee2918e46f84e41f4d91681f825856ae7c12e80c1253f6d1d3e128c469",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/RemarkSerializer.h"
+    },
+    "llvm/include/llvm/Remarks/RemarkStreamer.h": {
+      "git_blob": "dd5bfcbc7ff9922ca8e2b20da66c4f4323eae6b6",
+      "sha256": "1c50cbeff698d09c2042db6bd34adfb4d6320fca28aca539019f67985e7b17f9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/RemarkStreamer.h"
+    },
+    "llvm/include/llvm/Remarks/RemarkStringTable.h": {
+      "git_blob": "fd88361e3d589fad055a9bb812d8ea3ca4d347ef",
+      "sha256": "6475ace02a5061ee556fa88294a5c5c1ad3ba8d91422b98bad91cc6b0b180bd4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/RemarkStringTable.h"
+    },
+    "llvm/include/llvm/Remarks/YAMLRemarkSerializer.h": {
+      "git_blob": "af9d8098330231f806cfc150a1f535009436531f",
+      "sha256": "8d146c57d0a55d87e060da9301e8539d1d045ec25dd1732910888f90e984a550",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Remarks/YAMLRemarkSerializer.h"
+    },
+    "llvm/include/llvm/Support/CheckedArithmetic.h": {
+      "git_blob": "69dcdc74e0153050f6d3145457c5f753e1a837e9",
+      "sha256": "92e84eb6dae629141629631019a52434be27e1e2fcdaba7ef7af9f920bca0a39",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/CheckedArithmetic.h"
+    },
+    "llvm/include/llvm/Support/GenericDomTreeConstruction.h": {
+      "git_blob": "557c9ec319e332b33bc079a929e2d0914dd2dc28",
+      "sha256": "6e88a56273066d85e134427e225b042a337563821aaad0386ce2badb9614822c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/GenericDomTreeConstruction.h"
+    },
+    "llvm/include/llvm/Support/NVPTXAddrSpace.h": {
+      "git_blob": "04f74c34787cc7ffa639d041f6e22c281968a2e2",
+      "sha256": "b7d405d8ece2cc0b92c202bf154f069410c270dd863d4b35cc4a8b29bec38c4e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/NVPTXAddrSpace.h"
+    },
+    "llvm/include/llvm-c/Comdat.h": {
+      "git_blob": "cf13f8507440e65d0af119eda889f4250554b64d",
+      "sha256": "21821baaae10c4079a244558d248fd6363c6489d194d63371afd18f815aa9310",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm-c/Comdat.h"
+    },
+    "llvm/include/llvm-c/Core.h": {
+      "git_blob": "2bd971983e287dd787c25a42543d0e8db8935328",
+      "sha256": "1dc17fcb91c751ee2fc2211d0b53add643ab7e840707401127afe4a35a7572b2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm-c/Core.h"
+    },
+    "llvm/include/llvm-c/DebugInfo.h": {
+      "git_blob": "70da3a61a46d83ff676b6f85268b89f2877f945a",
+      "sha256": "27f662ca1d6d297175023b84eaf1680f58efb66cb9f42b96a17c5edf65f0055d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm-c/DebugInfo.h"
+    },
+    "llvm/include/llvm-c/Remarks.h": {
+      "git_blob": "b3468a55e504665463937aad7097630f1ec4f58d",
+      "sha256": "ea39f46f281430cb69be515f47e530ead43fcec07b4613625eb4052271fe8f20",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm-c/Remarks.h"
+    },
+    "llvm/lib/IR/AttributeImpl.h": {
+      "git_blob": "707c8205ee1f90290c51d98970b663c9b7c40421",
+      "sha256": "951b6e6b518c7aa3f73c09db93692c1b598bdb8bd65ee9d73bb85be0673b5819",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/AttributeImpl.h"
+    },
+    "llvm/lib/IR/ConstantsContext.h": {
+      "git_blob": "cc9bad431787c8b01a8fd81d5e62130410f59d0e",
+      "sha256": "5785efda172f9a55249d3025f4709867d4ad3bcd15578da2400ec4e71bc2b53f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/ConstantsContext.h"
+    },
+    "llvm/lib/IR/LLVMContextImpl.h": {
+      "git_blob": "2c9921df0422e4130ddff9932d66a5f78c292e92",
+      "sha256": "fd261c6644575ae634a979a85fdbde365ad44b3288a5555187f38f398be76616",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/LLVMContextImpl.h"
+    },
+    "llvm/lib/IR/MetadataImpl.h": {
+      "git_blob": "b4188dd7d3ee46e2da4f43091d15277807214e04",
+      "sha256": "7bef64b69ed4282dad08a5c5fc6f9a85ede5ae67e95496e1978af4c1d82770f0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/MetadataImpl.h"
+    },
+    "llvm/lib/IR/SymbolTableListTraitsImpl.h": {
+      "git_blob": "990552f9b65a1e4a67065e4b6591c14a24181de0",
+      "sha256": "2a658620753768b35330e6768b42cd25f50283acf6cb9c504cd440301293ac13",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IR/SymbolTableListTraitsImpl.h"
+    },
+    "llvm/lib/Remarks/BitstreamRemarkParser.h": {
+      "git_blob": "914edd89612909186fbb25443efa8e7fc1660bac",
+      "sha256": "366a9c27ddc5abfa1e4828b650c88cb24538a5ce54720c9a0c1d189854f8400e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/BitstreamRemarkParser.h"
+    },
+    "llvm/lib/Remarks/YAMLRemarkParser.h": {
+      "git_blob": "9a30e9e295cb26caa90c944ea2a4a6ae3d6e4176",
+      "sha256": "a8b8f6d2658c17009bd9d56d109156447ec46df672c78adb9845361474f89850",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Remarks/YAMLRemarkParser.h"
+    },
+    "llvm/include/llvm/ADT/Any.h": {
+      "git_blob": "a29aaa3439715a4f3e809e5bc9486b2f6739596a",
+      "sha256": "a5383b41545edfc886738a361a8bd776168a7e4e716f74214a76ade11f08a302",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/Any.h"
+    },
+    "llvm/include/llvm/ADT/DepthFirstIterator.h": {
+      "git_blob": "3c54f321bf2d5b7475c449e9c6bd1d9e1b59c94e",
+      "sha256": "82341baee24841594fabf9e3ab462e9e903334f99f105e8b211ea700bcb8ea95",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/DepthFirstIterator.h"
+    },
+    "llvm/include/llvm/ADT/GenericConvergenceVerifier.h": {
+      "git_blob": "dc9495ce57bfd66c57c9a05e546b52f279959e5b",
+      "sha256": "6556c5ea06474201324a26cf6079258388a84d979b3cb3d5cd1f2d80f314c4fd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/GenericConvergenceVerifier.h"
+    },
+    "llvm/include/llvm/ADT/GenericCycleInfo.h": {
+      "git_blob": "365992c0be8dcb6e10041651c8db08aeee9b5dce",
+      "sha256": "94b7628d908eb2674fddd2deb65b338d02b159da2e2e62dd18922e6a6c7d0e6e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/GenericCycleInfo.h"
+    },
+    "llvm/include/llvm/ADT/GenericSSAContext.h": {
+      "git_blob": "426a083778d6e95c15182b6769e38bae4afb2fcc",
+      "sha256": "5043fe433f6526ec51f039e451a1c2ad014ec33e3423e24dd8ef9d637d446668",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/GenericSSAContext.h"
+    },
+    "llvm/include/llvm/ADT/StableHashing.h": {
+      "git_blob": "b6bd23c6945bf9964efcf2bba5f913c53a094f58",
+      "sha256": "ea7d745580babdc6644801a2fe04064d028953eff294f259f10673f327f477e6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ADT/StableHashing.h"
+    },
+    "llvm/include/llvm/Bitstream/BitCodes.h": {
+      "git_blob": "205024f754dfb676c1dff1116646721ba6aeb7ec",
+      "sha256": "fc40c342677e86db6179841261e28c4b5f2a44f73dd5f4ff3d569ddf5e3dd398",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Bitstream/BitCodes.h"
+    },
+    "llvm/include/llvm/Bitstream/BitstreamWriter.h": {
+      "git_blob": "a2938642f824a16aa803b64ac865497ef80f19df",
+      "sha256": "00a40c6e81c2f84c897ec69e60c438b503e17b2baf8aea302011e80d011c03dd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Bitstream/BitstreamWriter.h"
+    },
+    "llvm/include/llvm/IR/CmpPredicate.h": {
+      "git_blob": "96b85426a4addb98442ec51a4e469073d9ed46fe",
+      "sha256": "6f3afdac44b91e37d2a626fa2b2c186e572576fbf56dc83e0e26edc462aa225c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/CmpPredicate.h"
+    },
+    "llvm/include/llvm/IR/ConstantFolder.h": {
+      "git_blob": "26b7242abc4d94a12dc47c61c37b5b3b55a49882",
+      "sha256": "e87c887c5d02591b5509a06ade264e9b9f73570649972619be49c8d40639aa35",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/ConstantFolder.h"
+    },
+    "llvm/include/llvm/IR/IRBuilderFolder.h": {
+      "git_blob": "db4ab5af2433a315e69b37418fba2eed93ffe792",
+      "sha256": "96c1bfbff5f3b346d9fc0c470123f05b3f868104d027195dd161c79dd4a755ff",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/IR/IRBuilderFolder.h"
+    },
+    "llvm/include/llvm/PassAnalysisSupport.h": {
+      "git_blob": "e81c0c4642d20c642bde17498670f6a7e5c40f03",
+      "sha256": "bea8e6daf3a92380182d3619441d24da7108801e28c299960b52e1b7ad095564",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/PassAnalysisSupport.h"
+    },
+    "llvm/include/llvm/PassSupport.h": {
+      "git_blob": "7f0306e33e832e2a5af4666a57d9cddd3a5abe9b",
+      "sha256": "49af1c5c08a6d5204439f6e4feef66bb855207530e1e5a5c47d185ce9eee4649",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/PassSupport.h"
+    },
+    "llvm/include/llvm/ProfileData/InstrProfData.inc": {
+      "git_blob": "46d6bb5bd8896fab6ae691b0f4e2a4c6b3bb5059",
+      "sha256": "fd36dfadf0ca00d0bb3bf2b958c28011fe85724ce5e3c64ec02117e771fa3768",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/ProfileData/InstrProfData.inc"
+    },
+    "llvm/include/llvm/Support/CFGDiff.h": {
+      "git_blob": "88f4fe52d20193b815e516a0c59399f8a6787dc2",
+      "sha256": "51307833c7a684cd6c41105dca57d480eb34d024efbe5913ad05cb4e3d373458",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/CFGDiff.h"
+    },
+    "llvm/include/llvm/Support/CFGUpdate.h": {
+      "git_blob": "18c34bb73695acb81f09feb284248546309404a8",
+      "sha256": "bef08039b62273a5acabf209fbfa9bf12a89fc97be90eb0ce33abd4768f34884",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/CFGUpdate.h"
+    },
+    "llvm/include/llvm/Support/Discriminator.h": {
+      "git_blob": "fa78cf3045de350efdc8355e483584fceaf6d015",
+      "sha256": "2c93e5bcac232848b04b2f7ce0c6b1fd49f623ed53e8d15874e3bc872c9d3ad1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/Discriminator.h"
+    },
+    "llvm/include/llvm/Support/GenericDomTree.h": {
+      "git_blob": "b6aae9f7928e3f6c0f04f3a290f4b2ea0eec5135",
+      "sha256": "16fab3ba6fa68a2cd14221d6d9e707d648e1a22da25725142242184cc2c6502f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/GenericDomTree.h"
+    },
+    "llvm/include/llvm/Support/InterleavedRange.h": {
+      "git_blob": "2c7b87036f4d1a2358a42a9cedf747c8950cb4f9",
+      "sha256": "035f0ae78cccb6e6a3419094753e417f8510af3f1272367f7f239a24b6d6964b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/InterleavedRange.h"
+    },
+    "llvm/include/llvm/Support/Registry.h": {
+      "git_blob": "01f785a8fd633079237dfd49a8b5272cbac7ff12",
+      "sha256": "80ba78c5f9269b1faf1ea81295ee32bd84205f519765e635ff03fcefd2f7418d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Support/Registry.h"
+    },
+    "llvm/include/llvm-c/Deprecated.h": {
+      "git_blob": "1ed5d11550d20c8924ad624e6bedbfa1c19b63f4",
+      "sha256": "dc0131614ca423510877f1605ae79cc33e3c02bed067e021cf7f46576643c7ae",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm-c/Deprecated.h"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

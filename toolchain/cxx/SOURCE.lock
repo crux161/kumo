@@ -6001,6 +6001,11 @@
       "git_blob": "4c7e2c5a5bf38219d8d17eeb69606deaf203009a",
       "sha256": "1c9774fbea033dcdc57432a65720347debce198d38788b8699621dfbbcc961ed",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/include/cinttypes"
+    },
+    "libcxx/include/unordered_set": {
+      "git_blob": "760f145091895e9f3c9504763c13457737705b4f",
+      "sha256": "494b912d6628416e588c1dcb17d965f8a06346972a8b82727366fb3695653ed8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/libcxx/include/unordered_set"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

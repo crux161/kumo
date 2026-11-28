@@ -1,9 +1,8 @@
-<!-- J948_r14_001 -->
-<!-- J949_r15_001 -->
 <!-- J950_r16_001 -->
 <!-- J951_r17_001 -->
 <!-- J952_r18_001 -->
 <!-- J953_r19_001 -->
+<!-- J958_r24_001 -->
 # LLVM for native KUMO — bootstrap libraries
 
 The first native bootstrap slice of PLAN/022 SH9. LLVM's `Support` and `Demangle` libraries
@@ -23,9 +22,13 @@ archive readers. Its general binary/IR factories and writers still need later li
 SH9-d5 builds all 70 MC units and its three-unit DWARF low-level prerequisite. The native proof
 exercises generic MC data-directive streaming and DWARF decoding, with complete component linkage.
 
+SH9-d6 builds all 80 Core IR units and the complete Remarks (11 units) and BitstreamReader
+(1 unit) prerequisites. Its native proof constructs, verifies, mutates and prints IR and
+round-trips optimization remarks through YAML and LLVM bitstream.
+
 ## Sources
 
-`SOURCE.lock` pins the measured closure: 1,155 files, 26,189,206 bytes. SH9-d1's 467 files hold every Support and
+`SOURCE.lock` pins the measured closure: 1,372 files, 31,162,694 bytes. SH9-d1's 467 files hold every Support and
 Demangle unit; the headers they and the proof include; the Unix layer (`lib/Support/Unix/*.inc`);
 BLAKE3's portable and NEON sources (not its x86 SIMD); `third-party/siphash`; the CMake config
 templates; and `llvm/LICENSE.TXT`, which also covers SipHash. Each file has its git blob ID and
@@ -50,6 +53,10 @@ and definitions those headers include. The libc++ layer gains the pinned `<cintt
 
 SH9-d5 adds 141 upstream files (1,504,017 bytes): all MC and DWARF low-level units, both CMake
 source lists and their measured header closure. Upstream bytes stay unchanged.
+
+SH9-d6 adds 217 exact upstream files (4,973,488 bytes): Core/Remarks/BitstreamReader sources,
+three CMake recipes and the measured header closure. libc++ gains the pinned `<unordered_set>`
+header. The same LLVM revision and platform patch apply.
 
 ## The KUMO port (`kumo.patch`)
 
@@ -271,9 +278,10 @@ The child's stdin is redirected to `/dev/null` (LLVM's empty-path redirect). Its
 stderr are the parent's own. relibc changes for this slice:
 
 - `posix_spawn` accepts `addopen("/dev/null")` on fds 0–2: the child gets no channel there and
-  installs `/dev/null` itself, as with Rust's `Stdio::null()`. Other paths still return
-  `EOPNOTSUPP`, because a child has no filesystem grant to open them. Giving children a grant
-  and redirecting to files are capability-policy decisions left for later.
+  installs `/dev/null` itself, as with Rust's `Stdio::null()`. Other paths return
+  `EOPNOTSUPP` for ungranted children. PROPOSAL/027 subsequently supplied fresh hereditary
+  child sessions (`KUMO_GRANT=fs`, narrowable to `fs-ro`) and file redirects;
+  `scripts/spawn-redirect-smoke.py` proves them through this LLVM process layer.
 - `posix_spawn_file_actions_addopen`/`addchdir` copy the caller's path (upstream took ownership
   of it with `CString::from_raw`), and `_destroy` now frees the actions.
 - `access`/`faccessat` answer from `stat` instead of `ENOSYS`. KUMO has no users, so the
@@ -285,3 +293,39 @@ scripts/relibc-headers.sh
 python3 scripts/llvm-process-smoke.py --run
 python3 scripts/metal-sh9-p1.py
 ```
+
+## Core IR (SH9-d6)
+
+`build-core.py` builds Support, Demangle, BinaryFormat, TargetParser, Core, Remarks and
+BitstreamReader. Every new source list is checked against its pinned upstream CMake recipe.
+The proof retains the complete Core/Remarks/BitstreamReader/BinaryFormat/TargetParser archives
+without section garbage collection: no undefined symbols and no unbuilt link components.
+It keeps the 4 MiB main stack used by the other LLVM proofs.
+
+`gen-target-tables.py` adds `IntrinsicImpl.inc` and all target intrinsic enum headers named by
+the pinned IR CMake recipe, using matching LLVM 22.1.8 TableGen. The manifest records their
+hashes and every measured `.td` input; the runner archives the generated include tree.
+Target intrinsic definitions are needed by IR's intrinsic APIs and auto-upgrade code. They do
+not supply an instruction encoder or target backend.
+
+The native proof covers:
+
+- A KUMO module, canonical types and AArch64 aggregate offsets, size and pointer size.
+- Branching SSA with a PHI node, its incoming edges and a dominator tree.
+- IRBuilder constant folding, replacement/restoration of uses, attributes and the generated
+  overloaded `llvm.bswap.i32` intrinsic declaration.
+- Verifier errors for a missing PHI predecessor and a wrong return type, followed by successful
+  verification after repairs.
+- Named metadata and finalized DWARF compile-unit, subprogram, type and source-location metadata.
+- YAML and bitstream optimization-remark serialization/parsing with exact semantic equality,
+  typed argument decoding, EOF and malformed-input rejection.
+- Printed IR with SSA/debug metadata, byte-exact file read-back on RAM FAT and removal.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/llvm-core-smoke.py --run
+python3 scripts/metal-sh9-d6.py
+```
+
+This is the IR foundation. Textual IR parsing, bitcode reading/writing, Object's general
+factories, MCParser, instruction backends, native tools and SMP acceptance remain later gates.

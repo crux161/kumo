@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #J950_r16_001
 #J951_r17_001
+#J958_r24_001
 """Generate bootstrap LLVM tables with the pinned LLVM TableGen version."""
 import hashlib
 import os
@@ -23,7 +24,7 @@ OBJECT_TABLES = (
 )
 
 
-def generate(source, generated, lock, requested=None, *, object_tables=False):
+def generate(source, generated, lock, requested=None, *, object_tables=False, core_tables=False):
     version = lock["ref"].removeprefix("llvmorg-")
     if requested is not None or os.environ.get("LLVM_TBLGEN"):
         candidate = str(requested) if requested is not None else os.environ["LLVM_TBLGEN"]
@@ -47,7 +48,19 @@ def generate(source, generated, lock, requested=None, *, object_tables=False):
     if object_tables:
         recipes += [("llvm/include/llvm/" + td, action, "llvm/" + dest)
                     for td, action, dest in OBJECT_TABLES]
-    for primary, action, destination in recipes:
+    core_recipes = []
+    if core_tables:
+        cmake = source / "llvm/include/llvm/IR/CMakeLists.txt"
+        if "llvm/include/llvm/IR/CMakeLists.txt" not in lock["files"]:
+            raise RuntimeError("unpinned Core table recipe")
+        dependencies.add("llvm/include/llvm/IR/CMakeLists.txt")
+        # Use the pinned upstream recipe for every target intrinsic enum. — TEAL
+        core_recipes = [("llvm/include/llvm/IR/Intrinsics.td", "intrinsic-impl", "llvm/IR/IntrinsicImpl.inc")]
+        core_recipes += [("llvm/include/llvm/IR/Intrinsics.td", "intrinsic-enums", "llvm/IR/" + name, prefix)
+                         for name, prefix in re.findall(r"tablegen\(LLVM (Intrinsics\w+\.h) -gen-intrinsic-enums -intrinsic-prefix=(\w+)\)", cmake.read_text())]
+        recipes += core_recipes
+    for recipe in recipes:
+        primary, action, destination = recipe[:3]
         td = source / primary
         # LLVM 22's depfile lists includes, omitting the main .td input. — KESTREL
         if primary not in lock["files"]:
@@ -58,6 +71,8 @@ def generate(source, generated, lock, requested=None, *, object_tables=False):
         depfile = output.with_name(output.name + ".d")
         command = [str(tool), "-gen-" + action, "-I", str(source / "llvm/include"),
                    "-I", str(td.parent), str(td), "-o", str(output), "-d", str(depfile)]
+        if len(recipe) == 4:
+            command += ["-intrinsic-prefix=" + recipe[3]]
         subprocess.run(command, check=True)
         for raw in depfile.read_text().replace("\\\n", " ").split(":", 1)[1].split():
             path = Path(raw).resolve()
@@ -68,6 +83,8 @@ def generate(source, generated, lock, requested=None, *, object_tables=False):
                 raise RuntimeError(f"unpinned TableGen input: {name}")
             dependencies.add(name)
     return {
+        **({"core_outputs_sha256": {r[2]: hashlib.sha256((generated / r[2]).read_bytes()).hexdigest()
+                                     for r in core_recipes}} if core_tables else {}),
         "tool": str(tool),
         "version": banner,
         "tool_sha256": hashlib.sha256(tool.read_bytes()).hexdigest(),
