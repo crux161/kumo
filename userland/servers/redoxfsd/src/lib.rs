@@ -3,6 +3,7 @@
 //j928
 //j929
 //J944_r10_001
+//J957_r23_001
 //! `redoxfsd`, the RedoxFS-backed `kumo-vfs` handler core (SH8-b, PLAN/008 S5/S6).
 //!
 //! It is the mount-scoped `fatfs` server's protocol with RedoxFS underneath. One process
@@ -43,7 +44,9 @@ pub use kumo_redoxfs;
 
 /// Sessions one mount admits, as many as fatfs's mount-scoped server (a Linux process tree
 /// holds one session per process).
-pub const MAX_SESSIONS: usize = 16;
+/// J957_r23_001 (PROPOSAL/027 P2d): 64, as fatfs. An open table is 256 bytes (measured on the
+/// host); the tables live on the heap, so the boxed server's stack-built value does not grow.
+pub const MAX_SESSIONS: usize = 64;
 /// Open handles per session.
 pub const MAX_OPEN_FILES: usize = 32;
 /// Advisory locks tracked across all sessions.
@@ -287,8 +290,8 @@ pub type Clock = fn() -> (u64, u32);
 /// The mount-scoped server: one RedoxFS volume and the soft state of every session on it.
 pub struct RedoxServer<D: Disk> {
     pub fs: FileSystem<D>,
-    sessions: [OpenTable; MAX_SESSIONS],
-    access: [u8; MAX_SESSIONS],
+    sessions: Vec<OpenTable>,
+    access: Vec<u8>,
     locks: [Option<LockEntry>; MAX_LOCKS],
     ahead: Option<Ahead>,
     ahead_buf: Vec<u8>,
@@ -301,8 +304,8 @@ impl<D: Disk> RedoxServer<D> {
     pub fn new(fs: FileSystem<D>, clock: Clock) -> Self {
         Self {
             fs,
-            sessions: [OpenTable::new(); MAX_SESSIONS],
-            access: [SESSION_READ_ONLY; MAX_SESSIONS],
+            sessions: alloc::vec![OpenTable::new(); MAX_SESSIONS],
+            access: alloc::vec![SESSION_READ_ONLY; MAX_SESSIONS],
             locks: [None; MAX_LOCKS],
             ahead: None,
             ahead_buf: Vec::new(),

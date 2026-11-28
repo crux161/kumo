@@ -4,6 +4,7 @@
 //j879
 //j881
 //J955_r21_001
+//J957_r23_001
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -252,6 +253,14 @@ fn main() {
             p2b_grants();
             return;
         }
+        // PROPOSAL/027 P2d: the session-budget proof (scripts/session-budget-smoke.py drives
+        // `sessions`; `fillchild` and `fillleaf` are the tree it spawns from SMOKE.ELF).
+        Some("sessions") => {
+            p2d_sessions();
+            return;
+        }
+        Some("fillchild") => p2d_fill_child(std::env::args().nth(2).unwrap_or_default()),
+        Some("fillleaf") => p2d_fill_leaf(std::env::args().nth(2).unwrap_or_default()),
         Some("grantchild") => {
             let args: Vec<String> = std::env::args().collect();
             p2b_child(&args[2..]);
@@ -1297,6 +1306,190 @@ fn p2b_child(args: &[String]) -> ! {
         _ => fail("unknown mode".to_string()),
     }
     std::process::exit(0)
+}
+
+/// PROPOSAL/027 P2d: one ring record under "std: p2d".
+fn p2d_line(args: core::fmt::Arguments<'_>) {
+    let text = format!("std: p2d {}\n", args);
+    let bytes = text.as_bytes();
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &bytes[..bytes.len().min(200)]);
+}
+
+macro_rules! p2dlog {
+    ($($arg:tt)*) => { p2d_line(format_args!($($arg)*)) };
+}
+
+const P2D_DIR: &str = "/P2D";
+const P2D_CHILDREN: usize = 7;
+const P2D_LEAVES: usize = 8;
+
+/// A grandchild: wait for `go` (so the whole tree is alive at once), then write and read back
+/// its own file. Exit 0 on success.
+fn p2d_fill_leaf(name: String) -> ! {
+    use std::io::BufRead as _;
+    let mut go = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut go);
+    let path = format!("{}/{}.TXT", P2D_DIR, name);
+    let ok = go == "go\n"
+        && std::fs::write(&path, name.as_bytes()).is_ok()
+        && std::fs::read(&path).map(|b| b == name.as_bytes()).unwrap_or(false);
+    if !ok {
+        p2dlog!("leaf {} failed (go {:?})", name, go);
+    }
+    std::process::exit(if ok { 0 } else { 1 })
+}
+
+/// A child: spawn eight gated grandchildren, report `ready N` (N spawned) on stdout, wait for
+/// `go`, pass it on, and exit with the number of grandchildren that failed (or failed to start).
+fn p2d_fill_child(k: String) -> ! {
+    use std::io::{BufRead as _, Write as _};
+    use std::process::{Command, Stdio};
+    let mut leaves: Vec<_> = (0..P2D_LEAVES)
+        .filter_map(|j| {
+            match Command::new("/SMOKE.ELF")
+                .args(["fillleaf", &format!("L{}{}", k, j)])
+                .stdin(Stdio::piped())
+                .spawn()
+            {
+                Ok(leaf) => Some(leaf),
+                Err(e) => {
+                    p2dlog!("child {} could not spawn leaf {}: {:?}", k, j, e.raw_os_error());
+                    None
+                }
+            }
+        })
+        .collect();
+    let started = leaves.len();
+    println!("ready {}", started);
+    let _ = std::io::stdout().flush();
+    let mut go = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut go);
+    for leaf in leaves.iter_mut() {
+        if let Some(mut stdin) = leaf.stdin.take() {
+            let _ = stdin.write_all(b"go\n");
+        }
+    }
+    let failed = leaves
+        .into_iter()
+        .filter(|_| true)
+        .map(|mut leaf| leaf.wait().map(|s| s.code() == Some(0)).unwrap_or(false))
+        .filter(|ok| !ok)
+        .count();
+    std::process::exit((failed + (P2D_LEAVES - started)) as i32)
+}
+
+/// PROPOSAL/027 P2d: fill one mount-scoped server to its session budget with a live granted
+/// tree, see the next grant refused at spawn time, then see the sessions come back. — TEAL
+#[inline(never)]
+fn p2d_sessions() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::process::{Command, Stdio};
+    let label = "P2d session budget";
+    p2dlog!("{} begin", label);
+    let mut ok = true;
+    let mut check = |good: bool, what: &str, detail: String| {
+        if good {
+            p2dlog!("{} -> OK", what);
+        } else {
+            p2dlog!("{} FAIL {}", what, detail);
+            ok = false;
+        }
+    };
+    check(std::fs::create_dir(P2D_DIR).is_ok(), "setup /P2D", String::new());
+
+    // 1. This process holds one session; seven children and their 56 grandchildren hold one
+    //    each: 64 sessions on this launch's server, all alive at the same time.
+    let mut children: Vec<_> = (0..P2D_CHILDREN)
+        .map(|k| {
+            Command::new("/SMOKE.ELF")
+                .args(["fillchild", &k.to_string()])
+                .env("KUMO_GRANT", "fs")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+        })
+        .collect();
+    for (k, child) in children.iter().enumerate() {
+        if let Err(e) = child {
+            p2dlog!("could not spawn child {}: {:?}", k, e.raw_os_error());
+        }
+    }
+    let mut readies = Vec::new();
+    for child in children.iter_mut() {
+        let line = child
+            .as_mut()
+            .ok()
+            .and_then(|c| c.stdout.take())
+            .and_then(|out| {
+                let mut line = String::new();
+                BufReader::new(out).read_line(&mut line).ok().map(|_| line)
+            })
+            .unwrap_or_default();
+        readies.push(line.trim().to_string());
+    }
+    let all_started = children.iter().all(|c| c.is_ok()) && readies.iter().all(|r| r == "ready 8");
+    check(all_started, "64 sessions at once: 7 granted children x 8 granted grandchildren",
+          format!("{:?}", readies));
+
+    // 2. The 65th session: the server refuses it, and posix_spawn says so (EAGAIN) instead of
+    //    starting a child whose filesystem is already dead.
+    let extra = Command::new("/SMOKE.ELF").args(["fillleaf", "X"]).env("KUMO_GRANT", "fs").stdin(Stdio::piped()).spawn();
+    let refused = match &extra {
+        Err(e) => e.raw_os_error() == Some(11),
+        Ok(_) => false,
+    };
+    let detail = format!("{:?}", extra.as_ref().map(|_| "started").map_err(|e| e.raw_os_error()));
+    if let Ok(mut child) = extra {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"go\n");
+        }
+        let _ = child.wait();
+    }
+    check(refused, "the 65th session is refused at spawn with EAGAIN", detail);
+
+    // 3. Release the tree: every grandchild writes and reads its own file.
+    for child in children.iter_mut().flatten() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"go\n");
+        }
+    }
+    let codes: Vec<_> = children
+        .into_iter()
+        .map(|c| c.and_then(|mut c| c.wait()).map(|s| s.code()).ok().flatten())
+        .collect();
+    let mut files = 0;
+    for k in 0..P2D_CHILDREN {
+        for j in 0..P2D_LEAVES {
+            let name = format!("L{}{}", k, j);
+            let path = format!("{}/{}.TXT", P2D_DIR, name);
+            if std::fs::read(&path).map(|b| b == name.as_bytes()).unwrap_or(false) {
+                files += 1;
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    check(codes.iter().all(|c| *c == Some(0)) && files == P2D_CHILDREN * P2D_LEAVES,
+          "56 grandchildren each wrote and read their own file", format!("codes {:?} files {}", codes, files));
+
+    // 4. Their sessions closed with them: a new granted child gets one again.
+    let again = Command::new("/SMOKE.ELF").args(["fillleaf", "AGAIN"]).env("KUMO_GRANT", "fs").stdin(Stdio::piped()).spawn();
+    let again_ok = match again {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(b"go\n");
+            }
+            child.wait().map(|s| s.code() == Some(0)).unwrap_or(false)
+        }
+        Err(_) => false,
+    };
+    let _ = std::fs::remove_file(format!("{}/AGAIN.TXT", P2D_DIR));
+    check(again_ok, "sessions come back when their processes exit", String::new());
+    check(std::fs::remove_dir(P2D_DIR).is_ok(), "files removed", String::new());
+    if ok {
+        p2dlog!("{} green", label);
+    } else {
+        p2dlog!("{} FAILED", label);
+    }
 }
 
 /// PROPOSAL/027 P2b: the child filesystem grant tree. Every record is one `-> OK` line, or the

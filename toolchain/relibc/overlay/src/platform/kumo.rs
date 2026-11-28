@@ -7,6 +7,7 @@
 //J954_r20_001
 //J955_r21_001
 //J956_r22_001
+//J957_r23_001
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -503,7 +504,10 @@ static mut FD_NONBLOCK: [bool; FD_SLOTS] = [false; FD_SLOTS];
 
 /// Descriptors this backend can hold. POSIX programs expect 0/1/2 to be stdio, so the table
 /// is indexed directly by the descriptor number.
-const FD_SLOTS: usize = 16;
+/// J957_r23_001 (PROPOSAL/027 P2d): 64, up from 16. A driver holds two pipe ends per running
+/// child (std's piped stdin + stdout), so 16 stopped a parent at its sixth child with EMFILE.
+/// A slot is at most a directory path wide, so the static table is about 18 KiB.
+const FD_SLOTS: usize = 64;
 
 /// Written by the startup thread before `main`, then only by the calling thread's own
 /// `open`/`read`/`close`. A second thread sharing descriptors needs the kernel to own the
@@ -1437,6 +1441,21 @@ fn spawn_elf(
                 close_handle(server);
                 close_handle(session);
                 return Err(Errno(EIO));
+            }
+            // J957_r23_001 (PROPOSAL/027 P2d): a server whose session table is full closes
+            // the session it was handed. Ask it one question first (stat "/"), so a refused
+            // grant fails this spawn with EAGAIN instead of starting a child whose filesystem
+            // is already dead.
+            let probe = [VFS_OP_STAT, 1, 0, b'/'];
+            let mut answer = [0u8; VFS_STAT_REPLY_LEN];
+            let n = if channel_write_bytes(session, &probe) == 0 {
+                channel_read_bytes(session, &mut answer)
+            } else {
+                0
+            };
+            if n == 0 || n == u64::MAX || answer[0] != VFS_OK {
+                close_handle(session);
+                return Err(Errno(EAGAIN));
             }
             if channel_write_tag(sender, STARTUP_TAG_FS, session) != 0 {
                 close_handle(session);

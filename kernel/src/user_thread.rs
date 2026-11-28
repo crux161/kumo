@@ -13,6 +13,7 @@
 //j883
 //j916
 //j919
+//J957_r23_001
 
 use core::cell::UnsafeCell;
 
@@ -402,10 +403,17 @@ pub struct UserSched {
     /// Exit statuses of children reaped at the wait boundaries, oldest first (SH4): the
     /// parent koid, the process koid and the exit code, drained one per `ProcessWait` by
     /// the parent they belong to, so a parent can collect every child's status, killed
-    /// ones included. A small fixed ring — the oldest entry falls off if nobody asks.
-    reaped: [(KoId, KoId, u64); 8],
-    reaped_len: usize,
+    /// ones included. Bounded — the oldest entry falls off if nobody asks.
+    /// J957_r23_001 (PROPOSAL/027 P2d): the bound was 8 for the whole system, so 56
+    /// grandchildren exiting together pushed out statuses their own parents had not yet
+    /// collected, and those parents' `waitpid` then waited on a dead child forever. The bound
+    /// is now [`REAPED_MAX`], every resident child at once, and a parent's uncollected
+    /// entries go when the parent itself is reaped (nobody is left to ask for them).
+    reaped: alloc::vec::Vec<(KoId, KoId, u64)>,
 }
+
+/// J957_r23_001: uncollected exit statuses the kernel keeps: one per resident child.
+const REAPED_MAX: usize = MAX_RESIDENT_CHILDREN;
 
 struct UserSchedCell(UnsafeCell<Option<UserSched>>);
 unsafe impl Sync for UserSchedCell {}
@@ -423,10 +431,8 @@ pub fn take_reaped(parent: KoId) -> Option<(KoId, u64)> {
     let p = sched_ptr();
     unsafe {
         let s = &mut *p;
-        let at = (0..s.reaped_len).find(|&at| s.reaped[at].0 == parent)?;
-        let (_, process, code) = s.reaped[at];
-        s.reaped.copy_within(at + 1..s.reaped_len, at);
-        s.reaped_len -= 1;
+        let at = s.reaped.iter().position(|entry| entry.0 == parent)?;
+        let (_, process, code) = s.reaped.remove(at);
         Some((process, code))
     }
 }
@@ -737,8 +743,7 @@ pub fn init(
             done: false,
             sora_current_call: None,
             resident_limit: job.resident_limit(),
-            reaped: [(KoId(0), KoId(0), 0); 8],
-            reaped_len: 0,
+            reaped: alloc::vec::Vec::with_capacity(REAPED_MAX),
         });
     }
     kumo_hal::active::set_tower_context_hook(tower_context);
@@ -1072,13 +1077,13 @@ fn reap_done(s: &mut UserSched) {
                 s.children[i].process,
                 s.children[i].exit_code,
             );
-            if s.reaped_len == s.reaped.len() {
-                s.reaped.copy_within(1.., 0);
-                s.reaped[s.reaped.len() - 1] = entry;
-            } else {
-                s.reaped[s.reaped_len] = entry;
-                s.reaped_len += 1;
+            // Statuses this process never collected have no one left to collect them.
+            let gone = entry.1;
+            s.reaped.retain(|reaped| reaped.0 != gone);
+            if s.reaped.len() == REAPED_MAX {
+                s.reaped.remove(0);
             }
+            s.reaped.push(entry);
             s.wait_queue.remove_thread(koid);
             release_persona(&s.children[i]);
             s.children.remove(i);
@@ -1176,14 +1181,8 @@ pub fn run_prepared_child(
         reap_done(s);
         // The sync runner consumed this child's status as its return; drop the queue copy
         // so a later ProcessWait does not report it twice (SH4).
-        let mut at = 0;
-        while at < s.reaped_len {
-            if s.reaped[at].1 == proc_koid {
-                s.reaped.copy_within(at + 1..s.reaped_len, at);
-                s.reaped_len -= 1;
-                break;
-            }
-            at += 1;
+        if let Some(at) = s.reaped.iter().position(|entry| entry.1 == proc_koid) {
+            s.reaped.remove(at);
         }
         code
     };
@@ -3120,8 +3119,57 @@ mod ax4_capacity_tests {
         assert_eq!(process_wait_for(KoId(500)), Errno::Ok.status());
         assert_eq!(take_reaped(KoId(500)), Some((KoId(601), KILLED_EXIT_CODE)));
         assert_eq!(take_reaped(KoId(500)), None);
-        assert_eq!(sched().reaped_len, 0);
+        assert!(sched().reaped.is_empty());
         assert_eq!(process_wait(), Errno::Ok.status());
+        assert!(sched().children.is_empty());
+    }
+    /// J957_r23_001 (PROPOSAL/027 P2d): twenty children of one parent end together and the
+    /// parent still collects every status (the ring used to hold 8 for the whole system); a
+    /// parent that is itself reaped takes its uncollected entries with it. — TEAL
+    #[test]
+    fn a_burst_of_exits_keeps_every_status_until_its_parent_asks() {
+        let _guard = AX4_LOCK.lock().unwrap();
+        let mut objects = ObjectManager::new();
+        let vmar = Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).unwrap();
+        init(&mut objects, KoId(7), vmar, 0).unwrap();
+        let sora = sched().user_thread.process();
+
+        for proc_koid in 600..620 {
+            assert_eq!(spawn_actor(&mut objects, proc_koid), Errno::Ok.status());
+        }
+        for child in sched_mut().children.iter_mut() {
+            child.parent = KoId(500);
+        }
+        for proc_koid in 600..620 {
+            assert_eq!(kill_process_threads(KoId(proc_koid)).killed, 1);
+        }
+        assert_eq!(process_wait_for(KoId(500)), Errno::Ok.status());
+        let mut seen: alloc::vec::Vec<u64> = (0..20)
+            .map(|_| take_reaped(KoId(500)).expect("every status kept").0 .0)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (600..620).collect::<alloc::vec::Vec<u64>>());
+        assert_eq!(take_reaped(KoId(500)), None);
+
+        // 701 belongs to 700; 701 ends uncollected, then 700 itself is reaped: Sora gets
+        // 700's status and 701's entry, which no one can ask for any more, is gone.
+        for proc_koid in [700, 701] {
+            assert_eq!(spawn_actor(&mut objects, proc_koid), Errno::Ok.status());
+        }
+        let at = sched()
+            .children
+            .iter()
+            .position(|c| c.process == KoId(701))
+            .unwrap();
+        sched_mut().children[at].parent = KoId(700);
+        assert_eq!(kill_process_threads(KoId(701)).killed, 1);
+        assert_eq!(process_wait_for(KoId(700)), Errno::Ok.status());
+        assert!(sched().reaped.iter().any(|entry| entry.0 == KoId(700)));
+        assert_eq!(kill_process_threads(KoId(700)).killed, 1);
+        assert_eq!(process_wait(), Errno::Ok.status());
+        assert!(sched().reaped.iter().all(|entry| entry.0 != KoId(700)));
+        assert_eq!(take_reaped(sora), Some((KoId(700), KILLED_EXIT_CODE)));
+        assert!(sched().reaped.is_empty());
         assert!(sched().children.is_empty());
     }
     //j873

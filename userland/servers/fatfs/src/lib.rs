@@ -5,6 +5,7 @@
 //j925
 //J944_r10_001
 //j929
+//J957_r23_001
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -282,8 +283,13 @@ impl Default for FatServer {
 
 /// Sessions the mount-scoped server admits (SH3-c). Every session reserves an open table.
 /// j924 (SH7-f): a Linux process tree on the image (cargo, rustc, rust-lld and the shim each
-/// spawn under) holds one session per process, so the image server admits sixteen.
-pub const MAX_SESSIONS: usize = 16;
+/// spawn under) holds one session per process, so the image server admitted sixteen.
+/// J957_r23_001 (PROPOSAL/027 P2d): native granted trees hold one per process too (a parallel
+/// make driving clang is ~2 per job), so 64. Measured on the host: an open table is 1,408
+/// bytes, so the static server state grows from 22,928 to about 91 KiB of .bss.
+pub const MAX_SESSIONS: usize = 64;
+// The shared state is a static, not a stack value; keep its growth deliberate.
+const _: () = assert!(core::mem::size_of::<SharedServer>() <= 128 * 1024);
 /// Session access byte: reads only (SH3-c2). The launcher's grant stays authoritative:
 /// the shared server holds an rw block channel, so a read-only session is enforced here.
 pub const SESSION_READ_ONLY: u8 = 0;
