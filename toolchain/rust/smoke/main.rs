@@ -3,6 +3,7 @@
 //j877
 //j879
 //j881
+//J955_r21_001
 #![feature(restricted_std)]
 //! The gate I-b program: std::fs, std::io, std::collections, and std::time over the kumo
 //! PAL, with every acceptance line mirrored to the kernel-log ring (the metal serial
@@ -244,6 +245,16 @@ fn main() {
             // The main thread parks in join; the worker's exit ends both.
             let _ = worker.join();
             std::process::exit(9);
+        }
+        // PROPOSAL/027 P2b: the child filesystem grant proof (scripts/child-grant-smoke.py drives
+        // `grants`; `grantchild` is every child and grandchild it spawns from SMOKE.ELF).
+        Some("grants") => {
+            p2b_grants();
+            return;
+        }
+        Some("grantchild") => {
+            let args: Vec<String> = std::env::args().collect();
+            p2b_child(&args[2..]);
         }
         Some("spawnnogrant") => {
             use std::io::Write as _;
@@ -1182,6 +1193,197 @@ fn lock_try(args: &[String]) {
 /// wait_with_output (std's poll-driven two-pipe reader); a spinning child killed and
 /// reaped with the kernel's killed status; and the no-grant proof — the child cannot open
 /// the file it was loaded from, because no filesystem grant travels with a spawn. — TEAL
+/// PROPOSAL/027 P2b: one ring record under "std: p2b".
+fn p2b_line(args: core::fmt::Arguments<'_>) {
+    let text = format!("std: p2b {}\n", args);
+    let bytes = text.as_bytes();
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &bytes[..bytes.len().min(200)]);
+}
+
+macro_rules! p2blog {
+    ($($arg:tt)*) => { p2b_line(format_args!($($arg)*)) };
+}
+
+const P2B_DIR: &str = "/P2B";
+const P2B_ROUNDS: usize = 150;
+
+/// The bytes of one busy file: `size` copies of `byte`.
+fn p2b_busy(path: &str, byte: u8, size: usize) -> bool {
+    let want = vec![byte; size];
+    if std::fs::write(path, &want).is_err() {
+        return false;
+    }
+    let mut good = true;
+    for _ in 0..P2B_ROUNDS {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() as usize == size && meta.is_file() => {}
+            _ => good = false,
+        }
+        match std::fs::read(path) {
+            Ok(bytes) if bytes == want => {}
+            _ => good = false,
+        }
+    }
+    good
+}
+
+/// Every process a `grants` tree spawns. `rw NAME DEPTH`: write /P2B/NAME.TXT, find the marker
+/// inherited, and (DEPTH > 1) spawn the next level with no env change. `ro NAME`: read the
+/// root file, fail to create, then try to widen by spawning `none` with `KUMO_GRANT=fs`.
+/// `none NAME`: must not be able to open anything. `busy K`: concurrent I/O on its own file.
+/// Exit 0 on success; failures log their reason and exit nonzero. — TEAL
+fn p2b_child(args: &[String]) -> ! {
+    use std::process::Command;
+    let mode = args.first().map(String::as_str).unwrap_or("");
+    let name = args.get(1).cloned().unwrap_or_default();
+    let fail = |why: String| -> ! {
+        p2blog!("child {} {}: {}", mode, name, why);
+        std::process::exit(1)
+    };
+    let marker = std::env::var("KUMO_GRANT").unwrap_or_default();
+    match mode {
+        "rw" => {
+            let depth: u32 = args.get(2).and_then(|d| d.parse().ok()).unwrap_or(1);
+            if marker != "fs" {
+                fail(format!("marker {:?}, want \"fs\"", marker));
+            }
+            let path = format!("{}/{}.TXT", P2B_DIR, name);
+            if let Err(e) = std::fs::write(&path, name.as_bytes()) {
+                fail(format!("write {}: {:?}", path, e.raw_os_error()));
+            }
+            if depth > 1 {
+                let next = format!("{}1", name);
+                match Command::new("/SMOKE.ELF").args(["grantchild", "rw", &next, &(depth - 1).to_string()]).status() {
+                    Ok(status) if status.code() == Some(0) => {}
+                    other => fail(format!("grandchild {:?}", other.map(|s| s.code()))),
+                }
+            }
+        }
+        "ro" => {
+            if marker != "fs-ro" {
+                fail(format!("marker {:?}, want \"fs-ro\"", marker));
+            }
+            match std::fs::read(format!("{}/ROOT.TXT", P2B_DIR)) {
+                Ok(bytes) if bytes == b"root" => {}
+                other => fail(format!("read ROOT.TXT {:?}", other.map_err(|e| e.raw_os_error()))),
+            }
+            match std::fs::write(format!("{}/{}.TXT", P2B_DIR, name), b"x") {
+                Err(e) if e.raw_os_error() == Some(13) => {}
+                other => fail(format!("write on a read-only grant: {:?}", other.map_err(|e| e.raw_os_error()))),
+            }
+            let next = format!("{}1", name);
+            match Command::new("/SMOKE.ELF").args(["grantchild", "none", &next]).env("KUMO_GRANT", "fs").status() {
+                Ok(status) if status.code() == Some(0) => {}
+                other => fail(format!("widening grandchild {:?}", other.map(|s| s.code()))),
+            }
+        }
+        "none" => {
+            if std::fs::metadata(format!("{}/ROOT.TXT", P2B_DIR)).is_ok() || std::fs::read("/SMOKE.ELF").is_ok() {
+                fail("a child with no grant opened a file".to_string());
+            }
+        }
+        "busy" => {
+            // Start only when the parent says so, once every busy child exists: then all of
+            // them and the parent are inside their loops at the same time.
+            let mut go = String::new();
+            if std::io::stdin().read_line(&mut go).is_err() || go != "go\n" {
+                fail(format!("no start signal ({:?})", go));
+            }
+            let k: usize = name.parse().unwrap_or(0);
+            if !p2b_busy(&format!("{}/B{}.TXT", P2B_DIR, k), b'a' + k as u8, 100 + 41 * k) {
+                fail("wrong stat or read while other processes worked".to_string());
+            }
+        }
+        _ => fail("unknown mode".to_string()),
+    }
+    std::process::exit(0)
+}
+
+/// PROPOSAL/027 P2b: the child filesystem grant tree. Every record is one `-> OK` line, or the
+/// failure spelled out; the green line comes only when all of them passed. — TEAL
+#[inline(never)]
+fn p2b_grants() {
+    use std::process::Command;
+    let label = "P2b child grants";
+    p2blog!("{} begin", label);
+    let mut ok = true;
+    let mut check = |good: bool, what: &str, detail: String| {
+        if good {
+            p2blog!("{} -> OK", what);
+        } else {
+            p2blog!("{} FAIL {}", what, detail);
+            ok = false;
+        }
+    };
+    let run = |args: &[&str], grant: Option<&str>| {
+        let mut command = Command::new("/SMOKE.ELF");
+        command.arg("grantchild").args(args);
+        if let Some(grant) = grant {
+            command.env("KUMO_GRANT", grant);
+        }
+        command.status().map(|s| s.code())
+    };
+    let setup = std::fs::create_dir(P2B_DIR).is_ok() && std::fs::write(format!("{}/ROOT.TXT", P2B_DIR), b"root").is_ok();
+    check(setup, "setup /P2B", String::new());
+
+    // 1. KUMO_GRANT=fs at the root of a tree reaches the grandchild without anyone re-asking.
+    let status = run(&["rw", "A", "2"], Some("fs"));
+    let a = std::fs::read(format!("{}/A.TXT", P2B_DIR)).unwrap_or_default();
+    let a1 = std::fs::read(format!("{}/A1.TXT", P2B_DIR)).unwrap_or_default();
+    check(matches!(status, Ok(Some(0))) && a == b"A" && a1 == b"A1",
+          "read-write tree: child and grandchild wrote their files, marker inherited",
+          format!("status {:?} A {:?} A1 {:?}", status, a, a1));
+
+    // 2. KUMO_GRANT=fs-ro: reads, cannot write, and cannot widen for its own child.
+    let status = run(&["ro", "R"], Some("fs-ro"));
+    let leaked = std::fs::metadata(format!("{}/R.TXT", P2B_DIR)).is_ok();
+    check(matches!(status, Ok(Some(0))) && !leaked,
+          "read-only grant: reads, write refused EACCES, its child gets nothing",
+          format!("status {:?} leaked {}", status, leaked));
+
+    // 3. No marker: no filesystem at all (SH4's rule).
+    let status = run(&["none", "N"], None);
+    check(matches!(status, Ok(Some(0))), "no marker: the child cannot open anything", format!("status {:?}", status));
+
+    // 4. Three granted children and this process do file I/O at the same time. Each child has
+    //    its own session, so nobody reads anyone else's reply.
+    let mut children: Vec<_> = (0..3)
+        .map(|k| {
+            Command::new("/SMOKE.ELF")
+                .args(["grantchild", "busy", &k.to_string()])
+                .env("KUMO_GRANT", "fs")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+        })
+        .collect();
+    for child in children.iter_mut().flatten() {
+        use std::io::Write as _;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"go\n");
+        }
+    }
+    let mine = p2b_busy(&format!("{}/ROOT2.TXT", P2B_DIR), b'z', 333);
+    let codes: Vec<_> = children
+        .into_iter()
+        .map(|child| child.and_then(|mut c| c.wait()).map(|s| s.code()).ok().flatten())
+        .collect();
+    check(mine && codes.iter().all(|c| *c == Some(0)),
+          "3 granted children and the parent do I/O concurrently, no crossed replies",
+          format!("parent {} children {:?}", mine, codes));
+
+    let mut clean = true;
+    for name in ["ROOT", "ROOT2", "A", "A1", "B0", "B1", "B2"] {
+        clean &= std::fs::remove_file(format!("{}/{}.TXT", P2B_DIR, name)).is_ok();
+    }
+    clean &= std::fs::remove_dir(P2B_DIR).is_ok();
+    check(clean, "files removed", String::new());
+    if ok {
+        p2blog!("{} green", label);
+    } else {
+        p2blog!("{} FAILED", label);
+    }
+}
+
 #[inline(never)]
 fn spawn_parent() {
     use std::io::Write as _;

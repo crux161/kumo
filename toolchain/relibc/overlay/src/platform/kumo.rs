@@ -5,6 +5,7 @@
 //J947_r13_001
 //J953_r19_001
 //J954_r20_001
+//J955_r21_001
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -143,8 +144,15 @@ const STARTUP_TAG_ENV: u8 = b'v';
 /// spawner keeps the other end; asynchronous signals travel down it and this process's
 /// caught/ignored masks travel up it.
 const STARTUP_TAG_SIGNAL: u8 = b's';
-/// SH6-b: the environment entry that asks a spawn to pass this process's filesystem grant.
+/// SH6-b: the environment entry that asks a spawn to grant the child a filesystem. Since
+/// J955_r21_001 (PROPOSAL/027 P2b) it is hereditary: it stays in the child's env.
 const KUMO_GRANT_FS: &[u8] = b"KUMO_GRANT=fs";
+/// J955_r21_001: the hereditary marker for a read-only grant.
+const KUMO_GRANT_FS_RO: &[u8] = b"KUMO_GRANT=fs-ro";
+/// kumo-vfs session-control grant (`SESSION_GRANT`) and its access byte (j924).
+const VFS_SESSION_GRANT: u8 = b'S';
+const VFS_SESSION_READ_ONLY: u8 = 0;
+const VFS_SESSION_READ_WRITE: u8 = 1;
 
 // The `kumo-vfs` wire protocol. relibc is built from its own vendored source tree by a
 // separate cargo invocation, so it cannot depend on the `kumo-vfs` crate; these constants
@@ -974,6 +982,18 @@ fn channel_write_tag(channel: u32, tag: u8, handle: u32) -> u64 {
     )
 }
 
+/// J955_r21_001: `bytes` plus one transferred handle in one message (a session grant). The
+/// handle stays the caller's when the write fails.
+fn channel_write_bytes_with_handle(channel: u32, bytes: &[u8], handle: u32) -> u64 {
+    syscall4(
+        SYSCALL_CHANNEL_WRITE,
+        u64::from(channel),
+        bytes.as_ptr() as u64,
+        bytes.len() as u64,
+        u64::from(handle),
+    )
+}
+
 fn handle_duplicate_raw(handle: u32) -> Option<u32> {
     syscall_ok(syscall4(
         SYSCALL_HANDLE_DUPLICATE,
@@ -1309,29 +1329,42 @@ fn spawn_elf(
                 return Err(Errno(EIO));
             }
         }
-        // SH6-b: the filesystem grant travels only when this spawn asks for it — the
-        // ratified opt-in, so a cargo-shaped tree can spawn again while the default stays
-        // SH4's "no grant". `KUMO_GRANT=fs` is consumed here, not passed on. — TEAL
-        let mut kept: [&[u8]; 16] = [b""; 16];
-        let mut kept_len = 0usize;
-        let mut grant_fs = false;
+        // SH6-b: the filesystem grant travels only when this spawn asks for it (the ratified
+        // opt-in; SH4's default is "no grant"). J955_r21_001 (PROPOSAL/027 P2b, G1/G4 (a)):
+        // the child gets a session of its own, minted over the mount's session-control
+        // channel, never a duplicate of ours; the marker stays in the child's env, so one
+        // opt-in at the root of a tree covers the tree; `KUMO_GRANT=fs-ro` narrows to a
+        // read-only session without the control channel, so nothing below it can widen. A
+        // process without the control channel grants nothing, whatever its env says. — TEAL
+        let mut grant = None;
         for env in envs {
-            if *env == KUMO_GRANT_FS {
-                grant_fs = true;
-            } else if kept_len < kept.len() {
-                kept[kept_len] = env;
-                kept_len += 1;
+            if *env == KUMO_GRANT_FS_RO {
+                grant = Some(VFS_SESSION_READ_ONLY);
+            } else if *env == KUMO_GRANT_FS && grant.is_none() {
+                grant = Some(VFS_SESSION_READ_WRITE);
             }
         }
-        let envs = &kept[..kept_len];
-        let fs = FS_HANDLE.load(Ordering::Relaxed);
-        if grant_fs && fs != 0 {
-            let Some(duplicate) = handle_duplicate_raw(fs) else {
-                return Err(Errno(ENOMEM));
-            };
-            if channel_write_tag(sender, STARTUP_TAG_FS, duplicate) != 0 {
-                close_handle(duplicate);
+        let control = FS_MOUNT_HANDLE.load(Ordering::Relaxed);
+        if let (Some(access), true) = (grant, control != 0) {
+            let (session, server) = channel_pair().ok_or(Errno(ENOMEM))?;
+            let request = [VFS_SESSION_GRANT, access];
+            if channel_write_bytes_with_handle(control, &request, server) != 0 {
+                close_handle(server);
+                close_handle(session);
                 return Err(Errno(EIO));
+            }
+            if channel_write_tag(sender, STARTUP_TAG_FS, session) != 0 {
+                close_handle(session);
+                return Err(Errno(EIO));
+            }
+            if access == VFS_SESSION_READ_WRITE {
+                let Some(duplicate) = handle_duplicate_raw(control) else {
+                    return Err(Errno(ENOMEM));
+                };
+                if channel_write_tag(sender, STARTUP_TAG_FS_MOUNT, duplicate) != 0 {
+                    close_handle(duplicate);
+                    return Err(Errno(EIO));
+                }
             }
         }
         let Some(argv_vmo) = startup_image(args) else {
