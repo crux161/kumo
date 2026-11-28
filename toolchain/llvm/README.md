@@ -2,6 +2,7 @@
 <!-- J949_r15_001 -->
 <!-- J950_r16_001 -->
 <!-- J951_r17_001 -->
+<!-- J952_r18_001 -->
 # LLVM for native KUMO — bootstrap libraries
 
 The first native bootstrap slice of PLAN/022 SH9. LLVM's `Support` and `Demangle` libraries
@@ -18,9 +19,12 @@ by the matching LLVM 22.1.8 host `llvm-tblgen`. It closes BinaryFormat's TargetP
 SH9-d4 builds all 36 Object units as `libLLVMObject.a` and proves native ELF and regular GNU
 archive readers. Its general binary/IR factories and writers still need later link components.
 
+SH9-d5 builds all 70 MC units and its three-unit DWARF low-level prerequisite. The native proof
+exercises generic MC data-directive streaming and DWARF decoding, with complete component linkage.
+
 ## Sources
 
-`SOURCE.lock` pins the measured closure: 1,014 files, 24,685,189 bytes. SH9-d1's 467 files hold every Support and
+`SOURCE.lock` pins the measured closure: 1,155 files, 26,189,206 bytes. SH9-d1's 467 files hold every Support and
 Demangle unit; the headers they and the proof include; the Unix layer (`lib/Support/Unix/*.inc`);
 BLAKE3's portable and NEON sources (not its x86 SIMD); `third-party/siphash`; the CMake config
 templates; and `llvm/LICENSE.TXT`, which also covers SipHash. Each file has its git blob ID and
@@ -42,6 +46,9 @@ upstream target descriptions; this does not build IR, CodeGen or an instruction 
 SH9-d4 adds 205 upstream files (3,333,189 bytes): every Object unit and its CMake recipe, the
 measured headers they require (including MC and IR declarations), and the enum-table recipes
 and definitions those headers include. The libc++ layer gains the pinned `<cinttypes>` header.
+
+SH9-d5 adds 141 upstream files (1,504,017 bytes): all MC and DWARF low-level units, both CMake
+source lists and their measured header closure. Upstream bytes stay unchanged.
 
 ## The KUMO port (`kumo.patch`)
 
@@ -159,7 +166,7 @@ python3 scripts/llvm-targetparser-smoke.py --run
 python3 scripts/metal-sh9-d3.py
 ```
 
-Object's remaining facilities, MC, IR and native `llvm-mc`/`lld` remain later slices. LLVM's process-launch integration
+Object's remaining facilities, IR and native `llvm-mc`/`lld` remain later slices. LLVM's process-launch integration
 for driver-style tools and PLAN/014's SMP acceptance gates remain open.
 
 ## Object ELF/archive readers (SH9-d4)
@@ -205,5 +212,41 @@ python3 scripts/llvm-object-smoke.py --run
 python3 scripts/metal-sh9-d4.py
 ```
 
-Next: MC and its prerequisites, then the IR components needed to close Object's remaining
-entry points. Native `llvm-mc`/`lld`, LLVM process launching and SMP acceptance remain open.
+## MC and DWARF low-level (SH9-d5)
+
+`build-mc.py` builds Support, Demangle, BinaryFormat, TargetParser, MC (70 units) and
+DebugInfoDWARFLowLevel (3 units). Both new source lists are checked against their pinned CMake
+recipes. MC's four upstream link components are all built. The proof retains the entire MC,
+DWARF low-level, BinaryFormat and TargetParser archives with `--whole-archive` and disables
+section garbage collection. The resulting ELF has no undefined symbols or unbuilt component
+dependencies, and retains the 4 MiB main stack. It uses the same eight matching-version tables
+as Object; no additional KUMO patch is needed.
+
+The native proof checks:
+
+- ELF section/symbol uniquing and attributes; absolute/alias expressions, relocatable symbol
+  addends, rejection of nonabsolute expressions and division by zero.
+- `MCInst` operands and generic data-fixup representation.
+- `MCAsmStreamer` assembly text: sections, global labels, integer and byte directives, symbolic
+  expressions, ULEB/SLEB directives and alignment. A data-only ELF assembly configuration supplies
+  pointer sizes; the required instruction-printer test fixture fails if called. Code emitter and
+  assembler backend are absent; no instruction behavior is supplied or tested.
+- ELF string-table suffix deduplication and COFF length-prefix/offset bytes.
+- DWARF expression decoding and unknown-opcode errors, CFI code/data alignment scaling,
+  truncated-CFI errors and the
+  unwind-row state machine with CFA and saved-register rules.
+- Byte-exact emitted assembly file round trip on RAM FAT, followed by removal.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/llvm-mc-smoke.py --run
+python3 scripts/metal-sh9-d5.py
+```
+
+This closes MC's library dependency set and proves generic APIs. Target instruction parsing,
+encoding, relocation application and object emission need MCParser and a real target backend;
+this slice does not provide a native `llvm-mc` executable. Object's reader configuration remains
+separate. Upstream's low-level DWARF expression iterator is not a complete operand-bounds
+validator; truncated expression operands are outside this proof. Next: the MCParser/target and
+IR prerequisites for the remaining Object/tool paths.
+Native `llvm-mc`/`lld`, LLVM process launching and SMP acceptance remain open.

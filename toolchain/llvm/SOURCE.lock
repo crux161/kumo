@@ -5071,6 +5071,711 @@
       "git_blob": "ed1f7505cafb10e6613a4e9bbfe139596a571a16",
       "sha256": "49025b2f592692e137adc5b02a56864e51955e965c9348ccf071f6bd7e60e7cd",
       "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Object/XCOFFObjectFile.cpp"
+    },
+    "llvm/include/llvm/BinaryFormat/WasmTraits.h": {
+      "git_blob": "dec50bbb05049c530e1f8381cda0986ea458a211",
+      "sha256": "6ee3392f8a9dab69ecff46e1a4086193cc48d62f7d3a55a33b5db97eb79e2d91",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/BinaryFormat/WasmTraits.h"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/CVRecord.h": {
+      "git_blob": "99de8ebef812fb49fd25b1b02a08bb7fc9c271aa",
+      "sha256": "d9341257a01a6f89b43292ee6cafcd6c21e6932fdabfe75b6eb5475d48f9bbdf",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/CVRecord.h"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/CodeView.h": {
+      "git_blob": "7a1008689296d874820ca2e74b7fbca373495ffb",
+      "sha256": "c8e6fcdf5bc28b775c3de147353f7dca8ceb7070877e17a2c416226f52935c94",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/CodeView.h"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/CodeViewError.h": {
+      "git_blob": "bb73a95f9eadd8af9c0e64891b1b5e9dce130152",
+      "sha256": "5b41ce3fda35651500ad27e5ad73e5166917ab1a7de0592fd143f059bfd613b1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/CodeViewError.h"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/CodeViewLanguages.def": {
+      "git_blob": "5c6335fffd4dd481b19eafa4ea5db0cb9da9a76d",
+      "sha256": "b25178a63f2695ddca77fbe10f6f6ed3fe98322cc314e958ab6a106714769149",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/CodeViewLanguages.def"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/CodeViewRegisters.def": {
+      "git_blob": "7c38b536c277f04ba51254c509e491c0e4e5dff6",
+      "sha256": "a0085e2caab7d4e561f199f1ae1d6f81c9bc008fe63a31d2250d49465841a09e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/CodeViewRegisters.def"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/CodeViewSymbols.def": {
+      "git_blob": "b38bdb482df43c8a1e71a061adc5a1dc710c593e",
+      "sha256": "371f501fcb8a5dd6a869d836aa19cf22ca360c599726de129a2402637c69251f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/CodeViewSymbols.def"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/CodeViewTypes.def": {
+      "git_blob": "a31111eb80a4ed3a5120ec1404ee9065669f6a85",
+      "sha256": "743c1a40d11ef77045c50bd50eaeea858173f1eedc1dbad1dcbffd860e04eb9b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/CodeViewTypes.def"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/Line.h": {
+      "git_blob": "79a87555cf007757c0430ae23c7fe75e5c494a6d",
+      "sha256": "b092a03d4cd45e550c5289aadf1ab435a2259e9556e37879fea16eeeea4f0c24",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/Line.h"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/RecordSerialization.h": {
+      "git_blob": "ecd1ece09dfbd9835ecac598e11d116fcced4887",
+      "sha256": "db91518a91105aba59f6d982caff3d1242310c7a4f5c5801291b12390bdf0eae",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/RecordSerialization.h"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/SymbolRecord.h": {
+      "git_blob": "c2897891544af47c7f251c844957f00fede95f97",
+      "sha256": "3c2c31b847f530946ceb3221393133b2239150be8bf4f45f427124d02fa40f7e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/SymbolRecord.h"
+    },
+    "llvm/include/llvm/DebugInfo/CodeView/TypeIndex.h": {
+      "git_blob": "1430fe83cc64ef5936247099fb60b97c69670c26",
+      "sha256": "4bd9feff700257c0e0afc12d468de623636f6928889ce049717285e02d5f433a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/CodeView/TypeIndex.h"
+    },
+    "llvm/include/llvm/DebugInfo/DWARF/LowLevel/DWARFCFIProgram.h": {
+      "git_blob": "e636296b058fd825a4fc96b44141e438c5468aa8",
+      "sha256": "da9516c30835878e435a0049c464cfa4008f076de6ff99b35ea35d710e92f44b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/DWARF/LowLevel/DWARFCFIProgram.h"
+    },
+    "llvm/include/llvm/DebugInfo/DWARF/LowLevel/DWARFDataExtractorSimple.h": {
+      "git_blob": "ffe0b50b036acae46bba1f8e5959d1ab92a86f5c",
+      "sha256": "23b7763739bd91f98b683125e3ad2b718a7e81a92d3a6013931239c91a34fc9d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/DWARF/LowLevel/DWARFDataExtractorSimple.h"
+    },
+    "llvm/include/llvm/DebugInfo/DWARF/LowLevel/DWARFExpression.h": {
+      "git_blob": "458a3a4e49e8b6229c5873551f47b240fdf93060",
+      "sha256": "4ee8bf90d8f6412ebc4c317864ebc77105433944ecee05c2448dce2b798722e1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/DWARF/LowLevel/DWARFExpression.h"
+    },
+    "llvm/include/llvm/DebugInfo/DWARF/LowLevel/DWARFUnwindTable.h": {
+      "git_blob": "828dea12d168c5160d8265a371b6b78d5c89b980",
+      "sha256": "31c6e6e6976789ed38e7e6bc0637f1b9a5cfc8922df3d7c98aa99d3dd2e5bd58",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/DebugInfo/DWARF/LowLevel/DWARFUnwindTable.h"
+    },
+    "llvm/include/llvm/MC/ConstantPools.h": {
+      "git_blob": "ff21ccda07a83645735a3ecd972ecaa7e3ce78a2",
+      "sha256": "685c6a3c344626287f2235027f4d824ecf91766893e7763562d4b7045baae2c9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/ConstantPools.h"
+    },
+    "llvm/include/llvm/MC/DXContainerPSVInfo.h": {
+      "git_blob": "eb6d9e14d92c3453429bee0dd918775e73caa92a",
+      "sha256": "7c4b2b310a09aecabd990bd26009076fe34e00bd3e3f7a740e2c3130e2ee099a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/DXContainerPSVInfo.h"
+    },
+    "llvm/include/llvm/MC/DXContainerRootSignature.h": {
+      "git_blob": "2b08b2439d2c04c57861eeb65d087eecd90d3f1c",
+      "sha256": "aca05bad9c7ab340775bd78665bf2502c9da1800b540d0cafc23923c79c57e09",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/DXContainerRootSignature.h"
+    },
+    "llvm/include/llvm/MC/MCAsmBackend.h": {
+      "git_blob": "e622eb8e6e2711f4f60858e170229f549a6eab18",
+      "sha256": "79e4d3649051de61158bd6423e5755fa2d544c40f1361bb3ae31ce239fa0fd73",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCAsmBackend.h"
+    },
+    "llvm/include/llvm/MC/MCAsmInfoCOFF.h": {
+      "git_blob": "dc7832c2f9e0be92cb23327f438b04a9f4bfe53f",
+      "sha256": "c3c7eee1094d7a953d0fdcd532547c01376a161e9bb78e005dd5234802d39c1c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCAsmInfoCOFF.h"
+    },
+    "llvm/include/llvm/MC/MCAsmInfoDarwin.h": {
+      "git_blob": "12bc3e97cdae1851cc45ba6c4892aed78e962924",
+      "sha256": "3de718ad3264ebe78629d4968c96ce54ba2d345aea75dd744779e399634a00ed",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCAsmInfoDarwin.h"
+    },
+    "llvm/include/llvm/MC/MCAsmInfoELF.h": {
+      "git_blob": "095ee4dabca143af83c5f132da40e5cc1be7d94e",
+      "sha256": "1e5262478bd21fe77e114b87eab49bb57ef37f54d676cd762aa3975d9413c1b0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCAsmInfoELF.h"
+    },
+    "llvm/include/llvm/MC/MCAsmInfoGOFF.h": {
+      "git_blob": "e62d2ae31ed71543f4615caedd09b153b4416917",
+      "sha256": "184fbe1f9d85ac327145c7dcb580090076f7d69c429ec0186d0910c0cfb42ce7",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCAsmInfoGOFF.h"
+    },
+    "llvm/include/llvm/MC/MCAsmInfoWasm.h": {
+      "git_blob": "d98de6c30d9cf0f8d38cce9d25338b43680f9b21",
+      "sha256": "4886d05a86a345d8e9c9109093f92feb3ad71a8e763d2f07a9a251c031a0eee1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCAsmInfoWasm.h"
+    },
+    "llvm/include/llvm/MC/MCAsmInfoXCOFF.h": {
+      "git_blob": "fd1ae8209565972aaefbe2b80524871249af129e",
+      "sha256": "3490965ac6c331250e056e723c38ba9eabd50d7fb67c3dc43540e4ace7ddb743",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCAsmInfoXCOFF.h"
+    },
+    "llvm/include/llvm/MC/MCAssembler.h": {
+      "git_blob": "dbae271a1c19875cd1931ac4096cb1353afa80b8",
+      "sha256": "bceb72a8b09a03e1348b47fa995a19fb9b7c89be46eb8af15c85ad1ac48ad33c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCAssembler.h"
+    },
+    "llvm/include/llvm/MC/MCCodeEmitter.h": {
+      "git_blob": "5f288e9e45c4b2d6f5a8246b3b26ea57f195be6b",
+      "sha256": "011da99603eed9a7a30eba80f77d2ffb46e93111b7cda76cbfa3aac9f293b90e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCCodeEmitter.h"
+    },
+    "llvm/include/llvm/MC/MCCodeView.h": {
+      "git_blob": "76e15b85184390f9d80e62d18424e0160e32e43c",
+      "sha256": "b9573ac8b2c89c798448f4bf2fa26a3b28fc510289f1de5ba61302c594fb49fa",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCCodeView.h"
+    },
+    "llvm/include/llvm/MC/MCDXContainerStreamer.h": {
+      "git_blob": "37e3c7ddaad2ca35eb502fff5bfcacf4df58edd4",
+      "sha256": "3d2d99a0d89f6919f34429d8ca22eee7dff563af4b3ebffc42b3797effca1f1e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCDXContainerStreamer.h"
+    },
+    "llvm/include/llvm/MC/MCDXContainerWriter.h": {
+      "git_blob": "9b6ba896a5f095e1fe6f0e9e00a70b29ff05ecee",
+      "sha256": "12fd794fb1635966a732b46cdb24c63fc7b3b369e8deada69558ede14ac71da2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCDXContainerWriter.h"
+    },
+    "llvm/include/llvm/MC/MCELFExtras.h": {
+      "git_blob": "2c0718886a11bbea68b1b4c4bad54224623b46c0",
+      "sha256": "da89db252bcaa699067899b76a263699c5cde4d9fa525767f58a23c940490e04",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCELFExtras.h"
+    },
+    "llvm/include/llvm/MC/MCELFObjectWriter.h": {
+      "git_blob": "35614cb9c911744cd56601e5062a8a5b7f42c4a5",
+      "sha256": "fe4d6cde6ac9e2332fe3867077e04ae19f22933af9a64638c8180e4fe980f9cd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCELFObjectWriter.h"
+    },
+    "llvm/include/llvm/MC/MCELFStreamer.h": {
+      "git_blob": "144f6bc3bd91ce16874cb480af747da9e9cf0f7f",
+      "sha256": "c366ff8495a66f67c1d57e09a1415ca837406aec7ae5b0e2eed5e524cd6ad6f7",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCELFStreamer.h"
+    },
+    "llvm/include/llvm/MC/MCGOFFObjectWriter.h": {
+      "git_blob": "57e152f6a61dc12f5e727309f407ee04e33832fd",
+      "sha256": "b47370896902d5ef6fa602f3aa5f6774849ec3e4293deb777714f0816615f141",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCGOFFObjectWriter.h"
+    },
+    "llvm/include/llvm/MC/MCGOFFStreamer.h": {
+      "git_blob": "886efe10d45df8e99762fa49bd3d952b7d3c36b5",
+      "sha256": "59883838e0d34983f5e202f304b7b53b83923559ae414caf35b034fe0eedafd0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCGOFFStreamer.h"
+    },
+    "llvm/include/llvm/MC/MCInstPrinter.h": {
+      "git_blob": "c615d01493989a36db8254933be35bbe2f595638",
+      "sha256": "446d4b00f3ab2e77f90c9bab2d2a34a1691cda6f0a888c0aa21ede862a56d0b2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCInstPrinter.h"
+    },
+    "llvm/include/llvm/MC/MCLabel.h": {
+      "git_blob": "0b8afac8f7548d8272b2a696b5ab54c92a7f3e7f",
+      "sha256": "a8961db098aea5676134fcf699a6d3e1634439530b99c321007f2f7f512e3c32",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCLabel.h"
+    },
+    "llvm/include/llvm/MC/MCMachObjectWriter.h": {
+      "git_blob": "2163312b9e3c81dcd9be07eab2e9386a168677c0",
+      "sha256": "b2d141b9ee17cc63cd1f921e5fb25303ddda9c2d58251120a7bbe58633de61ec",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCMachObjectWriter.h"
+    },
+    "llvm/include/llvm/MC/MCObjectStreamer.h": {
+      "git_blob": "3c5a6ce42e4f82425ee40a58008cc89d7a5462cc",
+      "sha256": "c9f49afa944542757dd124152e4653b0cdf8d1928700ffe57fe9bdef0e730da1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCObjectStreamer.h"
+    },
+    "llvm/include/llvm/MC/MCObjectWriter.h": {
+      "git_blob": "54a8f8236f6e4ac9c9e01dd3bbd697b439f345d5",
+      "sha256": "ab90278acfa755503c875ce443866e090e2ed377cc0c6b8b33dea85346e80a97",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCObjectWriter.h"
+    },
+    "llvm/include/llvm/MC/MCSFrame.h": {
+      "git_blob": "694aec55aefeb48b84e513c8830cd2d255adb5a3",
+      "sha256": "8694ed9d2749d9bd2dcb4151e9964f052019b917861d76a0b5fb6ba51a4097b6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSFrame.h"
+    },
+    "llvm/include/llvm/MC/MCSPIRVObjectWriter.h": {
+      "git_blob": "3cbca4c46c5dea6315230a222ed5862858d570c9",
+      "sha256": "1d8578a1cd716df7d456132cc7180ccc36b9b23f25ec9823e44e8ff0d42df690",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSPIRVObjectWriter.h"
+    },
+    "llvm/include/llvm/MC/MCSPIRVStreamer.h": {
+      "git_blob": "42559f7522b50f0155ebb843f48a14723e50552b",
+      "sha256": "0173904ea21caccbce334e5ae1ca061f9522756d846da7299221743d40bc45ea",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSPIRVStreamer.h"
+    },
+    "llvm/include/llvm/MC/MCSectionCOFF.h": {
+      "git_blob": "71efc4191c286f21074ecb1f4602cf2ef7de0ff3",
+      "sha256": "10f74f293d6c84d810cea89c4498802baec6469eeba280d82b6a6ba32e07d6db",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSectionCOFF.h"
+    },
+    "llvm/include/llvm/MC/MCSectionDXContainer.h": {
+      "git_blob": "7d8e0c50101f737246666f1a6199c8914751faf2",
+      "sha256": "4906f4c0dc7a1d7e5c21e573d964d7846687453adb38769f203cfa05c05b6e68",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSectionDXContainer.h"
+    },
+    "llvm/include/llvm/MC/MCSectionELF.h": {
+      "git_blob": "f089dd9ea5af8cad985fbd1e31ae135ffbfe0fe9",
+      "sha256": "255fc74f175acdc9debb9169594b2919ac6b70dd3f718db2abb8c74a1cf71f17",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSectionELF.h"
+    },
+    "llvm/include/llvm/MC/MCSectionMachO.h": {
+      "git_blob": "a65d7e0b478749e3200496d1cd2ce6804e4425ae",
+      "sha256": "0d66c25bf04a33a86551e57a5e0d151367522ceeefef7d8e99251a713899b714",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSectionMachO.h"
+    },
+    "llvm/include/llvm/MC/MCSectionSPIRV.h": {
+      "git_blob": "685096506cfdc86e6df2adf8155deca3dac9b0e7",
+      "sha256": "0eb99d2f09862e8f0acdf843755a883658500e178601a2832d46787ab0dbf7dd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSectionSPIRV.h"
+    },
+    "llvm/include/llvm/MC/MCSectionWasm.h": {
+      "git_blob": "5ec01edf196cd51a58d245d71aa518b9674f38b3",
+      "sha256": "f6ca44f783482fdd854c2ee095d10dc6eed59ed05e2b5ef5c5ba9bb3ffac7612",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSectionWasm.h"
+    },
+    "llvm/include/llvm/MC/MCSectionXCOFF.h": {
+      "git_blob": "0571f95d9be21e9ef826de1d43cf6b3667e0ffa6",
+      "sha256": "7629816325438ca024a1812496e443af46bfec669ec19a918eee5a37ab58329b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSectionXCOFF.h"
+    },
+    "llvm/include/llvm/MC/MCSymbolCOFF.h": {
+      "git_blob": "fe1e8f68364202f800563dd30364517cc9f74cb5",
+      "sha256": "e1776a3e3e95645467f51858449e89d0a7fe9ffc05a4b655ffa4d36720a19a27",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSymbolCOFF.h"
+    },
+    "llvm/include/llvm/MC/MCSymbolELF.h": {
+      "git_blob": "1af175a18e8ecd00ddd557973270ff68c5f1e806",
+      "sha256": "706748f1824162781173b010d2311a57d6044ff704b821f5bbc9f791378c2d34",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSymbolELF.h"
+    },
+    "llvm/include/llvm/MC/MCSymbolGOFF.h": {
+      "git_blob": "310cc4db9a7e2e0e23aae58b98a6ba933ef3eee7",
+      "sha256": "151e3004cacc1a9f4deef8b4c5e64fcc32d25fbbd45689ebcdba172004774e20",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSymbolGOFF.h"
+    },
+    "llvm/include/llvm/MC/MCSymbolMachO.h": {
+      "git_blob": "2b8bfe0dcac5ec838c50c69587fb9f0b5c2bf1cf",
+      "sha256": "211bdf9d4e7c5486424d0ad0969388bdf670e13e75e9543fcb8dda2f0dc8792d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSymbolMachO.h"
+    },
+    "llvm/include/llvm/MC/MCSymbolXCOFF.h": {
+      "git_blob": "e1d61e2bb76fb60a4baf16f36ae65946a3834cd0",
+      "sha256": "749b0d0fa61b81db40eb088636a48b5689d6188f58a2bbbea8e74b8a3b2e2832",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCSymbolXCOFF.h"
+    },
+    "llvm/include/llvm/MC/MCTargetOptionsCommandFlags.h": {
+      "git_blob": "168131b43cca8517af72c3afc15bf7934c89c64c",
+      "sha256": "bf065cf27616934abfec5bf94e7f863aeaf3babedda665f1d18e56d4b484b4ca",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCTargetOptionsCommandFlags.h"
+    },
+    "llvm/include/llvm/MC/MCValue.h": {
+      "git_blob": "c9a680ec327a6e9cb958d7bbed7357fdcd24e3db",
+      "sha256": "e2613a966c78660ebb714d1a13dfd2a5d394c12929d8b04002823816fc8b2bb6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCValue.h"
+    },
+    "llvm/include/llvm/MC/MCWasmObjectWriter.h": {
+      "git_blob": "9dd588d0a15b92e92a253c1b421ca488e55a6498",
+      "sha256": "faf828381d3b6ff23d83625a4d077630e4807fa9b6c501ffe2fa94e083276b48",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCWasmObjectWriter.h"
+    },
+    "llvm/include/llvm/MC/MCWasmStreamer.h": {
+      "git_blob": "e8a71975c5d6257b9c71076e2fc1a8da4c152266",
+      "sha256": "08fdeac46c5d73e04c2477507a88555e2cc61d1f0aeb4517cba85e8c3dfc5662",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCWasmStreamer.h"
+    },
+    "llvm/include/llvm/MC/MCWin64EH.h": {
+      "git_blob": "f9af9857d68670951fc76943fedf400783ff04b4",
+      "sha256": "be81878ca718642d41f00cc17ebc15223cc040007fd30b8488e7ecc97b73b80f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCWin64EH.h"
+    },
+    "llvm/include/llvm/MC/MCWinCOFFObjectWriter.h": {
+      "git_blob": "4a9cf9c56ff01ff62f617c120caaff276e56625c",
+      "sha256": "f89d08206b07e35cc9e9ecd97f9e8755a2dd708284682d5bf1b916ab1e744b3f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCWinCOFFObjectWriter.h"
+    },
+    "llvm/include/llvm/MC/MCWinCOFFStreamer.h": {
+      "git_blob": "45849b99de36ae3a663a3c48ae23393484766564",
+      "sha256": "d9c91acd6db6904a202c348b0ade7ba0c81a52fb802bb884247873161d6b23a0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCWinCOFFStreamer.h"
+    },
+    "llvm/include/llvm/MC/MCXCOFFObjectWriter.h": {
+      "git_blob": "04172286ca7703273ecdc6560af9e9a6eeccf7d9",
+      "sha256": "4e5ce793b5aeb3a31637221664e28825ca6ba91c0c12ade2d6079176285e5cb0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCXCOFFObjectWriter.h"
+    },
+    "llvm/include/llvm/MC/MCXCOFFStreamer.h": {
+      "git_blob": "c3bc2ca94f711a16f79bdd16d5eb85a955c831f6",
+      "sha256": "411b37703160aa17ba1a65f782daa16282966b9c08e985820f2533c9abdc3e3e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/MC/MCXCOFFStreamer.h"
+    },
+    "llvm/include/llvm/Support/Win64EH.h": {
+      "git_blob": "ec3413b31ee4a541391d25b3a616b6d1fed37c88",
+      "sha256": "1dd17f3a1b44b0e7a088946fd9406447ba2cc684ac359ba3c115b84fd5ae68d8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/include/llvm/Support/Win64EH.h"
+    },
+    "llvm/lib/DebugInfo/DWARF/LowLevel/CMakeLists.txt": {
+      "git_blob": "eda8d2314b7dded9d7bcca56515d31ec3dcb8b4b",
+      "sha256": "b41eb6a094571ad9b223abec997436d8bfa47f74245c99fea1ae89336cac24c5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/DebugInfo/DWARF/LowLevel/CMakeLists.txt"
+    },
+    "llvm/lib/DebugInfo/DWARF/LowLevel/DWARFCFIProgram.cpp": {
+      "git_blob": "eaf56b30715922cdc7669337ec3636f593f09b73",
+      "sha256": "8254bb008fad9692f924587ff4d0393b64130c3d9da782b7ac36a9c6c1c99b4f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/DebugInfo/DWARF/LowLevel/DWARFCFIProgram.cpp"
+    },
+    "llvm/lib/DebugInfo/DWARF/LowLevel/DWARFExpression.cpp": {
+      "git_blob": "61bd6fcb65bfa363ca89606628b9b0245b393058",
+      "sha256": "f8d8bfb23c39ac17503b04bb9cfdb9d2b61da2223864fa9d62e107f1c953558f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/DebugInfo/DWARF/LowLevel/DWARFExpression.cpp"
+    },
+    "llvm/lib/DebugInfo/DWARF/LowLevel/DWARFUnwindTable.cpp": {
+      "git_blob": "20f52673eefe1b9a94b1d3100dd4cd0f8f46f62b",
+      "sha256": "362eecf614759f85e6a6b34cad934e1483b1eb45905a4786f3129cc6d576d28d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/DebugInfo/DWARF/LowLevel/DWARFUnwindTable.cpp"
+    },
+    "llvm/lib/MC/CMakeLists.txt": {
+      "git_blob": "1388f130bb80659fd8de8a65686168f64562506f",
+      "sha256": "66fdc07dbc307d99a9f99cc028e0edc22f4f8bc32d1dddb815f6ab1e439ec757",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/CMakeLists.txt"
+    },
+    "llvm/lib/MC/ConstantPools.cpp": {
+      "git_blob": "bf74ad42f91fdb2c0122ec02465075f053e605f1",
+      "sha256": "d4895a12ced17058b838241278eafccea6d44a45b84edc56833d5be38cdcc34e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/ConstantPools.cpp"
+    },
+    "llvm/lib/MC/DXContainerPSVInfo.cpp": {
+      "git_blob": "f70c8b1af01b3cb57851292df6c0223ebf81f8b8",
+      "sha256": "1b9176fae19575bcdac567209831966395d25fdea6e7dca98b92dc86c0205ecb",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/DXContainerPSVInfo.cpp"
+    },
+    "llvm/lib/MC/DXContainerRootSignature.cpp": {
+      "git_blob": "713aa3d8143e883ded87f5439e6c1e19c7f7d58f",
+      "sha256": "86cedd3e94c9decbc0952f87cbcd976192dc62b9c22d01a61521b950669965b5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/DXContainerRootSignature.cpp"
+    },
+    "llvm/lib/MC/ELFObjectWriter.cpp": {
+      "git_blob": "759d3e0e14291c5eb602d27c36ee75722d0156d9",
+      "sha256": "4486875d39d26a29502630127ba630af00e885bcaa275888fea198bc8e3a502d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/ELFObjectWriter.cpp"
+    },
+    "llvm/lib/MC/GOFFObjectWriter.cpp": {
+      "git_blob": "366ca088449dc5351464c5e86c49f3e631f34a1b",
+      "sha256": "ada275266fa0a456101a6ee02d54a09b39c13e9b5ab8969b982bf62cf78da2f7",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/GOFFObjectWriter.cpp"
+    },
+    "llvm/lib/MC/MCAsmBackend.cpp": {
+      "git_blob": "55ec4a6675010774560e538462ed013939bb9c84",
+      "sha256": "f55641bcaa0e87420a7f4d59a896e98100b263818d73085a49704715e455acc2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmBackend.cpp"
+    },
+    "llvm/lib/MC/MCAsmInfo.cpp": {
+      "git_blob": "19032634f43d7acc82a3135669bd511fa020d688",
+      "sha256": "665998b2fbc784826effce1fa7cf8ace560103a90d4627d6bc0f6daaa7799979",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmInfo.cpp"
+    },
+    "llvm/lib/MC/MCAsmInfoCOFF.cpp": {
+      "git_blob": "54717df6c27606ecc564f9de25b913561795a5ce",
+      "sha256": "2412fce1a2443cd50ba7dab1013a97c90f33b6b2fb80919acfc10eae67f3ff7d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmInfoCOFF.cpp"
+    },
+    "llvm/lib/MC/MCAsmInfoDarwin.cpp": {
+      "git_blob": "e156fa0f498f8e468f27c20be52b286cefc64e45",
+      "sha256": "b021892bfb14454cf07702a35f3bf1efcef76e8017003a5141705bd974e5dad6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmInfoDarwin.cpp"
+    },
+    "llvm/lib/MC/MCAsmInfoELF.cpp": {
+      "git_blob": "6670971c3c6ed5433cb8c76bb5b66d7e3216d327",
+      "sha256": "424e198624823ccf3164566ed44284932b9b543398b6e75aa70c60911bacf8ac",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmInfoELF.cpp"
+    },
+    "llvm/lib/MC/MCAsmInfoGOFF.cpp": {
+      "git_blob": "4dc33943609db7eff04e5406a007780039279b4c",
+      "sha256": "8d03ade333fc418ef9af444638dc9a630177aed696097cb37f3a155a4a32fbf4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmInfoGOFF.cpp"
+    },
+    "llvm/lib/MC/MCAsmInfoWasm.cpp": {
+      "git_blob": "5e44f48c3c0820d0edcf9a0ee7bbb583f5d4b256",
+      "sha256": "ba04a630b118438f4fc8844f656af2267c500e974ea1e4cbf82f0365b46b4084",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmInfoWasm.cpp"
+    },
+    "llvm/lib/MC/MCAsmInfoXCOFF.cpp": {
+      "git_blob": "0403b4409f2ecef77f975afa90309dac2bba3795",
+      "sha256": "3810e13ce2edf64521c688f64127091bc8f989d3da47b786ed71434a4cd42a38",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmInfoXCOFF.cpp"
+    },
+    "llvm/lib/MC/MCAsmMacro.cpp": {
+      "git_blob": "bc95f98f295700d197cdb454ee6ba51b4cd23464",
+      "sha256": "7fe89f4ab624fa82d2dbaf9ac38592096a5a6853cbde0eb9fe7919bc5a80ba48",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmMacro.cpp"
+    },
+    "llvm/lib/MC/MCAsmStreamer.cpp": {
+      "git_blob": "33e288ecf991a82c62a912ac7d330dbb09dd7af4",
+      "sha256": "e75882392426af4c847a443e2e2886d652a2e6dd4cdf50d95218444e2ec7769f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAsmStreamer.cpp"
+    },
+    "llvm/lib/MC/MCAssembler.cpp": {
+      "git_blob": "7b55371fcf0e8bef5faa3b63cc8fb73ebd846c07",
+      "sha256": "4033a77aff34a113774cb0f11a93228f04656e66966e68bdce09c7fb0e2060d8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCAssembler.cpp"
+    },
+    "llvm/lib/MC/MCCodeEmitter.cpp": {
+      "git_blob": "76a8406cee7bd570c3a6c040e8094fe109de1f3c",
+      "sha256": "449de4d50a750a6e0bfe5a7a0f5a356fff30783f99202ea4dff5ba5dd0fb774a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCCodeEmitter.cpp"
+    },
+    "llvm/lib/MC/MCCodeView.cpp": {
+      "git_blob": "335934a7793e4fb31a5ee00b453f011cdac2f70a",
+      "sha256": "4da2c1c3617c21f7ed8a562336fc96ec0028668ffdf7a74f18e1257a1ad91c59",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCCodeView.cpp"
+    },
+    "llvm/lib/MC/MCContext.cpp": {
+      "git_blob": "5df8692d2e7ba997578486ad3f6f20b88daa411c",
+      "sha256": "876c50635013236817010854e4d725fde6402ee06f6e1af1e88bec3201f17f73",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCContext.cpp"
+    },
+    "llvm/lib/MC/MCDXContainerStreamer.cpp": {
+      "git_blob": "88c6c8b7e9784ecd3e6d0f895d2a5e0e1ce056c2",
+      "sha256": "df344bcd7876f9c7198efa5a88863590caf3d5945683de934079523e0df32028",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCDXContainerStreamer.cpp"
+    },
+    "llvm/lib/MC/MCDXContainerWriter.cpp": {
+      "git_blob": "ebed41145408710ae7ce5b1201a6c8105f200d39",
+      "sha256": "18d51298a678013e6e7882708f23888b661df9cfcc8e6cbdc292049a59d5c80d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCDXContainerWriter.cpp"
+    },
+    "llvm/lib/MC/MCDwarf.cpp": {
+      "git_blob": "e8f000a584839c8db7f5f8b22f7714245db6c7fc",
+      "sha256": "e9a36a7c775cfa9976f2a324c8d3e92d267855cf51e83293b2782b65f2f938f7",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCDwarf.cpp"
+    },
+    "llvm/lib/MC/MCELFObjectTargetWriter.cpp": {
+      "git_blob": "b3cb1e001621a061896692157c56e036bb06f1a0",
+      "sha256": "98278f15669c5b8389ac8c52dd1492a454db35436ea2f6e608887e52017f0cd6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCELFObjectTargetWriter.cpp"
+    },
+    "llvm/lib/MC/MCELFStreamer.cpp": {
+      "git_blob": "2adb8901d69df5b5d32ad795b3b9c9c503fb0754",
+      "sha256": "ad7208ba18dbaff8cd7f6817e520bdb30cf8d265c6c66be708be859076ca51e2",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCELFStreamer.cpp"
+    },
+    "llvm/lib/MC/MCExpr.cpp": {
+      "git_blob": "d7d300a8bc072f951bcb76cc653ce5c46147fa8b",
+      "sha256": "11daac3b8f624497ba5ec78caa50d47540c4e98d3e0874576189d7d63f253780",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCExpr.cpp"
+    },
+    "llvm/lib/MC/MCFragment.cpp": {
+      "git_blob": "85d1c5888f1da27456a4defeb69743ad5645b682",
+      "sha256": "d0a41437f890d6acb5c76d0ed6f2e8499f09da1659e214b14c008877d9939e0e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCFragment.cpp"
+    },
+    "llvm/lib/MC/MCGOFFStreamer.cpp": {
+      "git_blob": "51580e006320745c7e7fcc4e51d392bb2c724aed",
+      "sha256": "895dfe82c05ee76399895c7c0c8b44707f0ac35a2d240ef7041b0cf1eece635f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCGOFFStreamer.cpp"
+    },
+    "llvm/lib/MC/MCInst.cpp": {
+      "git_blob": "61eeb5e5a5c7125fa91b76b539832d830095570a",
+      "sha256": "23eb675312aee18e591fe860af7ded8391b1fb9b0fa5de8055ddacefa26e0511",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCInst.cpp"
+    },
+    "llvm/lib/MC/MCInstPrinter.cpp": {
+      "git_blob": "afa5f9e07e841b2d88cbc4a1a47bb611ddeccaad",
+      "sha256": "42556a51471a2aaed3068bd162cd0f68f0de35c4a93f54254ee16ee143925a0c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCInstPrinter.cpp"
+    },
+    "llvm/lib/MC/MCInstrAnalysis.cpp": {
+      "git_blob": "cea905d092e0b35afae7fda5fb9a8ff286160bb6",
+      "sha256": "2eb768e61ecb785be87cfe773bf06cd824205940d93f91554a01f79f7841a6db",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCInstrAnalysis.cpp"
+    },
+    "llvm/lib/MC/MCInstrDesc.cpp": {
+      "git_blob": "f54db55804d3db86e11aacc773dcf274e1393600",
+      "sha256": "2e3b39aad84a9015e4bfe3531281b399f20755cc3875d3e1c2f28fe95aca2b3f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCInstrDesc.cpp"
+    },
+    "llvm/lib/MC/MCInstrInfo.cpp": {
+      "git_blob": "ab63db04053242079ca30d137c43df8e041b7000",
+      "sha256": "70330bfa3febe9ba675fb400ad3455634642a80651f5d6c5a0079c6a91653e5a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCInstrInfo.cpp"
+    },
+    "llvm/lib/MC/MCLabel.cpp": {
+      "git_blob": "66ee73c5bbb3e740a1afb55cf1bfb667df885139",
+      "sha256": "e29efd59dd7018804c37dd647b36d5aa0fe532ee127e84cbed0687d74d787e2e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCLabel.cpp"
+    },
+    "llvm/lib/MC/MCLinkerOptimizationHint.cpp": {
+      "git_blob": "34d29191468b65552699494378d24a8be517b5fa",
+      "sha256": "fba2853e1d00c6d1ec294c675fd3fa55ff71ba97fc78912505e9d19e9d9e0839",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCLinkerOptimizationHint.cpp"
+    },
+    "llvm/lib/MC/MCMachOStreamer.cpp": {
+      "git_blob": "dbb5dd79d1eb510a222ebcc2c7f39f443aa33d10",
+      "sha256": "d9ca3a3148203b951a6738d9019cf8a066b2e04d80a07d5abe8ec4672764821e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCMachOStreamer.cpp"
+    },
+    "llvm/lib/MC/MCMachObjectTargetWriter.cpp": {
+      "git_blob": "a57b8a7ac0ff39f0f03cc46cbdf603803e5f505a",
+      "sha256": "83e8475d10bf9457b9ab3fdf9459a29c7d05d6708d545d58b40e5cb4d4c62231",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCMachObjectTargetWriter.cpp"
+    },
+    "llvm/lib/MC/MCNullStreamer.cpp": {
+      "git_blob": "651d4b8f37791f666a290438326b82b853a8b86f",
+      "sha256": "2f1406adc792a238b974e0ff678df93212c24353cb692a0353fedcd3f744afa4",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCNullStreamer.cpp"
+    },
+    "llvm/lib/MC/MCObjectFileInfo.cpp": {
+      "git_blob": "5afe00eee224202e6da987438835008843eba4dd",
+      "sha256": "ace63ab8a78b50593ca3643e52cd30d0d361abd2ee7e144e500f0481ac99a87a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCObjectFileInfo.cpp"
+    },
+    "llvm/lib/MC/MCObjectStreamer.cpp": {
+      "git_blob": "0c64d89d7b4911a86a209534615fd623c03c5955",
+      "sha256": "1af717a1bce53a668e9234743bca4ca9bcf48055e84a298e689439a17160cf84",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCObjectStreamer.cpp"
+    },
+    "llvm/lib/MC/MCObjectWriter.cpp": {
+      "git_blob": "7cbd0b489d9f69aa79167351cd4f24aaea9d7a44",
+      "sha256": "a75b05826248acece2512902595637cb11e16828cafd53ce3fd55ebe10e71d39",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCObjectWriter.cpp"
+    },
+    "llvm/lib/MC/MCPseudoProbe.cpp": {
+      "git_blob": "11e42118a29ef63ddabdaf68e3245faf9ffdd624",
+      "sha256": "fde59d6f934039a09ef81b78a90bda7b1caec570a6a172ba25294a23371d2e63",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCPseudoProbe.cpp"
+    },
+    "llvm/lib/MC/MCRegisterInfo.cpp": {
+      "git_blob": "77fb7332619cd3334112eeb7c5d2e3409483410f",
+      "sha256": "47733724bd240f8bcb8e4a4171ca5c3c1a318ccc464c3fdf55c9383ee3579ab8",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCRegisterInfo.cpp"
+    },
+    "llvm/lib/MC/MCSFrame.cpp": {
+      "git_blob": "e0a90dfdb3af1176dda2b726cc013c951ab3ce4f",
+      "sha256": "a0e3ff41c9449b2964c88e25ce6260d4b2435326da12418ae7fbe2558df7b65b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSFrame.cpp"
+    },
+    "llvm/lib/MC/MCSPIRVStreamer.cpp": {
+      "git_blob": "d2534375e501edc6d21cafba433c099fbf2bac89",
+      "sha256": "b3d3bd638be31ebfd5a4a060ff1d81e67623d3f0be6050ba3ca73e9098b320ec",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSPIRVStreamer.cpp"
+    },
+    "llvm/lib/MC/MCSchedule.cpp": {
+      "git_blob": "527ccf3fc36e076490594313bcc62767f6d3ac0b",
+      "sha256": "bc267c75dcd6d97026b3a1b2546f9ccc069287879e0e4548e99542240b92e5a5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSchedule.cpp"
+    },
+    "llvm/lib/MC/MCSection.cpp": {
+      "git_blob": "a668e7919b7b97f1ce2dc81be4e8d2ac7b3cd3d6",
+      "sha256": "d9ec30715198b2c21213966b3378a42659806563809962c5ee039278efd468ba",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSection.cpp"
+    },
+    "llvm/lib/MC/MCSectionMachO.cpp": {
+      "git_blob": "67c82353b2b907a4bead1cd7e76152392cc5d037",
+      "sha256": "05c48766f10849a2719c872be8d32a8397ef1e0119285bc3547a8527afffceca",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSectionMachO.cpp"
+    },
+    "llvm/lib/MC/MCStreamer.cpp": {
+      "git_blob": "bc7398120096e47760722b4ec9d5e904624446c1",
+      "sha256": "4874fe26c55c012b3adc1df7dd7fca6f72ebdb460bb14feebc5d8f9d92a7e14c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCStreamer.cpp"
+    },
+    "llvm/lib/MC/MCSubtargetInfo.cpp": {
+      "git_blob": "89a08327dd259dc232dcd7ee8d65404160b7201b",
+      "sha256": "f8cef34494bfca719fdce961c0759aa0e650e38881c960de48bd4ef737e2236d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSubtargetInfo.cpp"
+    },
+    "llvm/lib/MC/MCSymbol.cpp": {
+      "git_blob": "cf44005139abfeb32937489eaaf15009d100f1ff",
+      "sha256": "e5ffffd730d0ac599df9ad8bfdd6e33ab2f5fbabaa77422b403ed1824e32b923",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSymbol.cpp"
+    },
+    "llvm/lib/MC/MCSymbolELF.cpp": {
+      "git_blob": "79774db0cc8e621f4a45cf298f0b5a7b24903b5a",
+      "sha256": "a25cc7dae5601ea2174ec1cfe30c8e9c55a89fa7cb6e17c691f51793acc95dde",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSymbolELF.cpp"
+    },
+    "llvm/lib/MC/MCSymbolGOFF.cpp": {
+      "git_blob": "00479d22232ff3b871cc77db67a01a234c25eedf",
+      "sha256": "b62408b1229fec91a85656fab6a4714c5b6215148285c82fe832cdd248987684",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSymbolGOFF.cpp"
+    },
+    "llvm/lib/MC/MCSymbolXCOFF.cpp": {
+      "git_blob": "599a3946a1ed7a18be9d5e6ab557290ccd98bddc",
+      "sha256": "c9f884cdc1d212ec9c8b7c4ec2c11c8ffcd41202ae78915c8e7f48ab84f18ccd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCSymbolXCOFF.cpp"
+    },
+    "llvm/lib/MC/MCTargetOptions.cpp": {
+      "git_blob": "be6d19d11162021bfcb6e5870a05f93fbe4d72be",
+      "sha256": "90037cb70506cf71a06adce2b6e00ade01d934d229d3162169f2d489478c8788",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCTargetOptions.cpp"
+    },
+    "llvm/lib/MC/MCTargetOptionsCommandFlags.cpp": {
+      "git_blob": "22494fa11eb2ae941849b3161d3fcad96f498822",
+      "sha256": "c41464dc0c0508a5dbfc860ea4efde6b680b71d9da83e1959ae5f17a0f852815",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCTargetOptionsCommandFlags.cpp"
+    },
+    "llvm/lib/MC/MCValue.cpp": {
+      "git_blob": "d1341f927584e8609d2111be696ef59dc0dc8a51",
+      "sha256": "e162a8f90037ceea4e4243bcbc99608c6f79da37ba4fcfa72ca80a467f167a4f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCValue.cpp"
+    },
+    "llvm/lib/MC/MCWasmObjectTargetWriter.cpp": {
+      "git_blob": "1ccb3a58d5c12e29f2d0eabe8137838bb0577a7e",
+      "sha256": "c7062d64bcf7573084da2dc381171ddc40c0033c87f6c5f4c88d96933bdfa196",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCWasmObjectTargetWriter.cpp"
+    },
+    "llvm/lib/MC/MCWasmStreamer.cpp": {
+      "git_blob": "1d3cf38d4bfdb3ed3bcca94dae63a8488f05d3fc",
+      "sha256": "b1001c91d9f75bb4434f234fbe6edc74ebc85e9f57e75d6b1dd95ca841a4fcde",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCWasmStreamer.cpp"
+    },
+    "llvm/lib/MC/MCWin64EH.cpp": {
+      "git_blob": "7a4b07991c674c51de36087b2d581eb16c73df43",
+      "sha256": "fd262ec3d0d16687da742c1b809fb997298df6eaebd1351da1a05a956663c233",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCWin64EH.cpp"
+    },
+    "llvm/lib/MC/MCWinCOFFStreamer.cpp": {
+      "git_blob": "2e632deaf32769a41f1f324e244262619bca9531",
+      "sha256": "43acfb68aa106032460ab23c71d5938e1fd447f201567ce55cca9d078d9c44a0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCWinCOFFStreamer.cpp"
+    },
+    "llvm/lib/MC/MCWinEH.cpp": {
+      "git_blob": "c5f0b95dc10ff5a0e5fc191a06999af502bbfc43",
+      "sha256": "a564f66d15e31f3b156ec09e0fb46127f1e850ba48c1e17d0c3416e8a00b3eb9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCWinEH.cpp"
+    },
+    "llvm/lib/MC/MCXCOFFObjectTargetWriter.cpp": {
+      "git_blob": "504e333cb2d49e8de978df8f32c812ed5a211acf",
+      "sha256": "f881bf4b14aec3a22a89d9acd96bc26bf50ae853b5edbfae91995273c4289454",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCXCOFFObjectTargetWriter.cpp"
+    },
+    "llvm/lib/MC/MCXCOFFStreamer.cpp": {
+      "git_blob": "b459b26045ae773fd1aeb0cf7cbe2e43e9ad6e6b",
+      "sha256": "e7bc283be91bc28a40eeb5dcbb0aeb533ce367720410c9edb77f85029aa20224",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MCXCOFFStreamer.cpp"
+    },
+    "llvm/lib/MC/MachObjectWriter.cpp": {
+      "git_blob": "b42155d18bf0ad1c72921327cfaa4659c5e623f6",
+      "sha256": "acb2e5053c092d5e10fd19498332c6aea7bf226d474eabb13de97f69c573420d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/MachObjectWriter.cpp"
+    },
+    "llvm/lib/MC/SPIRVObjectWriter.cpp": {
+      "git_blob": "d693ea33d8d7bba49711846f71d9ce5aab5232c7",
+      "sha256": "fb9b9c76d67b375cfd9419fae82d48cd0647783c38dc566358b614d9f8ff5869",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/SPIRVObjectWriter.cpp"
+    },
+    "llvm/lib/MC/StringTableBuilder.cpp": {
+      "git_blob": "f2b82998f245735795ab1fa3fb4e7e322726c238",
+      "sha256": "3b45dd42e0d029b229e7420fe8a3df0910986254bec5819929ecf2cf29e2b6a6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/StringTableBuilder.cpp"
+    },
+    "llvm/lib/MC/TargetRegistry.cpp": {
+      "git_blob": "9263dda65a8b0065e7497fc7d0cac420517df669",
+      "sha256": "25164fb266ba23a78e567313d7634a47929afd0a8790da708e5d29fd4f16117c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/TargetRegistry.cpp"
+    },
+    "llvm/lib/MC/WasmObjectWriter.cpp": {
+      "git_blob": "15590b31fd07ff0f6c10e9f589fc7d989ac2b3c2",
+      "sha256": "96bac153462377c7d12fb600ddf931d74d05363b434087a33f3676783a81f7d9",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/WasmObjectWriter.cpp"
+    },
+    "llvm/lib/MC/WinCOFFObjectWriter.cpp": {
+      "git_blob": "8f850c0228f3738f0d9f7a42e8b46c2eaa1a9776",
+      "sha256": "bdfba995a7282d52ed2921f644257f4bc25b6543154ecf996ece5e6bf985fcfd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/WinCOFFObjectWriter.cpp"
+    },
+    "llvm/lib/MC/XCOFFObjectWriter.cpp": {
+      "git_blob": "d466009348c4739eb5076b3b49ee99fa32491fe2",
+      "sha256": "ae5ef535a9999cae28fcbd2765cfcf58123d6ef2b9957d04b66d8868e05f78c0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/lib/MC/XCOFFObjectWriter.cpp"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

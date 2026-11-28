@@ -3,6 +3,7 @@
 #J949_r15_001
 #J950_r16_001
 #J951_r17_001
+#J952_r18_001
 """Build LLVM's bootstrap libraries (llvmorg-22.1.8) for native KUMO.
 
 The sources are the measured closure pinned in toolchain/llvm/SOURCE.lock; toolchain/llvm/kumo.patch
@@ -51,21 +52,23 @@ def units(source):
 
 
 def main(component="support"):
-    if component not in ("support", "binaryformat", "targetparser", "object"):
+    if component not in ("support", "binaryformat", "targetparser", "object", "mc"):
         raise ValueError(f"unknown LLVM bootstrap component: {component}")
     object_library = component == "object"
-    targetparser = component in ("targetparser", "object")
-    binaryformat = component in ("binaryformat", "targetparser", "object")
-    whole_closure = component == "targetparser"
+    mc_library = component == "mc"
+    targetparser = component in ("targetparser", "object", "mc")
+    binaryformat = component in ("binaryformat", "targetparser", "object", "mc")
+    whole_closure = component in ("targetparser", "mc")
     tag, label = {"support": ("SH9-d1", "LLVM Support"), "binaryformat": ("SH9-d2", "LLVM BinaryFormat"),
-                  "targetparser": ("SH9-d3", "LLVM TargetParser"), "object": ("SH9-d4", "LLVM Object")}[component]
+                  "targetparser": ("SH9-d3", "LLVM TargetParser"), "object": ("SH9-d4", "LLVM Object"),
+                  "mc": ("SH9-d5", "LLVM MC")}[component]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sysroot", type=Path, default=ROOT / "target/kumo-sysroot")
     parser.add_argument("--out", type=Path, default=ROOT / f"target/llvm-{component}")
     parser.add_argument("--libcxx-out", type=Path, default=ROOT / "target/cxx-libcxx")
     parser.add_argument("--eh-out", type=Path, default=ROOT / "target/cxx-eh")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
-    parser.add_argument("--tblgen", type=Path, help="LLVM 22.1.8 llvm-tblgen (TargetParser/Object)")
+    parser.add_argument("--tblgen", type=Path, help="LLVM 22.1.8 llvm-tblgen (TargetParser/Object/MC)")
     args = parser.parse_args()
     sysroot, out = args.sysroot.resolve(), args.out.resolve()
     libcxx_out, eh_out = args.libcxx_out.resolve(), args.eh_out.resolve()
@@ -105,7 +108,7 @@ def main(component="support"):
         shutil.rmtree(generated)
     runpy.run_path(str(TOOL / "gen-config.py"))["generate"](source / "llvm/include/llvm/Config", generated)
     tablegen = (runpy.run_path(str(TOOL / "gen-target-tables.py"))["generate"](
-        source, generated, lock, args.tblgen, object_tables=object_library) if targetparser else None)
+        source, generated, lock, args.tblgen, object_tables=object_library or mc_library) if targetparser else None)
     fixtures = (runpy.run_path(str(TOOL / "make-object-fixtures.py"))["generate"](
         out / "fixtures", generated) if object_library else None)
 
@@ -131,12 +134,16 @@ def main(component="support"):
 
     support_units, demangle_units = units(source)
     library_units = {"Support": support_units, "Demangle": demangle_units}
-    for name in ((["BinaryFormat"] if binaryformat else []) + (["TargetParser"] if targetparser else [])
-                 + (["Object"] if object_library else [])):
+    component_paths = {name: name for name in (
+        (["BinaryFormat"] if binaryformat else []) + (["TargetParser"] if targetparser else [])
+        + (["Object"] if object_library else []) + (["MC"] if mc_library else []))}
+    if mc_library:
+        component_paths["DebugInfoDWARFLowLevel"] = "DebugInfo/DWARF/LowLevel"
+    for name, directory in component_paths.items():
         # Keep every unit from each pinned upstream component's source list. — KESTREL
-        cmake = source / f"llvm/lib/{name}/CMakeLists.txt"
+        cmake = source / f"llvm/lib/{directory}/CMakeLists.txt"
         names = re.findall(r"^  (\w+\.cpp)$", cmake.read_text(), re.MULTILINE)
-        found = sorted((source / f"llvm/lib/{name}").glob("*.cpp"))
+        found = sorted((source / f"llvm/lib/{directory}").glob("*.cpp"))
         if not names or {path.name for path in found} != set(names):
             raise RuntimeError(f"{name} closure differs from its pinned CMake source list")
         library_units[name] = found
@@ -157,7 +164,7 @@ def main(component="support"):
     libcxx_build = runpy.run_path(str(CXX / "build-libcxx.py"))
     script = libcxx_build["stack_link_script"](out)
     elf = out / f"llvm-{component}-smoke"
-    # Retain every BinaryFormat/TargetParser function to prove the complete link closure. — KESTREL
+    # Retain all component functions beyond Support/Demangle to prove their link closure. — KESTREL
     link_archives = (["--whole-archive", *archives[2:], "--no-whole-archive", *archives[:2]]
                      if whole_closure else archives)
     run(["ld.lld", "-static", *([] if whole_closure else ["--gc-sections"]), "--eh-frame-hdr", "-z", "noexecstack",
@@ -187,19 +194,24 @@ def main(component="support"):
                 resource_inputs[str(path)] = sha(path)
 
     unbuilt = ["TargetParser"] if binaryformat and not targetparser else []
-    if object_library:
-        cmake = (source / "llvm/lib/Object/CMakeLists.txt").read_text()
-        links = re.search(r"LINK_COMPONENTS\s+([^)]*)\)", cmake).group(1).split()
-        unbuilt = [name for name in links if name not in library_units]
+    if object_library or mc_library:
+        links = set()
+        for directory in component_paths.values():
+            cmake = (source / f"llvm/lib/{directory}/CMakeLists.txt").read_text()
+            # DEPENDS names generated targets, not LLVM link components. — KESTREL
+            block = re.search(r"LINK_COMPONENTS\s+([^)]*)\)", cmake).group(1)
+            links.update(re.split(r"\bDEPENDS\b", block, maxsplit=1)[0].split())
+        unbuilt = sorted(links - library_units.keys())
     manifest = {
         "llvm_revision": lock["revision"],
         "llvm_ref": lock["ref"],
         "scope": f"LLVM {' + '.join(library_units)} for aarch64-unknown-kumo against the installed libc++ layer; "
                  "platform port staged by toolchain/llvm/kumo.patch; config rendered by gen-config.py",
         "unbuilt_link_components": unbuilt,
-        "whole_archive_components": ["BinaryFormat", "TargetParser"] if whole_closure else [],
+        "whole_archive_components": list(library_units)[2:] if whole_closure else [],
         "gc_sections": not whole_closure,
-        "proof_scope": "native ELF and archive readers" if object_library else label,
+        "proof_scope": ("native ELF and archive readers" if object_library else
+                        "generic MC data directives and DWARF low-level APIs" if mc_library else label),
         "tablegen": tablegen,
         "fixtures": fixtures,
         "units": {name.lower(): len(paths) for name, paths in library_units.items()},
