@@ -1,8 +1,8 @@
 <!-- J951_r17_001 -->
-<!-- J952_r18_001 -->
 <!-- J953_r19_001 -->
 <!-- J958_r24_001 -->
 <!-- J959_r25_001 -->
+<!-- J960_r26_001 -->
 # LLVM for native KUMO — bootstrap libraries and tools
 
 The first native bootstrap slice of PLAN/022 SH9. LLVM's `Support` and `Demangle` libraries
@@ -30,9 +30,13 @@ SH9-d7 adds complete AsmParser (4 units), BitReader (5) and IRReader (1) librari
 the real upstream `llvm-dis` executable. Native tools can now read textual IR or bitcode,
 and a granted child can run `llvm-dis input.bc -o output.ll`.
 
+SH9-d8 closes Object's complete native component set with MCParser (13 units) and TextAPI
+(15 units). Generic binary loading and native indexed archive output are exercised with every
+component archive retained. A minimal compiler-rt archive supplies the real cache builtin.
+
 ## Sources
 
-`SOURCE.lock` pins the measured closure: 1,400 files, 32,180,905 bytes. SH9-d1's 467 files hold every Support and
+`SOURCE.lock` pins the measured closure: 1,443 files, 32,977,521 bytes. SH9-d1's 467 files hold every Support and
 Demangle unit; the headers they and the proof include; the Unix layer (`lib/Support/Unix/*.inc`);
 BLAKE3's portable and NEON sources (not its x86 SIMD); `third-party/siphash`; the CMake config
 templates; and `llvm/LICENSE.TXT`, which also covers SipHash. Each file has its git blob ID and
@@ -65,6 +69,11 @@ header. The same LLVM revision and platform patch apply.
 SH9-d7 adds 28 exact upstream files (1,018,211 bytes): all ten reader units, their CMake
 recipes and measured headers, plus `llvm-dis.cpp` and its component recipe. No libc++ or
 platform patch expansion is needed.
+
+SH9-d8 adds 37 LLVM files (754,752 bytes): all MCParser/TextAPI sources and recipes, plus
+seven measured headers. Six compiler-rt files (41,864 bytes), including its licence, add the
+unchanged AArch64 `__clear_cache` implementation and header closure. No libc++ or LLVM port
+patch changes are needed.
 
 ## The KUMO port (`kumo.patch`)
 
@@ -182,8 +191,8 @@ python3 scripts/llvm-targetparser-smoke.py --run
 python3 scripts/metal-sh9-d3.py
 ```
 
-Object's remaining facilities, IR and native `llvm-mc`/`lld` remain later slices. LLVM's process-launch integration
-for driver-style tools and PLAN/014's SMP acceptance gates remain open.
+Later slices below add IR, process launch and Object's remaining dependencies. Native
+`llvm-mc`/`lld` and PLAN/014's SMP acceptance gates remain open.
 
 ## Object ELF/archive readers (SH9-d4)
 
@@ -263,8 +272,8 @@ This closes MC's library dependency set and proves generic APIs. Target instruct
 encoding, relocation application and object emission need MCParser and a real target backend;
 this slice does not provide a native `llvm-mc` executable. Object's reader configuration remains
 separate. Upstream's low-level DWARF expression iterator is not a complete operand-bounds
-validator; truncated expression operands are outside this proof. Next: the MCParser/target and
-IR prerequisites for the remaining Object/tool paths.
+validator; truncated expression operands are outside this proof. The later IR and MCParser
+slices below close Object's dependencies; target instruction facilities remain open.
 Native `llvm-mc`/`lld` and SMP acceptance remain open; process launching is SH9-p1, below.
 
 ## Process launch (SH9-p1)
@@ -376,6 +385,57 @@ python3 scripts/metal-sh9-d7.py
 ```
 
 `llvm-dis` reads LLVM bitcode and emits textual LLVM IR. It supplies no machine-instruction
-assembler, optimizer, code generator, linker or native rustc/cargo. BitWriter, Object's
-remaining components (MCParser/TextAPI), real target backends, the native compiler bootstrap,
-SMP and measured resource budgets remain later gates.
+assembler, optimizer, code generator, linker or native rustc/cargo. SH9-d8 below closes Object's
+remaining components (MCParser/TextAPI). BitWriter, real target backends, the native compiler
+bootstrap, SMP and measured resource budgets remain later gates.
+
+## Complete Object component set (SH9-d8)
+
+`build-objectfull.py` builds 449 units in 15 LLVM libraries: Support, Demangle, BinaryFormat,
+TargetParser, Object, MC, DebugInfoDWARFLowLevel, Core, Remarks, BitstreamReader, AsmParser,
+BitReader, IRReader, MCParser and TextAPI. Every component after Support/Demangle is retained
+completely, without section GC. Object's full upstream component list is now built: the proof
+has no undefined symbols or missing LLVM components and keeps its 4 MiB stack. Older Object
+reader mode keeps its earlier dependency boundary.
+
+The complete link first pulled in Support's instruction-cache code and exposed the missing
+`__clear_cache` compiler builtin. The builder now supplies it in `libkumo-builtins.a`, compiled
+from the pinned, unchanged LLVM compiler-rt implementation. Its normal AArch64 path reads cache
+properties, cleans data/instruction cache lines as required, and uses the required barriers.
+KUMO already permits those EL0 cache operations through UCI, but the live proof found that
+reading CTR_EL0 still trapped. The AArch64 HAL now also enables UCT beside UCI; no syscall or
+ABI change is needed. The proof calls the real builtin through LLVM on an unaligned private
+buffer and checks the bytes are preserved. The original kernel traps at that CTR_EL0 read.
+This does not claim JIT execution, writable executable mappings or SMP instruction-coherence
+acceptance.
+
+The runtime proof covers:
+
+- MC lexing of identifiers, directives, integers, strings/comments and a malformed string.
+- Generic `createBinary` loading ELF64LE, ELF32BE, ARM64 COFF, arm64 Mach-O and Wasm objects.
+- The generic bitcode factory's IR symbolic file, defined symbols and KUMO target triple.
+- TextAPI YAML v4 and JSON v5 serialization/parsing, architecture/weak exports, invalid input,
+  and Object's TAPI universal/symbolic adapter.
+- Native deterministic GNU archive encoding with mixed ELF and bitcode members, long member
+  names, indexed symbol lookup and undefined-symbol exclusion; repeated bytes match exactly.
+- Error propagation for truncated object formats and unknown magic.
+- The upstream archive stream writer writing RAM FAT, exact comparison with the buffer writer,
+  owning file-factory read-back, missing-file errors and cleanup.
+
+`make-format-fixtures.py` uses the host compiler to create the COFF/Mach-O/Wasm inputs; existing
+object and IR fixture generators supply ELF/bitcode. Their bytes and generated headers are
+recorded and reproducible. COFF compilation disables incremental-linker compatibility so the
+object timestamp is zero rather than the host wall clock. Machine instructions in those inputs
+are produced on the host. The archive bytes are produced natively on KUMO. The archive stream/buffer APIs are tested;
+the atomic temporary-file wrapper and thin/external archives are outside this proof.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/llvm-objectfull-smoke.py --run
+python3 scripts/metal-sh9-d8.py
+```
+
+This closes the Object library dependency set. It does not supply a native `llvm-ar` (its upstream
+recipe also needs target components and driver libraries), a machine assembler, optimizer,
+code generator, linker, or native rustc/cargo. Native BitWriter prerequisites, real target
+instruction/codegen facilities, the compiler bootstrap, SMP and measured budgets remain open.

@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j881
 //j882
 //j905
 //j912
 //j887
+//J960_r26_001
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -1819,6 +1819,9 @@ pub mod mmu {
                 // benign (the same access EL0 already has to the data it is flushing).
                 "mrs {tmp}, sctlr_el1",
                 "orr {tmp}, {tmp}, #(1 << 26)",
+                // LLVM compiler-rt reads CTR_EL0 before maintaining caches. UCT=0 traps
+                // that EL0 read even when UCI permits the cache operations. — TEAL
+                "orr {tmp}, {tmp}, #(1 << 15)",
                 "msr sctlr_el1, {tmp}",
                 "isb",
                 mair = in(reg) MAIR_VALUE,
