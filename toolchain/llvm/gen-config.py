@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 #J948_r14_001
+#J953_r19_001
 """Render LLVM's CMake config templates for native KUMO (aarch64-unknown-kumo).
 
 LLVM's CMake probes the host and writes llvm/Config/*.h; KUMO has no native CMake run yet, so
 this renders the pinned templates with the answers that run would give on relibc. Every value
 here is a fact about relibc or a deliberate "off" for this first slice: no dlopen, no crash
-backtraces, no posix_spawn (KUMO has no exec), no zlib/zstd/ICU/iconv. — TEAL
+backtraces, no zlib/zstd/ICU/iconv. posix_spawn is on (SH9-p1): relibc's KUMO spawn loads the
+ELF through the parent's filesystem, and fork/exec does not exist. — TEAL
 """
 import argparse
 from pathlib import Path
@@ -37,6 +39,7 @@ VALUES = {
     "HAVE_GETRUSAGE": "1",
     "HAVE_LIBPTHREAD": "1",
     "HAVE_PREAD": "1",
+    "HAVE_POSIX_SPAWN": "1",
     "HAVE_PTHREAD_H": "1",
     "HAVE_PTHREAD_MUTEX_LOCK": "1",
     "HAVE_PTHREAD_RWLOCK_INIT": "1",

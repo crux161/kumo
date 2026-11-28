@@ -1621,3 +1621,38 @@ diff --git a/src/header/sys_random/mod.rs b/src/header/sys_random/mod.rs
 
  /// See <https://www.man7.org/linux/man-pages/man2/getrandom.2.html>.
  ///
+diff --git a/src/header/spawn/file_actions.rs b/src/header/spawn/file_actions.rs
+--- a/src/header/spawn/file_actions.rs
++++ b/src/header/spawn/file_actions.rs
+@@ -121,7 +121,9 @@
+         panic!("file_actions cannot be NULL");
+     }
+     unsafe {
+-        let _ = *(file_actions.cast::<FileActions>());
++        // KUMO (J953_r19_001): `let _ = *place` drops nothing; free the actions, which now
++        // own only copies.
++        ptr::drop_in_place(file_actions.cast::<FileActions>());
+     }
+     0
+ }
+@@ -154,7 +156,9 @@
+         path: if path.is_null() {
+             CString::new("").unwrap()
+         } else {
+-            unsafe { CString::from_raw(path.cast_mut()) }
++            // KUMO (J953_r19_001): copy the caller's string. from_raw took ownership of
++            // memory the caller still owns (LLVM passes the literal "/dev/null").
++            unsafe { core::ffi::CStr::from_ptr(path) }.into()
+         },
+         flag: oflag,
+         mode,
+@@ -210,7 +214,8 @@
+         if path.is_null() {
+             CString::new("").unwrap()
+         } else {
+-            CString::from_raw(path.cast_mut())
++            // KUMO (J953_r19_001): copy, as in addopen.
++            core::ffi::CStr::from_ptr(path).into()
+         }
+     }));
+     0

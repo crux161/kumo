@@ -4,6 +4,7 @@
 #J950_r16_001
 #J951_r17_001
 #J952_r18_001
+#J953_r19_001
 """Build LLVM's bootstrap libraries (llvmorg-22.1.8) for native KUMO.
 
 The sources are the measured closure pinned in toolchain/llvm/SOURCE.lock; toolchain/llvm/kumo.patch
@@ -52,7 +53,7 @@ def units(source):
 
 
 def main(component="support"):
-    if component not in ("support", "binaryformat", "targetparser", "object", "mc"):
+    if component not in ("support", "binaryformat", "targetparser", "object", "mc", "process"):
         raise ValueError(f"unknown LLVM bootstrap component: {component}")
     object_library = component == "object"
     mc_library = component == "mc"
@@ -61,7 +62,8 @@ def main(component="support"):
     whole_closure = component in ("targetparser", "mc")
     tag, label = {"support": ("SH9-d1", "LLVM Support"), "binaryformat": ("SH9-d2", "LLVM BinaryFormat"),
                   "targetparser": ("SH9-d3", "LLVM TargetParser"), "object": ("SH9-d4", "LLVM Object"),
-                  "mc": ("SH9-d5", "LLVM MC")}[component]
+                  "mc": ("SH9-d5", "LLVM MC"),
+                  "process": ("SH9-p1", "LLVM process launch")}[component]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sysroot", type=Path, default=ROOT / "target/kumo-sysroot")
     parser.add_argument("--out", type=Path, default=ROOT / f"target/llvm-{component}")

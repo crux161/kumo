@@ -2968,8 +2968,29 @@ const fn unsupported() -> Errno {
 }
 
 impl Pal for Sys {
+    /// J953_r19_001: access/faccessat answer from stat. KUMO has no users: holding the
+    /// filesystem grant is the permission, so an existing path passes F_OK, R_OK and W_OK
+    /// (a write the volume refuses still fails at write time, with the server's error).
+    /// X_OK passes for directories (search) and regular files: spawn runs any ELF it can
+    /// read and FAT keeps no execute bits. /dev/null is not executable. LLVM's
+    /// sys::fs::exists and can_execute (findProgramByName) ride on this. — TEAL
     fn faccessat(fd: c_int, path: CStr, amode: c_int, flags: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{EACCES, EINVAL},
+            fcntl::{AT_EACCESS, AT_SYMLINK_NOFOLLOW},
+            unistd::{R_OK, W_OK, X_OK},
+        };
+
+        if amode & !(R_OK | W_OK | X_OK) != 0 || flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW) != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let mut st = stat::default();
+        Self::fstatat(fd, Some(path), Out::from_mut(&mut st), 0)?;
+        let kind = st.st_mode & 0o170000;
+        if amode & X_OK != 0 && kind != 0o040000 && kind != 0o100000 {
+            return Err(Errno(EACCES));
+        }
+        Ok(())
     }
 
     unsafe fn brk(addr: *mut c_void) -> Result<*mut c_void> {
@@ -4357,6 +4378,18 @@ impl Pal for Sys {
                         stdio[to as usize] = Some((tags[to as usize], duplicate));
                     }
                     Action::Close(fd) if (0..3).contains(&fd) => {
+                        if let Some((_, previous)) = stdio[fd as usize].take() {
+                            close_handle(previous);
+                        }
+                    }
+                    // J953_r19_001: LLVM's ExecuteAndWait redirects an empty path to
+                    // "/dev/null" with addopen. Like Stdio::null() above, the child gets no
+                    // channel there and seats /dev/null itself. Opening any other path for a
+                    // child needs a filesystem grant the child does not have, so it stays
+                    // EOPNOTSUPP.
+                    Action::Open { fd, path, .. }
+                        if (0..3).contains(&fd) && path.as_bytes() == DEV_NULL =>
+                    {
                         if let Some((_, previous)) = stdio[fd as usize].take() {
                             close_handle(previous);
                         }

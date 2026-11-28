@@ -3,6 +3,7 @@
 <!-- J950_r16_001 -->
 <!-- J951_r17_001 -->
 <!-- J952_r18_001 -->
+<!-- J953_r19_001 -->
 # LLVM for native KUMO — bootstrap libraries
 
 The first native bootstrap slice of PLAN/022 SH9. LLVM's `Support` and `Demangle` libraries
@@ -61,8 +62,8 @@ Applied to a staged copy only, so `vendor/` stays upstream. Every hunk is `__kum
 - `Unix/Path.inc` `dontNeedImpl`/`willNeedImpl`: VMO mappings take no paging hints, so these are
   no-ops, as on AIX and z/OS.
 - `Unix/Program.inc` `Wait`: relibc has `waitpid` but not `wait4` or `rusage`, so it waits with
-  `waitpid` and reports no `ProcessStatistics`. Spawning still fails cleanly at run time, because
-  KUMO has no exec.
+  `waitpid` and reports no `ProcessStatistics`. Processes are launched with `posix_spawn`
+  (SH9-p1, below); KUMO has no fork or exec.
 - `TargetParser/Triple.h` and `Triple.cpp`: a KUMO-only `Kumo` OS enum, type-name and exact
   `kumo` spelling recognition. It is appended after existing OS values, which retain their numbers.
   Native tools can parse and normalize their own triple and compute its ELF data layout.
@@ -71,8 +72,8 @@ Applied to a staged copy only, so `vendor/` stays upstream. Every hunk is `__kum
 
 There is no native CMake run yet, so `gen-config.py` renders the pinned `llvm/Config` templates
 with the answers that run would give on relibc. Threads, pthread rwlocks, `sigaltstack`, `sysconf`,
-`mmap`, `futimens`, `getrusage`, `strerror_r` and `setenv` are on. `dlopen`, crash-handler
-backtraces, `posix_spawn`, zlib, zstd, ICU and iconv are off for this slice. The triple is
+`mmap`, `futimens`, `getrusage`, `strerror_r`, `setenv` and (since SH9-p1) `posix_spawn` are on.
+`dlopen`, crash-handler backtraces, zlib, zstd, ICU and iconv are off. The triple is
 `aarch64-unknown-kumo`.
 
 ## Build and proof
@@ -249,4 +250,38 @@ this slice does not provide a native `llvm-mc` executable. Object's reader confi
 separate. Upstream's low-level DWARF expression iterator is not a complete operand-bounds
 validator; truncated expression operands are outside this proof. Next: the MCParser/target and
 IR prerequisites for the remaining Object/tool paths.
-Native `llvm-mc`/`lld`, LLVM process launching and SMP acceptance remain open.
+Native `llvm-mc`/`lld` and SMP acceptance remain open; process launching is SH9-p1, below.
+
+## Process launch (SH9-p1)
+
+LLVM's `sys::ExecuteAndWait`, `ExecuteNoWait` and `Wait` launch native KUMO programs the way
+clang's driver launches its tools. `gen-config.py` turns `HAVE_POSIX_SPAWN` on, so LLVM never
+reaches its `fork` path. relibc's KUMO `posix_spawn` loads the ELF through the parent's
+filesystem and passes stdio as channels. `build-process.py` builds Support and Demangle with
+`process-smoke.cpp`, which runs the Rust std smoke on the RAM FAT image (`/SMOKE.ELF spawnchild`,
+exit 7) three times and checks:
+
+- `findProgramByName("SMOKE.ELF", {"/BIN", "/"})` finds `/SMOKE.ELF`;
+- `ExecuteAndWait` returns the child's exit status;
+- `ExecuteNoWait` followed by a polling `Wait` (`WNOHANG`) and by a blocking `Wait` both reap
+  the child with status 7, and a second wait on a reaped child fails;
+- a missing program and a stdout redirect to a file both fail cleanly at spawn time.
+
+The child's stdin is redirected to `/dev/null` (LLVM's empty-path redirect). Its stdout and
+stderr are the parent's own. relibc changes for this slice:
+
+- `posix_spawn` accepts `addopen("/dev/null")` on fds 0–2: the child gets no channel there and
+  installs `/dev/null` itself, as with Rust's `Stdio::null()`. Other paths still return
+  `EOPNOTSUPP`, because a child has no filesystem grant to open them. Giving children a grant
+  and redirecting to files are capability-policy decisions left for later.
+- `posix_spawn_file_actions_addopen`/`addchdir` copy the caller's path (upstream took ownership
+  of it with `CString::from_raw`), and `_destroy` now frees the actions.
+- `access`/`faccessat` answer from `stat` instead of `ENOSYS`. KUMO has no users, so the
+  filesystem grant is the permission. `X_OK` passes for directories and regular files, since
+  spawn runs any readable ELF and FAT stores no execute bits.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/llvm-process-smoke.py --run
+python3 scripts/metal-sh9-p1.py
+```
