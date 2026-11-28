@@ -6,6 +6,7 @@
 //j932
 //j933
 //j934
+//J954_r20_001
 
 extern crate alloc;
 
@@ -7698,7 +7699,9 @@ fn eval_command(
             b"std-smoke",
             Some(&slots[..count]),
             false,
-            FsGrant::Image,
+            // J954_r20_001 (PROPOSAL/027 P2a): a mount-scoped server, so the child also holds
+            // the session-control channel that P2b mints its children's sessions from.
+            FsGrant::ImageMount,
             false,
             false,
             StdinMode::Finite(b"\n"),
@@ -7724,7 +7727,9 @@ fn eval_command(
             b"relibc",
             Some(&slots[..count]),
             false,
-            FsGrant::Image,
+            // J954_r20_001 (PROPOSAL/027 P2a): a mount-scoped server, so the child also holds
+            // the session-control channel that P2b mints its children's sessions from.
+            FsGrant::ImageMount,
             true,
             false,
             StdinMode::Finite(b"a line from sora\n"),

@@ -3,6 +3,8 @@
 //j897
 //J944_r10_001
 //J947_r13_001
+//J953_r19_001
+//J954_r20_001
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -127,6 +129,8 @@ const STARTUP_TAG_STDOUT: u8 = b'o';
 const STARTUP_TAG_STDERR: u8 = b'e';
 const STARTUP_TAG_ARGV: u8 = b'a';
 const STARTUP_TAG_FS: u8 = b'f';
+/// J954_r20_001: the mount's session-control channel (kumo-rt `STARTUP_TAG_FS_MOUNT`).
+const STARTUP_TAG_FS_MOUNT: u8 = b'm';
 const STARTUP_TAG_TTY: u8 = b't';
 /// Mirror of `kumo-rt`'s `STARTUP_TAG_NET` (userland/kumo-rt/src/sys.rs). Only `net`
 /// launches receive the client end of a `kns1` session channel; absent, sockets do not
@@ -297,6 +301,11 @@ static STDERR_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// The client end of a filesystem server's `kumo-vfs` channel, or `0` when the launcher
 /// granted none — in which case this process cannot name a file at all.
 static FS_HANDLE: AtomicU32 = AtomicU32::new(0);
+/// J954_r20_001 (PROPOSAL/027 P2a): the mount's session-control channel (`'m'`), when the launcher
+/// granted one. Holding it is authority to open more read-write sessions on the same volume
+/// (`[b'S'][access]` + a server end); P2b mints one per granted child with it. Kept, not
+/// closed, from P2a on; nothing sends on it yet.
+static FS_MOUNT_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// The explicitly granted client end of this process's `ttyd` control channel.
 static TTY_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// The explicitly granted client end of this process's `kns1` netstack session, or `0`
@@ -1546,6 +1555,13 @@ fn channel_read_bytes_nonblock(channel: u32, buf: &mut [u8]) -> u64 {
 
 /// One `kumo-vfs` request/reply exchange. The read blocks until the server answers, which
 /// is the whole reason the launcher spawns the server before the client.
+/// J954_r20_001 (PROPOSAL/027 P2a): one VFS round trip at a time per process. A session
+/// answers requests in order on one channel, and any holder of the channel reads the next
+/// message, so two threads that each wrote a request could each read the other's reply (the
+/// P2a proof saw hundreds of wrong stats and reads in 8 threads x 200 rounds). The lock is
+/// relibc's futex mutex, so a waiter sleeps while the holder is blocked on the server. — TEAL
+static VFS_CALL_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
 fn vfs_call(request: &[u8], reply: &mut [u8]) -> Result<usize> {
     use crate::header::errno::{EBADF, EIO};
 
@@ -1553,6 +1569,7 @@ fn vfs_call(request: &[u8], reply: &mut [u8]) -> Result<usize> {
     if channel == 0 {
         return Err(Errno(EBADF));
     }
+    let _one_round_trip = VFS_CALL_LOCK.lock();
     if channel_write_bytes(channel, request) != 0 {
         return Err(Errno(EIO));
     }
@@ -2545,6 +2562,7 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> (u32, u32) {
                 close_handle(core::mem::replace(&mut argv_vmo, handle));
             }
             STARTUP_TAG_FS => install_startup_handle(&FS_HANDLE, handle),
+            STARTUP_TAG_FS_MOUNT => install_startup_handle(&FS_MOUNT_HANDLE, handle),
             STARTUP_TAG_TTY => install_startup_handle(&TTY_HANDLE, handle),
             STARTUP_TAG_NET => install_startup_handle(&NET_HANDLE, handle),
             STARTUP_TAG_SIGNAL => install_startup_handle(&SIGNAL_HANDLE, handle),
