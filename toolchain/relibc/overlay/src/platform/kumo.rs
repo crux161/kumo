@@ -6,6 +6,7 @@
 //J953_r19_001
 //J954_r20_001
 //J955_r21_001
+//J956_r22_001
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -153,6 +154,97 @@ const KUMO_GRANT_FS_RO: &[u8] = b"KUMO_GRANT=fs-ro";
 const VFS_SESSION_GRANT: u8 = b'S';
 const VFS_SESSION_READ_ONLY: u8 = 0;
 const VFS_SESSION_READ_WRITE: u8 = 1;
+/// J956_r22_001 (PROPOSAL/027 P2c): one replayed spawn file action per startup message: a
+/// read-only VMO holding `[kind u8][fd u8][to u8][0][flags u32 LE]` + the path (open only).
+const STARTUP_TAG_REDIRECT: u8 = b'r';
+const REDIRECT_OPEN: u8 = 1;
+const REDIRECT_DUP: u8 = 2;
+const REDIRECT_CLOSE: u8 = 3;
+const REDIRECT_HEADER: usize = 8;
+/// One VmoRead moves at most 256 bytes, so a redirected path is at most this long.
+const REDIRECT_PATH_MAX: usize = 256 - REDIRECT_HEADER;
+const REDIRECT_MAX: usize = 8;
+/// A redirect the child could not open again before `main` (POSIX's failed-exec status).
+const REDIRECT_FAILURE_STATUS: u64 = 127;
+
+/// A spawn file action on fds 0-2 that the child replays on its own session, in order.
+#[derive(Clone, Copy)]
+struct Redirect {
+    kind: u8,
+    fd: u8,
+    to: u8,
+    flags: u32,
+    path: [u8; REDIRECT_PATH_MAX],
+    path_len: usize,
+}
+
+/// J956_r22_001: the access a spawn with this env grants its child, or None. A marker only
+/// grants with the session-control channel in hand (P2b); `fs-ro` wins over `fs`.
+fn spawn_grant(envs: &[&[u8]]) -> Option<u8> {
+    let mut grant = None;
+    for env in envs {
+        if *env == KUMO_GRANT_FS_RO {
+            grant = Some(VFS_SESSION_READ_ONLY);
+        } else if *env == KUMO_GRANT_FS && grant.is_none() {
+            grant = Some(VFS_SESSION_READ_WRITE);
+        }
+    }
+    grant.filter(|_| FS_MOUNT_HANDLE.load(Ordering::Relaxed) != 0)
+}
+
+/// J956_r22_001: replay the parent's redirects (startup tag 'r') on this process's own
+/// session, after stdio is seated and before `main`. A file that cannot be opened again (it
+/// was renamed after the parent opened it) ends the process with status 127. — TEAL
+fn apply_startup_redirects(vmos: &[u32]) {
+    for &vmo in vmos {
+        let mut record = [0u8; REDIRECT_HEADER + REDIRECT_PATH_MAX + 1];
+        let ok = vmo_read(vmo, 0, record.as_mut_ptr(), REDIRECT_HEADER + REDIRECT_PATH_MAX) == 0;
+        close_handle(vmo);
+        let (kind, fd, to) = (record[0], c_int::from(record[1]), c_int::from(record[2]));
+        let flags = u32::from_le_bytes(record[4..8].try_into().unwrap()) as c_int;
+        let applied = ok
+            && match kind {
+                REDIRECT_OPEN => {
+                    // The record is zero-padded, so the path is NUL-terminated in place.
+                    let path = unsafe { CStr::from_ptr(record[REDIRECT_HEADER..].as_ptr().cast()) };
+                    match Sys::openat(crate::header::fcntl::AT_FDCWD, path, flags, 0) {
+                        Ok(opened) if opened == fd => true,
+                        Ok(opened) => {
+                            let seated = Sys::dup2(opened, fd).is_ok();
+                            let _ = Sys::close(opened);
+                            seated
+                        }
+                        Err(_) => false,
+                    }
+                }
+                REDIRECT_DUP => Sys::dup2(fd, to).is_ok(),
+                REDIRECT_CLOSE => {
+                    let _ = Sys::close(fd);
+                    true
+                }
+                _ => false,
+            };
+        if !applied {
+            let _ = syscall4(SYSCALL_PROCESS_EXIT, REDIRECT_FAILURE_STATUS, 0, 0, 0);
+        }
+    }
+}
+
+/// J956_r22_001: one redirect as its startup VMO.
+fn redirect_vmo(redirect: &Redirect) -> Option<u32> {
+    let mut record = [0u8; REDIRECT_HEADER + REDIRECT_PATH_MAX];
+    record[0] = redirect.kind;
+    record[1] = redirect.fd;
+    record[2] = redirect.to;
+    record[4..8].copy_from_slice(&redirect.flags.to_le_bytes());
+    record[REDIRECT_HEADER..REDIRECT_HEADER + redirect.path_len].copy_from_slice(&redirect.path[..redirect.path_len]);
+    let vmo = vmo_create_raw(record.len() as u64)?;
+    if vmo_write(vmo, 0, record.as_ptr(), record.len()) != 0 {
+        close_handle(vmo);
+        return None;
+    }
+    Some(vmo)
+}
 
 // The `kumo-vfs` wire protocol. relibc is built from its own vendored source tree by a
 // separate cargo invocation, so it cannot depend on the `kumo-vfs` crate; these constants
@@ -1165,6 +1257,7 @@ fn spawn_elf(
     args: &[&[u8]],
     envs: &[&[u8]],
     stdio: &[Option<(u8, u32)>; 3],
+    redirects: &[Redirect],
 ) -> Result<pid_t> {
     use crate::header::{
         errno::{E2BIG, EAGAIN, EINVAL, EIO, ENOMEM},
@@ -1336,16 +1429,8 @@ fn spawn_elf(
         // opt-in at the root of a tree covers the tree; `KUMO_GRANT=fs-ro` narrows to a
         // read-only session without the control channel, so nothing below it can widen. A
         // process without the control channel grants nothing, whatever its env says. — TEAL
-        let mut grant = None;
-        for env in envs {
-            if *env == KUMO_GRANT_FS_RO {
-                grant = Some(VFS_SESSION_READ_ONLY);
-            } else if *env == KUMO_GRANT_FS && grant.is_none() {
-                grant = Some(VFS_SESSION_READ_WRITE);
-            }
-        }
         let control = FS_MOUNT_HANDLE.load(Ordering::Relaxed);
-        if let (Some(access), true) = (grant, control != 0) {
+        if let Some(access) = spawn_grant(envs) {
             let (session, server) = channel_pair().ok_or(Errno(ENOMEM))?;
             let request = [VFS_SESSION_GRANT, access];
             if channel_write_bytes_with_handle(control, &request, server) != 0 {
@@ -1365,6 +1450,14 @@ fn spawn_elf(
                     close_handle(duplicate);
                     return Err(Errno(EIO));
                 }
+            }
+        }
+        // J956_r22_001 (P2c): the redirects ride after the session, in action order.
+        for redirect in redirects {
+            let vmo = redirect_vmo(redirect).ok_or(Errno(ENOMEM))?;
+            if channel_write_tag(sender, STARTUP_TAG_REDIRECT, vmo) != 0 {
+                close_handle(vmo);
+                return Err(Errno(EIO));
             }
         }
         let Some(argv_vmo) = startup_image(args) else {
@@ -2356,6 +2449,55 @@ fn handle_matches_no_source(handle: u32, source: FdSlot) -> bool {
     !matches!(source, FdSlot::Input(other) | FdSlot::Output(other) if other == handle)
 }
 
+/// J956_r22_001: descriptors other than `skip` that alias the open file `handle`. A vfs
+/// handle is per open, and dup copies it, so equal handles in one process are one open file
+/// description (POSIX): they share the offset, the size and O_APPEND, and the server-side
+/// entry closes with the last of them.
+fn file_alias_count(handle: u32, skip: c_int) -> usize {
+    let mut count = 0;
+    for index in 0..FD_SLOTS {
+        if index as c_int == skip {
+            continue;
+        }
+        if let Some(FdSlot::File { handle: other, .. }) = fd_slot(index as c_int) {
+            if *other == handle {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// J956_r22_001: after `fildes` moved its offset, size or flags, give every alias of the same
+/// open file the same values, so `dup`, `dup2` and `F_DUPFD` share one file position.
+fn file_share(fildes: c_int) {
+    let Some(FdSlot::File { handle, offset, size, flags, .. }) = fd_slot(fildes).map(|slot| *slot) else {
+        return;
+    };
+    for index in 0..FD_SLOTS {
+        if index as c_int == fildes {
+            continue;
+        }
+        if let Some(FdSlot::File { handle: other, offset: o, size: s, flags: f, .. }) = fd_slot(index as c_int) {
+            if *other == handle {
+                *o = offset;
+                *s = size;
+                *f = flags;
+            }
+        }
+    }
+}
+
+/// Release the server-side entry of an open file (SH3-d2d). Best-effort: a close never
+/// surfaces server failure.
+fn vfs_close_handle(handle: u32) {
+    let mut request = [0u8; CLOSE_REQUEST_LEN];
+    request[0] = VFS_OP_CLOSE;
+    request[1..5].copy_from_slice(&handle.to_le_bytes());
+    let mut reply = [0u8; 1];
+    let _ = vfs_call(&request, &mut reply);
+}
+
 fn socket_alias_count(id: u32, skip: c_int) -> usize {
     let mut count = 0;
     for index in 0..FD_SLOTS {
@@ -2577,6 +2719,8 @@ fn startup_fail(message: &[u8]) -> ! {
 fn take_bootstrap_capabilities(bootstrap: u32) -> (u32, u32) {
     let mut argv_vmo = 0_u32;
     let mut env_vmo = 0_u32;
+    let mut redirect_vmos = [0_u32; REDIRECT_MAX];
+    let mut redirect_count = 0usize;
     let mut tag = 0_u8;
     loop {
         let (count, raw_handle) = channel_read_with_handle(bootstrap, &mut tag);
@@ -2596,6 +2740,10 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> (u32, u32) {
             }
             STARTUP_TAG_FS => install_startup_handle(&FS_HANDLE, handle),
             STARTUP_TAG_FS_MOUNT => install_startup_handle(&FS_MOUNT_HANDLE, handle),
+            STARTUP_TAG_REDIRECT if redirect_count < REDIRECT_MAX => {
+                redirect_vmos[redirect_count] = handle;
+                redirect_count += 1;
+            }
             STARTUP_TAG_TTY => install_startup_handle(&TTY_HANDLE, handle),
             STARTUP_TAG_NET => install_startup_handle(&NET_HANDLE, handle),
             STARTUP_TAG_SIGNAL => install_startup_handle(&SIGNAL_HANDLE, handle),
@@ -2636,6 +2784,7 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> (u32, u32) {
             *slot = FdSlot::Output(handle);
         }
     }
+    apply_startup_redirects(&redirect_vmos[..redirect_count]);
     (argv_vmo, env_vmo)
 }
 
@@ -3120,12 +3269,10 @@ impl Pal for Sys {
             FdSlot::File { handle, .. } => {
                 // Release the server-side slot (SH3-d2d): a vfs handle is a server-table
                 // index with no lifetime of its own, so client close is what frees it.
-                // Best-effort — a close never surfaces server failure.
-                let mut request = [0u8; CLOSE_REQUEST_LEN];
-                request[0] = VFS_OP_CLOSE;
-                request[1..5].copy_from_slice(&handle.to_le_bytes());
-                let mut reply = [0u8; 1];
-                let _ = vfs_call(&request, &mut reply);
+                // J956_r22_001: only with its last alias; a dup of it must keep working.
+                if file_alias_count(handle, fildes) == 0 {
+                    vfs_close_handle(handle);
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -3160,6 +3307,14 @@ impl Pal for Sys {
                 *fd_slot(fildes2).ok_or(Errno(EBADF))? = FdSlot::Closed;
                 if channel_alias_count(handle, fildes2) == 0 && handle_matches_no_source(handle, source) {
                     close_handle(handle);
+                }
+            }
+            // J956_r22_001: the replaced open file closes with its last alias (it leaked).
+            FdSlot::File { handle, .. } => {
+                *fd_slot(fildes2).ok_or(Errno(EBADF))? = FdSlot::Closed;
+                let source_same = matches!(source, FdSlot::File { handle: h, .. } if h == handle);
+                if file_alias_count(handle, fildes2) == 0 && !source_same {
+                    vfs_close_handle(handle);
                 }
             }
             _ => {}
@@ -3398,6 +3553,7 @@ impl Pal for Sys {
                     } else {
                         0
                     };
+                    file_share(fildes);
                     Ok(0)
                 }
                 FdSlot::Closed => Err(Errno(EBADF)),
@@ -3507,6 +3663,7 @@ impl Pal for Sys {
         if let Some(FdSlot::File { size, .. }) = fd_slot(fildes) {
             *size = length;
         }
+        file_share(fildes);
         Ok(())
     }
 
@@ -3789,6 +3946,7 @@ impl Pal for Sys {
         if let FdSlot::File { offset, .. } = slot {
             *offset = next;
         }
+        file_share(fildes);
         Ok(next as off_t)
     }
 
@@ -4248,6 +4406,7 @@ impl Pal for Sys {
         if let Some(FdSlot::File { offset, .. }) = fd_slot(fildes) {
             *offset += got as u64;
         }
+        file_share(fildes);
         Ok(got)
     }
 
@@ -4359,7 +4518,8 @@ impl Pal for Sys {
         envp: Option<NulTerminated<*mut c_char>>,
     ) -> Result<pid_t> {
         use crate::header::{
-            errno::{E2BIG, EINVAL, EMFILE, EOPNOTSUPP},
+            errno::{E2BIG, EACCES, EINVAL, EMFILE, ENAMETOOLONG, EOPNOTSUPP},
+            fcntl::{AT_FDCWD, O_ACCMODE, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC},
             spawn::Action,
         };
 
@@ -4389,6 +4549,19 @@ impl Pal for Sys {
             }
         }
 
+        // J956_r22_001 (P2c): file redirects need a filesystem grant for the child.
+        let grant = spawn_grant(&envs[..envn]);
+        let mut redirects = [Redirect {
+            kind: 0,
+            fd: 0,
+            to: 0,
+            flags: 0,
+            path: [0; REDIRECT_PATH_MAX],
+            path_len: 0,
+        }; REDIRECT_MAX];
+        let mut redirect_count = 0usize;
+        // Which of the child's fds 0-2 a redirect (not a channel) now backs.
+        let mut redirected = [false; 3];
         let mut stdio: [Option<(u8, u32)>; 3] = [None; 3];
         for fd in 0..3usize {
             let handle = match fd_slot(fd as c_int).map(|slot| *slot) {
@@ -4403,6 +4576,31 @@ impl Pal for Sys {
         if let Some(fac) = fac {
             for action in fac {
                 match action {
+                    // J956_r22_001: `dup2(1, 2)` after stdout went to a file is `2>&1`: the
+                    // child aliases its own open file, so the two share one offset.
+                    Action::Dup2(from, to)
+                        if (0..3).contains(&to) && (0..3).contains(&from) && redirected[from as usize] =>
+                    {
+                        if from == to {
+                            continue;
+                        }
+                        if redirect_count == REDIRECT_MAX {
+                            return Err(Errno(E2BIG));
+                        }
+                        if let Some((_, previous)) = stdio[to as usize].take() {
+                            close_handle(previous);
+                        }
+                        redirects[redirect_count].kind = REDIRECT_DUP;
+                        redirects[redirect_count].fd = from as u8;
+                        redirects[redirect_count].to = to as u8;
+                        redirect_count += 1;
+                        redirected[to as usize] = true;
+                    }
+                    // A channel cannot replace an earlier redirect: the child seats channels
+                    // before it replays redirects.
+                    Action::Dup2(_, to) if (0..3).contains(&to) && redirected[to as usize] => {
+                        return Err(Errno(EOPNOTSUPP));
+                    }
                     Action::Dup2(from, to) if (0..3).contains(&to) => {
                         let handle = match fd_slot(from).map(|slot| *slot) {
                             Some(FdSlot::Input(handle)) | Some(FdSlot::Output(handle))
@@ -4432,6 +4630,15 @@ impl Pal for Sys {
                         if let Some((_, previous)) = stdio[fd as usize].take() {
                             close_handle(previous);
                         }
+                        if redirected[fd as usize] {
+                            if redirect_count == REDIRECT_MAX {
+                                return Err(Errno(E2BIG));
+                            }
+                            redirects[redirect_count].kind = REDIRECT_CLOSE;
+                            redirects[redirect_count].fd = fd as u8;
+                            redirect_count += 1;
+                            redirected[fd as usize] = false;
+                        }
                     }
                     // J953_r19_001: LLVM's ExecuteAndWait redirects an empty path to
                     // "/dev/null" with addopen. Like Stdio::null() above, the child gets no
@@ -4439,18 +4646,49 @@ impl Pal for Sys {
                     // child needs a filesystem grant the child does not have, so it stays
                     // EOPNOTSUPP.
                     Action::Open { fd, path, .. }
-                        if (0..3).contains(&fd) && path.as_bytes() == DEV_NULL =>
+                        if (0..3).contains(&fd) && path.as_bytes() == DEV_NULL && !redirected[fd as usize] =>
                     {
                         if let Some((_, previous)) = stdio[fd as usize].take() {
                             close_handle(previous);
                         }
+                    }
+                    // J956_r22_001 (PROPOSAL/027 P2c, G5 (a)): a granted child's redirect to a
+                    // file. The parent opens it here with the full flags, so creation and
+                    // truncation happen once and ENOENT/EACCES come back from posix_spawn;
+                    // the child reopens it by path (without O_CREAT/O_TRUNC/O_EXCL) before
+                    // `main`. A read-only grant refuses a writable redirect here, since the
+                    // child's session could not open it. — TEAL
+                    Action::Open { fd, path, flag, mode } if (0..3).contains(&fd) && grant.is_some() => {
+                        let bytes = path.as_bytes();
+                        if bytes.len() > REDIRECT_PATH_MAX {
+                            return Err(Errno(ENAMETOOLONG));
+                        }
+                        if redirect_count == REDIRECT_MAX {
+                            return Err(Errno(E2BIG));
+                        }
+                        if grant == Some(VFS_SESSION_READ_ONLY) && flag & O_ACCMODE != O_RDONLY {
+                            return Err(Errno(EACCES));
+                        }
+                        let probe = Sys::openat(AT_FDCWD, CStr::borrow(&path), flag, mode)?;
+                        let _ = Sys::close(probe);
+                        if let Some((_, previous)) = stdio[fd as usize].take() {
+                            close_handle(previous);
+                        }
+                        let entry = &mut redirects[redirect_count];
+                        entry.kind = REDIRECT_OPEN;
+                        entry.fd = fd as u8;
+                        entry.flags = (flag & !(O_CREAT | O_TRUNC | O_EXCL)) as u32;
+                        entry.path[..bytes.len()].copy_from_slice(bytes);
+                        entry.path_len = bytes.len();
+                        redirect_count += 1;
+                        redirected[fd as usize] = true;
                     }
                     _ => return Err(Errno(EOPNOTSUPP)),
                 }
             }
         }
 
-        spawn_elf(program, &args[..argn], &envs[..envn], &stdio)
+        spawn_elf(program, &args[..argn], &envs[..envn], &stdio, &redirects[..redirect_count])
     }
 
     fn symlinkat(path1: CStr, fd: c_int, path2: CStr) -> Result<()> {
@@ -4654,6 +4892,7 @@ impl Pal for Sys {
                         ino,
                     };
                 }
+                file_share(fildes);
                 Ok(total)
             }
             Some(FdSlot::Socket { kind, .. }) if kind == SOCKET_KIND_TCP => {
@@ -4726,6 +4965,7 @@ impl Pal for Sys {
         if let Some(FdSlot::File { size: slot_size, .. }) = fd_slot(fildes) {
             *slot_size = size;
         }
+        file_share(fildes);
         Ok(total)
     }
 
