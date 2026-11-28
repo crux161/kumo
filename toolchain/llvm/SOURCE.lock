@@ -6861,6 +6861,146 @@
       "git_blob": "1ed5d11550d20c8924ad624e6bedbfa1c19b63f4",
       "sha256": "dc0131614ca423510877f1605ae79cc33e3c02bed067e021cf7f46576643c7ae",
       "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm-c/Deprecated.h"
+    },
+    "llvm/lib/AsmParser/AsmParserContext.cpp": {
+      "git_blob": "453e6994d2b9e962515b9df410d502311be81228",
+      "sha256": "ebe375f030d1dd968f6ca957d263847f7939fc24a7cedb806dbc6b8c6b62971c",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/AsmParser/AsmParserContext.cpp"
+    },
+    "llvm/lib/AsmParser/CMakeLists.txt": {
+      "git_blob": "dcfcc06f093a77a083f77fe90fd5e8859bc65f58",
+      "sha256": "d3dfef20c9df1f58c74d7b9f7dd30ee8585073b7791745282a1038bbe7d021ac",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/AsmParser/CMakeLists.txt"
+    },
+    "llvm/lib/AsmParser/LLLexer.cpp": {
+      "git_blob": "9ac671062966c3f7394b18b94a9847e4c3bcc27f",
+      "sha256": "47e673e2544959cd17a4b5c81f42e22280b2d7ad82260a27dc964af7ea7f2970",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/AsmParser/LLLexer.cpp"
+    },
+    "llvm/lib/AsmParser/LLParser.cpp": {
+      "git_blob": "03b808c4fdeefedddc194cb0db969914a8fb6656",
+      "sha256": "431d6ec192aa9eae19e369aaf7e259f0d23a9e040edb26db16834e6b31291f39",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/AsmParser/LLParser.cpp"
+    },
+    "llvm/lib/AsmParser/Parser.cpp": {
+      "git_blob": "c5346d097731483823d6b21cb902343917f7eebd",
+      "sha256": "5995b10912e3d850cb5bf74c21a85bfd4163f3877e33947b7dd206875f6b7a1a",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/AsmParser/Parser.cpp"
+    },
+    "llvm/lib/Bitcode/Reader/BitReader.cpp": {
+      "git_blob": "5e7d612862475048456579a59dff5482649bad55",
+      "sha256": "2398770384f5e5dd5d7737dc9154de07fac6ceef4e81cd2c5930277df88bc354",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitcode/Reader/BitReader.cpp"
+    },
+    "llvm/lib/Bitcode/Reader/BitcodeAnalyzer.cpp": {
+      "git_blob": "911ec7501eb8b53ef4d77bebf1386041e006233f",
+      "sha256": "44f10dd2d33a15982f8d503b2bb87655397b38ed480d330cb3aad05616e68e19",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitcode/Reader/BitcodeAnalyzer.cpp"
+    },
+    "llvm/lib/Bitcode/Reader/BitcodeReader.cpp": {
+      "git_blob": "9dd993f0dc17381d255ada5062ed959f569d8d5c",
+      "sha256": "a66a69b33e05150507384ba28bc65d40f2c6b348b45d99cfa1f2d8466f92b661",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitcode/Reader/BitcodeReader.cpp"
+    },
+    "llvm/lib/Bitcode/Reader/CMakeLists.txt": {
+      "git_blob": "7a385613105acde04393147c48dfe7bdcbee7477",
+      "sha256": "cf4a3a0345ea508b40bde8a00874ce827ba53b2904eb44d9d20e5c88d071baee",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitcode/Reader/CMakeLists.txt"
+    },
+    "llvm/lib/Bitcode/Reader/MetadataLoader.cpp": {
+      "git_blob": "c63dc8f00785e3d3e4d5721247c834120dc56831",
+      "sha256": "95b5918505960495fe7423ea499dc8769ef1582a3c55bdeab2baca6a964a147e",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitcode/Reader/MetadataLoader.cpp"
+    },
+    "llvm/lib/Bitcode/Reader/ValueList.cpp": {
+      "git_blob": "cced319294b36c7a03d57164c37d57511f7f94c1",
+      "sha256": "437ed9e63dc65eccacd0e496f6414f59607ffe8619419dc8b1a5b9e287b0ed20",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitcode/Reader/ValueList.cpp"
+    },
+    "llvm/lib/IRReader/CMakeLists.txt": {
+      "git_blob": "256d65c9f939d0a4398972bb755ab1c6b8e86b21",
+      "sha256": "6e562dc84657f282418a383208be61e8e02816e8bb41a079db2420e3cd92f2a5",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IRReader/CMakeLists.txt"
+    },
+    "llvm/lib/IRReader/IRReader.cpp": {
+      "git_blob": "29bf18c01fd7c30996f78e303407f970b9f7c48f",
+      "sha256": "b5abc2d056cd64245322a675c99927b1acebada6f127e01002679ebfbf32530f",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/IRReader/IRReader.cpp"
+    },
+    "llvm/tools/llvm-dis/CMakeLists.txt": {
+      "git_blob": "5804754ba696ed229f563751cffa9024bf3a37e5",
+      "sha256": "94ac6439686dabe6835d21f1d2a5b83d74b3db00da590204a6c0c44010e2b3b1",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/tools/llvm-dis/CMakeLists.txt"
+    },
+    "llvm/tools/llvm-dis/llvm-dis.cpp": {
+      "git_blob": "818185ff5c6caf8d731716d5f3f8f0673d2af7b3",
+      "sha256": "1173cf4a9973f6b32668d3d340bcc4185f58733bbb5651fb46544c95da0a2a93",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/tools/llvm-dis/llvm-dis.cpp"
+    },
+    "llvm/include/llvm/AsmParser/LLLexer.h": {
+      "git_blob": "0e379e5a75e65f767b1817ab4985025c335302be",
+      "sha256": "54d6e3b25b8cfc79fa75da0b73b153b7a5771b6488de51e0da8e71aeb94f55e0",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/AsmParser/LLLexer.h"
+    },
+    "llvm/include/llvm/AsmParser/LLParser.h": {
+      "git_blob": "9eb31d7e0a451127318fdb270d0bad09cfcab933",
+      "sha256": "5b3d7fb341d6828ef332af91bfd325ef46fa04a5afbed5d9a2d86e31b10947fd",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/AsmParser/LLParser.h"
+    },
+    "llvm/include/llvm/AsmParser/LLToken.h": {
+      "git_blob": "24f84cfa09e34297ef580c3a51ef499e97bc58a8",
+      "sha256": "7db309ecc9b3556f8e13e81c74aa483db3b5a212c778051b520b53bedc913a76",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/AsmParser/LLToken.h"
+    },
+    "llvm/include/llvm/AsmParser/Parser.h": {
+      "git_blob": "22b0881d92b53dcc7f4c78b8cb0c9408204467d2",
+      "sha256": "430bdbdb825f8df7c92c6205abd09639f92c3f765d0ce597cd9c8482267b774d",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/AsmParser/Parser.h"
+    },
+    "llvm/include/llvm/AsmParser/SlotMapping.h": {
+      "git_blob": "aae2a863babd9810714a026dc7329df6b24d1bae",
+      "sha256": "a722ad9ce9cb83c33876f1384f348c81c100c2a512fe3aea90729c47ad83498b",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/AsmParser/SlotMapping.h"
+    },
+    "llvm/include/llvm/Bitcode/BitcodeAnalyzer.h": {
+      "git_blob": "c8677aa7e811c4b77bb5cf99fca593fe72efd60e",
+      "sha256": "cf2c8e446973e8da00f3d62d1dd843c17f2d9dee045a05cb36489c0f4d2761ad",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Bitcode/BitcodeAnalyzer.h"
+    },
+    "llvm/include/llvm/Bitcode/BitcodeCommon.h": {
+      "git_blob": "22d1872fe49cc9fa4ba5099844079d9b697b2722",
+      "sha256": "eea2751bd3553fdc8e50609629eafd679f0de8effc9939576ab10458fc18b074",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Bitcode/BitcodeCommon.h"
+    },
+    "llvm/include/llvm/Bitcode/LLVMBitCodes.h": {
+      "git_blob": "2451d588bdbf7d91d79be7055900db3f41677b55",
+      "sha256": "a11fdb222369dfdef7a92629336573a4fa9905dfbfdd4642daff1f29a1176d28",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/Bitcode/LLVMBitCodes.h"
+    },
+    "llvm/include/llvm-c/BitReader.h": {
+      "git_blob": "c38c3ce3e01b2c8275166321e31e645aaffe2b9e",
+      "sha256": "fefdeb693257ed85e1971048f6526ee30c934e9a92c8b4db87b644499de195dc",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm-c/BitReader.h"
+    },
+    "llvm/include/llvm-c/IRReader.h": {
+      "git_blob": "4818ad780d48a9e85624a4e3ff6eadd1efd8744a",
+      "sha256": "57b77355c69b76e4e6805c7bd7ae9053db91cc2534a00965f2fe1a1d2f5a8eef",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm-c/IRReader.h"
+    },
+    "llvm/lib/Bitcode/Reader/MetadataLoader.h": {
+      "git_blob": "bab855ca635910795714bba2c03981b0e887cbc8",
+      "sha256": "68230b86a488630cde6ba099a14eff8d598a2d7ce45a64356e7831b23a596e57",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitcode/Reader/MetadataLoader.h"
+    },
+    "llvm/lib/Bitcode/Reader/ValueList.h": {
+      "git_blob": "a5b3f6e207077a72fa7d53d6f14cf30a07bac400",
+      "sha256": "bdd312a89ba891bbd58030f3a422eb5aa56fbc99913293c08bad1c2222753e05",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Bitcode/Reader/ValueList.h"
+    },
+    "llvm/include/llvm/AsmParser/NumberedValues.h": {
+      "git_blob": "6ea75754c0c8410a05fe7204b23caadca15b53be",
+      "sha256": "d69d60337e5e3a414efbe891c38ac12b97b310fa67fe42010cd03c87264be7e6",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/AsmParser/NumberedValues.h"
     }
   },
   "revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"

@@ -1,9 +1,9 @@
-<!-- J950_r16_001 -->
 <!-- J951_r17_001 -->
 <!-- J952_r18_001 -->
 <!-- J953_r19_001 -->
 <!-- J958_r24_001 -->
-# LLVM for native KUMO — bootstrap libraries
+<!-- J959_r25_001 -->
+# LLVM for native KUMO — bootstrap libraries and tools
 
 The first native bootstrap slice of PLAN/022 SH9. LLVM's `Support` and `Demangle` libraries
 (llvmorg-22.1.8, the same revision as `toolchain/cxx`) are built for `aarch64-unknown-kumo`
@@ -26,9 +26,13 @@ SH9-d6 builds all 80 Core IR units and the complete Remarks (11 units) and Bitst
 (1 unit) prerequisites. Its native proof constructs, verifies, mutates and prints IR and
 round-trips optimization remarks through YAML and LLVM bitstream.
 
+SH9-d7 adds complete AsmParser (4 units), BitReader (5) and IRReader (1) libraries, plus
+the real upstream `llvm-dis` executable. Native tools can now read textual IR or bitcode,
+and a granted child can run `llvm-dis input.bc -o output.ll`.
+
 ## Sources
 
-`SOURCE.lock` pins the measured closure: 1,372 files, 31,162,694 bytes. SH9-d1's 467 files hold every Support and
+`SOURCE.lock` pins the measured closure: 1,400 files, 32,180,905 bytes. SH9-d1's 467 files hold every Support and
 Demangle unit; the headers they and the proof include; the Unix layer (`lib/Support/Unix/*.inc`);
 BLAKE3's portable and NEON sources (not its x86 SIMD); `third-party/siphash`; the CMake config
 templates; and `llvm/LICENSE.TXT`, which also covers SipHash. Each file has its git blob ID and
@@ -57,6 +61,10 @@ source lists and their measured header closure. Upstream bytes stay unchanged.
 SH9-d6 adds 217 exact upstream files (4,973,488 bytes): Core/Remarks/BitstreamReader sources,
 three CMake recipes and the measured header closure. libc++ gains the pinned `<unordered_set>`
 header. The same LLVM revision and platform patch apply.
+
+SH9-d7 adds 28 exact upstream files (1,018,211 bytes): all ten reader units, their CMake
+recipes and measured headers, plus `llvm-dis.cpp` and its component recipe. No libc++ or
+platform patch expansion is needed.
 
 ## The KUMO port (`kumo.patch`)
 
@@ -327,5 +335,47 @@ python3 scripts/llvm-core-smoke.py --run
 python3 scripts/metal-sh9-d6.py
 ```
 
-This is the IR foundation. Textual IR parsing, bitcode reading/writing, Object's general
-factories, MCParser, instruction backends, native tools and SMP acceptance remain later gates.
+This is the IR foundation. SH9-d7 below closes textual IR parsing and bitcode reading.
+Native bitcode writing, Object's general factories, MCParser, instruction backends, native
+compiler tools and SMP acceptance remain later gates.
+
+## IR readers and native llvm-dis (SH9-d7)
+
+`build-irreader.py` builds all AsmParser, BitReader and IRReader units over Core's complete
+prerequisites. The library proof retains every component after Support/Demangle with
+`--whole-archive` and disables section garbage collection: no LLVM component dependencies
+remain unbuilt, and no ELF symbols are undefined. The same builder separately links the
+unchanged upstream `llvm/tools/llvm-dis/llvm-dis.cpp` with section GC and its complete link
+components. Both ELFs carry a 4 MiB main stack. The tool translation unit uses hosted C++ so
+upstream's ordinary `main` has C linkage; libraries keep their freestanding configuration.
+
+`make-ir-fixtures.py` requires matching LLVM 22.1.8 `llvm-as` (set `LLVM_AS` to select it).
+It assembles `ir-fixture.ll` on the host and records the producer, source, bitcode and generated
+header hashes. This slice proves native bitcode reading; native bitcode writing awaits the
+larger BitWriter dependency set.
+
+The native proof covers textual IR parsing and print/reparse, malformed syntax and undefined
+SSA diagnostics, eager bitcode reading, lazy function/metadata materialization, bad magic and
+truncated input, IRReader's text/bitcode dispatch in memory and through files, and missing-file
+errors. Semantic checks cover globals, branching SSA/PHI, function attributes and debug metadata.
+It then launches the real native tool with `KUMO_GRANT=fs`, reparses the annotated IR it writes,
+checks its LLVM version report through a stdout redirect, and checks a missing-input failure
+through stderr. Temporary output files are removed.
+
+The runners use `mtools` (`mformat`, `mcopy`, `mmd`) to prepare a private 40 MiB RAM FAT volume
+containing `/DIS.ELF` and the standard boot read fixtures/boot-sector marker. The normal image's 1 MiB free space
+cannot hold this host tool. No image-builder, server, kernel or persistent disk change is
+needed. The native tool is extracted again on the host to check its exact bytes; the tool,
+volume and parent ELF hashes bind the same artifacts to QEMU and metal. Runtime archives and
+fixtures are copied to the evidence directory. A successful metal run returns to INDRA login.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/llvm-irreader-smoke.py --run
+python3 scripts/metal-sh9-d7.py
+```
+
+`llvm-dis` reads LLVM bitcode and emits textual LLVM IR. It supplies no machine-instruction
+assembler, optimizer, code generator, linker or native rustc/cargo. BitWriter, Object's
+remaining components (MCParser/TextAPI), real target backends, the native compiler bootstrap,
+SMP and measured resource budgets remain later gates.

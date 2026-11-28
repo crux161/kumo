@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#J951_r17_001
 #J952_r18_001
 #J953_r19_001
 #J956_r22_001
 #J958_r24_001
+#J959_r25_001
 """Build LLVM's bootstrap libraries (llvmorg-22.1.8) for native KUMO.
 
 The sources are the measured closure pinned in toolchain/llvm/SOURCE.lock; toolchain/llvm/kumo.patch
@@ -52,18 +52,20 @@ def units(source):
 
 
 def main(component="support"):
-    if component not in ("support", "binaryformat", "targetparser", "object", "mc", "process", "redirect", "core"):
+    if component not in ("support", "binaryformat", "targetparser", "object", "mc", "process", "redirect", "core", "irreader"):
         raise ValueError(f"unknown LLVM bootstrap component: {component}")
-    core_library = component == "core"
+    irreader_library = component == "irreader"
+    core_library = component in ("core", "irreader")
     object_library = component == "object"
     mc_library = component == "mc"
-    targetparser = component in ("targetparser", "object", "mc", "core")
-    binaryformat = component in ("binaryformat", "targetparser", "object", "mc", "core")
-    whole_closure = component in ("targetparser", "mc", "core")
+    targetparser = component in ("targetparser", "object", "mc", "core", "irreader")
+    binaryformat = component in ("binaryformat", "targetparser", "object", "mc", "core", "irreader")
+    whole_closure = component in ("targetparser", "mc", "core", "irreader")
     tag, label = {"support": ("SH9-d1", "LLVM Support"), "binaryformat": ("SH9-d2", "LLVM BinaryFormat"),
                   "targetparser": ("SH9-d3", "LLVM TargetParser"), "object": ("SH9-d4", "LLVM Object"),
                   "mc": ("SH9-d5", "LLVM MC"),
                   "core": ("SH9-d6", "LLVM Core"),
+                  "irreader": ("SH9-d7", "LLVM IR readers"),
                   "process": ("SH9-p1", "LLVM process launch"),
                   "redirect": ("P2c", "LLVM spawn redirects")}[component]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -72,7 +74,7 @@ def main(component="support"):
     parser.add_argument("--libcxx-out", type=Path, default=ROOT / "target/cxx-libcxx")
     parser.add_argument("--eh-out", type=Path, default=ROOT / "target/cxx-eh")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
-    parser.add_argument("--tblgen", type=Path, help="LLVM 22.1.8 llvm-tblgen (TargetParser/Object/MC/Core)")
+    parser.add_argument("--tblgen", type=Path, help="LLVM 22.1.8 llvm-tblgen (TargetParser/Object/MC/Core/IRReader)")
     args = parser.parse_args()
     sysroot, out = args.sysroot.resolve(), args.out.resolve()
     libcxx_out, eh_out = args.libcxx_out.resolve(), args.eh_out.resolve()
@@ -116,6 +118,10 @@ def main(component="support"):
     fixtures = (runpy.run_path(str(TOOL / "make-object-fixtures.py"))["generate"](
         out / "fixtures", generated) if object_library else None)
 
+    if irreader_library:
+        fixtures = runpy.run_path(str(TOOL / "make-ir-fixtures.py"))["generate"](
+            out / "fixtures", generated)
+
     out.mkdir(parents=True, exist_ok=True)
     common = ["--target=aarch64-unknown-none", f"--sysroot={sysroot}", "-D__kumo__", "-O2", "-ffreestanding",
               "-fno-pic", "-fno-pie", "-fno-stack-protector", "-ffunction-sections", "-fdata-sections",
@@ -145,6 +151,8 @@ def main(component="support"):
         component_paths["DebugInfoDWARFLowLevel"] = "DebugInfo/DWARF/LowLevel"
     if core_library:
         component_paths.update({"Core": "IR", "Remarks": "Remarks", "BitstreamReader": "Bitstream/Reader"})
+    if irreader_library:
+        component_paths.update({"AsmParser": "AsmParser", "BitReader": "Bitcode/Reader", "IRReader": "IRReader"})
     for name, directory in component_paths.items():
         # Keep every unit from each pinned upstream component's source list. — KESTREL
         cmake = source / f"llvm/lib/{directory}/CMakeLists.txt"
@@ -162,11 +170,36 @@ def main(component="support"):
         archive.unlink(missing_ok=True)
         run(["llvm-ar", "rcs", archive, *members])
 
+    crt = out / "crt0.o"
+    run(["clang", "--target=aarch64-unknown-none", "-c", ROOT / "toolchain/relibc/smoke/crt0.S", "-o", crt])
+    native_tool = None
+    native_depfiles = []
+    native_tools = {}
+    if irreader_library:
+        tool_source = source / "llvm/tools/llvm-dis/llvm-dis.cpp"
+        cmake = source / "llvm/tools/llvm-dis/CMakeLists.txt"
+        required = re.search(r"set\(LLVM_LINK_COMPONENTS\s+([^)]*)\)", cmake.read_text()).group(1).split()
+        if set(required) - library_units.keys():
+            raise RuntimeError("llvm-dis has unbuilt link components")
+        # Hosted main has C linkage; the libraries still use the freestanding configuration. — TEAL
+        tool_obj = out / "llvm-dis.o"
+        run(["clang++", *common, "-fhosted", *cxx, "-MD", "-MF", f"{tool_obj}.d", "-c", tool_source, "-o", tool_obj])
+        native_depfiles.append(Path(f"{tool_obj}.d"))
+        native_tool = out / "llvm-dis"
+        tool_script = runpy.run_path(str(CXX / "build-libcxx.py"))["stack_link_script"](out)
+        run(["ld.lld", "-static", "--gc-sections", "--eh-frame-hdr", "-z", "noexecstack",
+             "-T", CXX / "eh-sections.ld", "-T", tool_script, f"-Map={out / 'llvm-dis.map'}", "-o", native_tool,
+             out / "crt0.o", tool_obj, "--start-group", *archives,
+             layer / "lib/libc++.a", layer / "lib/libc++abi.a", layer / "lib/libunwind.a", libc, "--end-group"])
+        runpy.run_path(str(CXX / "build-libcxx.py"))["set_stack_size"](native_tool, MAIN_STACK)
+        if run(["llvm-nm", "--undefined-only", native_tool], capture=True).strip():
+            raise RuntimeError("unresolved symbols in native llvm-dis")
+        native_tools["llvm-dis"] = {"elf_sha256": sha(native_tool), "elf_bytes": native_tool.stat().st_size,
+                                    "link_components": required, "source": "llvm/tools/llvm-dis/llvm-dis.cpp"}
+
     smoke = TOOL / f"{component}-smoke.cpp"
     smoke_obj = out / "smoke.o"
     run(["clang++", *common, *cxx, "-MD", "-MF", f"{smoke_obj}.d", "-c", smoke, "-o", smoke_obj])
-    crt = out / "crt0.o"
-    run(["clang", "--target=aarch64-unknown-none", "-c", ROOT / "toolchain/relibc/smoke/crt0.S", "-o", crt])
     libcxx_build = runpy.run_path(str(CXX / "build-libcxx.py"))
     script = libcxx_build["stack_link_script"](out)
     elf = out / f"llvm-{component}-smoke"
@@ -185,11 +218,13 @@ def main(component="support"):
 
     # Record the measured LLVM inputs, and reject accidental use of an unpinned header. — KESTREL
     dependencies = set(tablegen["source_dependencies"] if tablegen else ())
+    if irreader_library:
+        dependencies.add("llvm/tools/llvm-dis/CMakeLists.txt")
     resource_roots = tuple(Path(run([driver, "-print-resource-dir"], capture=True).strip()).resolve()
                            for driver in ("clang", "clang++"))
     resource_inputs = {}
     for depfile in [*(objects / (str(path.relative_to(source)).replace("/", "_") + ".o.d")
-                      for paths in library_units.values() for path in paths), Path(f"{smoke_obj}.d")]:
+                      for paths in library_units.values() for path in paths), Path(f"{smoke_obj}.d"), *native_depfiles]:
         for path in libcxx_build["dependencies"](depfile, ROOT, (source, generated, layer, sysroot, TOOL, *resource_roots)):
             if path.is_relative_to(source):
                 name = str(path.relative_to(source))
@@ -218,9 +253,11 @@ def main(component="support"):
         "gc_sections": not whole_closure,
         "proof_scope": ("native ELF and archive readers" if object_library else
                         "generic MC data directives and DWARF low-level APIs" if mc_library else
+                        "native textual IR/bitcode readers and upstream llvm-dis" if irreader_library else
                         "native IR construction, verification, printing, metadata and remarks" if core_library else label),
         "tablegen": tablegen,
         "fixtures": fixtures,
+        "native_tools": native_tools,
         "units": {name.lower(): len(paths) for name, paths in library_units.items()},
         "source_dependencies": sorted(dependencies),
         "source_closure_files": len(lock["files"]),
@@ -230,10 +267,11 @@ def main(component="support"):
         "compiler_resource_inputs_sha256": dict(sorted(resource_inputs.items())),
         "inputs_sha256": {str(path): sha(path) for path in (
             Path(__file__).resolve(), lock_path, TOOL / "kumo.patch", TOOL / "gen-config.py", smoke,
-            CXX / "build-libcxx.py", CXX / "SOURCE.lock", libc, layer / "lib/libc++.a", layer / "include/c++/v1/__config_site",
+            CXX / "build-libcxx.py", CXX / "SOURCE.lock", libc, layer / "lib/libc++.a", layer / "lib/libc++abi.a", layer / "lib/libunwind.a", layer / "include/c++/v1/__config_site",
             *((TOOL / f"build-{component}.py",) if component != "support" else ()),
             *((TOOL / "gen-target-tables.py",) if targetparser else ()),
-            *((TOOL / "make-object-fixtures.py", TOOL / "object-fixture.S") if object_library else ()))},
+            *((TOOL / "make-object-fixtures.py", TOOL / "object-fixture.S") if object_library else ()),
+            *((TOOL / "make-ir-fixtures.py", TOOL / "ir-fixture.ll") if irreader_library else ()))},
         "generated_sha256": {str(path.relative_to(generated)): sha(path)
                              for path in sorted(generated.rglob("*")) if path.is_file()},
         "archives_sha256": {path.name: sha(path) for path in archives},
